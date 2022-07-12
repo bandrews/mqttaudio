@@ -21,13 +21,13 @@ To find ALSA devices:  mqttaudio --list-devices
 
 To control, send a valid JSON message to the topic specified:
 
-    {command: "play", message: {file: "http://example.com/audio.wav", loop: true, volume: 0.75, exclusive: false, maxPlayLength: 60000}}
+    {"command": "play", "message": {"file": "http://example.com/audio.wav", "loop": true, "volume": 0.75, "exclusive": false, "maxPlayLength": 60000}}
 
-    {command: "stopall"}
+    {"command": "stopall"}
 
-    {command: "fadeout", message: {time: 10000}}
+    {"command": "fadeout", "message": {"time": 10000}}
 
-    {command: "precache", message: {file: "http://example.com/loadme.wav"}}
+    {"command": "precache", "message": {"file": "http://example.com/loadme.wav"}}
 
 File paths can be local or remote.
 All times in milliseconds.
