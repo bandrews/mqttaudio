@@ -2,7 +2,7 @@
 MQTT-controlled simple command line audio player, designed for building interactive entertainment on a budget.
 
 ## Dependencies
-To install:  make install-dependencies
+To install:  sudo make install-dependencies
 
 Dependencies to be installed include sdl2, librt, mosquitto, asound and curl (see Makefile for details)
 
@@ -32,7 +32,7 @@ To control, send a valid JSON message to the topic specified:
 File paths can be local or remote.
 All times in milliseconds.
 
-Supported formats: WAV, MP3, OGG, MOD (untested)
+Supported formats: WAV, OGG.  MP3 and MOD may work but are untested
 
 Tip:  A 5.1 audio USB breakout box, combined with careful ALSA configuration that splits the output devices into single-channel PCM devices, can support up to six independent channels at once of output.  Run a separate instance of mqttaudio for each target output device.
 
