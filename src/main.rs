@@ -272,7 +272,7 @@ async fn main() {
                     tracing::info!("Processing command: {:?}", cmd);
 
                     match cmd {
-                        mqtt::commands::AudioCommand::Play { file, volume, voice } => {
+                        mqtt::commands::AudioCommand::Play { file, volume, voice, channel_map } => {
                             // Decode file
                             match audio::decoder::decode_file(&file, Some(output_sample_rate)) {
                                 Ok(buffer) => {
@@ -299,14 +299,32 @@ async fn main() {
                                     let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
                                     drop(voice_mgr);
 
-                                    // Add to mixer
-                                    let sample = ActiveSample::new(
-                                        sample_id,
-                                        voice_id,
-                                        Arc::new(buffer),
-                                        volume,
-                                        voice_volume,
-                                    );
+                                    // Convert channel_map to mixer format
+                                    let sample = if let Some(map) = channel_map {
+                                        // Custom channel mapping
+                                        let mapping: Vec<(usize, usize)> = map.iter()
+                                            .map(|m| (m.src, m.dest))
+                                            .collect();
+                                        tracing::debug!("Using custom channel mapping: {:?}", mapping);
+                                        ActiveSample::new_with_mapping(
+                                            sample_id,
+                                            voice_id,
+                                            Arc::new(buffer),
+                                            volume,
+                                            voice_volume,
+                                            mapping,
+                                        )
+                                    } else {
+                                        // Default channel mapping (1:1)
+                                        ActiveSample::new(
+                                            sample_id,
+                                            voice_id,
+                                            Arc::new(buffer),
+                                            volume,
+                                            voice_volume,
+                                        )
+                                    };
+
                                     let mut state = mixer_state.lock().unwrap();
                                     state.active_samples.push(sample);
 

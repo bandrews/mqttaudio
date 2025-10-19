@@ -11,6 +11,13 @@ pub struct MqttCommand {
     pub message: Option<serde_json::Value>,
 }
 
+/// Channel mapping for routing source channels to destination channels
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct ChannelMapping {
+    pub src: usize,
+    pub dest: usize,
+}
+
 /// Play command parameters
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PlayMessage {
@@ -19,8 +26,9 @@ pub struct PlayMessage {
     pub volume: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub voice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_map: Option<Vec<ChannelMapping>>,
     // Future fields for later phases:
-    // pub channel_map: Option<Vec<...>>,   // Phase 7
     // #[serde(rename = "loop")]
     // pub loop_mode: Option<bool>,         // Future
     // pub fade_in: Option<u32>,            // Phase 9
@@ -54,6 +62,7 @@ pub enum AudioCommand {
         file: String,
         volume: f32,
         voice: Option<String>,
+        channel_map: Option<Vec<ChannelMapping>>,
     },
     StopAll,
     VoiceStop {
@@ -108,6 +117,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 file: play_msg.file,
                 volume: play_msg.volume.unwrap_or(1.0),
                 voice: play_msg.voice,
+                channel_map: play_msg.channel_map,
             })
         }
         "stopall" | "soundStopAll" => {
@@ -153,10 +163,11 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice } => {
+            AudioCommand::Play { file, volume, voice, channel_map } => {
                 assert_eq!(file, "test.wav");
                 assert_eq!(volume, 1.0); // Default volume
                 assert!(voice.is_none()); // No voice specified
+                assert!(channel_map.is_none()); // No channel map specified
             }
             _ => panic!("Expected Play command"),
         }
@@ -168,10 +179,11 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice } => {
+            AudioCommand::Play { file, volume, voice, channel_map } => {
                 assert_eq!(file, "test.wav");
                 assert_eq!(volume, 0.5);
                 assert!(voice.is_none());
+                assert!(channel_map.is_none());
             }
             _ => panic!("Expected Play command"),
         }
@@ -183,10 +195,11 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice } => {
+            AudioCommand::Play { file, volume, voice, channel_map } => {
                 assert_eq!(file, "http://example.com/audio.mp3");
                 assert_eq!(volume, 0.8);
                 assert!(voice.is_none());
+                assert!(channel_map.is_none());
             }
             _ => panic!("Expected Play command"),
         }
@@ -210,10 +223,11 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice } => {
+            AudioCommand::Play { file, volume, voice, channel_map } => {
                 assert_eq!(file, "test.wav");
                 assert_eq!(volume, 1.0);
                 assert_eq!(voice, Some("ambience".to_string()));
+                assert!(channel_map.is_none());
             }
             _ => panic!("Expected Play command"),
         }
@@ -225,10 +239,11 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice } => {
+            AudioCommand::Play { file, volume, voice, channel_map } => {
                 assert_eq!(file, "music.mp3");
                 assert_eq!(volume, 0.6);
                 assert_eq!(voice, Some("background".to_string()));
+                assert!(channel_map.is_none());
             }
             _ => panic!("Expected Play command"),
         }
@@ -366,6 +381,123 @@ mod tests {
         match result.unwrap_err() {
             ParseError::JsonError(_) => {}, // OK
             e => panic!("Expected JsonError, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_channel_map_stereo() {
+        let json = r#"{"command": "play", "message": {"file": "test.wav", "channel_map": [{"src": 0, "dest": 6}, {"src": 1, "dest": 7}]}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, volume, voice, channel_map } => {
+                assert_eq!(file, "test.wav");
+                assert_eq!(volume, 1.0);
+                assert!(voice.is_none());
+
+                let map = channel_map.unwrap();
+                assert_eq!(map.len(), 2);
+                assert_eq!(map[0], ChannelMapping { src: 0, dest: 6 });
+                assert_eq!(map[1], ChannelMapping { src: 1, dest: 7 });
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_channel_map_quad() {
+        let json = r#"{"command": "play", "message": {
+            "file": "quad.wav",
+            "channel_map": [
+                {"src": 0, "dest": 0},
+                {"src": 1, "dest": 1},
+                {"src": 2, "dest": 2},
+                {"src": 3, "dest": 3}
+            ]
+        }}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, channel_map, .. } => {
+                assert_eq!(file, "quad.wav");
+
+                let map = channel_map.unwrap();
+                assert_eq!(map.len(), 4);
+                assert_eq!(map[0], ChannelMapping { src: 0, dest: 0 });
+                assert_eq!(map[1], ChannelMapping { src: 1, dest: 1 });
+                assert_eq!(map[2], ChannelMapping { src: 2, dest: 2 });
+                assert_eq!(map[3], ChannelMapping { src: 3, dest: 3 });
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_channel_map_complex_routing() {
+        let json = r#"{"command": "play", "message": {
+            "file": "surround.wav",
+            "voice": "ambience",
+            "volume": 0.7,
+            "channel_map": [
+                {"src": 0, "dest": 8},
+                {"src": 1, "dest": 9},
+                {"src": 2, "dest": 10},
+                {"src": 3, "dest": 11}
+            ]
+        }}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, volume, voice, channel_map } => {
+                assert_eq!(file, "surround.wav");
+                assert_eq!(volume, 0.7);
+                assert_eq!(voice, Some("ambience".to_string()));
+
+                let map = channel_map.unwrap();
+                assert_eq!(map.len(), 4);
+                assert_eq!(map[0], ChannelMapping { src: 0, dest: 8 });
+                assert_eq!(map[1], ChannelMapping { src: 1, dest: 9 });
+                assert_eq!(map[2], ChannelMapping { src: 2, dest: 10 });
+                assert_eq!(map[3], ChannelMapping { src: 3, dest: 11 });
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_channel_map_mono_to_multiple() {
+        // One source channel to multiple destinations
+        let json = r#"{"command": "play", "message": {
+            "file": "mono.wav",
+            "channel_map": [
+                {"src": 0, "dest": 0},
+                {"src": 0, "dest": 1}
+            ]
+        }}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { channel_map, .. } => {
+                let map = channel_map.unwrap();
+                assert_eq!(map.len(), 2);
+                assert_eq!(map[0], ChannelMapping { src: 0, dest: 0 });
+                assert_eq!(map[1], ChannelMapping { src: 0, dest: 1 });
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_channel_map_empty() {
+        let json = r#"{"command": "play", "message": {"file": "test.wav", "channel_map": []}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { channel_map, .. } => {
+                let map = channel_map.unwrap();
+                assert_eq!(map.len(), 0);
+            }
+            _ => panic!("Expected Play command"),
         }
     }
 }

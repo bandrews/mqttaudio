@@ -31,7 +31,12 @@ pub async fn connect_mqtt(
 ) -> Result<(AsyncClient, EventLoop), MqttError> {
     tracing::info!("Connecting to MQTT broker: {}:{}", server, port);
 
-    let mut mqttoptions = MqttOptions::new("mqttaudio", server, port);
+    // Use unique client ID with random suffix to avoid conflicts
+    use rand::Rng;
+    let random_suffix: u32 = rand::thread_rng().gen();
+    let client_id = format!("mqttaudio_{:08x}", random_suffix);
+
+    let mut mqttoptions = MqttOptions::new(client_id, server, port);
     mqttoptions.set_keep_alive(Duration::from_secs(60));
     mqttoptions.set_clean_session(true);
 
@@ -72,8 +77,9 @@ pub async fn process_mqtt_events(
             Ok(Event::Incoming(Packet::SubAck(_))) => {
                 tracing::debug!("MQTT subscription acknowledged");
             }
-            Ok(_) => {
-                // Other events (PingResp, etc.) - ignore
+            Ok(event) => {
+                // Other events (PingResp, etc.)
+                tracing::trace!("MQTT event: {:?}", event);
             }
             Err(e) => {
                 tracing::error!("MQTT error: {}", e);

@@ -347,4 +347,122 @@ mod tests {
             assert_eq!(s, 0.0);
         }
     }
+
+    #[test]
+    fn test_mono_to_multichannel() {
+        // Mono source to 8-channel output
+        let data = vec![0.5; 10]; // 10 frames, 1 channel
+        let buffer = Arc::new(DecodedBuffer::new(data, 1, 48000));
+
+        // Route mono to channels 4 and 5
+        let channel_map = vec![(0, 4), (0, 5)];
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map);
+
+        let mut state = MixerState::new(8);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 80]; // 10 frames * 8 channels
+        mix_audio(&mut output, &mut state);
+
+        // Check first frame
+        assert_eq!(output[0], 0.0); // Channel 0: silence
+        assert_eq!(output[1], 0.0); // Channel 1: silence
+        assert_eq!(output[2], 0.0); // Channel 2: silence
+        assert_eq!(output[3], 0.0); // Channel 3: silence
+        assert_eq!(output[4], 0.5); // Channel 4: mono signal
+        assert_eq!(output[5], 0.5); // Channel 5: mono signal
+        assert_eq!(output[6], 0.0); // Channel 6: silence
+        assert_eq!(output[7], 0.0); // Channel 7: silence
+
+        // Check second frame
+        assert_eq!(output[12], 0.5); // Frame 1, Channel 4
+        assert_eq!(output[13], 0.5); // Frame 1, Channel 5
+    }
+
+    #[test]
+    fn test_quad_to_stereo_downmix() {
+        // 4-channel source to stereo output (channels 0 and 1)
+        let mut data = Vec::new();
+        for _ in 0..10 {  // 10 frames
+            data.push(0.1); // Front left
+            data.push(0.2); // Front right
+            data.push(0.3); // Rear left
+            data.push(0.4); // Rear right
+        }
+        let buffer = Arc::new(DecodedBuffer::new(data, 4, 48000));
+
+        // Mix surround channels to stereo
+        let channel_map = vec![
+            (0, 0), // Front left → Left
+            (1, 1), // Front right → Right
+            (2, 0), // Rear left → Left (mix)
+            (3, 1), // Rear right → Right (mix)
+        ];
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map);
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 20]; // 10 frames * 2 channels
+        mix_audio(&mut output, &mut state);
+
+        // First frame: L should be 0.1 + 0.3 = 0.4, R should be 0.2 + 0.4 = 0.6
+        assert!((output[0] - 0.4).abs() < 0.0001);
+        assert!((output[1] - 0.6).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_sparse_channel_routing() {
+        // Stereo to channels 6 and 9 (leaving gaps)
+        let data = vec![0.3, 0.7, 0.3, 0.7]; // 2 frames, 2 channels
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+
+        let channel_map = vec![(0, 6), (1, 9)];
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map);
+
+        let mut state = MixerState::new(12);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 24]; // 2 frames * 12 channels
+        mix_audio(&mut output, &mut state);
+
+        // Frame 0
+        for ch in 0..12 {
+            let idx = ch;
+            if ch == 6 {
+                assert_eq!(output[idx], 0.3);
+            } else if ch == 9 {
+                assert_eq!(output[idx], 0.7);
+            } else {
+                assert_eq!(output[idx], 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn test_out_of_bounds_channel_routing() {
+        // Test that out-of-bounds channel mappings are safely ignored
+        let data = vec![0.5, 0.5, 0.5, 0.5]; // 2 frames, 2 channels
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+
+        // Map to invalid destinations
+        let channel_map = vec![
+            (0, 0),   // Valid
+            (1, 100), // Out of bounds (only 4 output channels)
+            (99, 2),  // Invalid source
+        ];
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map);
+
+        let mut state = MixerState::new(4);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 8]; // 2 frames * 4 channels
+        mix_audio(&mut output, &mut state);
+
+        // Only channel 0 should have audio (the valid mapping)
+        assert_eq!(output[0], 0.5); // Frame 0, Ch 0
+        assert_eq!(output[1], 0.0); // Frame 0, Ch 1
+        assert_eq!(output[2], 0.0); // Frame 0, Ch 2
+        assert_eq!(output[3], 0.0); // Frame 0, Ch 3
+    }
 }
