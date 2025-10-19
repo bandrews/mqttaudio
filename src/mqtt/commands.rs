@@ -28,10 +28,11 @@ pub struct PlayMessage {
     pub voice: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_map: Option<Vec<ChannelMapping>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fade_in: Option<u32>, // Fade in duration in milliseconds
     // Future fields for later phases:
     // #[serde(rename = "loop")]
     // pub loop_mode: Option<bool>,         // Future
-    // pub fade_in: Option<u32>,            // Phase 9
     // pub max_play_length: Option<i32>,    // Future
 }
 
@@ -75,6 +76,7 @@ pub enum AudioCommand {
         volume: f32,
         voice: Option<String>,
         channel_map: Option<Vec<ChannelMapping>>,
+        fade_in: Option<u32>, // Fade in duration in milliseconds
     },
     StopAll,
     VoiceStop {
@@ -137,6 +139,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 volume: play_msg.volume.unwrap_or(1.0),
                 voice: play_msg.voice,
                 channel_map: play_msg.channel_map,
+                fade_in: play_msg.fade_in,
             })
         }
         "stopall" | "soundStopAll" => {
@@ -201,7 +204,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map } => {
+            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
                 assert_eq!(file, "test.wav");
                 assert_eq!(volume, 1.0); // Default volume
                 assert!(voice.is_none()); // No voice specified
@@ -217,7 +220,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map } => {
+            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
                 assert_eq!(file, "test.wav");
                 assert_eq!(volume, 0.5);
                 assert!(voice.is_none());
@@ -233,7 +236,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map } => {
+            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
                 assert_eq!(file, "http://example.com/audio.mp3");
                 assert_eq!(volume, 0.8);
                 assert!(voice.is_none());
@@ -261,7 +264,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map } => {
+            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
                 assert_eq!(file, "test.wav");
                 assert_eq!(volume, 1.0);
                 assert_eq!(voice, Some("ambience".to_string()));
@@ -277,7 +280,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map } => {
+            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
                 assert_eq!(file, "music.mp3");
                 assert_eq!(volume, 0.6);
                 assert_eq!(voice, Some("background".to_string()));
@@ -428,7 +431,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map } => {
+            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
                 assert_eq!(file, "test.wav");
                 assert_eq!(volume, 1.0);
                 assert!(voice.is_none());
@@ -486,7 +489,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map } => {
+            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
                 assert_eq!(file, "surround.wav");
                 assert_eq!(volume, 0.7);
                 assert_eq!(voice, Some("ambience".to_string()));
@@ -610,6 +613,33 @@ mod tests {
         match result.unwrap_err() {
             ParseError::MissingMessage => {}, // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_with_fade_in() {
+        let json = r#"{"command": "play", "message": {"file": "test.wav", "fade_in": 2000}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, fade_in, .. } => {
+                assert_eq!(file, "test.wav");
+                assert_eq!(fade_in, Some(2000));
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_without_fade_in() {
+        let json = r#"{"command": "play", "message": {"file": "test.wav"}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { fade_in, .. } => {
+                assert_eq!(fade_in, None);
+            }
+            _ => panic!("Expected Play command"),
         }
     }
 }

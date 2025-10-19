@@ -4,6 +4,83 @@
 use crate::audio::types::DecodedBuffer;
 use std::sync::Arc;
 
+/// Fade state for audio samples
+#[derive(Debug, Clone, PartialEq)]
+pub enum FadeState {
+    /// No fading
+    None,
+    /// Fading in: (frames_elapsed, total_fade_frames)
+    In { elapsed: usize, duration: usize },
+    /// Fading out: (frames_elapsed, total_fade_frames)
+    Out { elapsed: usize, duration: usize },
+}
+
+impl FadeState {
+    /// Create a new fade in state
+    pub fn fade_in(duration_ms: u32, sample_rate: u32) -> Self {
+        let duration_frames = ((duration_ms as f32 / 1000.0) * sample_rate as f32) as usize;
+        FadeState::In {
+            elapsed: 0,
+            duration: duration_frames,
+        }
+    }
+
+    /// Create a new fade out state
+    pub fn fade_out(duration_ms: u32, sample_rate: u32) -> Self {
+        let duration_frames = ((duration_ms as f32 / 1000.0) * sample_rate as f32) as usize;
+        FadeState::Out {
+            elapsed: 0,
+            duration: duration_frames,
+        }
+    }
+
+    /// Calculate fade multiplier for the current position
+    /// Returns a value between 0.0 and 1.0
+    pub fn multiplier(&self) -> f32 {
+        match self {
+            FadeState::None => 1.0,
+            FadeState::In { elapsed, duration } => {
+                if *duration == 0 {
+                    return 1.0;
+                }
+                (*elapsed as f32 / *duration as f32).min(1.0)
+            }
+            FadeState::Out { elapsed, duration } => {
+                if *duration == 0 {
+                    return 0.0;
+                }
+                (1.0 - (*elapsed as f32 / *duration as f32)).max(0.0)
+            }
+        }
+    }
+
+    /// Advance fade state by one frame
+    pub fn advance(&mut self) {
+        match self {
+            FadeState::In { elapsed, duration } => {
+                if *elapsed < *duration {
+                    *elapsed += 1;
+                }
+            }
+            FadeState::Out { elapsed, duration } => {
+                if *elapsed < *duration {
+                    *elapsed += 1;
+                }
+            }
+            FadeState::None => {}
+        }
+    }
+
+    /// Check if fade is complete
+    pub fn is_complete(&self) -> bool {
+        match self {
+            FadeState::None => true,
+            FadeState::In { elapsed, duration } => elapsed >= duration,
+            FadeState::Out { elapsed, duration } => elapsed >= duration,
+        }
+    }
+}
+
 /// Active sample being played
 pub struct ActiveSample {
     /// Unique sample ID
@@ -26,6 +103,9 @@ pub struct ActiveSample {
 
     /// Channel routing: vec![(src_channel, dest_channel), ...]
     pub channel_map: Vec<(usize, usize)>,
+
+    /// Fade state (in/out/none)
+    pub fade_state: FadeState,
 }
 
 impl ActiveSample {
@@ -44,6 +124,7 @@ impl ActiveSample {
             volume,
             voice_volume,
             channel_map,
+            fade_state: FadeState::None,
         }
     }
 
@@ -65,12 +146,28 @@ impl ActiveSample {
             volume,
             voice_volume,
             channel_map,
+            fade_state: FadeState::None,
         }
     }
 
+    /// Set the fade state for this sample
+    pub fn set_fade(&mut self, fade_state: FadeState) {
+        self.fade_state = fade_state;
+    }
+
     /// Check if this sample has finished playing
+    /// A sample is finished if it reached the end OR if fade out is complete
     pub fn is_finished(&self) -> bool {
-        self.position >= self.buffer.frames
+        // Reached end of buffer
+        if self.position >= self.buffer.frames {
+            return true;
+        }
+
+        // Fade out complete
+        match self.fade_state {
+            FadeState::Out { elapsed, duration } => elapsed >= duration,
+            _ => false,
+        }
     }
 
     /// Get the combined volume (sample volume * voice volume)
@@ -127,12 +224,12 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
 
 /// Mix a single sample into the output buffer
 fn mix_sample_into_output(
-    sample: &ActiveSample,
+    sample: &mut ActiveSample,
     output: &mut [f32],
     frames: usize,
     output_channels: usize,
 ) {
-    let combined_volume = sample.combined_volume();
+    let base_volume = sample.combined_volume();
 
     for frame_idx in 0..frames {
         let src_position = sample.position + frame_idx;
@@ -141,6 +238,10 @@ fn mix_sample_into_output(
         if src_position >= sample.buffer.frames {
             break;
         }
+
+        // Calculate fade multiplier for this frame
+        let fade_multiplier = sample.fade_state.multiplier();
+        let final_volume = base_volume * fade_multiplier;
 
         // Apply channel mapping and mix into output
         for &(src_ch, dest_ch) in &sample.channel_map {
@@ -152,9 +253,12 @@ fn mix_sample_into_output(
             let src_idx = src_position * sample.buffer.channels + src_ch;
             let dest_idx = frame_idx * output_channels + dest_ch;
 
-            // Mix with combined volume applied (sample volume * voice volume)
-            output[dest_idx] += sample.buffer.data[src_idx] * combined_volume;
+            // Mix with combined volume and fade applied
+            output[dest_idx] += sample.buffer.data[src_idx] * final_volume;
         }
+
+        // Advance fade state
+        sample.fade_state.advance();
     }
 }
 
@@ -465,4 +569,175 @@ mod tests {
         assert_eq!(output[2], 0.0); // Frame 0, Ch 2
         assert_eq!(output[3], 0.0); // Frame 0, Ch 3
     }
+
+    // === Fade Tests ===
+
+    #[test]
+    fn test_fade_state_creation() {
+        let fade_in = FadeState::fade_in(1000, 48000); // 1 second at 48kHz
+        assert_eq!(fade_in, FadeState::In { elapsed: 0, duration: 48000 });
+
+        let fade_out = FadeState::fade_out(500, 44100); // 0.5 seconds at 44.1kHz
+        assert_eq!(fade_out, FadeState::Out { elapsed: 0, duration: 22050 });
+    }
+
+    #[test]
+    fn test_fade_in_multiplier() {
+        // At start: 0/10 = 0.0
+        let fade_start = FadeState::In { elapsed: 0, duration: 10 };
+        assert_eq!(fade_start.multiplier(), 0.0);
+
+        // At 30%: 3/10 = 0.3
+        let fade_30 = FadeState::In { elapsed: 3, duration: 10 };
+        assert!((fade_30.multiplier() - 0.3).abs() < 0.01);
+
+        // At 50%: 5/10 = 0.5
+        let fade_50 = FadeState::In { elapsed: 5, duration: 10 };
+        assert_eq!(fade_50.multiplier(), 0.5);
+
+        // At 100%: 10/10 = 1.0
+        let fade_100 = FadeState::In { elapsed: 10, duration: 10 };
+        assert_eq!(fade_100.multiplier(), 1.0);
+
+        // Beyond 100%: clamped to 1.0
+        let fade_over = FadeState::In { elapsed: 15, duration: 10 };
+        assert_eq!(fade_over.multiplier(), 1.0);
+    }
+
+    #[test]
+    fn test_fade_out_multiplier() {
+        // At start: 1 - (0/10) = 1.0
+        let fade_start = FadeState::Out { elapsed: 0, duration: 10 };
+        assert_eq!(fade_start.multiplier(), 1.0);
+
+        // At 30%: 1 - (3/10) = 0.7
+        let fade_30 = FadeState::Out { elapsed: 3, duration: 10 };
+        assert!((fade_30.multiplier() - 0.7).abs() < 0.01);
+
+        // At 50%: 1 - (5/10) = 0.5
+        let fade_50 = FadeState::Out { elapsed: 5, duration: 10 };
+        assert_eq!(fade_50.multiplier(), 0.5);
+
+        // At 100%: 1 - (10/10) = 0.0
+        let fade_100 = FadeState::Out { elapsed: 10, duration: 10 };
+        assert_eq!(fade_100.multiplier(), 0.0);
+
+        // Beyond 100%: clamped to 0.0
+        let fade_over = FadeState::Out { elapsed: 15, duration: 10 };
+        assert_eq!(fade_over.multiplier(), 0.0);
+    }
+
+    #[test]
+    fn test_fade_state_advance() {
+        let mut fade = FadeState::In { elapsed: 0, duration: 5 };
+
+        assert!(!fade.is_complete());
+        fade.advance();
+        assert_eq!(fade, FadeState::In { elapsed: 1, duration: 5 });
+
+        for _ in 0..4 {
+            fade.advance();
+        }
+        assert_eq!(fade, FadeState::In { elapsed: 5, duration: 5 });
+        assert!(fade.is_complete());
+
+        // Advancing past completion stays at max
+        fade.advance();
+        assert_eq!(fade, FadeState::In { elapsed: 5, duration: 5 });
+    }
+
+    #[test]
+    fn test_fade_in_mixing() {
+        // Create a 10-frame buffer at 48kHz
+        let buffer = create_test_buffer(10, 2, 1.0);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0);
+
+        // Set 10-frame fade in (one frame per iteration)
+        sample.set_fade(FadeState::In { elapsed: 0, duration: 10 });
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Process 10 frames
+        let mut output = vec![0.0f32; 20]; // 10 frames * 2 channels
+        mix_audio(&mut output, &mut state);
+
+        // First frame should be silent (0/10 = 0.0)
+        assert_eq!(output[0], 0.0);
+        assert_eq!(output[1], 0.0);
+
+        // Frame at position 5 should be ~0.5 (5/10 = 0.5)
+        let frame5_l = output[10]; // Frame 5, channel 0
+        let frame5_r = output[11]; // Frame 5, channel 1
+        assert!((frame5_l - 0.5).abs() < 0.1);
+        assert!((frame5_r - 0.5).abs() < 0.1);
+
+        // Last frame should be close to 1.0 (9/10 = 0.9)
+        let last_l = output[18]; // Frame 9, channel 0
+        let last_r = output[19]; // Frame 9, channel 1
+        assert!((last_l - 0.9).abs() < 0.1);
+        assert!((last_r - 0.9).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_fade_out_mixing() {
+        // Create a 10-frame buffer
+        let buffer = create_test_buffer(10, 2, 1.0);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0);
+
+        // Set 10-frame fade out
+        sample.set_fade(FadeState::Out { elapsed: 0, duration: 10 });
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 20]; // 10 frames * 2 channels
+        mix_audio(&mut output, &mut state);
+
+        // First frame should be full volume (1 - 0/10 = 1.0)
+        assert_eq!(output[0], 1.0);
+        assert_eq!(output[1], 1.0);
+
+        // Frame at position 5 should be ~0.5 (1 - 5/10 = 0.5)
+        let frame5_l = output[10];
+        let frame5_r = output[11];
+        assert!((frame5_l - 0.5).abs() < 0.1);
+        assert!((frame5_r - 0.5).abs() < 0.1);
+
+        // Last frame should be close to 0.1 (1 - 9/10 = 0.1)
+        let last_l = output[18];
+        let last_r = output[19];
+        assert!((last_l - 0.1).abs() < 0.1);
+        assert!((last_r - 0.1).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_fade_out_completes_sample() {
+        // Create a long buffer
+        let buffer = create_test_buffer(100, 2, 1.0);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0);
+
+        // Set short fade out
+        sample.set_fade(FadeState::Out { elapsed: 0, duration: 5 });
+
+        assert!(!sample.is_finished());
+
+        // Manually advance to completion
+        for _ in 0..5 {
+            sample.fade_state.advance();
+        }
+
+        // Sample should be marked as finished even though buffer has more frames
+        assert!(sample.is_finished());
+    }
+
+    #[test]
+    fn test_zero_duration_fade() {
+        let fade_in = FadeState::In { elapsed: 0, duration: 0 };
+        assert_eq!(fade_in.multiplier(), 1.0); // Instant full volume
+
+        let fade_out = FadeState::Out { elapsed: 0, duration: 0 };
+        assert_eq!(fade_out.multiplier(), 0.0); // Instant silence
+    }
 }
+

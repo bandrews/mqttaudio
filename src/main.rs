@@ -286,7 +286,7 @@ async fn main() {
                     tracing::info!("Processing command: {:?}", cmd);
 
                     match cmd {
-                        mqtt::commands::AudioCommand::Play { file, volume, voice, channel_map } => {
+                        mqtt::commands::AudioCommand::Play { file, volume, voice, channel_map, fade_in } => {
                             // Load file (with caching)
                             let mut cache_mgr = cache_manager.lock().unwrap();
                             let buffer_result = cache_mgr.get_or_load(&file, output_sample_rate).await;
@@ -318,7 +318,7 @@ async fn main() {
                                     drop(voice_mgr);
 
                                     // Convert channel_map to mixer format
-                                    let sample = if let Some(map) = channel_map {
+                                    let mut sample = if let Some(map) = channel_map {
                                         // Custom channel mapping
                                         let mapping: Vec<(usize, usize)> = map.iter()
                                             .map(|m| (m.src, m.dest))
@@ -326,7 +326,7 @@ async fn main() {
                                         tracing::debug!("Using custom channel mapping: {:?}", mapping);
                                         ActiveSample::new_with_mapping(
                                             sample_id,
-                                            voice_id,
+                                            voice_id.clone(),
                                             buffer,
                                             volume,
                                             voice_volume,
@@ -336,12 +336,18 @@ async fn main() {
                                         // Default channel mapping (1:1)
                                         ActiveSample::new(
                                             sample_id,
-                                            voice_id,
+                                            voice_id.clone(),
                                             buffer,
                                             volume,
                                             voice_volume,
                                         )
                                     };
+
+                                    // Apply fade in if requested
+                                    if let Some(fade_ms) = fade_in {
+                                        sample.set_fade(audio::mixer::FadeState::fade_in(fade_ms, output_sample_rate));
+                                        tracing::debug!("Applied {}ms fade in to voice '{}'", fade_ms, voice_id);
+                                    }
 
                                     let mut state = mixer_state.lock().unwrap();
                                     state.active_samples.push(sample);
@@ -383,19 +389,30 @@ async fn main() {
                                 tracing::info!("Stopped voice '{}': removed {} samples", voice, removed);
                             }
                         }
-                        mqtt::commands::AudioCommand::VoiceFadeOut { voice, time_ms: _ } => {
-                            // TODO: Implement fade out in Phase 9
-                            // For now, just stop the voice immediately
-                            tracing::warn!("Voice fade out not yet implemented (Phase 9), stopping voice '{}' immediately", voice);
-
-                            let mut voice_mgr = voice_manager.lock().unwrap();
-                            let sample_ids = voice_mgr.clear_voice(&voice);
+                        mqtt::commands::AudioCommand::VoiceFadeOut { voice, time_ms } => {
+                            // Get sample IDs in the voice
+                            let voice_mgr = voice_manager.lock().unwrap();
+                            let sample_ids = voice_mgr.get_voice_sample_ids(&voice);
                             drop(voice_mgr);
 
-                            if !sample_ids.is_empty() {
+                            if sample_ids.is_empty() {
+                                tracing::warn!("Voice '{}' not found or already empty", voice);
+                            } else {
+                                // Apply fade out to all samples in the voice
                                 let mut state = mixer_state.lock().unwrap();
-                                state.active_samples.retain(|s| !sample_ids.contains(&s.id));
-                                tracing::info!("Stopped voice '{}': {} samples", voice, sample_ids.len());
+                                let mut updated_count = 0;
+                                for sample in state.active_samples.iter_mut() {
+                                    if sample_ids.contains(&sample.id) {
+                                        sample.set_fade(audio::mixer::FadeState::fade_out(time_ms, output_sample_rate));
+                                        updated_count += 1;
+                                    }
+                                }
+                                drop(state);
+
+                                tracing::info!(
+                                    "Applied {}ms fade out to voice '{}' ({} samples)",
+                                    time_ms, voice, updated_count
+                                );
                             }
                         }
                         mqtt::commands::AudioCommand::VoiceVolume { voice, volume: new_volume } => {
