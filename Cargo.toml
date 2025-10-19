@@ -1,0 +1,53 @@
+[package]
+name = "mqttaudio"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mo Fang Heavy Industries LLC"]
+description = "MQTT-controlled multichannel audio player for interactive entertainment"
+license = "MIT"
+
+[dependencies]
+# Audio I/O
+cpal = "0.15"
+
+# Audio decoding
+symphonia = { version = "0.5", features = ["all"] }
+
+# Sample rate conversion
+rubato = "0.14"
+
+# MQTT
+rumqttc = "0.24"
+
+# HTTP client
+reqwest = { version = "0.11", features = ["stream"] }
+
+# JSON parsing
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# DSP utilities
+dasp = "0.11"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Lock-free structures
+ringbuf = "0.3"
+
+# Signal handling
+ctrlc = "3.4"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[profile.release]
+lto = true
+codegen-units = 1
