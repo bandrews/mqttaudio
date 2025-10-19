@@ -8,6 +8,8 @@ mod mqtt;
 mod voice;
 
 use clap::Parser;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use tokio::sync::mpsc;
 use tracing_subscriber;
 
 #[derive(Parser, Debug)]
@@ -60,7 +62,8 @@ struct Args {
     test_mixer: bool,
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let args = Args::parse();
 
     // Initialize logging
@@ -179,20 +182,137 @@ fn main() {
         return;
     }
 
-    // TODO: Phase 2 - Set up audio decoding
-    // TODO: Phase 5 - Connect to MQTT
-    // TODO: Phase 6+ - Implement full audio engine
+    // MQTT mode (Phase 5)
+    if let (Some(server), Some(topic)) = (args.server, args.topic) {
+        let port = args.port.unwrap_or(1883);
 
-    tracing::info!("mqttaudio initialized successfully");
-    tracing::info!("Press Ctrl+C to exit");
+        tracing::info!("Starting MQTT mode");
 
-    // For now, just wait for Ctrl+C
-    let (tx, rx) = std::sync::mpsc::channel();
-    ctrlc::set_handler(move || {
-        tx.send(()).expect("Could not send signal on channel");
-    })
-    .expect("Error setting Ctrl-C handler");
+        // Connect to MQTT broker
+        let (_client, eventloop) = match mqtt::client::connect_mqtt(&server, port, &topic).await {
+            Ok((c, el)) => (c, el),
+            Err(e) => {
+                tracing::error!("Failed to connect to MQTT broker: {}", e);
+                std::process::exit(1);
+            }
+        };
 
-    rx.recv().expect("Could not receive from channel");
-    tracing::info!("Shutting down...");
+        // Set up audio device
+        let host = cpal::default_host();
+        let device = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                tracing::error!("No default output device available");
+                std::process::exit(1);
+            }
+        };
+
+        let config = match device.default_output_config() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("Failed to get device config: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let output_sample_rate = config.sample_rate().0;
+        let output_channels = config.channels() as usize;
+
+        tracing::info!("Audio device: {}", device.name().unwrap_or_else(|_| "Unknown".to_string()));
+        tracing::info!("  Sample rate: {} Hz", output_sample_rate);
+        tracing::info!("  Channels: {}", output_channels);
+
+        // Create mixer state
+        use audio::mixer::{ActiveSample, MixerState};
+        use std::sync::{Arc, Mutex};
+
+        let mixer_state = Arc::new(Mutex::new(MixerState {
+            active_samples: Vec::new(),
+            output_channels,
+        }));
+
+        let mixer_state_clone = mixer_state.clone();
+
+        // Start audio stream
+        let stream = device.build_output_stream(
+            &config.into(),
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let mut state = mixer_state_clone.lock().unwrap();
+                audio::mixer::mix_audio(data, &mut state);
+
+                // Remove finished samples
+                state.active_samples.retain(|s| !s.is_finished());
+            },
+            |err| {
+                tracing::error!("Audio stream error: {}", err);
+            },
+            None,
+        ).expect("Failed to build audio stream");
+
+        stream.play().expect("Failed to start audio stream");
+        tracing::info!("Audio stream started");
+
+        // Create command channel
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(100);
+
+        // Spawn MQTT event processor
+        tokio::spawn(async move {
+            mqtt::client::process_mqtt_events(eventloop, cmd_tx).await;
+        });
+
+        // Main command processing loop
+        tracing::info!("Ready to receive MQTT commands on topic: {}", topic);
+
+        while let Some(payload) = cmd_rx.recv().await {
+            match mqtt::commands::parse_command(&payload) {
+                Ok(cmd) => {
+                    tracing::info!("Processing command: {:?}", cmd);
+
+                    match cmd {
+                        mqtt::commands::AudioCommand::Play { file, volume } => {
+                            // Decode file
+                            match audio::decoder::decode_file(&file, Some(output_sample_rate)) {
+                                Ok(buffer) => {
+                                    tracing::info!(
+                                        "Loaded {}: {} channels, {} frames ({:.2}s)",
+                                        file,
+                                        buffer.channels,
+                                        buffer.frames,
+                                        buffer.frames as f32 / buffer.sample_rate as f32
+                                    );
+
+                                    // Add to mixer
+                                    let sample = ActiveSample::new(Arc::new(buffer), volume);
+                                    let mut state = mixer_state.lock().unwrap();
+                                    state.active_samples.push(sample);
+
+                                    tracing::info!("Now playing {} active samples", state.active_samples.len());
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to load {}: {}", file, e);
+                                }
+                            }
+                        }
+                        mqtt::commands::AudioCommand::StopAll => {
+                            let mut state = mixer_state.lock().unwrap();
+                            let count = state.active_samples.len();
+                            state.active_samples.clear();
+                            tracing::info!("Stopped {} samples", count);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to parse command: {}", e);
+                }
+            }
+        }
+
+        // Keep stream alive
+        drop(stream);
+        return;
+    }
+
+    // No mode specified - show help
+    tracing::warn!("No mode specified. Use --help for options.");
+    tracing::info!("Example: mqttaudio --server localhost --topic audio/commands");
 }
