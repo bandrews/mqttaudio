@@ -194,6 +194,10 @@ YOU MUST follow this debugging framework for ANY technical issue:
 
 When my instructions are unclear to you, ask me. I love questions. If you have a guess or suggestion, that's great. You're always welcome to share.
 
+## The environment
+
+You are likely developing on a MacOS X environment.  This means certain Linux-only commands like 'timeout' may not be available to you.
+
 ## Tone
 
 Remember, don't be overly positive - we're colleagues and you don't need to impress me.  Be flat, honest and upfront with me.  

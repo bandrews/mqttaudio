@@ -66,11 +66,33 @@ struct Args {
 async fn main() {
     let args = Args::parse();
 
-    // Initialize logging
-    let log_level = if args.verbose {
-        tracing::Level::DEBUG
-    } else {
-        tracing::Level::INFO
+    // Load configuration
+    let mut config = match config::Config::load_from_path_or_default(args.config.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to load configuration: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Merge CLI arguments into config (CLI overrides config file)
+    config.merge_cli_args(
+        args.server.clone(),
+        args.port,
+        args.topic.clone(),
+        args.device.clone(),
+        args.sample_rate,
+        args.verbose,
+    );
+
+    // Initialize logging based on config
+    let log_level = match config.logging.level.as_str() {
+        "error" => tracing::Level::ERROR,
+        "warn" => tracing::Level::WARN,
+        "info" => tracing::Level::INFO,
+        "debug" => tracing::Level::DEBUG,
+        "trace" => tracing::Level::TRACE,
+        _ => tracing::Level::INFO,
     };
 
     tracing_subscriber::fmt()
@@ -88,12 +110,12 @@ async fn main() {
 
     // Get device configuration
     match audio::engine::get_default_device_config() {
-        Ok(config) => {
+        Ok(device_config) => {
             tracing::info!(
                 "Default device config: {} Hz, {} channels, {} frame buffer",
-                config.sample_rate,
-                config.channels,
-                config.buffer_size
+                device_config.sample_rate,
+                device_config.channels,
+                device_config.buffer_size
             );
         }
         Err(e) => {
@@ -182,77 +204,92 @@ async fn main() {
         return;
     }
 
-    // MQTT mode (Phase 5)
-    if let (Some(server), Some(topic)) = (args.server, args.topic) {
-        let port = args.port.unwrap_or(1883);
+    // MQTT mode - validate config first
+    if let Err(errors) = config.validate() {
+        eprintln!("Configuration validation failed:");
+        for error in errors {
+            eprintln!("  - {}", error);
+        }
+        std::process::exit(1);
+    }
 
-        tracing::info!("Starting MQTT mode");
+    // Check if MQTT topic is configured
+    let topic = match &config.mqtt.topic {
+        Some(t) => t.clone(),
+        None => {
+            eprintln!("Error: MQTT topic is required. Specify via --topic or in config file.");
+            eprintln!("Run with --help for usage information.");
+            std::process::exit(1);
+        }
+    };
 
-        // Connect to MQTT broker
-        let (_client, eventloop) = match mqtt::client::connect_mqtt(&server, port, &topic).await {
-            Ok((c, el)) => (c, el),
-            Err(e) => {
-                tracing::error!("Failed to connect to MQTT broker: {}", e);
-                std::process::exit(1);
-            }
-        };
+    tracing::info!("Starting MQTT mode");
+    tracing::info!("  Server: {}:{}", config.mqtt.server, config.mqtt.port);
+    tracing::info!("  Topic: {}", topic);
 
-        // Set up audio device
-        let host = cpal::default_host();
-        let device = match host.default_output_device() {
-            Some(d) => d,
-            None => {
-                tracing::error!("No default output device available");
-                std::process::exit(1);
-            }
-        };
+    // Connect to MQTT broker
+    let (_client, eventloop) = match mqtt::client::connect_mqtt(&config.mqtt.server, config.mqtt.port, &topic).await {
+        Ok((c, el)) => (c, el),
+        Err(e) => {
+            tracing::error!("Failed to connect to MQTT broker: {}", e);
+            std::process::exit(1);
+        }
+    };
 
-        let config = match device.default_output_config() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("Failed to get device config: {}", e);
-                std::process::exit(1);
-            }
-        };
+    // Set up audio device
+    let host = cpal::default_host();
+    let device = match host.default_output_device() {
+        Some(d) => d,
+        None => {
+            tracing::error!("No default output device available");
+            std::process::exit(1);
+        }
+    };
 
-        let output_sample_rate = config.sample_rate().0;
-        let output_channels = config.channels() as usize;
+    let device_config = match device.default_output_config() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to get device config: {}", e);
+            std::process::exit(1);
+        }
+    };
 
-        tracing::info!("Audio device: {}", device.name().unwrap_or_else(|_| "Unknown".to_string()));
-        tracing::info!("  Sample rate: {} Hz", output_sample_rate);
-        tracing::info!("  Channels: {}", output_channels);
+    let output_sample_rate = device_config.sample_rate().0;
+    let output_channels = device_config.channels() as usize;
 
-        // Create mixer state and voice manager
-        use audio::mixer::{ActiveSample, MixerState};
-        use std::sync::{Arc, Mutex};
-        use voice::VoiceManager;
+    tracing::info!("Audio device: {}", device.name().unwrap_or_else(|_| "Unknown".to_string()));
+    tracing::info!("  Sample rate: {} Hz", output_sample_rate);
+    tracing::info!("  Channels: {}", output_channels);
 
-        let mixer_state = Arc::new(Mutex::new(MixerState {
-            active_samples: Vec::new(),
-            output_channels,
-        }));
+    // Create mixer state and voice manager
+    use audio::mixer::{ActiveSample, MixerState};
+    use std::sync::{Arc, Mutex};
+    use voice::VoiceManager;
 
-        let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));
+    let mixer_state = Arc::new(Mutex::new(MixerState {
+        active_samples: Vec::new(),
+        output_channels,
+    }));
 
-        // Create cache manager
-        let cache_dir = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".mqttaudio")
-            .join("cache");
+    let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));
 
-        let cache_manager = match cache::CacheManager::new(cache_dir) {
-            Ok(cm) => Arc::new(Mutex::new(cm)),
-            Err(e) => {
-                tracing::error!("Failed to initialize cache: {}", e);
-                std::process::exit(1);
-            }
-        };
+    // Create cache manager using config
+    let cache_dir = config.cache_directory();
+    tracing::info!("Cache directory: {}", cache_dir.display());
 
-        let mixer_state_clone = mixer_state.clone();
+    let cache_manager = match cache::CacheManager::new(cache_dir) {
+        Ok(cm) => Arc::new(Mutex::new(cm)),
+        Err(e) => {
+            tracing::error!("Failed to initialize cache: {}", e);
+            std::process::exit(1);
+        }
+    };
 
-        // Start audio stream
-        let stream = device.build_output_stream(
-            &config.into(),
+    let mixer_state_clone = mixer_state.clone();
+
+    // Start audio stream
+    let stream = device.build_output_stream(
+        &device_config.into(),
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let mut state = mixer_state_clone.lock().unwrap();
                 audio::mixer::mix_audio(data, &mut state);
@@ -485,10 +522,4 @@ async fn main() {
 
         // Keep stream alive
         drop(stream);
-        return;
-    }
-
-    // No mode specified - show help
-    tracing::warn!("No mode specified. Use --help for options.");
-    tracing::info!("Example: mqttaudio --server localhost --topic audio/commands");
 }

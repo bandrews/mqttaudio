@@ -1,6 +1,6 @@
 # mqttaudio Documentation
 
-Complete architecture and design documentation for mqttaudio v0.1.0.
+Complete architecture and design documentation for mqttaudio v2.0.
 
 ## Documentation Index
 

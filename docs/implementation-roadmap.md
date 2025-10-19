@@ -805,7 +805,7 @@ Before calling it done:
 - [ ] Example config file provided
 - [ ] Can run for 1+ hours without issues
 
-## Next Steps After v0.1.0
+## Next Steps After v2
 
 Future enhancements (see individual docs for details):
 - [ ] MQTT authentication support

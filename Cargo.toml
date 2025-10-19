@@ -1,6 +1,6 @@
 [package]
 name = "mqttaudio"
-version = "0.1.0"
+version = "2.0.0"
 edition = "2021"
 authors = ["Mo Fang Heavy Industries LLC"]
 description = "MQTT-controlled multichannel audio player for interactive entertainment"
