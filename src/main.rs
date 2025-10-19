@@ -234,6 +234,20 @@ async fn main() {
 
         let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));
 
+        // Create cache manager
+        let cache_dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".mqttaudio")
+            .join("cache");
+
+        let cache_manager = match cache::CacheManager::new(cache_dir) {
+            Ok(cm) => Arc::new(Mutex::new(cm)),
+            Err(e) => {
+                tracing::error!("Failed to initialize cache: {}", e);
+                std::process::exit(1);
+            }
+        };
+
         let mixer_state_clone = mixer_state.clone();
 
         // Start audio stream
@@ -273,8 +287,12 @@ async fn main() {
 
                     match cmd {
                         mqtt::commands::AudioCommand::Play { file, volume, voice, channel_map } => {
-                            // Decode file
-                            match audio::decoder::decode_file(&file, Some(output_sample_rate)) {
+                            // Load file (with caching)
+                            let mut cache_mgr = cache_manager.lock().unwrap();
+                            let buffer_result = cache_mgr.get_or_load(&file, output_sample_rate).await;
+                            drop(cache_mgr);
+
+                            match buffer_result {
                                 Ok(buffer) => {
                                     // Use provided voice or auto-generate one
                                     let voice_id = voice.unwrap_or_else(|| {
@@ -309,7 +327,7 @@ async fn main() {
                                         ActiveSample::new_with_mapping(
                                             sample_id,
                                             voice_id,
-                                            Arc::new(buffer),
+                                            buffer,
                                             volume,
                                             voice_volume,
                                             mapping,
@@ -319,7 +337,7 @@ async fn main() {
                                         ActiveSample::new(
                                             sample_id,
                                             voice_id,
-                                            Arc::new(buffer),
+                                            buffer,
                                             volume,
                                             voice_volume,
                                         )
@@ -405,6 +423,39 @@ async fn main() {
                                 );
                             } else {
                                 tracing::warn!("Voice '{}' not found", voice);
+                            }
+                        }
+                        mqtt::commands::AudioCommand::Precache { file } => {
+                            let mut cache_mgr = cache_manager.lock().unwrap();
+                            match cache_mgr.precache(&file, output_sample_rate).await {
+                                Ok(()) => {
+                                    tracing::info!("Precached: {}", file);
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to precache {}: {}", file, e);
+                                }
+                            }
+                        }
+                        mqtt::commands::AudioCommand::CacheClear => {
+                            let mut cache_mgr = cache_manager.lock().unwrap();
+                            match cache_mgr.clear_all() {
+                                Ok(()) => {
+                                    tracing::info!("Cache cleared successfully");
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to clear cache: {}", e);
+                                }
+                            }
+                        }
+                        mqtt::commands::AudioCommand::CacheInvalidate { file } => {
+                            let mut cache_mgr = cache_manager.lock().unwrap();
+                            match cache_mgr.invalidate(&file) {
+                                Ok(()) => {
+                                    tracing::info!("Invalidated cache for: {}", file);
+                                }
+                                Err(e) => {
+                                    tracing::error!("Failed to invalidate {}: {}", file, e);
+                                }
                             }
                         }
                     }

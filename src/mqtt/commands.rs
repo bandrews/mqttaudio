@@ -55,6 +55,18 @@ pub struct VoiceVolumeMessage {
     pub volume: f32,
 }
 
+/// Precache command parameters
+#[derive(Debug, Deserialize, Serialize)]
+pub struct PrecacheMessage {
+    pub file: String,
+}
+
+/// Cache invalidate command parameters
+#[derive(Debug, Deserialize, Serialize)]
+pub struct CacheInvalidateMessage {
+    pub file: String,
+}
+
 /// Internal audio command after parsing
 #[derive(Debug, Clone)]
 pub enum AudioCommand {
@@ -75,6 +87,13 @@ pub enum AudioCommand {
     VoiceVolume {
         voice: String,
         volume: f32,
+    },
+    Precache {
+        file: String,
+    },
+    CacheClear,
+    CacheInvalidate {
+        file: String,
     },
 }
 
@@ -147,6 +166,25 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             Ok(AudioCommand::VoiceVolume {
                 voice: voice_msg.voice,
                 volume: voice_msg.volume,
+            })
+        }
+        "precache" | "soundPrecache" => {
+            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
+            let precache_msg: PrecacheMessage = serde_json::from_value(message)?;
+
+            Ok(AudioCommand::Precache {
+                file: precache_msg.file,
+            })
+        }
+        "cache_clear" => {
+            Ok(AudioCommand::CacheClear)
+        }
+        "cache_invalidate" => {
+            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
+            let invalidate_msg: CacheInvalidateMessage = serde_json::from_value(message)?;
+
+            Ok(AudioCommand::CacheInvalidate {
+                file: invalidate_msg.file,
             })
         }
         unknown => Err(ParseError::UnknownCommand(unknown.to_string())),
@@ -498,6 +536,80 @@ mod tests {
                 assert_eq!(map.len(), 0);
             }
             _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_precache_command() {
+        let json = r#"{"command": "precache", "message": {"file": "http://example.com/bigfile.wav"}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Precache { file } => {
+                assert_eq!(file, "http://example.com/bigfile.wav");
+            }
+            _ => panic!("Expected Precache command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sound_precache_alias() {
+        let json = r#"{"command": "soundPrecache", "message": {"file": "test.wav"}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Precache { file } => {
+                assert_eq!(file, "test.wav");
+            }
+            _ => panic!("Expected Precache command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_precache_missing_message() {
+        let json = r#"{"command": "precache"}"#;
+        let result = parse_command(json);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ParseError::MissingMessage => {}, // OK
+            e => panic!("Expected MissingMessage error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_cache_clear_command() {
+        let json = r#"{"command": "cache_clear"}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::CacheClear => {}, // OK
+            _ => panic!("Expected CacheClear command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cache_invalidate_command() {
+        let json = r#"{"command": "cache_invalidate", "message": {"file": "http://example.com/old.wav"}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::CacheInvalidate { file } => {
+                assert_eq!(file, "http://example.com/old.wav");
+            }
+            _ => panic!("Expected CacheInvalidate command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cache_invalidate_missing_message() {
+        let json = r#"{"command": "cache_invalidate"}"#;
+        let result = parse_command(json);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ParseError::MissingMessage => {}, // OK
+            e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
     }
 }

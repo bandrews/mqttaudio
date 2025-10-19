@@ -48,8 +48,15 @@ ctrlc = "3.4"
 # Random number generation
 rand = "0.8"
 
+# Date/time handling
+chrono = "0.4"
+
+# Directory utilities
+dirs = "5.0"
+
 [dev-dependencies]
 criterion = "0.5"
+tempfile = "3.8"
 
 [profile.release]
 lto = true
