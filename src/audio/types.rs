@@ -1,10 +1,9 @@
 // ABOUTME: Core audio data types and structures.
 // ABOUTME: Defines buffers, samples, and audio configuration types.
 
-use std::sync::Arc;
-
 /// Decoded audio buffer in f32 format, ready for playback
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Will be used in Phase 2
 pub struct DecodedBuffer {
     /// Interleaved PCM samples (f32 format)
     pub data: Vec<f32>,
@@ -17,6 +16,7 @@ pub struct DecodedBuffer {
 }
 
 impl DecodedBuffer {
+    #[allow(dead_code)] // Will be used in Phase 2
     pub fn new(data: Vec<f32>, channels: usize, sample_rate: u32) -> Self {
         let frames = data.len() / channels;
         Self {

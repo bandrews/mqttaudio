@@ -46,6 +46,10 @@ struct Args {
     /// List available audio devices and exit
     #[arg(long)]
     list_devices: bool,
+
+    /// Play a 440Hz test tone (for testing audio output)
+    #[arg(long)]
+    test_tone: bool,
 }
 
 fn main() {
@@ -87,7 +91,33 @@ fn main() {
         }
     }
 
-    // TODO: Phase 1 - Initialize audio output
+    // Handle --test-tone (Phase 1)
+    if args.test_tone {
+        tracing::info!("Starting test tone mode (440Hz sine wave)...");
+        match audio::engine::init_test_sine_wave() {
+            Ok(_stream) => {
+                tracing::info!("Test tone playing. Press Ctrl+C to exit.");
+
+                // Keep stream alive until Ctrl+C
+                let (tx, rx) = std::sync::mpsc::channel();
+                ctrlc::set_handler(move || {
+                    tx.send(()).expect("Could not send signal on channel");
+                })
+                .expect("Error setting Ctrl-C handler");
+
+                rx.recv().expect("Could not receive from channel");
+                tracing::info!("Stopping test tone...");
+
+                // Stream will be dropped here, stopping playback
+            }
+            Err(e) => {
+                tracing::error!("Failed to initialize audio stream: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     // TODO: Phase 2 - Set up audio decoding
     // TODO: Phase 5 - Connect to MQTT
     // TODO: Phase 6+ - Implement full audio engine
