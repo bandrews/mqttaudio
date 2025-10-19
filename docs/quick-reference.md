@@ -197,8 +197,8 @@ MQTT → Command Handler → Audio Engine → Mixer → cpal → Device
 
 ## Version Compatibility
 
-**v0.1.0:**
-- Supports legacy mqttaudio commands (soundPlay, etc.)
+**v2.0.0:**
+- Supports legacy mqttaudio v0.1.x commands (soundPlay, etc.)
 - Config format stable
 - Command format stable
 

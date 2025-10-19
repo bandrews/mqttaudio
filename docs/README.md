@@ -210,8 +210,9 @@ When updating this documentation:
 
 ## Version History
 
-- **v0.1.0-design** (Current) - Complete architecture documentation
-- **v0.1.0** (Planned) - First release
+- **v2.0.0** (2025-10-19) - Complete Rust rewrite with full feature set
+- **v0.1.1** (2021-03-28) - Python implementation with basic features
+- **v0.1.0** (2021-03-28) - Initial Python release
 
 ## Contact
 

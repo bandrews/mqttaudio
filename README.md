@@ -62,39 +62,321 @@ mosquitto -v
 # Basic usage with defaults
 mqttaudio --server localhost --topic audio/commands
 
-# With custom audio device
-mqttaudio --server localhost --topic audio/commands --list-devices
+# With custom audio device (first list available devices)
+mqttaudio --list-devices
 mqttaudio --server localhost --topic audio/commands --device "Your Device Name"
 
-# With config file
+# With config file (recommended for production)
 mqttaudio --config config.json
 ```
 
-### 3. Send Commands
+### 3. Send Your First Command
+
+Open another terminal and send a test command:
 
 ```bash
-# Play a simple stereo file
+# Play a simple audio file
+mosquitto_pub -t audio/commands -m '{"command": "play", "message": {"file": "/path/to/sound.wav"}}'
+```
+
+You should hear the audio play immediately!
+
+## Common Usage Examples
+
+Here are ready-to-use examples for common tasks. Just copy and paste these commands (replacing file paths as needed).
+
+### Playing Local Audio Files
+
+**Simple playback:**
+```bash
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
   "message": {
-    "file": "/path/to/sound.wav"
+    "file": "/Users/you/Music/doorbell.wav"
   }
 }'
+```
 
-# Play with fade in and volume
+**With volume control (50%):**
+```bash
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
   "message": {
-    "file": "http://example.com/music.mp3",
-    "volume": 0.7,
-    "fade_in": 2000,
+    "file": "/Users/you/Music/notification.wav",
+    "volume": 0.5
+  }
+}'
+```
+
+**Looping background music:**
+```bash
+mosquitto_pub -t audio/commands -m '{
+  "command": "play",
+  "message": {
+    "file": "/Users/you/Music/ambient.ogg",
     "loop": true,
     "voice": "background"
   }
 }'
+```
 
-# Stop all audio
+### Playing Remote Audio (HTTP/HTTPS)
+
+**Play from URL:**
+```bash
+mosquitto_pub -t audio/commands -m '{
+  "command": "play",
+  "message": {
+    "file": "https://example.com/sounds/welcome.mp3"
+  }
+}'
+```
+
+**Pre-cache a file for instant playback later:**
+```bash
+# First, cache it
+mosquitto_pub -t audio/commands -m '{
+  "command": "precache",
+  "message": {
+    "file": "https://example.com/sounds/large-file.wav"
+  }
+}'
+
+# Later, play it instantly (served from cache)
+mosquitto_pub -t audio/commands -m '{
+  "command": "play",
+  "message": {
+    "file": "https://example.com/sounds/large-file.wav"
+  }
+}'
+```
+
+### Fading and Volume Control
+
+**Fade in over 2 seconds:**
+```bash
+mosquitto_pub -t audio/commands -m '{
+  "command": "play",
+  "message": {
+    "file": "/path/to/music.mp3",
+    "fade_in": 2000,
+    "voice": "music"
+  }
+}'
+```
+
+**Fade out a voice:**
+```bash
+mosquitto_pub -t audio/commands -m '{
+  "command": "voice_fade_out",
+  "message": {
+    "voice": "music",
+    "time": 3000
+  }
+}'
+```
+
+**Adjust voice volume on the fly:**
+```bash
+mosquitto_pub -t audio/commands -m '{
+  "command": "voice_volume",
+  "message": {
+    "voice": "background",
+    "volume": 0.3
+  }
+}'
+```
+
+### Voice Grouping (Controlling Multiple Sounds Together)
+
+Voices let you group related sounds and control them together.
+
+**Start background ambience:**
+```bash
+# Add rain sound to "ambience" voice
+mosquitto_pub -t audio/commands -m '{
+  "command": "play",
+  "message": {
+    "file": "/sounds/rain.wav",
+    "voice": "ambience",
+    "loop": true,
+    "volume": 0.4
+  }
+}'
+
+# Add wind sound to the same voice
+mosquitto_pub -t audio/commands -m '{
+  "command": "play",
+  "message": {
+    "file": "/sounds/wind.wav",
+    "voice": "ambience",
+    "loop": true,
+    "volume": 0.3
+  }
+}'
+```
+
+**Stop all sounds in the "ambience" voice:**
+```bash
+mosquitto_pub -t audio/commands -m '{
+  "command": "voice_stop",
+  "message": {
+    "voice": "ambience"
+  }
+}'
+```
+
+### Multichannel Routing
+
+Route audio to specific output channels (great for surround sound or multi-zone installations).
+
+**Play stereo file on channels 2-3 instead of 0-1:**
+```bash
+mosquitto_pub -t audio/commands -m '{
+  "command": "play",
+  "message": {
+    "file": "/sounds/stereo.wav",
+    "channel_map": [
+      {"src": 0, "dest": 2},
+      {"src": 1, "dest": 3}
+    ]
+  }
+}'
+```
+
+**Play quad audio to rear speakers (channels 4-7):**
+```bash
+mosquitto_pub -t audio/commands -m '{
+  "command": "play",
+  "message": {
+    "file": "/sounds/surround-quad.wav",
+    "channel_map": [
+      {"src": 0, "dest": 4},
+      {"src": 1, "dest": 5},
+      {"src": 2, "dest": 6},
+      {"src": 3, "dest": 7}
+    ]
+  }
+}'
+```
+
+### Stopping Audio
+
+**Stop all audio immediately:**
+```bash
 mosquitto_pub -t audio/commands -m '{"command": "stopall"}'
+```
+
+**Stop a specific voice:**
+```bash
+mosquitto_pub -t audio/commands -m '{
+  "command": "voice_stop",
+  "message": {
+    "voice": "effects"
+  }
+}'
+```
+
+**Fade out everything over 5 seconds:**
+```bash
+mosquitto_pub -t audio/commands -m '{
+  "command": "fadeout",
+  "message": {
+    "time": 5000
+  }
+}'
+```
+
+### Cache Management
+
+**Clear entire cache:**
+```bash
+mosquitto_pub -t audio/commands -m '{"command": "cache_clear"}'
+```
+
+**Invalidate a specific cached file (force re-download):**
+```bash
+mosquitto_pub -t audio/commands -m '{
+  "command": "cache_invalidate",
+  "message": {
+    "file": "https://example.com/sounds/updated-file.mp3"
+  }
+}'
+```
+
+## Complete Usage Scenario
+
+Here's a complete example showing how you might use mqttaudio for an interactive installation:
+
+```bash
+# Terminal 1: Start mqttaudio
+mqttaudio --server localhost --topic gallery/audio
+
+# Terminal 2: Control the installation
+TOPIC="gallery/audio"
+
+# Pre-cache all assets for instant playback
+mosquitto_pub -t $TOPIC -m '{"command": "precache", "message": {"file": "/sounds/ambient-forest.ogg"}}'
+mosquitto_pub -t $TOPIC -m '{"command": "precache", "message": {"file": "/sounds/bird-chirp.wav"}}'
+mosquitto_pub -t $TOPIC -m '{"command": "precache", "message": {"file": "/sounds/narration.mp3"}}'
+
+# Start ambient background (looping, low volume)
+mosquitto_pub -t $TOPIC -m '{
+  "command": "play",
+  "message": {
+    "file": "/sounds/ambient-forest.ogg",
+    "voice": "ambience",
+    "loop": true,
+    "volume": 0.2,
+    "fade_in": 3000
+  }
+}'
+
+# Play a one-shot sound effect when visitor approaches
+mosquitto_pub -t $TOPIC -m '{
+  "command": "play",
+  "message": {
+    "file": "/sounds/bird-chirp.wav",
+    "voice": "effects",
+    "volume": 0.8
+  }
+}'
+
+# Duck the ambience and play narration
+mosquitto_pub -t $TOPIC -m '{
+  "command": "voice_volume",
+  "message": {
+    "voice": "ambience",
+    "volume": 0.05
+  }
+}'
+
+mosquitto_pub -t $TOPIC -m '{
+  "command": "play",
+  "message": {
+    "file": "/sounds/narration.mp3",
+    "voice": "narration",
+    "volume": 0.9
+  }
+}'
+
+# Wait for narration to finish, then restore ambience volume
+sleep 30
+mosquitto_pub -t $TOPIC -m '{
+  "command": "voice_volume",
+  "message": {
+    "voice": "ambience",
+    "volume": 0.2
+  }
+}'
+
+# When closing: fade out everything
+mosquitto_pub -t $TOPIC -m '{
+  "command": "fadeout",
+  "message": {
+    "time": 5000
+  }
+}'
 ```
 
 ## Configuration
@@ -271,83 +553,6 @@ All commands are JSON objects sent to the configured MQTT topic.
     "time": 5000
   }
 }
-```
-
-## Examples
-
-### Background Music with Sound Effects
-
-```bash
-# Start looping background music
-mosquitto_pub -t audio/commands -m '{
-  "command": "play",
-  "message": {
-    "file": "/sounds/ambient.ogg",
-    "voice": "music",
-    "volume": 0.3,
-    "loop": true,
-    "fade_in": 2000
-  }
-}'
-
-# Play one-shot sound effect
-mosquitto_pub -t audio/commands -m '{
-  "command": "play",
-  "message": {
-    "file": "/sounds/doorbell.wav",
-    "voice": "effects",
-    "volume": 1.0
-  }
-}'
-
-# Fade out music after 30 seconds
-sleep 30
-mosquitto_pub -t audio/commands -m '{
-  "command": "voice_fade_out",
-  "message": {
-    "voice": "music",
-    "time": 3000
-  }
-}'
-```
-
-### Multichannel Surround Sound
-
-```bash
-# Play quad audio routed to specific outputs
-mosquitto_pub -t audio/commands -m '{
-  "command": "play",
-  "message": {
-    "file": "/sounds/surround.wav",
-    "channel_map": [
-      {"src": 0, "dest": 0},
-      {"src": 1, "dest": 1},
-      {"src": 2, "dest": 6},
-      {"src": 3, "dest": 7}
-    ],
-    "volume": 0.8
-  }
-}'
-```
-
-### HTTP Streaming with Caching
-
-```bash
-# First play downloads and caches
-mosquitto_pub -t audio/commands -m '{
-  "command": "play",
-  "message": {
-    "file": "https://example.com/audio/theme.mp3"
-  }
-}'
-
-# Second play is instant (served from cache)
-mosquitto_pub -t audio/commands -m '{
-  "command": "play",
-  "message": {
-    "file": "https://example.com/audio/theme.mp3"
-  }
-}'
 ```
 
 ## Performance

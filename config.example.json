@@ -1,0 +1,141 @@
+{
+  "_comment": "mqttaudio Example Configuration File",
+  "_usage": "Copy this file to config.json or ~/.config/mqttaudio/config.json and customize for your setup",
+
+  "mqtt": {
+    "server": "localhost",
+    "port": 1883,
+    "topic": "audio/commands",
+    "client_id": null,
+    "reconnect_delay_seconds": 10,
+
+    "_notes": [
+      "server: MQTT broker hostname or IP address",
+      "port: MQTT broker port (default: 1883)",
+      "topic: MQTT topic to subscribe to (required). Supports wildcards like 'audio/#'",
+      "client_id: MQTT client ID. If null, auto-generates 'mqttaudio_<pid>'",
+      "reconnect_delay_seconds: Wait time before reconnecting after disconnect"
+    ]
+  },
+
+  "audio": {
+    "device": null,
+    "sample_rate": 48000,
+    "buffer_size": 512,
+    "channel_names": {
+      "0": "front_left",
+      "1": "front_right",
+      "2": "center",
+      "3": "lfe",
+      "4": "rear_left",
+      "5": "rear_right",
+      "6": "side_left",
+      "7": "side_right"
+    },
+    "channel_volumes": {
+      "lfe": 0.7,
+      "side_left": 0.85,
+      "side_right": 0.85
+    },
+
+    "_notes": [
+      "device: Audio output device name. null = system default. Use --list-devices to see options",
+      "sample_rate: Output sample rate in Hz. Common values: 44100, 48000, 96000",
+      "buffer_size: Audio buffer size in frames. Smaller = lower latency but higher CPU",
+      "  Common values: 256 (low latency), 512 (balanced), 1024 (high compatibility)",
+      "channel_names: Optional mapping of channel numbers to human-readable names",
+      "channel_volumes: Per-channel calibration (0.0-1.0) to compensate for hardware differences"
+    ]
+  },
+
+  "cache": {
+    "enabled": true,
+    "directory": "~/.mqttaudio/cache",
+    "revalidate_after_seconds": 300,
+
+    "_notes": [
+      "enabled: Enable disk caching of downloaded HTTP files",
+      "directory: Directory for cache storage. ~ expands to user home",
+      "revalidate_after_seconds: Time before checking if cached file is stale",
+      "  0 = always check server, 300 = check every 5 minutes, high value = rarely check"
+    ]
+  },
+
+  "security": {
+    "allowed_directories": [
+      "/opt/sounds",
+      "~/audio"
+    ],
+
+    "_notes": [
+      "allowed_directories: Whitelist of directories for local file access",
+      "Empty array = no local files allowed (HTTP/HTTPS URLs only)",
+      "Paths can use ~ for user home directory",
+      "All paths are validated and path traversal attempts are blocked"
+    ]
+  },
+
+  "logging": {
+    "level": "info",
+    "verbose": false,
+
+    "_notes": [
+      "level: Log level - 'error', 'warn', 'info', 'debug', or 'trace'",
+      "verbose: Legacy verbose mode. Equivalent to level: 'debug'"
+    ]
+  },
+
+  "_example_configs": {
+    "_minimal": {
+      "mqtt": {
+        "topic": "audio/commands"
+      }
+    },
+
+    "_development": {
+      "mqtt": {
+        "server": "localhost",
+        "topic": "dev/audio"
+      },
+      "cache": {
+        "revalidate_after_seconds": 10
+      },
+      "logging": {
+        "level": "debug"
+      }
+    },
+
+    "_production_multichannel": {
+      "mqtt": {
+        "server": "mqtt.example.com",
+        "topic": "exhibits/gallery/audio"
+      },
+      "audio": {
+        "device": "USB Audio Interface",
+        "sample_rate": 48000,
+        "buffer_size": 512,
+        "channel_names": {
+          "0": "zone1_left",
+          "1": "zone1_right",
+          "2": "zone2_left",
+          "3": "zone2_right",
+          "4": "zone3_left",
+          "5": "zone3_right",
+          "6": "zone4_left",
+          "7": "zone4_right"
+        }
+      },
+      "cache": {
+        "revalidate_after_seconds": 3600
+      },
+      "security": {
+        "allowed_directories": [
+          "/opt/gallery/sounds"
+        ]
+      },
+      "logging": {
+        "level": "info"
+      }
+    }
+  }
+}

@@ -14,7 +14,7 @@ use tracing_subscriber;
 
 #[derive(Parser, Debug)]
 #[command(name = "mqttaudio")]
-#[command(version = "0.1.0")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "MQTT-controlled multichannel audio player", long_about = None)]
 struct Args {
     /// Path to configuration file

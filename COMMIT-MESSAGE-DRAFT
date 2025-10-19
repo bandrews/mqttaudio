@@ -1,159 +1,72 @@
-Phase 11: Polish and Testing - Complete testing infrastructure and documentation
+Phase 12: Release Preparation - Complete v2.0.0 documentation and release artifacts
 
-This commit completes Phase 11 of the mqttaudio implementation roadmap by adding
-comprehensive testing infrastructure, performance benchmarks, documentation, and
-validation tools.
+This commit completes Phase 12 of the implementation roadmap, preparing mqttaudio
+v2.0.0 for general release with comprehensive documentation and release artifacts.
 
-## What Changed
+Changes made:
 
-### Audio Quality Fix: Click-Free Stop Commands
+1. Created example configuration file (config.example.json)
+   - Comprehensive example with all configuration options
+   - Inline comments explaining each setting
+   - Multiple example configurations for different use cases
+   - Development, production, and minimal configuration examples
 
-Fixed audio popping/clicking issue when stopping samples via StopAll and VoiceStop
-commands. These commands now apply a brief 10ms fade-out before removing samples,
-preventing waveform discontinuities that cause audible clicks.
+2. Wrote comprehensive CHANGELOG.md
+   - Complete v2.0.0 feature list and changes
+   - Migration guide from v0.1.x Python version
+   - Performance improvements documented
+   - Technical details and backwards compatibility notes
+   - Historical entries for v0.1.1 and v0.1.0
 
-**Root Cause:** Immediate sample removal would cut audio mid-waveform, creating
-sharp discontinuities (e.g., jumping from +0.3 amplitude to 0.0) which manifest
-as clicks/pops.
+3. Fixed version number in source code
+   - Removed hardcoded "0.1.0" from main.rs
+   - Now uses env!("CARGO_PKG_VERSION") to pull from Cargo.toml
+   - Ensures version is maintained in single source of truth
+   - Binary now correctly reports version 2.0.0
 
-**Fix:** All stop commands (StopAll, VoiceStop) now apply a 10ms automatic fade-out
-before removal. This is imperceptible to users but ensures smooth ramp to zero,
-eliminating clicks entirely.
+4. Built and tested release binary
+   - Clean release build completed successfully
+   - Binary size: 5.7 MB (optimized with LTO and single codegen unit)
+   - All 104 tests passing
+   - Version reporting verified: mqttaudio 2.0.0
 
-**Changed files:**
-- src/main.rs: Updated StopAll and VoiceStop handlers to apply fade-out
-  instead of immediate removal
+5. Updated documentation for version consistency
+   - Updated docs/README.md version history to reflect v2.0.0 release
+   - Updated docs/quick-reference.md version compatibility section
+   - Ensured all documentation references appropriate versions
 
-### Testing Infrastructure (104 tests, all passing)
+6. Enhanced main README.md with comprehensive usage examples
+   - Added extensive "Common Usage Examples" section with ready-to-use commands
+   - Organized examples by use case: local files, remote files, fading, voices, routing
+   - Added complete usage scenario showing interactive installation workflow
+   - Included pre-caching examples, ducking techniques, and cache management
+   - Removed redundant "Examples" section to eliminate duplication
+   - Made it much easier for new users to get started quickly
 
-Existing comprehensive unit test coverage includes:
-- audio::mixer: 21 tests (fading, channel mapping, mixing, saturation)
-- audio::resampler: 6 tests (upsampling, downsampling, edge cases)
-- cache::disk: 7 tests (CRUD operations, metadata persistence)
-- cache::memory: 9 tests (CRUD, memory tracking, Arc ref counting)
-- config: 18 tests (parsing, validation, CLI argument merging)
-- mqtt::commands: 31 tests (all command types, JSON parsing, validation)
-- mqtt::client: 2 tests (connection, event processing)
-- voice: 10 tests (voice manager operations, lifecycle)
+All Phase 12 tasks completed:
+ Update README.md with usage instructions (already comprehensive)
+ Create example config file (config.example.json)
+ Build release binaries (target/release/mqttaudio)
+ Write CHANGELOG.md (comprehensive changelog created)
+ Ready for version tagging
 
-All tests use real logic (not mocked behavior) and run independently.
-
-### Performance Benchmarks
-
-Created comprehensive criterion-based benchmarks in benches/mixer_benchmark.rs:
-
-**Benchmark Results (macOS, release build):**
-- Mix 1 sample (512 frames, stereo): ~1 μs (target: <200 μs) ✅
-- Mix 10 samples: ~9 μs (target: <2000 μs) ✅
-- Mix 20 samples: ~18 μs
-- Channel routing (stereo→8ch): <5 μs
-- Fade operations: <2 μs overhead
-
-With 10.67ms buffer duration (512 frames @ 48kHz) and <5ms safe target,
-the mixer has **massive headroom** - could handle hundreds of simultaneous samples.
-
-Benchmark suite covers:
-- Single and multiple sample mixing (1, 5, 10, 20 samples)
-- Channel mapping scenarios (stereo→mono, stereo→8ch, quad→8ch)
-- Fade operations (in, out, none)
-- Multichannel output (2, 8, 16 channels)
-- Various buffer sizes (128, 256, 512, 1024 frames)
-- Realistic scenarios (background music + effects)
-
-Run with: `cargo bench`
-
-### Documentation
-
-Created comprehensive README.md covering:
-- Feature overview and project description
-- Installation instructions (all platforms)
-- Quick start guide with examples
-- Complete configuration reference (CLI and JSON)
-- All MQTT commands with detailed parameters
-- Usage examples (background music, surround sound, HTTP caching)
-- Performance characteristics and benchmarks
-- Development guide and troubleshooting
-- Project structure documentation
-
-### Stress Testing
-
-Created tests/scripts/stress_test.sh - comprehensive system stress test:
-
-**Test Scenarios:**
-1. Rapid play commands (100 commands rapid-fire)
-2. Voice management (create, control, destroy multiple voices)
-3. Complex channel routing (multichannel scenarios)
-4. Fade operations (various durations and patterns)
-5. Maximum simultaneous samples (25+ concurrent)
-6. Stop-all under heavy load
-7. Cache operations
-8. Sustained operation (1 minute continuous commands)
-9. Error handling (invalid JSON, missing fields, nonexistent files)
-
-Run with: `./tests/scripts/stress_test.sh`
-
-### Library Interface
-
-Added src/lib.rs to expose modules for benchmarking and external testing.
-mqttaudio can now be used as both a binary and a library.
-
-## What's Working
-
-All Phase 11 objectives from implementation roadmap completed:
-
-✅ Comprehensive unit tests (104 tests, likely >80% coverage)
-✅ Performance testing and optimization (benchmarks confirm targets exceeded)
-✅ Error handling (robust throughout, tested with malformed inputs)
-✅ Logging improvements (113 tracing statements, appropriate levels)
-✅ Documentation review and creation (comprehensive README.md)
-✅ Stress testing infrastructure (automated test suite)
-
-## Testing
-
-```bash
-# Run all unit tests
-cargo test
-
-# Run benchmarks
-cargo bench
-
-# Run stress tests (requires running mqttaudio instance)
-cargo build --release
-./target/release/mqttaudio --server localhost --topic audio/test &
-./tests/scripts/stress_test.sh
-```
-
-## Performance Validation
-
-The mixer exceeds all performance targets by orders of magnitude:
-- Callback time: <20 μs for 10 samples (target: <5000 μs)
-- Headroom: >99% (could handle 200+ simultaneous samples)
-- Zero allocations in audio callback
-- Linear scaling with sample count
-
-System is ready for production deployment.
-
-## Next Steps
-
-Phase 11 is complete. The system is production-ready with:
-- Robust test coverage
-- Validated performance
-- Comprehensive documentation
-- Stress-tested stability
-
-Optional future enhancements (Phase 12+) in implementation-roadmap.md.
+The project is now ready for v2.0.0 release with:
+- Complete, comprehensive documentation
+- Example configuration file for users
+- Changelog documenting all features and changes
+- Tested release binary
+- All tests passing (104 tests)
+- Performance targets met
+- Backwards compatibility with v0.1.x command format
 
 Prompts:
-- "You previously planned out your full plan for implementing this application!
-  Please review your notes to yourself in @docs/ - read every single file in
-  there, as well as @CLAUDE.md. You can also read the commit messages in git
-  from previous commits to see the work that's been done so far. Phases 1
-  through 10 have been implemented. Please proceed with Phase 11 as per the
-  implementation plan."
-- "During the sustained operation test, I heard some very mild popping between
-  samples. Can you diagnose why this popping might be happening?"
-- "Yes, this is a great idea. Apply it to all forms of stop, please."
+- "You are building an app for allowing users to play polyphonic audio remotely
+  by sending commands over an MQTT server. Phases 1 through 11 have been implemented.
+  Please proceed with Phase 12 as per the implementation plan. Make sure the
+  documentation is comprehensive, complete and ready for general use."
+- "Please flesh out the README file with more quick start guide documentation
+  including sample messages for various tasks."
 
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
+> Generated with Claude Code (https://claude.com/claude-code)
 
 Co-Authored-By: Claude <noreply@anthropic.com>
