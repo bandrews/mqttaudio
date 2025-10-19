@@ -3,7 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+#[cfg(test)]
+use std::path::Path;
 use std::fs;
 use std::io;
 
@@ -55,8 +57,6 @@ pub struct DiskCache {
 pub enum CacheError {
     IoError(io::Error),
     JsonError(serde_json::Error),
-    #[allow(dead_code)]
-    InvalidUrl(String),
     HttpError(String),
 }
 
@@ -65,7 +65,6 @@ impl std::fmt::Display for CacheError {
         match self {
             CacheError::IoError(e) => write!(f, "I/O error: {}", e),
             CacheError::JsonError(e) => write!(f, "JSON error: {}", e),
-            CacheError::InvalidUrl(url) => write!(f, "Invalid URL: {}", url),
             CacheError::HttpError(msg) => write!(f, "HTTP error: {}", msg),
         }
     }
@@ -225,12 +224,14 @@ impl DiskCache {
     }
 
     /// Get cache directory path
+    #[cfg(test)]
     #[allow(dead_code)]
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
     }
 
     /// Get number of cached entries
+    #[cfg(test)]
     pub fn entry_count(&self) -> usize {
         self.metadata.entries.len()
     }

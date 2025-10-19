@@ -99,20 +99,4 @@ impl CacheManager {
         tracing::info!("Invalidated cache for: {}", file_path);
         Ok(())
     }
-
-    /// Get cache statistics
-    pub fn stats(&self) -> CacheStats {
-        CacheStats {
-            memory_entries: self.memory_cache.len(),
-            memory_mb: self.memory_cache.memory_usage_mb(),
-            disk_entries: self.disk_cache.entry_count(),
-        }
-    }
-}
-
-/// Cache statistics
-pub struct CacheStats {
-    pub memory_entries: usize,
-    pub memory_mb: f64,
-    pub disk_entries: usize,
 }

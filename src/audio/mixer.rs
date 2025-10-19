@@ -72,6 +72,7 @@ impl FadeState {
     }
 
     /// Check if fade is complete
+    #[cfg(test)]
     pub fn is_complete(&self) -> bool {
         match self {
             FadeState::None => true,
@@ -129,7 +130,6 @@ impl ActiveSample {
     }
 
     /// Create a new active sample with custom channel mapping
-    #[allow(dead_code)] // Used in Phase 7 for channel routing
     pub fn new_with_mapping(
         id: u64,
         voice_id: String,
@@ -186,7 +186,7 @@ pub struct MixerState {
 }
 
 impl MixerState {
-    #[allow(dead_code)] // Used directly in engine.rs for now
+    #[cfg(test)]
     pub fn new(output_channels: usize) -> Self {
         Self {
             active_samples: Vec::new(),

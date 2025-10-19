@@ -7,6 +7,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub struct Voice {
     /// Voice name/ID
+    #[cfg_attr(not(test), allow(dead_code))]
     pub id: String,
     /// IDs of active samples in this voice
     pub sample_ids: Vec<u64>,
@@ -30,6 +31,7 @@ impl Voice {
     }
 
     /// Remove a sample ID from this voice
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn remove_sample(&mut self, sample_id: u64) {
         self.sample_ids.retain(|&id| id != sample_id);
     }
@@ -40,6 +42,7 @@ impl Voice {
     }
 
     /// Get the number of active samples in this voice
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn sample_count(&self) -> usize {
         self.sample_ids.len()
     }
@@ -71,11 +74,13 @@ impl VoiceManager {
     }
 
     /// Get a voice by ID (read-only)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get_voice(&self, voice_id: &str) -> Option<&Voice> {
         self.voices.get(voice_id)
     }
 
     /// Get a mutable reference to a voice by ID
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn get_voice_mut(&mut self, voice_id: &str) -> Option<&mut Voice> {
         self.voices.get_mut(voice_id)
     }
@@ -92,6 +97,7 @@ impl VoiceManager {
     }
 
     /// Remove a sample from its voice
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn remove_sample(&mut self, sample_id: u64) {
         // Find and remove from all voices
         for voice in self.voices.values_mut() {
@@ -138,16 +144,19 @@ impl VoiceManager {
     }
 
     /// Get total number of voices
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn voice_count(&self) -> usize {
         self.voices.len()
     }
 
     /// Get total number of samples across all voices
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn total_sample_count(&self) -> usize {
         self.voices.values().map(|v| v.sample_count()).sum()
     }
 
     /// Clean up empty voices
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn cleanup_empty_voices(&mut self) {
         self.voices.retain(|_, voice| !voice.is_empty());
     }

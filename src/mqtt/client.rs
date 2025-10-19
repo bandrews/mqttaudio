@@ -7,15 +7,12 @@ use tokio::sync::mpsc;
 
 #[derive(Debug)]
 pub enum MqttError {
-    #[allow(dead_code)] // May be used for explicit connection errors in future
-    ConnectionError(rumqttc::ClientError),
     SubscriptionError(rumqttc::ClientError),
 }
 
 impl std::fmt::Display for MqttError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MqttError::ConnectionError(e) => write!(f, "MQTT connection error: {}", e),
             MqttError::SubscriptionError(e) => write!(f, "MQTT subscription error: {}", e),
         }
     }
@@ -94,18 +91,13 @@ pub async fn process_mqtt_events(
 mod tests {
     use super::*;
 
-    // Note: These tests require a running MQTT broker
-    // They are marked as ignored to avoid breaking CI
-
     #[tokio::test]
-    #[ignore]
     async fn test_connect_mqtt() {
         let result = connect_mqtt("localhost", 1883, "test/topic").await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_mqtt_event_processing() {
         let (client, eventloop) = connect_mqtt("localhost", 1883, "test/topic")
             .await

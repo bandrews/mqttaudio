@@ -192,6 +192,7 @@ impl Config {
     }
 
     /// Get expanded allowed directories
+    #[cfg(test)]
     pub fn allowed_directories(&self) -> Vec<PathBuf> {
         self.security.allowed_directories
             .iter()
@@ -279,7 +280,6 @@ impl Config {
 pub enum ConfigError {
     IoError(String),
     ParseError(String),
-    ValidationError(Vec<String>),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -287,13 +287,6 @@ impl std::fmt::Display for ConfigError {
         match self {
             ConfigError::IoError(e) => write!(f, "IO error: {}", e),
             ConfigError::ParseError(e) => write!(f, "Parse error: {}", e),
-            ConfigError::ValidationError(errors) => {
-                write!(f, "Validation errors:\n")?;
-                for error in errors {
-                    write!(f, "  - {}\n", error)?;
-                }
-                Ok(())
-            }
         }
     }
 }

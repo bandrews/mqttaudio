@@ -44,22 +44,26 @@ impl MemoryCache {
     }
 
     /// Check if a key is in the cache
+    #[cfg(test)]
     pub fn contains(&self, key: &str) -> bool {
         self.cache.contains_key(key)
     }
 
     /// Get the number of cached items
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.cache.len()
     }
 
     /// Check if the cache is empty
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }
 
     /// Get memory usage estimate in bytes
     /// Calculates based on decoded PCM data size
+    #[cfg(test)]
     pub fn memory_usage_bytes(&self) -> usize {
         self.cache.values()
             .map(|buf| buf.data.len() * std::mem::size_of::<f32>())
@@ -67,6 +71,7 @@ impl MemoryCache {
     }
 
     /// Get memory usage estimate in MB
+    #[cfg(test)]
     pub fn memory_usage_mb(&self) -> f64 {
         self.memory_usage_bytes() as f64 / (1024.0 * 1024.0)
     }
