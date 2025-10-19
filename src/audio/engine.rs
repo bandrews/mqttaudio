@@ -2,11 +2,12 @@
 // ABOUTME: Handles sample loading, voice management, and mixer state updates.
 
 use crate::audio::decoder;
+use crate::audio::mixer::{ActiveSample, MixerState};
 use crate::audio::types::DeviceConfig;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// List available audio output devices
 pub fn list_devices() {
@@ -187,6 +188,93 @@ pub fn play_file(path: &str) -> Result<Stream, Box<dyn std::error::Error>> {
     // Log when playback should finish
     let duration_secs = buffer.frames as f32 / buffer.sample_rate as f32;
     tracing::info!("Playback started - duration: {:.2}s", duration_secs);
+
+    Ok(stream)
+}
+
+/// Test mixer with multiple simultaneous samples
+pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
+    // Get audio device
+    let host = cpal::default_host();
+    let device = host.default_output_device()
+        .ok_or("No default output device available")?;
+
+    let config = device.default_output_config()?;
+    let output_sample_rate = config.sample_rate().0;
+    let output_channels = config.channels() as usize;
+
+    tracing::info!("Initializing mixer test:");
+    tracing::info!("  Device: {}", device.name()?);
+    tracing::info!("  Sample rate: {} Hz", output_sample_rate);
+    tracing::info!("  Channels: {}", output_channels);
+
+    // Load test files if they exist, otherwise generate test tones
+    let test_files = vec![
+        "/Users/bandrews/src/mqttaudio/tests/audio/test_440hz_2s.wav",
+        "/Users/bandrews/src/mqttaudio/tests/audio/test_880hz_48khz.wav",
+    ];
+
+    let mut buffers = Vec::new();
+    for (i, file_path) in test_files.iter().enumerate() {
+        match decoder::decode_file(file_path, Some(output_sample_rate)) {
+            Ok(buffer) => {
+                tracing::info!(
+                    "Loaded sample {}: {} channels, {} frames ({:.2}s)",
+                    i + 1,
+                    buffer.channels,
+                    buffer.frames,
+                    buffer.frames as f32 / buffer.sample_rate as f32
+                );
+                buffers.push(Arc::new(buffer));
+            }
+            Err(e) => {
+                tracing::warn!("Could not load {}: {}", file_path, e);
+            }
+        }
+    }
+
+    if buffers.is_empty() {
+        return Err("No test files could be loaded for mixer test".into());
+    }
+
+    // Create active samples with different volumes to demonstrate mixing
+    let mut active_samples = Vec::new();
+    for (i, buffer) in buffers.iter().enumerate() {
+        let volume = 0.3; // Reduce volume to avoid clipping when mixing
+        let sample = ActiveSample::new(buffer.clone(), volume);
+        active_samples.push(sample);
+        tracing::info!("Added sample {} to mixer at {}% volume", i + 1, (volume * 100.0) as u32);
+    }
+
+    // Create mixer state
+    let mixer_state = Arc::new(Mutex::new(MixerState {
+        active_samples,
+        output_channels,
+    }));
+
+    let mixer_state_clone = mixer_state.clone();
+
+    // Build audio stream with mixer
+    let stream = device.build_output_stream(
+        &config.into(),
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            // Audio callback - mix all active samples
+            let mut state = mixer_state_clone.lock().unwrap();
+            crate::audio::mixer::mix_audio(data, &mut state);
+
+            // Remove finished samples
+            state.active_samples.retain(|s| !s.is_finished());
+        },
+        move |err| {
+            tracing::error!("Stream error: {}", err);
+        },
+        None,
+    )?;
+
+    stream.play()?;
+
+    let num_samples = mixer_state.lock().unwrap().active_samples.len();
+    tracing::info!("Mixer started with {} simultaneous samples", num_samples);
 
     Ok(stream)
 }

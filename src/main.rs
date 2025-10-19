@@ -54,6 +54,10 @@ struct Args {
     /// Play an audio file (for testing decoder)
     #[arg(long)]
     file: Option<String>,
+
+    /// Test mixer with multiple simultaneous files (Phase 4)
+    #[arg(long)]
+    test_mixer: bool,
 }
 
 fn main() {
@@ -142,6 +146,33 @@ fn main() {
             }
             Err(e) => {
                 tracing::error!("Failed to play file: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Handle --test-mixer (Phase 4)
+    if args.test_mixer {
+        tracing::info!("Starting mixer test (multiple simultaneous samples)...");
+        match audio::engine::test_mixer() {
+            Ok(_stream) => {
+                tracing::info!("Mixer test running. Press Ctrl+C to exit.");
+
+                // Keep stream alive until Ctrl+C
+                let (tx, rx) = std::sync::mpsc::channel();
+                ctrlc::set_handler(move || {
+                    tx.send(()).expect("Could not send signal on channel");
+                })
+                .expect("Error setting Ctrl-C handler");
+
+                rx.recv().expect("Could not receive from channel");
+                tracing::info!("Stopping mixer test...");
+
+                // Stream will be dropped here, stopping playback
+            }
+            Err(e) => {
+                tracing::error!("Failed to start mixer test: {}", e);
                 std::process::exit(1);
             }
         }
