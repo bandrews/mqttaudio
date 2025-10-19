@@ -6,6 +6,12 @@ use std::sync::Arc;
 
 /// Active sample being played
 pub struct ActiveSample {
+    /// Unique sample ID
+    pub id: u64,
+
+    /// Voice ID this sample belongs to
+    pub voice_id: String,
+
     /// Pre-decoded audio buffer (shared, immutable)
     pub buffer: Arc<DecodedBuffer>,
 
@@ -15,22 +21,28 @@ pub struct ActiveSample {
     /// Per-sample volume (0.0 - 1.0)
     pub volume: f32,
 
+    /// Voice-level volume (0.0 - 1.0)
+    pub voice_volume: f32,
+
     /// Channel routing: vec![(src_channel, dest_channel), ...]
     pub channel_map: Vec<(usize, usize)>,
 }
 
 impl ActiveSample {
     /// Create a new active sample with default stereo mapping
-    pub fn new(buffer: Arc<DecodedBuffer>, volume: f32) -> Self {
+    pub fn new(id: u64, voice_id: String, buffer: Arc<DecodedBuffer>, volume: f32, voice_volume: f32) -> Self {
         // Default channel mapping: 1:1 for available channels
         let channel_map = (0..buffer.channels)
             .map(|ch| (ch, ch))
             .collect();
 
         Self {
+            id,
+            voice_id,
             buffer,
             position: 0,
             volume,
+            voice_volume,
             channel_map,
         }
     }
@@ -38,14 +50,20 @@ impl ActiveSample {
     /// Create a new active sample with custom channel mapping
     #[allow(dead_code)] // Used in Phase 7 for channel routing
     pub fn new_with_mapping(
+        id: u64,
+        voice_id: String,
         buffer: Arc<DecodedBuffer>,
         volume: f32,
+        voice_volume: f32,
         channel_map: Vec<(usize, usize)>,
     ) -> Self {
         Self {
+            id,
+            voice_id,
             buffer,
             position: 0,
             volume,
+            voice_volume,
             channel_map,
         }
     }
@@ -53,6 +71,11 @@ impl ActiveSample {
     /// Check if this sample has finished playing
     pub fn is_finished(&self) -> bool {
         self.position >= self.buffer.frames
+    }
+
+    /// Get the combined volume (sample volume * voice volume)
+    pub fn combined_volume(&self) -> f32 {
+        self.volume * self.voice_volume
     }
 }
 
@@ -109,6 +132,8 @@ fn mix_sample_into_output(
     frames: usize,
     output_channels: usize,
 ) {
+    let combined_volume = sample.combined_volume();
+
     for frame_idx in 0..frames {
         let src_position = sample.position + frame_idx;
 
@@ -127,8 +152,8 @@ fn mix_sample_into_output(
             let src_idx = src_position * sample.buffer.channels + src_ch;
             let dest_idx = frame_idx * output_channels + dest_ch;
 
-            // Mix with volume applied
-            output[dest_idx] += sample.buffer.data[src_idx] * sample.volume;
+            // Mix with combined volume applied (sample volume * voice volume)
+            output[dest_idx] += sample.buffer.data[src_idx] * combined_volume;
         }
     }
 }
@@ -145,7 +170,7 @@ mod tests {
     #[test]
     fn test_single_sample_mixing() {
         let buffer = create_test_buffer(10, 2, 0.5);
-        let sample = ActiveSample::new(buffer, 1.0);
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0);
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -164,8 +189,8 @@ mod tests {
         let buffer1 = create_test_buffer(10, 2, 0.3);
         let buffer2 = create_test_buffer(10, 2, 0.4);
 
-        let sample1 = ActiveSample::new(buffer1, 1.0);
-        let sample2 = ActiveSample::new(buffer2, 1.0);
+        let sample1 = ActiveSample::new(1, "test".to_string(), buffer1, 1.0, 1.0);
+        let sample2 = ActiveSample::new(2, "test".to_string(), buffer2, 1.0, 1.0);
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample1);
@@ -183,7 +208,7 @@ mod tests {
     #[test]
     fn test_volume_control() {
         let buffer = create_test_buffer(10, 2, 1.0);
-        let sample = ActiveSample::new(buffer, 0.5); // 50% volume
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 0.5, 1.0); // 50% sample volume
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -198,12 +223,46 @@ mod tests {
     }
 
     #[test]
+    fn test_voice_volume() {
+        let buffer = create_test_buffer(10, 2, 1.0);
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 0.5); // 50% voice volume
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 20];
+        mix_audio(&mut output, &mut state);
+
+        // Should be 1.0 * 1.0 * 0.5 = 0.5
+        for &s in &output {
+            assert_eq!(s, 0.5);
+        }
+    }
+
+    #[test]
+    fn test_combined_volume() {
+        let buffer = create_test_buffer(10, 2, 1.0);
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 0.5, 0.4); // 50% sample * 40% voice
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 20];
+        mix_audio(&mut output, &mut state);
+
+        // Should be 1.0 * 0.5 * 0.4 = 0.2
+        for &s in &output {
+            assert!((s - 0.2).abs() < 0.0001);
+        }
+    }
+
+    #[test]
     fn test_saturation() {
         let buffer1 = create_test_buffer(10, 2, 0.8);
         let buffer2 = create_test_buffer(10, 2, 0.8);
 
-        let sample1 = ActiveSample::new(buffer1, 1.0);
-        let sample2 = ActiveSample::new(buffer2, 1.0);
+        let sample1 = ActiveSample::new(1, "test".to_string(), buffer1, 1.0, 1.0);
+        let sample2 = ActiveSample::new(2, "test".to_string(), buffer2, 1.0, 1.0);
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample1);
@@ -226,7 +285,7 @@ mod tests {
 
         // Map: L→1, R→3 (4-channel output)
         let channel_map = vec![(0, 1), (1, 3)];
-        let sample = ActiveSample::new_with_mapping(buffer, 1.0, channel_map);
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map);
 
         let mut state = MixerState::new(4);
         state.active_samples.push(sample);
@@ -250,7 +309,7 @@ mod tests {
     #[test]
     fn test_sample_completion() {
         let buffer = create_test_buffer(5, 2, 0.5);
-        let sample = ActiveSample::new(buffer, 1.0);
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0);
 
         assert!(!sample.is_finished());
 
@@ -267,7 +326,7 @@ mod tests {
     #[test]
     fn test_partial_sample_playback() {
         let buffer = create_test_buffer(10, 2, 0.5);
-        let mut sample = ActiveSample::new(buffer, 1.0);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0);
         sample.position = 8; // Start near the end
 
         let mut state = MixerState::new(2);

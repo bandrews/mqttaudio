@@ -222,14 +222,17 @@ async fn main() {
         tracing::info!("  Sample rate: {} Hz", output_sample_rate);
         tracing::info!("  Channels: {}", output_channels);
 
-        // Create mixer state
+        // Create mixer state and voice manager
         use audio::mixer::{ActiveSample, MixerState};
         use std::sync::{Arc, Mutex};
+        use voice::VoiceManager;
 
         let mixer_state = Arc::new(Mutex::new(MixerState {
             active_samples: Vec::new(),
             output_channels,
         }));
+
+        let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));
 
         let mixer_state_clone = mixer_state.clone();
 
@@ -269,20 +272,41 @@ async fn main() {
                     tracing::info!("Processing command: {:?}", cmd);
 
                     match cmd {
-                        mqtt::commands::AudioCommand::Play { file, volume } => {
+                        mqtt::commands::AudioCommand::Play { file, volume, voice } => {
                             // Decode file
                             match audio::decoder::decode_file(&file, Some(output_sample_rate)) {
                                 Ok(buffer) => {
+                                    // Use provided voice or auto-generate one
+                                    let voice_id = voice.unwrap_or_else(|| {
+                                        format!("_auto_{}", std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_millis())
+                                    });
+
                                     tracing::info!(
-                                        "Loaded {}: {} channels, {} frames ({:.2}s)",
+                                        "Loaded {}: {} channels, {} frames ({:.2}s) [voice: {}]",
                                         file,
                                         buffer.channels,
                                         buffer.frames,
-                                        buffer.frames as f32 / buffer.sample_rate as f32
+                                        buffer.frames as f32 / buffer.sample_rate as f32,
+                                        voice_id
                                     );
 
+                                    // Get sample ID and voice volume from voice manager
+                                    let mut voice_mgr = voice_manager.lock().unwrap();
+                                    let sample_id = voice_mgr.add_sample_to_voice(&voice_id);
+                                    let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
+                                    drop(voice_mgr);
+
                                     // Add to mixer
-                                    let sample = ActiveSample::new(Arc::new(buffer), volume);
+                                    let sample = ActiveSample::new(
+                                        sample_id,
+                                        voice_id,
+                                        Arc::new(buffer),
+                                        volume,
+                                        voice_volume,
+                                    );
                                     let mut state = mixer_state.lock().unwrap();
                                     state.active_samples.push(sample);
 
@@ -297,7 +321,73 @@ async fn main() {
                             let mut state = mixer_state.lock().unwrap();
                             let count = state.active_samples.len();
                             state.active_samples.clear();
+                            drop(state);
+
+                            // Note: We don't need to explicitly clear voices here.
+                            // The audio callback cleanup will handle calling voice_manager.remove_sample()
+                            // for each finished sample, which will auto-cleanup empty voices.
+
                             tracing::info!("Stopped {} samples", count);
+                        }
+                        mqtt::commands::AudioCommand::VoiceStop { voice } => {
+                            // Get sample IDs to remove
+                            let mut voice_mgr = voice_manager.lock().unwrap();
+                            let sample_ids = voice_mgr.clear_voice(&voice);
+                            drop(voice_mgr);
+
+                            if sample_ids.is_empty() {
+                                tracing::warn!("Voice '{}' not found or already empty", voice);
+                            } else {
+                                // Remove samples from mixer
+                                let mut state = mixer_state.lock().unwrap();
+                                let initial_count = state.active_samples.len();
+                                state.active_samples.retain(|s| !sample_ids.contains(&s.id));
+                                let removed = initial_count - state.active_samples.len();
+
+                                tracing::info!("Stopped voice '{}': removed {} samples", voice, removed);
+                            }
+                        }
+                        mqtt::commands::AudioCommand::VoiceFadeOut { voice, time_ms: _ } => {
+                            // TODO: Implement fade out in Phase 9
+                            // For now, just stop the voice immediately
+                            tracing::warn!("Voice fade out not yet implemented (Phase 9), stopping voice '{}' immediately", voice);
+
+                            let mut voice_mgr = voice_manager.lock().unwrap();
+                            let sample_ids = voice_mgr.clear_voice(&voice);
+                            drop(voice_mgr);
+
+                            if !sample_ids.is_empty() {
+                                let mut state = mixer_state.lock().unwrap();
+                                state.active_samples.retain(|s| !sample_ids.contains(&s.id));
+                                tracing::info!("Stopped voice '{}': {} samples", voice, sample_ids.len());
+                            }
+                        }
+                        mqtt::commands::AudioCommand::VoiceVolume { voice, volume: new_volume } => {
+                            // Set voice volume in voice manager
+                            let mut voice_mgr = voice_manager.lock().unwrap();
+                            let success = voice_mgr.set_voice_volume(&voice, new_volume);
+                            let actual_volume = voice_mgr.get_voice_volume(&voice).unwrap_or(1.0);
+                            drop(voice_mgr);
+
+                            if success {
+                                // Update all active samples in this voice
+                                let mut state = mixer_state.lock().unwrap();
+                                let mut updated_count = 0;
+                                for sample in state.active_samples.iter_mut() {
+                                    if sample.voice_id == voice {
+                                        sample.voice_volume = actual_volume;
+                                        updated_count += 1;
+                                    }
+                                }
+                                drop(state);
+
+                                tracing::info!(
+                                    "Set voice '{}' volume to {:.2} (updated {} samples)",
+                                    voice, actual_volume, updated_count
+                                );
+                            } else {
+                                tracing::warn!("Voice '{}' not found", voice);
+                            }
                         }
                     }
                 }

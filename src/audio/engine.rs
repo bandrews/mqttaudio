@@ -241,7 +241,13 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
     let mut active_samples = Vec::new();
     for (i, buffer) in buffers.iter().enumerate() {
         let volume = 0.3; // Reduce volume to avoid clipping when mixing
-        let sample = ActiveSample::new(buffer.clone(), volume);
+        let sample = ActiveSample::new(
+            (i + 1) as u64,
+            "test_mixer".to_string(),
+            buffer.clone(),
+            volume,
+            1.0, // Voice volume
+        );
         active_samples.push(sample);
         tracing::info!("Added sample {} to mixer at {}% volume", i + 1, (volume * 100.0) as u32);
     }
