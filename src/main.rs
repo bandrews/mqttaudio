@@ -50,6 +50,10 @@ struct Args {
     /// Play a 440Hz test tone (for testing audio output)
     #[arg(long)]
     test_tone: bool,
+
+    /// Play an audio file (for testing decoder)
+    #[arg(long)]
+    file: Option<String>,
 }
 
 fn main() {
@@ -112,6 +116,32 @@ fn main() {
             }
             Err(e) => {
                 tracing::error!("Failed to initialize audio stream: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Handle --file (Phase 2)
+    if let Some(file_path) = args.file {
+        match audio::engine::play_file(&file_path) {
+            Ok(_stream) => {
+                tracing::info!("File playing. Press Ctrl+C to exit.");
+
+                // Keep stream alive until Ctrl+C
+                let (tx, rx) = std::sync::mpsc::channel();
+                ctrlc::set_handler(move || {
+                    tx.send(()).expect("Could not send signal on channel");
+                })
+                .expect("Error setting Ctrl-C handler");
+
+                rx.recv().expect("Could not receive from channel");
+                tracing::info!("Stopping playback...");
+
+                // Stream will be dropped here, stopping playback
+            }
+            Err(e) => {
+                tracing::error!("Failed to play file: {}", e);
                 std::process::exit(1);
             }
         }
