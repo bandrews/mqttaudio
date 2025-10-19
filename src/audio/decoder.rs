@@ -1,6 +1,7 @@
 // ABOUTME: Audio file decoding using symphonia.
 // ABOUTME: Supports WAV, OGG, MP3, FLAC formats.
 
+use crate::audio::resampler;
 use crate::audio::types::DecodedBuffer;
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::DecoderOptions;
@@ -16,6 +17,7 @@ use std::path::Path;
 pub enum DecodeError {
     IoError(std::io::Error),
     SymphoniaError(SymphoniaError),
+    ResampleError(resampler::ResampleError),
     NoDefaultTrack,
     UnsupportedFormat,
 }
@@ -25,6 +27,7 @@ impl std::fmt::Display for DecodeError {
         match self {
             DecodeError::IoError(e) => write!(f, "I/O error: {}", e),
             DecodeError::SymphoniaError(e) => write!(f, "Decode error: {}", e),
+            DecodeError::ResampleError(e) => write!(f, "Resample error: {}", e),
             DecodeError::NoDefaultTrack => write!(f, "No default audio track found"),
             DecodeError::UnsupportedFormat => write!(f, "Unsupported audio format"),
         }
@@ -45,8 +48,18 @@ impl From<SymphoniaError> for DecodeError {
     }
 }
 
-/// Decode an audio file to f32 PCM samples
-pub fn decode_file(path: &str) -> Result<DecodedBuffer, DecodeError> {
+impl From<resampler::ResampleError> for DecodeError {
+    fn from(err: resampler::ResampleError) -> Self {
+        DecodeError::ResampleError(err)
+    }
+}
+
+/// Decode an audio file to f32 PCM samples, optionally resampling to target rate
+///
+/// # Arguments
+/// * `path` - Path to the audio file
+/// * `target_sample_rate` - If Some, resample to this rate. If None, use file's native rate
+pub fn decode_file(path: &str, target_sample_rate: Option<u32>) -> Result<DecodedBuffer, DecodeError> {
     tracing::debug!("Decoding file: {}", path);
 
     // Open the file
@@ -131,7 +144,19 @@ pub fn decode_file(path: &str) -> Result<DecodedBuffer, DecodeError> {
         path
     );
 
-    Ok(DecodedBuffer::new(samples, channels, sample_rate))
+    // Resample if needed
+    let (final_data, final_sample_rate) = if let Some(target_rate) = target_sample_rate {
+        if sample_rate != target_rate {
+            let resampled = resampler::resample(samples, sample_rate, target_rate, channels)?;
+            (resampled, target_rate)
+        } else {
+            (samples, sample_rate)
+        }
+    } else {
+        (samples, sample_rate)
+    };
+
+    Ok(DecodedBuffer::new(final_data, channels, final_sample_rate))
 }
 
 /// Convert symphonia audio buffer to interleaved f32 samples

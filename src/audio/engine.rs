@@ -103,9 +103,17 @@ pub fn init_test_sine_wave() -> Result<Stream, Box<dyn std::error::Error>> {
 
 /// Play an audio file
 pub fn play_file(path: &str) -> Result<Stream, Box<dyn std::error::Error>> {
-    // Decode the audio file
+    // Get audio device first to determine target sample rate
+    let host = cpal::default_host();
+    let device = host.default_output_device()
+        .ok_or("No default output device available")?;
+
+    let config = device.default_output_config()?;
+    let output_sample_rate = config.sample_rate().0;
+
+    // Decode the audio file with automatic resampling to device sample rate
     tracing::info!("Loading audio file: {}", path);
-    let buffer = decoder::decode_file(path)?;
+    let buffer = decoder::decode_file(path, Some(output_sample_rate))?;
 
     tracing::info!(
         "Loaded: {} channels, {} Hz, {} frames ({:.2}s)",
@@ -115,29 +123,12 @@ pub fn play_file(path: &str) -> Result<Stream, Box<dyn std::error::Error>> {
         buffer.frames as f32 / buffer.sample_rate as f32
     );
 
-    // Get audio device
-    let host = cpal::default_host();
-    let device = host.default_output_device()
-        .ok_or("No default output device available")?;
-
-    let config = device.default_output_config()?;
     let output_channels = config.channels() as usize;
-    let output_sample_rate = config.sample_rate().0;
 
     tracing::info!("Initializing audio stream:");
     tracing::info!("  Device: {}", device.name()?);
     tracing::info!("  Sample rate: {} Hz", output_sample_rate);
     tracing::info!("  Channels: {}", output_channels);
-
-    // Warn if sample rates don't match (Phase 3 will fix this)
-    if buffer.sample_rate != output_sample_rate {
-        tracing::warn!(
-            "Sample rate mismatch! File: {} Hz, Device: {} Hz",
-            buffer.sample_rate,
-            output_sample_rate
-        );
-        tracing::warn!("Playback speed will be incorrect. Phase 3 will add resampling.");
-    }
 
     // Wrap buffer in Arc for sharing with callback
     let buffer = Arc::new(buffer);
