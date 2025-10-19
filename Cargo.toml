@@ -58,6 +58,10 @@ dirs = "5.0"
 criterion = "0.5"
 tempfile = "3.8"
 
+[[bench]]
+name = "mixer_benchmark"
+harness = false
+
 [profile.release]
 lto = true
 codegen-units = 1

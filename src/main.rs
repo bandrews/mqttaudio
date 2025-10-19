@@ -397,19 +397,28 @@ async fn main() {
                             }
                         }
                         mqtt::commands::AudioCommand::StopAll => {
+                            // Apply quick 10ms fade-out to prevent clicks/pops
+                            const STOP_FADE_MS: u32 = 10;
+
                             let mut state = mixer_state.lock().unwrap();
                             let count = state.active_samples.len();
-                            state.active_samples.clear();
+
+                            for sample in state.active_samples.iter_mut() {
+                                sample.set_fade(audio::mixer::FadeState::fade_out(STOP_FADE_MS, output_sample_rate));
+                            }
                             drop(state);
 
-                            // Note: We don't need to explicitly clear voices here.
-                            // The audio callback cleanup will handle calling voice_manager.remove_sample()
-                            // for each finished sample, which will auto-cleanup empty voices.
+                            // Note: Samples will be automatically removed by the audio callback
+                            // when the fade completes (is_finished() returns true).
+                            // Voice cleanup also happens automatically.
 
-                            tracing::info!("Stopped {} samples", count);
+                            tracing::info!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS);
                         }
                         mqtt::commands::AudioCommand::VoiceStop { voice } => {
-                            // Get sample IDs to remove
+                            // Apply quick 10ms fade-out to prevent clicks/pops
+                            const STOP_FADE_MS: u32 = 10;
+
+                            // Get sample IDs in the voice
                             let mut voice_mgr = voice_manager.lock().unwrap();
                             let sample_ids = voice_mgr.clear_voice(&voice);
                             drop(voice_mgr);
@@ -417,13 +426,21 @@ async fn main() {
                             if sample_ids.is_empty() {
                                 tracing::warn!("Voice '{}' not found or already empty", voice);
                             } else {
-                                // Remove samples from mixer
+                                // Apply fade-out to all samples in the voice
                                 let mut state = mixer_state.lock().unwrap();
-                                let initial_count = state.active_samples.len();
-                                state.active_samples.retain(|s| !sample_ids.contains(&s.id));
-                                let removed = initial_count - state.active_samples.len();
+                                let mut updated_count = 0;
+                                for sample in state.active_samples.iter_mut() {
+                                    if sample_ids.contains(&sample.id) {
+                                        sample.set_fade(audio::mixer::FadeState::fade_out(STOP_FADE_MS, output_sample_rate));
+                                        updated_count += 1;
+                                    }
+                                }
+                                drop(state);
 
-                                tracing::info!("Stopped voice '{}': removed {} samples", voice, removed);
+                                tracing::info!(
+                                    "Stopping voice '{}': {} samples ({}ms fade-out)",
+                                    voice, updated_count, STOP_FADE_MS
+                                );
                             }
                         }
                         mqtt::commands::AudioCommand::VoiceFadeOut { voice, time_ms } => {
