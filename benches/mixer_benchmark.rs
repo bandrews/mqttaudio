@@ -29,6 +29,7 @@ fn create_mixer_state(num_samples: usize, output_channels: usize) -> MixerState 
     let mut state = MixerState {
         active_samples: Vec::new(),
         output_channels,
+        ducking_engine: None,
     };
 
     let buffer = create_test_buffer(2, 48000); // 1 second of stereo audio
@@ -57,6 +58,7 @@ fn create_mixer_state_with_routing(
     let mut state = MixerState {
         active_samples: Vec::new(),
         output_channels: dest_channels,
+        ducking_engine: None,
     };
 
     let buffer = create_test_buffer(src_channels, 48000);
