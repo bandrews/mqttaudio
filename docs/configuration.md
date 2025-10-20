@@ -50,6 +50,14 @@ If no config file is found, defaults are used.
     "directory": "~/.mqttaudio/cache",
     "revalidate_after_seconds": 300
   },
+  "ducking_rules": [
+    {
+      "primary_voice": "narration",
+      "ducked_voices": ["music", "effects"],
+      "target_volume": 0.15,
+      "fade_duration_ms": 2000
+    }
+  ],
   "security": {
     "allowed_directories": [
       "/opt/sounds",
@@ -144,6 +152,69 @@ Applied globally to all audio on that channel. Useful for:
 - Compensating for different speaker sensitivities
 - Balancing volume across a multi-speaker setup
 - Reducing volume on specific zones
+
+### Ducking Rules
+
+Audio ducking automatically reduces the volume of background voices when foreground voices are playing.
+
+```json
+"ducking_rules": [
+  {
+    "primary_voice": "narration",
+    "ducked_voices": ["music", "effects"],
+    "target_volume": 0.15,
+    "fade_duration_ms": 2000
+  },
+  {
+    "primary_voice": "dialog",
+    "ducked_voices": ["music", "effects", "narration"],
+    "target_volume": 0.05,
+    "fade_duration_ms": 1000
+  }
+]
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `primary_voice` | string | Yes | Voice that triggers ducking when it plays |
+| `ducked_voices` | array of strings | Yes | Voices that will be reduced in volume |
+| `target_volume` | float | Yes | Volume multiplier (0.0 - 1.0) for ducked voices |
+| `fade_duration_ms` | integer | Yes | Duration of fade in milliseconds |
+
+**Behavior:**
+- When a primary voice starts playing, all ducked voices smoothly fade to `target_volume` over `fade_duration_ms`
+- When the primary voice stops, ducked voices restore to their original volume over the same duration
+- Multiple rules can apply simultaneously (uses the lowest target volume and fastest fade)
+- All fades are glitch-free, even when ducking parameters change mid-fade
+
+**Example - Museum Installation:**
+```json
+"ducking_rules": [
+  {
+    "primary_voice": "announcement",
+    "ducked_voices": ["music", "effects", "narration"],
+    "target_volume": 0.02,
+    "fade_duration_ms": 500
+  },
+  {
+    "primary_voice": "narration",
+    "ducked_voices": ["music", "effects"],
+    "target_volume": 0.15,
+    "fade_duration_ms": 2000
+  }
+]
+```
+
+This creates a priority hierarchy:
+- **Announcements** (highest priority): Ducks everything to 2% in 500ms
+- **Narration** (medium priority): Ducks music and effects to 15% in 2 seconds
+- **Music/Effects** (lowest priority): Never trigger ducking
+
+**Notes:**
+- Ducking rules are optional - if not specified, no ducking occurs
+- Target volume is a multiplier applied to the current volume (not an absolute value)
+- A voice can be both a primary voice in one rule and a ducked voice in another
+- If no voices are playing that match a primary voice, the rule has no effect
 
 ### Cache Settings
 
@@ -390,6 +461,42 @@ mqttaudio
   },
   "logging": {
     "level": "debug"
+  }
+}
+```
+
+### Interactive Installation with Audio Ducking
+```json
+{
+  "mqtt": {
+    "server": "localhost",
+    "topic": "installation/audio"
+  },
+  "audio": {
+    "device": "USB Audio Interface"
+  },
+  "ducking_rules": [
+    {
+      "primary_voice": "announcement",
+      "ducked_voices": ["music", "effects", "narration"],
+      "target_volume": 0.02,
+      "fade_duration_ms": 500
+    },
+    {
+      "primary_voice": "narration",
+      "ducked_voices": ["music", "effects"],
+      "target_volume": 0.15,
+      "fade_duration_ms": 2000
+    },
+    {
+      "primary_voice": "dialog",
+      "ducked_voices": ["music", "effects"],
+      "target_volume": 0.10,
+      "fade_duration_ms": 1500
+    }
+  ],
+  "security": {
+    "allowed_directories": ["/opt/installation/audio"]
   }
 }
 ```

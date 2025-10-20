@@ -2,6 +2,7 @@
 // ABOUTME: Runs in audio callback thread with strict real-time constraints.
 
 use crate::audio::types::DecodedBuffer;
+use crate::audio::ducking::DuckingEngine;
 use std::sync::Arc;
 
 /// Fade state for audio samples
@@ -183,6 +184,9 @@ pub struct MixerState {
 
     /// Number of output channels
     pub output_channels: usize,
+
+    /// Ducking engine for automatic voice volume reduction
+    pub ducking_engine: Option<DuckingEngine>,
 }
 
 impl MixerState {
@@ -191,6 +195,7 @@ impl MixerState {
         Self {
             active_samples: Vec::new(),
             output_channels,
+            ducking_engine: None,
         }
     }
 }
@@ -210,7 +215,14 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
 
     // Mix each active sample into the output
     for sample in &mut state.active_samples {
-        mix_sample_into_output(sample, output, frames, state.output_channels);
+        // Get ducking multiplier for this sample's voice
+        let ducking_multiplier = if let Some(ref mut engine) = state.ducking_engine {
+            engine.get_multiplier(&sample.voice_id, frames)
+        } else {
+            1.0  // No ducking
+        };
+
+        mix_sample_into_output(sample, output, frames, state.output_channels, ducking_multiplier);
 
         // Advance playback position
         sample.position += frames;
@@ -228,6 +240,7 @@ fn mix_sample_into_output(
     output: &mut [f32],
     frames: usize,
     output_channels: usize,
+    ducking_multiplier: f32,
 ) {
     let base_volume = sample.combined_volume();
 
@@ -241,7 +254,7 @@ fn mix_sample_into_output(
 
         // Calculate fade multiplier for this frame
         let fade_multiplier = sample.fade_state.multiplier();
-        let final_volume = base_volume * fade_multiplier;
+        let final_volume = base_volume * fade_multiplier * ducking_multiplier;
 
         // Apply channel mapping and mix into output
         for &(src_ch, dest_ch) in &sample.channel_map {

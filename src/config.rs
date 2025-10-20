@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs;
+use crate::audio::ducking::DuckingRule;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -109,6 +110,8 @@ pub struct Config {
     pub cache: CacheConfig,
     pub security: SecurityConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub ducking_rules: Vec<DuckingRule>,
 }
 
 impl Default for Config {
@@ -119,6 +122,7 @@ impl Default for Config {
             cache: CacheConfig::default(),
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
+            ducking_rules: Vec::new(),
         }
     }
 }

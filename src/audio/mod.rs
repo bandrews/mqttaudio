@@ -6,3 +6,4 @@ pub mod mixer;
 pub mod decoder;
 pub mod resampler;
 pub mod types;
+pub mod ducking;

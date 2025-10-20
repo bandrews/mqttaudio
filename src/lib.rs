@@ -7,6 +7,7 @@ pub mod audio {
     pub mod decoder;
     pub mod resampler;
     pub mod engine;
+    pub mod ducking;
 }
 
 pub mod cache {

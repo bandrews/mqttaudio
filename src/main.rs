@@ -263,15 +263,28 @@ async fn main() {
 
     // Create mixer state and voice manager
     use audio::mixer::{ActiveSample, MixerState};
+    use audio::ducking::DuckingEngine;
     use std::sync::{Arc, Mutex};
+    use std::collections::HashSet;
     use voice::VoiceManager;
+
+    // Create ducking engine from config rules
+    let ducking_engine = if !config.ducking_rules.is_empty() {
+        Some(DuckingEngine::new(config.ducking_rules.clone(), output_sample_rate))
+    } else {
+        None
+    };
 
     let mixer_state = Arc::new(Mutex::new(MixerState {
         active_samples: Vec::new(),
         output_channels,
+        ducking_engine,
     }));
 
     let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));
+
+    // Track active voices for ducking notifications
+    let active_voices: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Create cache manager using config
     let cache_dir = config.cache_directory();
@@ -286,6 +299,7 @@ async fn main() {
     };
 
     let mixer_state_clone = mixer_state.clone();
+    let active_voices_clone = active_voices.clone();
 
     // Start audio stream
     let stream = device.build_output_stream(
@@ -294,8 +308,29 @@ async fn main() {
                 let mut state = mixer_state_clone.lock().unwrap();
                 audio::mixer::mix_audio(data, &mut state);
 
+                // Track which voices had samples before cleanup
+                let voices_before: HashSet<String> = state.active_samples.iter()
+                    .map(|s| s.voice_id.clone())
+                    .collect();
+
                 // Remove finished samples
                 state.active_samples.retain(|s| !s.is_finished());
+
+                // Track which voices have samples after cleanup
+                let voices_after: HashSet<String> = state.active_samples.iter()
+                    .map(|s| s.voice_id.clone())
+                    .collect();
+
+                // Notify ducking engine of voices that became inactive
+                if let Some(ref mut engine) = state.ducking_engine {
+                    for voice in voices_before.difference(&voices_after) {
+                        engine.notify_voice_active(voice, false);
+                    }
+                }
+
+                // Update active voices tracker
+                let mut active = active_voices_clone.lock().unwrap();
+                *active = voices_after;
             },
             |err| {
                 tracing::error!("Audio stream error: {}", err);
@@ -386,10 +421,26 @@ async fn main() {
                                         tracing::debug!("Applied {}ms fade in to voice '{}'", fade_ms, voice_id);
                                     }
 
-                                    let mut state = mixer_state.lock().unwrap();
-                                    state.active_samples.push(sample);
+                                    // Notify ducking engine if voice became active
+                                    let mut active_voices_guard = active_voices.lock().unwrap();
+                                    let was_active = active_voices_guard.contains(&voice_id);
+                                    if !was_active {
+                                        active_voices_guard.insert(voice_id.clone());
+                                        drop(active_voices_guard);
 
-                                    tracing::info!("Now playing {} active samples", state.active_samples.len());
+                                        // Notify ducking engine that voice became active
+                                        let mut state = mixer_state.lock().unwrap();
+                                        if let Some(ref mut engine) = state.ducking_engine {
+                                            engine.notify_voice_active(&voice_id, true);
+                                        }
+                                        state.active_samples.push(sample);
+                                        tracing::info!("Now playing {} active samples", state.active_samples.len());
+                                    } else {
+                                        drop(active_voices_guard);
+                                        let mut state = mixer_state.lock().unwrap();
+                                        state.active_samples.push(sample);
+                                        tracing::info!("Now playing {} active samples", state.active_samples.len());
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!("Failed to load {}: {}", file, e);

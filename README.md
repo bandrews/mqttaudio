@@ -9,6 +9,7 @@ mqttaudio is a high-performance, real-time audio engine that receives commands o
 - **Polyphonic Mixing**: Play multiple audio files simultaneously
 - **Multichannel Routing**: Route audio to specific output channels (supports up to 16+ channels)
 - **Voice Grouping**: Group sounds together for coordinated control
+- **Audio Ducking**: Automatically reduce background audio when foreground voices play
 - **Smooth Fading**: Fade in/out individual samples or entire voices
 - **HTTP Caching**: Automatically cache remote audio files for instant playback
 - **Format Support**: WAV, MP3, OGG, FLAC via symphonia decoder
@@ -186,6 +187,127 @@ mosquitto_pub -t audio/commands -m '{
   }
 }'
 ```
+
+### Audio Ducking
+
+Audio ducking automatically reduces the volume of background voices when foreground voices are playing. This is essential for applications like museums, interactive installations, or any scenario where speech needs to be intelligible over background music or effects.
+
+**How It Works:**
+- Define ducking rules that specify which voices (primary) cause other voices (ducked) to reduce in volume
+- When a primary voice starts playing, ducked voices smoothly fade down to the target volume
+- When the primary voice stops, ducked voices restore to their original volume
+- Multiple rules can apply simultaneously (the system uses the lowest volume and fastest fade)
+- All fades are glitch-free, even when rules change mid-fade
+
+**Configuration:**
+
+Add ducking rules to your `config.json`:
+
+```json
+{
+  "mqtt": {
+    "server": "localhost",
+    "port": 1883,
+    "topic": "audio/commands"
+  },
+  "audio": {
+    "device": "My Audio Interface",
+    "sample_rate": 48000
+  },
+  "ducking_rules": [
+    {
+      "primary_voice": "narration",
+      "ducked_voices": ["music", "effects"],
+      "target_volume": 0.15,
+      "fade_duration_ms": 2000
+    },
+    {
+      "primary_voice": "dialog",
+      "ducked_voices": ["music", "effects", "narration"],
+      "target_volume": 0.05,
+      "fade_duration_ms": 1000
+    }
+  ]
+}
+```
+
+**Configuration Parameters:**
+- `primary_voice`: Voice that triggers ducking
+- `ducked_voices`: Array of voices that should be reduced in volume
+- `target_volume`: Volume multiplier (0.0 to 1.0) to fade ducked voices to
+- `fade_duration_ms`: Duration of fade in milliseconds
+
+**Example Usage:**
+
+```bash
+# Start mqttaudio with ducking configuration
+mqttaudio --config ducking_config.json
+
+# In another terminal, start background music
+mosquitto_pub -t audio/commands -m '{
+  "command": "play",
+  "message": {
+    "file": "/sounds/background-music.mp3",
+    "voice": "music",
+    "volume": 0.7,
+    "loop": true
+  }
+}'
+
+# Play narration - music will automatically duck to 15% over 2 seconds
+mosquitto_pub -t audio/commands -m '{
+  "command": "play",
+  "message": {
+    "file": "/sounds/tour-narration.mp3",
+    "voice": "narration",
+    "volume": 0.9
+  }
+}'
+
+# When narration finishes, music will restore to 70% over 2 seconds
+```
+
+**Testing Ducking:**
+
+A comprehensive demo script is included to test ducking with tone files:
+
+```bash
+# Run the ducking demo (listens for smooth fading)
+./demo_ducking.sh
+```
+
+The demo showcases:
+1. Simple ducking (narration reduces music volume)
+2. Multiple rules (dialog reduces music even more during narration)
+3. Multiple ducked voices (both music and effects duck together)
+4. Rapid transitions (stress test for smooth fading)
+
+**Advanced Scenarios:**
+
+Ducking priority hierarchy:
+```json
+{
+  "ducking_rules": [
+    {
+      "primary_voice": "announcement",
+      "ducked_voices": ["music", "effects", "narration"],
+      "target_volume": 0.02,
+      "fade_duration_ms": 500
+    },
+    {
+      "primary_voice": "narration",
+      "ducked_voices": ["music", "effects"],
+      "target_volume": 0.15,
+      "fade_duration_ms": 2000
+    }
+  ]
+}
+```
+
+This creates a 3-tier priority system:
+- **Announcements** (highest priority): Ducks everything to 2%
+- **Narration** (medium priority): Ducks music and effects to 15%
+- **Music/Effects** (lowest priority): Never trigger ducking
 
 ### Voice Grouping (Controlling Multiple Sounds Together)
 
@@ -445,6 +567,14 @@ Create `config.json`:
     "directory": "~/.cache/mqttaudio",
     "max_memory_mb": 500
   },
+  "ducking_rules": [
+    {
+      "primary_voice": "narration",
+      "ducked_voices": ["music", "effects"],
+      "target_volume": 0.15,
+      "fade_duration_ms": 2000
+    }
+  ],
   "security": {
     "allowed_directories": [
       "/opt/sounds",
@@ -630,6 +760,7 @@ mqttaudio/
 │   ├── audio/
 │   │   ├── engine.rs     # Audio engine coordinator
 │   │   ├── mixer.rs      # Real-time mixer (audio callback)
+│   │   ├── ducking.rs    # Audio ducking engine
 │   │   ├── decoder.rs    # Audio file decoding
 │   │   ├── resampler.rs  # Sample rate conversion
 │   │   └── types.rs      # Audio data types

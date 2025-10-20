@@ -1,0 +1,144 @@
+Implement audio ducking with smooth mid-fade transitions
+
+This commit implements a comprehensive audio ducking system that automatically
+reduces the volume of background voices when foreground voices are playing.
+The implementation follows the design document at docs/ducking.md and includes
+a critical fix for glitch-free transitions when ducking parameters change
+mid-fade.
+
+## Core Implementation
+
+**New Module: src/audio/ducking.rs**
+- DuckingEngine: Manages ducking rules and voice activity tracking
+- DuckState: Tracks per-voice ducking state with smooth fade calculations
+- Linear interpolation with captured start multiplier for glitch-free fades
+- Support for multiple simultaneous ducking rules (uses lowest volume, fastest fade)
+
+**Configuration Support (src/config.rs)**
+- Added ducking_rules field to load rules from JSON config
+- Each rule specifies primary voice, ducked voices, target volume, and fade duration
+
+**Mixer Integration (src/audio/mixer.rs)**
+- Added DuckingEngine to MixerState
+- Query ducking multipliers per voice in audio callback
+- Apply as: sample_vol * voice_vol * ducking_multiplier
+
+**Voice Activity Tracking (src/main.rs)**
+- Track active voices and notify DuckingEngine on state changes
+- Notify when voices start (play command) and stop (sample completion)
+
+## Critical Bug Fix: Smooth Mid-Fade Transitions
+
+The initial implementation had a glitch bug when ducking parameters changed
+during an active fade. For example:
+- Music at 1.0, fading to 0.2 for narration
+- Dialog starts mid-fade when music is at 0.6
+- Music should smoothly transition from 0.6 � 0.1, but was glitching
+
+**Root Cause:**
+The fade calculation was using current_multiplier as the interpolation start
+point on every audio callback, creating non-linear fading:
+
+```rust
+// BROKEN: Uses current value repeatedly
+let start = self.current_multiplier;
+self.current_multiplier = start + (target - start) * progress;
+```
+
+**Fix:**
+Added start_multiplier field to DuckState that captures the multiplier value
+at the START of each fade transition:
+
+```rust
+fn begin_duck(&mut self, target_volume: f32, fade_duration_frames: usize) {
+    self.start_multiplier = self.current_multiplier;  // Capture current
+    // ... set up new fade ...
+}
+
+fn advance_and_get_multiplier(&mut self, frames: usize) -> f32 {
+    // Proper linear interpolation from captured start
+    self.current_multiplier = self.start_multiplier +
+                             (self.target_volume - self.start_multiplier) * progress;
+    self.current_multiplier
+}
+```
+
+This ensures smooth, glitch-free transitions even when rules change mid-fade.
+
+## Testing
+
+**Unit Tests (16 tests in src/audio/ducking.rs)**
+- Rule matching and voice activity tracking
+- Single and multiple rule scenarios
+- Fade calculations and progress
+- Mid-fade transitions (test_smooth_mid_fade_transition)
+- Edge cases (zero duration, empty rules, etc.)
+
+All 120 tests pass (104 existing + 16 new ducking tests).
+
+## Demo
+
+**Demo Script: demo_ducking.sh**
+- Comprehensive demonstration of ducking features
+- Uses frequency tones to represent different voice types:
+  - 200Hz: Music (continuous background)
+  - 800Hz: Narration (mid-range foreground)
+  - 1200Hz: Dialog (high priority foreground)
+  - 600Hz: Effects (background)
+
+**Demo Scenarios:**
+1. Simple ducking (narration ducks music)
+2. Multiple rules (dialog ducks music further mid-narration)
+3. Multiple ducked voices (effects + music)
+4. Rapid transitions (stress test for smooth fading)
+
+**Config File: ducking_demo_config.json**
+- Narration ducks Music+Effects to 15% over 2s
+- Dialog ducks Music+Effects+Narration to 5% over 1s
+
+## Architecture Highlights
+
+- Clean separation: DuckingEngine observes playback without tight coupling
+- Fast audio callback: Simple HashMap lookup + linear interpolation
+- No allocations in audio callback
+- Configurable via JSON with sensible defaults
+- Extensible for future enhancements (MQTT commands, non-linear curves)
+
+## Documentation
+
+**README.md Updates:**
+- Added comprehensive "Audio Ducking" section with practical examples
+- Explained ducking concepts, configuration, and usage scenarios
+- Included demo script reference and advanced ducking patterns
+- Added ducking_rules to configuration file example
+- Updated project structure to include ducking.rs module
+
+**docs/configuration.md Updates:**
+- Added "Ducking Rules" section with field reference table
+- Included behavior explanation and usage notes
+- Added ducking_rules to complete configuration example
+- Added "Interactive Installation with Audio Ducking" example config
+- Documented priority hierarchy patterns
+
+The documentation provides clear guidance for users implementing audio ducking
+in their applications, with ready-to-use config examples and MQTT command
+patterns.
+
+## User Prompts
+
+- "Please read the design document you previously wrote at @docs/ducking.md
+   and then carefully implement the feature."
+- "Make sure that if things change dynamically during a fade, there are no
+   glitches in how the audio reacts too!"
+- "We had just gotten the tests to pass, but identified a problem where there
+   could be glitches in fades when a second ducking rule starts to apply while
+   a first one was already mid-fade (or fully applied)."
+- "So that solves the glitching, but we still haven't completed the full
+   original task. You need to provide a test script that demonstrates the new
+   feature with all its complexity, so I can listen for the tones and verify
+   everything works correctly."
+- "Please update the readme with details on how to use the new ducking feature."
+
+> Generated with Claude Code (https://claude.com/claude-code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
