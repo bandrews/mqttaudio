@@ -260,6 +260,28 @@ mosquitto_pub -t audio/commands -m '{
 }'
 ```
 
+**Play mono PA announcement to all speakers (one-to-many routing):**
+```bash
+# Route a mono file to channels 0, 1, 2, 3, 4, and 5 simultaneously
+mosquitto_pub -t audio/commands -m '{
+  "command": "play",
+  "message": {
+    "file": "/sounds/announcement.wav",
+    "channel_map": [
+      {"src": 0, "dest": 0},
+      {"src": 0, "dest": 1},
+      {"src": 0, "dest": 2},
+      {"src": 0, "dest": 3},
+      {"src": 0, "dest": 4},
+      {"src": 0, "dest": 5}
+    ],
+    "voice": "announcements"
+  }
+}'
+```
+
+**Note:** You can map a single source channel to multiple output channels by specifying multiple entries with the same `src` value. This is useful for broadcasting announcements across multiple zones or speakers.
+
 ### Stopping Audio
 
 **Stop all audio immediately:**

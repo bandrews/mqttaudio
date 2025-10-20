@@ -64,6 +64,17 @@ Channel map is an array of source-to-destination mappings:
 - Stereo file → Output channels 0, 1
 - Multi-channel → Output channels 0, 1, 2, 3... (sequential)
 
+**One-to-many routing:**
+You can map a single source channel to multiple output channels by specifying multiple entries with the same `src` value:
+```json
+"channel_map": [
+  {"src": 0, "dest": 0},  // Map source channel 0 to output 0
+  {"src": 0, "dest": 1},  // AND to output 1
+  {"src": 0, "dest": 2}   // AND to output 2
+]
+```
+This is useful for PA announcements or broadcasting a mono signal to multiple zones.
+
 **Channel names** are defined in config file (see configuration.md).
 
 ### Examples
