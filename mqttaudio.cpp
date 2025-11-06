@@ -39,6 +39,8 @@ unsigned int port = 1883;
 std::string topic = "";
 std::string alsaDevice = "";
 std::string uriprefix = "";
+std::string username = "";
+std::string password = "";
 
 vector<string> preloads;
 
@@ -375,6 +377,22 @@ static int parse_opt(int key, char *arg, struct argp_state *state)
         }
         break;
 
+    case 'U':
+        if (arg != NULL && *arg != '\0')
+        {
+            printf("Setting MQTT username to '%s'\n", arg);
+            username = arg;
+        }
+        break;
+
+    case 'P':
+        if (arg != NULL && *arg != '\0')
+        {
+            printf("Setting MQTT password\n");
+            password = arg;
+        }
+        break;
+
     case 'l':
         listAlsaDevices("pcm");
         exit(0);
@@ -412,6 +430,8 @@ int main(int argc, char **argv)
             {"server", 's', "server", 0, "The MQTT server to connect to (default localhost)"},
             {"port", 'p', "port", 0, "The MQTT server port (default 1883)"},
             {"topic", 't', "topic", 0, "The MQTT server topic to subscribe to (wildcards allowed)"},
+            {"username", 'U', "username", 0, "The MQTT username for authentication (optional)"},
+            {"password", 'P', "password", 0, "The MQTT password for authentication (optional)"},
             {"alsa-device", 'd', "pcm", 0, "The ALSA PCM device to use (setting this option overrides the SDL_AUDIODRIVER and AUDIODEV environment variables)"},
             {"list-devices", 'l', 0, 0, "Lists available ALSA PCM devices for the 'd' switch."},
             {"verbose", 'v', 0, 0, "Writes logging information for every sound played to stdout."},
@@ -462,6 +482,19 @@ int main(int argc, char **argv)
     {
         mosquitto_connect_callback_set(mosq, connect_callback);
         mosquitto_message_callback_set(mosq, message_callback);
+
+        // Set username and password if provided
+        if (!username.empty() || !password.empty())
+        {
+            rc = mosquitto_username_pw_set(mosq,
+                username.empty() ? NULL : username.c_str(),
+                password.empty() ? NULL : password.c_str());
+            if (rc != MOSQ_ERR_SUCCESS)
+            {
+                fprintf(stderr, "Failed to set username/password: %d\n", rc);
+                return EX_CONFIG;
+            }
+        }
 
         printf("Connecting to server %s\n", server.c_str());
         rc = mosquitto_connect(mosq, server.c_str(), port, 60);
