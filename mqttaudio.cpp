@@ -29,7 +29,7 @@
 using namespace std;
 using namespace rapidjson;
 
-const char *argp_program_version = "0.1.1";
+const char *argp_program_version = "0.2.0";
 const char *argp_program_bug_address = "contact@mofangheavyindustries.com";
 
 int frequency = 44100;
