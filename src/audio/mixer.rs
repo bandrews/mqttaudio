@@ -3,6 +3,8 @@
 
 use crate::audio::types::DecodedBuffer;
 use crate::audio::ducking::DuckingEngine;
+use crate::audio::bass_management::BassManagement;
+use ringbuf::HeapConsumer;
 use std::sync::Arc;
 
 /// Fade state for audio samples
@@ -177,16 +179,68 @@ impl ActiveSample {
     }
 }
 
+/// Active live input (microphone) being mixed
+pub struct LiveInput {
+    /// Voice ID this input belongs to (for ducking)
+    pub voice_id: String,
+
+    /// Ring buffer consumer for receiving audio samples
+    pub consumer: HeapConsumer<f32>,
+
+    /// Number of input channels
+    pub input_channels: usize,
+
+    /// Per-input volume (0.0 - 1.0)
+    pub volume: f32,
+
+    /// Voice-level volume (0.0 - 1.0)
+    pub voice_volume: f32,
+
+    /// Channel routing: vec![(src_channel, dest_channel), ...]
+    pub channel_map: Vec<(usize, usize)>,
+}
+
+impl LiveInput {
+    /// Create a new live input with the given routing
+    pub fn new(
+        voice_id: String,
+        consumer: HeapConsumer<f32>,
+        input_channels: usize,
+        volume: f32,
+        channel_map: Vec<(usize, usize)>,
+    ) -> Self {
+        Self {
+            voice_id,
+            consumer,
+            input_channels,
+            volume,
+            voice_volume: 1.0,
+            channel_map,
+        }
+    }
+
+    /// Get the combined volume (input volume * voice volume)
+    pub fn combined_volume(&self) -> f32 {
+        self.volume * self.voice_volume
+    }
+}
+
 /// Mixer state shared between engine and audio callback
 pub struct MixerState {
     /// List of currently playing samples
     pub active_samples: Vec<ActiveSample>,
+
+    /// List of active live inputs (microphones)
+    pub live_inputs: Vec<LiveInput>,
 
     /// Number of output channels
     pub output_channels: usize,
 
     /// Ducking engine for automatic voice volume reduction
     pub ducking_engine: Option<DuckingEngine>,
+
+    /// Bass management for LFE extraction and crossover filtering
+    pub bass_management: Option<BassManagement>,
 }
 
 impl MixerState {
@@ -194,8 +248,10 @@ impl MixerState {
     pub fn new(output_channels: usize) -> Self {
         Self {
             active_samples: Vec::new(),
+            live_inputs: Vec::new(),
             output_channels,
             ducking_engine: None,
+            bass_management: None,
         }
     }
 }
@@ -226,6 +282,23 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
 
         // Advance playback position
         sample.position += frames;
+    }
+
+    // Mix each live input into the output
+    for input in &mut state.live_inputs {
+        // Get ducking multiplier for this input's voice
+        let ducking_multiplier = if let Some(ref mut engine) = state.ducking_engine {
+            engine.get_multiplier(&input.voice_id, frames)
+        } else {
+            1.0  // No ducking
+        };
+
+        mix_live_input_into_output(input, output, frames, state.output_channels, ducking_multiplier);
+    }
+
+    // Apply bass management (LFE extraction and crossover filtering)
+    if let Some(ref mut bm) = state.bass_management {
+        bm.process(output, state.output_channels);
     }
 
     // Apply saturation to prevent clipping
@@ -272,6 +345,50 @@ fn mix_sample_into_output(
 
         // Advance fade state
         sample.fade_state.advance();
+    }
+}
+
+/// Mix a live input (microphone) into the output buffer
+fn mix_live_input_into_output(
+    input: &mut LiveInput,
+    output: &mut [f32],
+    frames: usize,
+    output_channels: usize,
+    ducking_multiplier: f32,
+) {
+    let final_volume = input.combined_volume() * ducking_multiplier;
+    let input_channels = input.input_channels;
+
+    // Read available samples from the ring buffer
+    // Process frame by frame to handle underruns gracefully
+    for frame_idx in 0..frames {
+        // Read one frame worth of samples
+        let samples_needed = input_channels;
+        let samples_available = input.consumer.len();
+
+        if samples_available < samples_needed {
+            // Underrun - not enough samples for a complete frame
+            // Leave remaining output as silence (already zeroed)
+            break;
+        }
+
+        // Read the entire frame from the ring buffer
+        let mut frame_samples = [0.0f32; 16]; // Support up to 16 input channels
+        for ch in 0..input_channels.min(16) {
+            if let Some(sample) = input.consumer.pop() {
+                frame_samples[ch] = sample;
+            }
+        }
+
+        // Apply channel mapping
+        for &(src_ch, dest_ch) in &input.channel_map {
+            if src_ch >= input_channels || dest_ch >= output_channels || src_ch >= 16 {
+                continue;
+            }
+
+            let dest_idx = frame_idx * output_channels + dest_ch;
+            output[dest_idx] += frame_samples[src_ch] * final_volume;
+        }
     }
 }
 
@@ -751,6 +868,209 @@ mod tests {
 
         let fade_out = FadeState::Out { elapsed: 0, duration: 0 };
         assert_eq!(fade_out.multiplier(), 0.0); // Instant silence
+    }
+
+    // === LiveInput Tests ===
+
+    fn create_test_ring_buffer_with_data(data: &[f32]) -> HeapConsumer<f32> {
+        use ringbuf::HeapRb;
+        let rb = HeapRb::<f32>::new(data.len() + 100);
+        let (mut producer, consumer) = rb.split();
+        producer.push_slice(data);
+        consumer
+    }
+
+    #[test]
+    fn test_live_input_basic_mixing() {
+        // Create ring buffer with stereo data (10 frames)
+        let data: Vec<f32> = (0..20).map(|i| if i % 2 == 0 { 0.5 } else { 0.3 }).collect();
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            2, // stereo input
+            1.0,
+            vec![(0, 0), (1, 1)], // 1:1 mapping
+        );
+
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 20]; // 10 frames * 2 channels
+        mix_audio(&mut output, &mut state);
+
+        // Check first frame
+        assert_eq!(output[0], 0.5); // Left
+        assert_eq!(output[1], 0.3); // Right
+
+        // Check last frame
+        assert_eq!(output[18], 0.5);
+        assert_eq!(output[19], 0.3);
+    }
+
+    #[test]
+    fn test_live_input_volume() {
+        // Create ring buffer with mono data
+        let data = vec![1.0f32; 10];
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            1, // mono input
+            0.5, // 50% volume
+            vec![(0, 0)],
+        );
+
+        let mut state = MixerState::new(1);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 10]; // 10 frames * 1 channel
+        mix_audio(&mut output, &mut state);
+
+        for &s in &output {
+            assert_eq!(s, 0.5); // 1.0 * 0.5 volume
+        }
+    }
+
+    #[test]
+    fn test_live_input_channel_routing() {
+        // Create ring buffer with mono data
+        let data = vec![0.7f32; 10];
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        // Route mono input to channels 2 and 3 (4-channel output)
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            1,
+            1.0,
+            vec![(0, 2), (0, 3)],
+        );
+
+        let mut state = MixerState::new(4);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 40]; // 10 frames * 4 channels
+        mix_audio(&mut output, &mut state);
+
+        // Check first frame
+        assert_eq!(output[0], 0.0); // Channel 0
+        assert_eq!(output[1], 0.0); // Channel 1
+        assert_eq!(output[2], 0.7); // Channel 2
+        assert_eq!(output[3], 0.7); // Channel 3
+    }
+
+    #[test]
+    fn test_live_input_underrun() {
+        // Create ring buffer with only 5 frames of data but request 10
+        let data = vec![0.8f32; 10]; // 5 stereo frames
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            2,
+            1.0,
+            vec![(0, 0), (1, 1)],
+        );
+
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 20]; // 10 frames requested
+        mix_audio(&mut output, &mut state);
+
+        // First 5 frames should have audio
+        for &s in &output[..10] {
+            assert_eq!(s, 0.8);
+        }
+
+        // Remaining 5 frames should be silence (underrun)
+        for &s in &output[10..] {
+            assert_eq!(s, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_live_input_mixed_with_samples() {
+        // Create a sample and a live input, verify they mix together
+        let buffer = create_test_buffer(10, 2, 0.3);
+        let sample = ActiveSample::new(1, "sfx".to_string(), buffer, 1.0, 1.0);
+
+        let data = vec![0.4f32; 20]; // 10 stereo frames
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            2,
+            1.0,
+            vec![(0, 0), (1, 1)],
+        );
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 20];
+        mix_audio(&mut output, &mut state);
+
+        // Should be 0.3 (sample) + 0.4 (input) = 0.7
+        for &s in &output {
+            assert!((s - 0.7).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn test_live_input_voice_volume() {
+        let data = vec![1.0f32; 10];
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let mut live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            1,
+            0.5, // 50% input volume
+            vec![(0, 0)],
+        );
+        live_input.voice_volume = 0.6; // 60% voice volume
+
+        let mut state = MixerState::new(1);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 10];
+        mix_audio(&mut output, &mut state);
+
+        // Combined: 1.0 * 0.5 * 0.6 = 0.3
+        for &s in &output {
+            assert!((s - 0.3).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn test_multiple_live_inputs() {
+        // Two microphones mixing to same outputs
+        let data1 = vec![0.2f32; 10];
+        let consumer1 = create_test_ring_buffer_with_data(&data1);
+        let live_input1 = LiveInput::new("mic1".to_string(), consumer1, 1, 1.0, vec![(0, 0)]);
+
+        let data2 = vec![0.3f32; 10];
+        let consumer2 = create_test_ring_buffer_with_data(&data2);
+        let live_input2 = LiveInput::new("mic2".to_string(), consumer2, 1, 1.0, vec![(0, 0)]);
+
+        let mut state = MixerState::new(1);
+        state.live_inputs.push(live_input1);
+        state.live_inputs.push(live_input2);
+
+        let mut output = vec![0.0f32; 10];
+        mix_audio(&mut output, &mut state);
+
+        // Both inputs mix additively: 0.2 + 0.3 = 0.5
+        for &s in &output {
+            assert!((s - 0.5).abs() < 0.0001);
+        }
     }
 }
 

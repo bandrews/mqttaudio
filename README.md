@@ -10,10 +10,12 @@ mqttaudio is a high-performance, real-time audio engine that receives commands o
 - **Multichannel Routing**: Route audio to specific output channels (supports up to 16+ channels)
 - **Voice Grouping**: Group sounds together for coordinated control
 - **Audio Ducking**: Automatically reduce background audio when foreground voices play
+- **Bass Management**: Route low frequencies to subwoofer (LFE) channel with configurable crossover
+- **Microphone Input**: Mix live audio inputs with matrix routing to output channels
 - **Smooth Fading**: Fade in/out individual samples or entire voices
 - **HTTP Caching**: Automatically cache remote audio files for instant playback
 - **Format Support**: WAV, MP3, OGG, FLAC via symphonia decoder
-- **Sample Rate Conversion**: Automatic resampling to match output device
+- **Sample Rate Conversion**: Automatic resampling to match output device (inputs and files)
 - **Low Latency**: Sub-millisecond mixing performance, handles 20+ simultaneous sounds
 - **Zero-Copy Architecture**: Efficient memory usage with Arc-based buffer sharing
 
@@ -309,6 +311,227 @@ This creates a 3-tier priority system:
 - **Narration** (medium priority): Ducks music and effects to 15%
 - **Music/Effects** (lowest priority): Never trigger ducking
 
+### Bass Management (LFE/Subwoofer)
+
+Bass management extracts low frequencies from designated channels and routes them to a subwoofer/LFE channel. This is essential for installations with separate subwoofers or professional sound systems that require bass redirection.
+
+**How It Works:**
+- Low-pass and high-pass Butterworth filters split audio at the crossover frequency
+- Bass (below crossover) is extracted and summed to the LFE channel
+- Optionally, bass can be removed from source channels (true bass management)
+- Uses biquad filters for efficient, real-time processing
+
+**Configuration:**
+
+Add bass management to your `config.json`:
+
+```json
+{
+  "mqtt": {
+    "server": "localhost",
+    "topic": "audio/commands"
+  },
+  "audio": {
+    "device": "My 8-Channel Interface",
+    "sample_rate": 48000
+  },
+  "bass_management": {
+    "enabled": true,
+    "lfe_channel": 3,
+    "crossover_frequency_hz": 80,
+    "source_channels": [0, 1, 2],
+    "remove_bass_from_sources": false
+  }
+}
+```
+
+**Configuration Parameters:**
+- `enabled`: Enable/disable bass management
+- `lfe_channel`: Output channel index for the subwoofer (0-indexed)
+- `crossover_frequency_hz`: Frequency cutoff in Hz (typically 80-120 Hz)
+- `source_channels`: Array of channel indices to extract bass from
+- `remove_bass_from_sources`: If true, removes bass from source channels after extraction (full bass management); if false, bass is copied to LFE but left in source channels
+
+**CLI Options:**
+
+Override config file settings from the command line:
+
+```bash
+# Set LFE channel (0-indexed)
+mqttaudio --lfe-channel 5 --crossover-frequency 100
+
+# Example: Route bass from front L/R to channel 5 (subwoofer)
+mqttaudio --config config.json --lfe-channel 5
+```
+
+**Use Cases:**
+
+1. **Home Theater 5.1**: Route bass from channels 0-4 to channel 3 (LFE)
+2. **Professional Installation**: Extract bass from all main speakers to dedicated subwoofer zone
+3. **Multi-zone Audio**: Send bass content to specific zones with subwoofers
+
+**Example Configuration for 5.1 System:**
+
+```json
+{
+  "bass_management": {
+    "enabled": true,
+    "lfe_channel": 3,
+    "crossover_frequency_hz": 80,
+    "source_channels": [0, 1, 2, 4, 5],
+    "remove_bass_from_sources": true
+  }
+}
+```
+
+This routes bass from Front L (0), Front R (1), Center (2), Surround L (4), and Surround R (5) to the LFE channel (3), and removes bass from those channels (as most 5.1 receivers expect).
+
+### Microphone Input Mixing
+
+mqttaudio can capture audio from microphone inputs and mix them into the output with flexible routing. This is ideal for scenarios like escape rooms, interactive installations, or live event systems where microphone audio needs to be routed to specific output channels.
+
+**How It Works:**
+- Captures audio from one or more input devices
+- Automatically resamples if input and output sample rates differ
+- Routes input channels to output channels via configurable matrix routing
+- Integrates with the voice system for ducking support
+- Lock-free ring buffers ensure glitch-free, low-latency operation
+
+**Configuration:**
+
+Add inputs to your `config.json`:
+
+```json
+{
+  "mqtt": {
+    "server": "localhost",
+    "topic": "audio/commands"
+  },
+  "audio": {
+    "device": "My 8-Channel Interface",
+    "sample_rate": 48000
+  },
+  "inputs": [
+    {
+      "device": "USB Microphone",
+      "volume": 0.8,
+      "voice_id": "gamemaster_mic",
+      "routes": [
+        {"source_channel": 0, "dest_channel": 4},
+        {"source_channel": 0, "dest_channel": 5}
+      ],
+      "latency_ms": 30
+    },
+    {
+      "device": "Built-in Microphone",
+      "volume": 1.0,
+      "voice_id": "player_mic",
+      "routes": [
+        {"source_channel": 0, "dest_channel": 6}
+      ],
+      "latency_ms": 20
+    }
+  ]
+}
+```
+
+**Configuration Parameters:**
+- `device`: Input device name (use `--list-inputs` to see available devices)
+- `volume`: Input volume multiplier (0.0 to 1.0)
+- `voice_id`: Voice name for ducking integration
+- `routes`: Array of source→destination channel mappings
+- `latency_ms`: Buffer latency in milliseconds (5-500, lower = less latency, higher = more stability)
+
+**CLI Options:**
+
+```bash
+# List available input devices
+mqttaudio --list-inputs
+
+# Output:
+# Available audio input devices:
+#   0. USB Microphone
+#      Sample rate: 48000 Hz
+#      Channels: 1
+#   1. Built-in Microphone
+#      Sample rate: 44100 Hz
+#      Channels: 2
+```
+
+**MQTT Commands for Input Control:**
+
+**Adjust input volume:**
+```json
+{
+  "command": "input_volume",
+  "message": {
+    "input": "gamemaster_mic",
+    "volume": 0.5
+  }
+}
+```
+
+The `input` field can be either the voice_id or the input index (0-based).
+
+**Mute/unmute an input:**
+```json
+{
+  "command": "input_mute",
+  "message": {
+    "input": "0",
+    "mute": true
+  }
+}
+```
+
+**Use Cases:**
+
+1. **Escape Room**: Route gamemaster microphone to player earpieces (channels 4-5)
+2. **Interactive Installation**: Capture visitor microphones for processing
+3. **Live Events**: Mix multiple microphones to specific output zones
+
+**Example: Escape Room Setup**
+
+```json
+{
+  "audio": {
+    "device": "MOTU 8A"
+  },
+  "inputs": [
+    {
+      "device": "Gamemaster Headset",
+      "volume": 0.9,
+      "voice_id": "gm_mic",
+      "routes": [
+        {"source_channel": 0, "dest_channel": 4},
+        {"source_channel": 0, "dest_channel": 5},
+        {"source_channel": 0, "dest_channel": 6},
+        {"source_channel": 0, "dest_channel": 7}
+      ],
+      "latency_ms": 25
+    }
+  ],
+  "ducking_rules": [
+    {
+      "primary_voice": "gm_mic",
+      "ducked_voices": ["ambient", "effects"],
+      "target_volume": 0.1,
+      "fade_duration_ms": 500
+    }
+  ]
+}
+```
+
+This routes the gamemaster's voice to all player earpiece channels (4-7) and automatically ducks ambient audio when the gamemaster speaks.
+
+**Sample Rate Handling:**
+
+If the input device sample rate differs from the output, mqttaudio automatically resamples using high-quality interpolation. A warning is logged when resampling occurs:
+
+```
+WARN Input device 'USB Microphone' sample rate (44100 Hz) differs from output (48000 Hz) - resampling will add latency
+```
+
 ### Voice Grouping (Controlling Multiple Sounds Together)
 
 Voices let you group related sounds and control them together.
@@ -531,19 +754,22 @@ mosquitto_pub -t $TOPIC -m '{
 mqttaudio [OPTIONS]
 
 OPTIONS:
-  --server <HOST>         MQTT server hostname [default: localhost]
-  --port <PORT>           MQTT server port [default: 1883]
-  --topic <TOPIC>         MQTT topic to subscribe to [default: audio/commands]
-  --device <NAME>         Audio output device name
-  --list-devices          List available audio devices and exit
-  --sample-rate <RATE>    Output sample rate [default: 48000]
-  --buffer-size <SIZE>    Audio buffer size in frames [default: 512]
-  --channels <COUNT>      Number of output channels [default: auto-detect]
-  --cache-dir <PATH>      HTTP cache directory [default: ~/.cache/mqttaudio]
-  --config <FILE>         Load configuration from JSON file
-  --verbose              Enable verbose logging (debug level)
-  --help                  Print help information
-  --version               Print version information
+  --server <HOST>              MQTT server hostname [default: localhost]
+  --port <PORT>                MQTT server port [default: 1883]
+  --topic <TOPIC>              MQTT topic to subscribe to [default: audio/commands]
+  --device <NAME>              Audio output device name
+  --list-devices               List available audio output devices and exit
+  --list-inputs                List available audio input devices and exit
+  --sample-rate <RATE>         Output sample rate [default: 48000]
+  --buffer-size <SIZE>         Audio buffer size in frames [default: 512]
+  --channels <COUNT>           Number of output channels [default: auto-detect]
+  --lfe-channel <INDEX>        LFE (subwoofer) channel index for bass management
+  --crossover-frequency <HZ>   Crossover frequency for bass management [default: 80]
+  --cache-dir <PATH>           HTTP cache directory [default: ~/.cache/mqttaudio]
+  --config <FILE>              Load configuration from JSON file
+  --verbose                    Enable verbose logging (debug level)
+  --help                       Print help information
+  --version                    Print version information
 ```
 
 ### Configuration File
@@ -567,6 +793,25 @@ Create `config.json`:
     "directory": "~/.cache/mqttaudio",
     "max_memory_mb": 500
   },
+  "bass_management": {
+    "enabled": true,
+    "lfe_channel": 3,
+    "crossover_frequency_hz": 80,
+    "source_channels": [0, 1, 2, 4, 5],
+    "remove_bass_from_sources": false
+  },
+  "inputs": [
+    {
+      "device": "USB Microphone",
+      "volume": 0.8,
+      "voice_id": "mic_1",
+      "routes": [
+        {"source_channel": 0, "dest_channel": 4},
+        {"source_channel": 0, "dest_channel": 5}
+      ],
+      "latency_ms": 25
+    }
+  ],
   "ducking_rules": [
     {
       "primary_voice": "narration",
@@ -696,6 +941,32 @@ All commands are JSON objects sent to the configured MQTT topic.
 }
 ```
 
+### Input Commands
+
+**Adjust input volume:**
+```json
+{
+  "command": "input_volume",
+  "message": {
+    "input": "gamemaster_mic",
+    "volume": 0.5
+  }
+}
+```
+
+The `input` field can be the voice_id or input index (0-based).
+
+**Mute/unmute an input:**
+```json
+{
+  "command": "input_mute",
+  "message": {
+    "input": "0",
+    "mute": true
+  }
+}
+```
+
 ### Global Fade Out
 
 ```json
@@ -755,28 +1026,30 @@ cargo build --verbose
 ```
 mqttaudio/
 ├── src/
-│   ├── main.rs           # Entry point, CLI handling
-│   ├── config.rs         # Configuration loading
+│   ├── main.rs              # Entry point, CLI handling
+│   ├── config.rs            # Configuration loading
 │   ├── audio/
-│   │   ├── engine.rs     # Audio engine coordinator
-│   │   ├── mixer.rs      # Real-time mixer (audio callback)
-│   │   ├── ducking.rs    # Audio ducking engine
-│   │   ├── decoder.rs    # Audio file decoding
-│   │   ├── resampler.rs  # Sample rate conversion
-│   │   └── types.rs      # Audio data types
+│   │   ├── engine.rs        # Audio engine coordinator
+│   │   ├── mixer.rs         # Real-time mixer (audio callback)
+│   │   ├── ducking.rs       # Audio ducking engine
+│   │   ├── bass_management.rs # LFE/subwoofer crossover filtering
+│   │   ├── input.rs         # Microphone/input device handling
+│   │   ├── decoder.rs       # Audio file decoding
+│   │   ├── resampler.rs     # Sample rate conversion
+│   │   └── types.rs         # Audio data types
 │   ├── mqtt/
-│   │   ├── client.rs     # MQTT connection
-│   │   └── commands.rs   # Command parsing
+│   │   ├── client.rs        # MQTT connection
+│   │   └── commands.rs      # Command parsing
 │   ├── cache/
-│   │   ├── disk.rs       # Disk cache implementation
-│   │   └── memory.rs     # Memory cache
-│   └── voice.rs          # Voice management
+│   │   ├── disk.rs          # Disk cache implementation
+│   │   └── memory.rs        # Memory cache
+│   └── voice.rs             # Voice management
 ├── benches/
-│   └── mixer_benchmark.rs # Performance benchmarks
-├── docs/                 # Architecture documentation
+│   └── mixer_benchmark.rs   # Performance benchmarks
+├── docs/                    # Architecture documentation
 ├── tests/
-│   └── audio/            # Test audio files
-└── legacy/               # Original Python implementation
+│   └── audio/               # Test audio files
+└── legacy/                  # Original Python implementation
 ```
 
 ## Troubleshooting

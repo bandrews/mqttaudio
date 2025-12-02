@@ -104,6 +104,66 @@ impl Default for LoggingConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+pub struct BassManagementConfig {
+    pub enabled: bool,
+    pub lfe_channel: usize,
+    pub crossover_frequency_hz: f32,
+    #[serde(default)]
+    pub source_channels: Vec<usize>,
+    pub remove_bass_from_sources: bool,
+}
+
+impl Default for BassManagementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            lfe_channel: 3, // Standard 5.1 LFE position
+            crossover_frequency_hz: 80.0,
+            source_channels: Vec::new(),
+            remove_bass_from_sources: false,
+        }
+    }
+}
+
+/// Configuration for a single input-to-output route
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InputRouteConfig {
+    /// Source channel on the input device (0-indexed)
+    pub source_channel: usize,
+    /// Destination channel on the output device (0-indexed)
+    pub dest_channel: usize,
+}
+
+/// Configuration for a single audio input (microphone)
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct InputConfig {
+    /// Device name (None = default input device)
+    pub device: Option<String>,
+    /// Volume (0.0 - 1.0)
+    pub volume: f32,
+    /// Voice ID for ducking integration
+    pub voice_id: String,
+    /// Channel routing from input to output
+    pub routes: Vec<InputRouteConfig>,
+    /// Buffer latency in milliseconds
+    pub latency_ms: u32,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            device: None,
+            volume: 1.0,
+            voice_id: "mic".to_string(),
+            routes: Vec::new(),
+            latency_ms: 20,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
 pub struct Config {
     pub mqtt: MqttConfig,
     pub audio: AudioConfig,
@@ -112,6 +172,10 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub ducking_rules: Vec<DuckingRule>,
+    #[serde(default)]
+    pub bass_management: BassManagementConfig,
+    #[serde(default)]
+    pub inputs: Vec<InputConfig>,
 }
 
 impl Default for Config {
@@ -123,6 +187,8 @@ impl Default for Config {
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
             ducking_rules: Vec::new(),
+            bass_management: BassManagementConfig::default(),
+            inputs: Vec::new(),
         }
     }
 }
@@ -213,6 +279,8 @@ impl Config {
         device: Option<String>,
         sample_rate: Option<u32>,
         verbose: bool,
+        lfe_channel: Option<usize>,
+        crossover_frequency: Option<f32>,
     ) {
         // Override MQTT settings
         if let Some(s) = server {
@@ -237,6 +305,14 @@ impl Config {
         if verbose {
             self.logging.verbose = true;
             self.logging.level = "debug".to_string();
+        }
+
+        // Override bass management settings
+        if let Some(ch) = lfe_channel {
+            self.bass_management.lfe_channel = ch;
+        }
+        if let Some(freq) = crossover_frequency {
+            self.bass_management.crossover_frequency_hz = freq;
         }
     }
 
@@ -270,6 +346,30 @@ impl Config {
         let valid_levels = vec!["error", "warn", "info", "debug", "trace"];
         if !valid_levels.contains(&self.logging.level.as_str()) {
             errors.push(format!("logging.level must be one of: {}", valid_levels.join(", ")));
+        }
+
+        // Bass management validation
+        if self.bass_management.enabled {
+            if self.bass_management.crossover_frequency_hz < 10.0
+                || self.bass_management.crossover_frequency_hz > 200.0 {
+                errors.push("bass_management.crossover_frequency_hz must be between 10 and 200".to_string());
+            }
+            if self.bass_management.source_channels.is_empty() {
+                errors.push("bass_management.source_channels must not be empty when enabled".to_string());
+            }
+        }
+
+        // Input validation
+        for (i, input) in self.inputs.iter().enumerate() {
+            if input.volume < 0.0 || input.volume > 1.0 {
+                errors.push(format!("inputs[{}].volume must be between 0.0 and 1.0", i));
+            }
+            if input.routes.is_empty() {
+                errors.push(format!("inputs[{}].routes must not be empty", i));
+            }
+            if input.latency_ms < 5 || input.latency_ms > 500 {
+                errors.push(format!("inputs[{}].latency_ms must be between 5 and 500", i));
+            }
         }
 
         if errors.is_empty() {
@@ -540,6 +640,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            None,
         );
 
         assert_eq!(config.mqtt.server, "overridden");
@@ -556,6 +658,8 @@ mod tests {
             Some("newdevice".to_string()),
             Some(96000),
             true,
+            Some(5),
+            Some(120.0),
         );
 
         assert_eq!(config.mqtt.server, "newserver");
@@ -565,6 +669,8 @@ mod tests {
         assert_eq!(config.audio.sample_rate, 96000);
         assert_eq!(config.logging.verbose, true);
         assert_eq!(config.logging.level, "debug");
+        assert_eq!(config.bass_management.lfe_channel, 5);
+        assert_eq!(config.bass_management.crossover_frequency_hz, 120.0);
     }
 
     #[test]
@@ -581,6 +687,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            None,
         );
 
         assert_eq!(config.mqtt.server, "original");  // Unchanged
@@ -594,9 +702,191 @@ mod tests {
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.verbose, false);
 
-        config.merge_cli_args(None, None, None, None, None, true);
+        config.merge_cli_args(None, None, None, None, None, true, None, None);
 
         assert_eq!(config.logging.verbose, true);
         assert_eq!(config.logging.level, "debug");
+    }
+
+    #[test]
+    fn test_bass_management_config_default() {
+        let config = Config::default();
+
+        assert_eq!(config.bass_management.enabled, false);
+        assert_eq!(config.bass_management.lfe_channel, 3);
+        assert_eq!(config.bass_management.crossover_frequency_hz, 80.0);
+        assert!(config.bass_management.source_channels.is_empty());
+        assert_eq!(config.bass_management.remove_bass_from_sources, false);
+    }
+
+    #[test]
+    fn test_bass_management_validation_invalid_crossover() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.bass_management.enabled = true;
+        config.bass_management.source_channels = vec![0, 1];
+        config.bass_management.crossover_frequency_hz = 5.0; // Too low
+
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("crossover_frequency_hz")));
+    }
+
+    #[test]
+    fn test_bass_management_validation_empty_sources() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.bass_management.enabled = true;
+        // source_channels is empty
+
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("source_channels")));
+    }
+
+    #[test]
+    fn test_bass_management_validation_valid() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.bass_management.enabled = true;
+        config.bass_management.source_channels = vec![0, 1];
+        config.bass_management.crossover_frequency_hz = 80.0;
+
+        let result = config.validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_input_config_default() {
+        let input = InputConfig::default();
+
+        assert!(input.device.is_none());
+        assert_eq!(input.volume, 1.0);
+        assert_eq!(input.voice_id, "mic");
+        assert!(input.routes.is_empty());
+        assert_eq!(input.latency_ms, 20);
+    }
+
+    #[test]
+    fn test_input_config_parse() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "inputs": [
+                {
+                    "device": "USB Microphone",
+                    "volume": 0.8,
+                    "voice_id": "gamemaster_mic",
+                    "routes": [
+                        {"source_channel": 0, "dest_channel": 4},
+                        {"source_channel": 0, "dest_channel": 5}
+                    ],
+                    "latency_ms": 30
+                }
+            ]
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.inputs.len(), 1);
+        let input = &config.inputs[0];
+        assert_eq!(input.device, Some("USB Microphone".to_string()));
+        assert_eq!(input.volume, 0.8);
+        assert_eq!(input.voice_id, "gamemaster_mic");
+        assert_eq!(input.routes.len(), 2);
+        assert_eq!(input.routes[0].source_channel, 0);
+        assert_eq!(input.routes[0].dest_channel, 4);
+        assert_eq!(input.routes[1].dest_channel, 5);
+        assert_eq!(input.latency_ms, 30);
+    }
+
+    #[test]
+    fn test_input_config_multiple_inputs() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "inputs": [
+                {
+                    "voice_id": "mic1",
+                    "routes": [{"source_channel": 0, "dest_channel": 0}]
+                },
+                {
+                    "device": "Second Mic",
+                    "voice_id": "mic2",
+                    "routes": [{"source_channel": 0, "dest_channel": 1}]
+                }
+            ]
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.inputs.len(), 2);
+        assert_eq!(config.inputs[0].voice_id, "mic1");
+        assert_eq!(config.inputs[1].voice_id, "mic2");
+    }
+
+    #[test]
+    fn test_input_validation_invalid_volume() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.inputs.push(InputConfig {
+            volume: 1.5, // Invalid
+            routes: vec![InputRouteConfig { source_channel: 0, dest_channel: 0 }],
+            ..Default::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("volume")));
+    }
+
+    #[test]
+    fn test_input_validation_empty_routes() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.inputs.push(InputConfig {
+            routes: vec![], // Invalid - empty
+            ..Default::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("routes")));
+    }
+
+    #[test]
+    fn test_input_validation_invalid_latency() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.inputs.push(InputConfig {
+            latency_ms: 1000, // Invalid - too high
+            routes: vec![InputRouteConfig { source_channel: 0, dest_channel: 0 }],
+            ..Default::default()
+        });
+
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("latency_ms")));
+    }
+
+    #[test]
+    fn test_input_validation_valid() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.inputs.push(InputConfig {
+            device: Some("Test Mic".to_string()),
+            volume: 0.8,
+            voice_id: "mic".to_string(),
+            routes: vec![
+                InputRouteConfig { source_channel: 0, dest_channel: 0 },
+                InputRouteConfig { source_channel: 0, dest_channel: 1 },
+            ],
+            latency_ms: 25,
+        });
+
+        let result = config.validate();
+        assert!(result.is_ok());
     }
 }

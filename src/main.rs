@@ -45,9 +45,13 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
-    /// List available audio devices and exit
+    /// List available audio output devices and exit
     #[arg(long)]
     list_devices: bool,
+
+    /// List available audio input devices and exit
+    #[arg(long)]
+    list_inputs: bool,
 
     /// Play a 440Hz test tone (for testing audio output)
     #[arg(long)]
@@ -60,6 +64,14 @@ struct Args {
     /// Test mixer with multiple simultaneous files (Phase 4)
     #[arg(long)]
     test_mixer: bool,
+
+    /// LFE (subwoofer) channel number for bass management
+    #[arg(long)]
+    lfe_channel: Option<usize>,
+
+    /// Crossover frequency (Hz) for bass management
+    #[arg(long)]
+    crossover_frequency: Option<f32>,
 }
 
 #[tokio::main]
@@ -83,6 +95,8 @@ async fn main() {
         args.device.clone(),
         args.sample_rate,
         args.verbose,
+        args.lfe_channel,
+        args.crossover_frequency,
     );
 
     // Initialize logging based on config
@@ -105,6 +119,12 @@ async fn main() {
     // Handle --list-devices
     if args.list_devices {
         audio::engine::list_devices();
+        return;
+    }
+
+    // Handle --list-inputs
+    if args.list_inputs {
+        audio::input::list_input_devices();
         return;
     }
 
@@ -275,11 +295,92 @@ async fn main() {
         None
     };
 
+    // Create bass management from config
+    let bass_management = if config.bass_management.enabled {
+        let bm_config = audio::bass_management::BassManagementConfig {
+            enabled: config.bass_management.enabled,
+            lfe_channel: config.bass_management.lfe_channel,
+            crossover_frequency_hz: config.bass_management.crossover_frequency_hz,
+            source_channels: config.bass_management.source_channels.clone(),
+            remove_bass_from_sources: config.bass_management.remove_bass_from_sources,
+        };
+        tracing::info!(
+            "Bass management enabled: LFE channel {}, crossover {} Hz, sources {:?}",
+            bm_config.lfe_channel,
+            bm_config.crossover_frequency_hz,
+            bm_config.source_channels
+        );
+        Some(audio::bass_management::BassManagement::new(bm_config, output_sample_rate, output_channels))
+    } else {
+        None
+    };
+
     let mixer_state = Arc::new(Mutex::new(MixerState {
         active_samples: Vec::new(),
+        live_inputs: Vec::new(),
         output_channels,
         ducking_engine,
+        bass_management,
     }));
+
+    // Initialize audio inputs from config
+    // Keep active input streams alive - they will be kept alive until the app exits
+    let mut _active_inputs: Vec<audio::input::ActiveInput> = Vec::new();
+    for (idx, input_config) in config.inputs.iter().enumerate() {
+        let stream_config = audio::input::InputStreamConfig {
+            device_name: input_config.device.clone(),
+            latency_ms: input_config.latency_ms,
+        };
+
+        match audio::input::create_input_stream(stream_config, output_sample_rate) {
+            Ok(mut active_input) => {
+                tracing::info!(
+                    "Opened input device: {} ({} channels, voice '{}')",
+                    input_config.device.as_deref().unwrap_or("default"),
+                    active_input.channels,
+                    input_config.voice_id
+                );
+
+                // Take ownership of the consumer for the mixer
+                if let Some(consumer) = active_input.take_consumer() {
+                    // Build channel map from routes config
+                    let channel_map: Vec<(usize, usize)> = input_config.routes.iter()
+                        .map(|r| (r.source_channel, r.dest_channel))
+                        .collect();
+
+                    // Create LiveInput for the mixer
+                    let live_input = audio::mixer::LiveInput::new(
+                        input_config.voice_id.clone(),
+                        consumer,
+                        active_input.channels,
+                        input_config.volume,
+                        channel_map,
+                    );
+
+                    // Add to mixer state
+                    mixer_state.lock().unwrap().live_inputs.push(live_input);
+
+                    tracing::info!(
+                        "Input {} routed: {:?}",
+                        idx,
+                        input_config.routes.iter()
+                            .map(|r| format!("{}→{}", r.source_channel, r.dest_channel))
+                            .collect::<Vec<_>>()
+                    );
+                }
+
+                // Keep the stream alive by storing it
+                _active_inputs.push(active_input);
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to open input device '{}': {}",
+                    input_config.device.as_deref().unwrap_or("default"),
+                    e
+                );
+            }
+        }
+    }
 
     let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));
 
@@ -578,6 +679,79 @@ async fn main() {
                                 Err(e) => {
                                     tracing::error!("Failed to invalidate {}: {}", file, e);
                                 }
+                            }
+                        }
+                        mqtt::commands::AudioCommand::InputVolume { input, volume: new_volume } => {
+                            let mut state = mixer_state.lock().unwrap();
+                            let mut found = false;
+
+                            // Try to find by index first
+                            if let Ok(idx) = input.parse::<usize>() {
+                                if idx < state.live_inputs.len() {
+                                    state.live_inputs[idx].volume = new_volume.clamp(0.0, 1.0);
+                                    tracing::info!(
+                                        "Set input {} volume to {:.2}",
+                                        idx, state.live_inputs[idx].volume
+                                    );
+                                    found = true;
+                                }
+                            }
+
+                            // Try to find by voice_id if not found by index
+                            if !found {
+                                for live_input in state.live_inputs.iter_mut() {
+                                    if live_input.voice_id == input {
+                                        live_input.volume = new_volume.clamp(0.0, 1.0);
+                                        tracing::info!(
+                                            "Set input '{}' volume to {:.2}",
+                                            input, live_input.volume
+                                        );
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if !found {
+                                tracing::warn!("Input '{}' not found", input);
+                            }
+                        }
+                        mqtt::commands::AudioCommand::InputMute { input, mute } => {
+                            let mut state = mixer_state.lock().unwrap();
+                            let mut found = false;
+
+                            // Try to find by index first
+                            if let Ok(idx) = input.parse::<usize>() {
+                                if idx < state.live_inputs.len() {
+                                    // Mute by setting volume to 0, unmute restores to 1.0
+                                    // Note: This is a simple mute - a more sophisticated version
+                                    // would store the previous volume
+                                    state.live_inputs[idx].volume = if mute { 0.0 } else { 1.0 };
+                                    tracing::info!(
+                                        "Input {} {}",
+                                        idx, if mute { "muted" } else { "unmuted" }
+                                    );
+                                    found = true;
+                                }
+                            }
+
+                            // Try to find by voice_id if not found by index
+                            if !found {
+                                for live_input in state.live_inputs.iter_mut() {
+                                    if live_input.voice_id == input {
+                                        live_input.volume = if mute { 0.0 } else { 1.0 };
+                                        tracing::info!(
+                                            "Input '{}' {}",
+                                            input, if mute { "muted" } else { "unmuted" }
+                                        );
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if !found {
+                                tracing::warn!("Input '{}' not found", input);
                             }
                         }
                     }

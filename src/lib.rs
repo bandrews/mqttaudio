@@ -8,6 +8,8 @@ pub mod audio {
     pub mod resampler;
     pub mod engine;
     pub mod ducking;
+    pub mod bass_management;
+    pub mod input;
 }
 
 pub mod cache {

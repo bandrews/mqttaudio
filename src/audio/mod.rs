@@ -7,3 +7,5 @@ pub mod decoder;
 pub mod resampler;
 pub mod types;
 pub mod ducking;
+pub mod bass_management;
+pub mod input;

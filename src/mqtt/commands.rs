@@ -68,6 +68,22 @@ pub struct CacheInvalidateMessage {
     pub file: String,
 }
 
+/// Input volume command parameters
+#[derive(Debug, Deserialize, Serialize)]
+pub struct InputVolumeMessage {
+    /// Input index (0-based) or voice_id
+    pub input: String,
+    pub volume: f32,
+}
+
+/// Input mute command parameters
+#[derive(Debug, Deserialize, Serialize)]
+pub struct InputMuteMessage {
+    /// Input index (0-based) or voice_id
+    pub input: String,
+    pub mute: bool,
+}
+
 /// Internal audio command after parsing
 #[derive(Debug, Clone)]
 pub enum AudioCommand {
@@ -96,6 +112,14 @@ pub enum AudioCommand {
     CacheClear,
     CacheInvalidate {
         file: String,
+    },
+    InputVolume {
+        input: String,
+        volume: f32,
+    },
+    InputMute {
+        input: String,
+        mute: bool,
     },
 }
 
@@ -188,6 +212,24 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
 
             Ok(AudioCommand::CacheInvalidate {
                 file: invalidate_msg.file,
+            })
+        }
+        "input_volume" => {
+            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
+            let input_msg: InputVolumeMessage = serde_json::from_value(message)?;
+
+            Ok(AudioCommand::InputVolume {
+                input: input_msg.input,
+                volume: input_msg.volume,
+            })
+        }
+        "input_mute" => {
+            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
+            let input_msg: InputMuteMessage = serde_json::from_value(message)?;
+
+            Ok(AudioCommand::InputMute {
+                input: input_msg.input,
+                mute: input_msg.mute,
             })
         }
         unknown => Err(ParseError::UnknownCommand(unknown.to_string())),
@@ -640,6 +682,86 @@ mod tests {
                 assert_eq!(fade_in, None);
             }
             _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_input_volume_by_index() {
+        let json = r#"{"command": "input_volume", "message": {"input": "0", "volume": 0.5}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::InputVolume { input, volume } => {
+                assert_eq!(input, "0");
+                assert_eq!(volume, 0.5);
+            }
+            _ => panic!("Expected InputVolume command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_input_volume_by_voice_id() {
+        let json = r#"{"command": "input_volume", "message": {"input": "gamemaster_mic", "volume": 0.8}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::InputVolume { input, volume } => {
+                assert_eq!(input, "gamemaster_mic");
+                assert_eq!(volume, 0.8);
+            }
+            _ => panic!("Expected InputVolume command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_input_volume_missing_message() {
+        let json = r#"{"command": "input_volume"}"#;
+        let result = parse_command(json);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ParseError::MissingMessage => {}, // OK
+            e => panic!("Expected MissingMessage error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_input_mute() {
+        let json = r#"{"command": "input_mute", "message": {"input": "0", "mute": true}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::InputMute { input, mute } => {
+                assert_eq!(input, "0");
+                assert_eq!(mute, true);
+            }
+            _ => panic!("Expected InputMute command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_input_mute_unmute() {
+        let json = r#"{"command": "input_mute", "message": {"input": "mic1", "mute": false}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::InputMute { input, mute } => {
+                assert_eq!(input, "mic1");
+                assert_eq!(mute, false);
+            }
+            _ => panic!("Expected InputMute command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_input_mute_missing_message() {
+        let json = r#"{"command": "input_mute"}"#;
+        let result = parse_command(json);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ParseError::MissingMessage => {}, // OK
+            e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
     }
 }
