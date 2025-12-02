@@ -59,9 +59,11 @@ pub fn get_input_config(device: &Device) -> Result<SupportedStreamConfig, InputE
 }
 
 /// Ring buffer size calculation based on latency
+/// Uses 4x the nominal latency to handle resampler chunk bursts and timing jitter
 pub fn calculate_ring_buffer_size(sample_rate: u32, channels: usize, latency_ms: u32) -> usize {
     let samples_per_ms = sample_rate as usize / 1000;
-    samples_per_ms * latency_ms as usize * channels
+    // 4x buffer provides headroom for resampler chunks and callback timing variations
+    samples_per_ms * latency_ms as usize * channels * 4
 }
 
 /// Create a ring buffer pair for audio transfer
@@ -249,13 +251,16 @@ fn create_resampling_input_stream(
                         // Interleave and write to ring buffer
                         if !output.is_empty() && !output[0].is_empty() {
                             let num_frames = output[0].len();
+                            let mut dropped = 0usize;
                             for frame_idx in 0..num_frames {
                                 for ch in 0..channels {
                                     if producer.push(output[ch][frame_idx]).is_err() {
-                                        // Overflow - drop remaining samples
-                                        return;
+                                        dropped += 1;
                                     }
                                 }
+                            }
+                            if dropped > 0 {
+                                tracing::debug!("Resampler output overflow: {} samples dropped", dropped);
                             }
                         }
                     }
@@ -306,17 +311,17 @@ mod tests {
 
     #[test]
     fn test_ring_buffer_size_calculation() {
-        // 48kHz, stereo, 20ms = 48 * 20 * 2 = 1920 samples
+        // 48kHz, stereo, 20ms = 48 * 20 * 2 * 4 = 7680 samples (4x for headroom)
         let size = calculate_ring_buffer_size(48000, 2, 20);
-        assert_eq!(size, 1920);
+        assert_eq!(size, 7680);
 
-        // 44.1kHz, mono, 10ms = 44 * 10 * 1 = 440 samples (integer division)
+        // 44.1kHz, mono, 10ms = 44 * 10 * 1 * 4 = 1760 samples (4x for headroom)
         let size = calculate_ring_buffer_size(44100, 1, 10);
-        assert_eq!(size, 440);
+        assert_eq!(size, 1760);
 
-        // 96kHz, 8 channels, 50ms = 96 * 50 * 8 = 38400 samples
+        // 96kHz, 8 channels, 50ms = 96 * 50 * 8 * 4 = 153600 samples (4x for headroom)
         let size = calculate_ring_buffer_size(96000, 8, 50);
-        assert_eq!(size, 38400);
+        assert_eq!(size, 153600);
     }
 
     #[test]

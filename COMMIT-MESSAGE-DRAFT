@@ -60,6 +60,21 @@ Captures audio from input devices and mixes into output with matrix routing.
 ### CLI
 - `--list-inputs` to enumerate available input devices
 
+## Bug Fix: Audio Popping During Resampled Input
+
+Fixed audio popping/clicking when input device sample rate differs from
+output (e.g., 48kHz mic → 44.1kHz speakers).
+
+**Root cause:** Ring buffer was sized for nominal latency only, but the
+resampler outputs audio in bursts (~941 samples per 1024-sample input chunk).
+When output callback timing varied slightly, the buffer would overflow,
+dropping samples mid-stream and causing discontinuities.
+
+**Fix:** Increased ring buffer size to 4x nominal latency, providing
+headroom for resampler chunk bursts and callback timing jitter. Also
+improved overflow handling to count dropped samples instead of aborting
+the entire chunk.
+
 ## Test Coverage
 - 164 total tests passing
 - Tests for biquad filter frequency response (attenuation verification)
@@ -67,6 +82,7 @@ Captures audio from input devices and mixes into output with matrix routing.
 - Tests for ring buffer operations, overflow/underflow handling
 - Tests for LiveInput mixing, config parsing, MQTT command parsing
 - Build is warning-free
+- Manual testing verified clean audio with resampling (48kHz→44.1kHz)
 
 ## Documentation
 - README updated with comprehensive sections for both features
@@ -79,6 +95,7 @@ Captures audio from input devices and mixes into output with matrix routing.
 - We need to be warnings clean
 - Make sure you've fully unit tested all of your work
 - Make sure both features are documented in the README thoroughly
+- Investigate audio popping during mic input (fixed: buffer sizing)
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 
