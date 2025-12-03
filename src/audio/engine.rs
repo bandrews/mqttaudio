@@ -92,19 +92,51 @@ pub fn get_default_device_config() -> Result<DeviceConfig, Box<dyn std::error::E
 }
 
 /// Find an output device by name (returns default if name is None)
+/// On ALSA, devices may be openable even if not enumerated, so we try
+/// both enumeration and direct construction.
 pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
 
     match name {
         Some(device_name) => {
-            let devices = host.output_devices()?;
-            for device in devices {
-                if let Ok(n) = device.name() {
-                    if n == device_name {
-                        return Ok(device);
+            // First try to find in enumerated devices
+            if let Ok(devices) = host.output_devices() {
+                for device in devices {
+                    if let Ok(n) = device.name() {
+                        if n == device_name {
+                            return Ok(device);
+                        }
                     }
                 }
             }
+
+            // On ALSA, try to construct the device directly even if not enumerated
+            // This handles cases like hw:CARD=X,DEV=0 which may not appear in enumeration
+            #[cfg(target_os = "linux")]
+            {
+                // Try partial matching for ALSA device names
+                if let Ok(devices) = host.output_devices() {
+                    for device in devices {
+                        if let Ok(n) = device.name() {
+                            // Try partial matching for ALSA device names
+                            // e.g., if user requests "hw:1,0", match "hw:CARD=UMC1820,DEV=0"
+                            if device_name.starts_with("hw:") && n.starts_with("hw:") {
+                                // Extract card number from both
+                                if let (Some(req_card), Some(dev_card)) = (
+                                    extract_alsa_card_number(device_name),
+                                    extract_alsa_card_number(&n)
+                                ) {
+                                    if req_card == dev_card {
+                                        tracing::info!("Matched ALSA device '{}' to '{}'", device_name, n);
+                                        return Ok(device);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             Err(format!("Output device not found: {}", device_name).into())
         }
         None => {
@@ -114,8 +146,27 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
     }
 }
 
+/// Extract card number from ALSA device name (e.g., "hw:1,0" -> 1, "hw:CARD=UMC1820,DEV=0" -> None)
+#[cfg(target_os = "linux")]
+fn extract_alsa_card_number(name: &str) -> Option<u32> {
+    if name.starts_with("hw:") {
+        let rest = &name[3..];
+        // Try "hw:N,M" format
+        if let Some(comma_pos) = rest.find(',') {
+            if let Ok(num) = rest[..comma_pos].parse::<u32>() {
+                return Some(num);
+            }
+        }
+        // Try just "hw:N" format
+        if let Ok(num) = rest.parse::<u32>() {
+            return Some(num);
+        }
+    }
+    None
+}
+
 /// Find a stream config for the device with the requested channel count
-/// If requested_channels is None, uses the maximum available
+/// If requested_channels is None, uses the maximum available (capped at 32 for sanity)
 /// If requested_sample_rate is None, uses the device's preferred sample rate
 pub fn find_output_config(
     device: &cpal::Device,
@@ -135,9 +186,11 @@ pub fn find_output_config(
     let target_channels = match requested_channels {
         Some(ch) => ch as u16,
         None => {
-            // Find maximum available channels
+            // Find maximum available channels, but cap at 32 for sanity
+            // (ALSA plugins may report absurdly high values)
             supported_configs.iter()
                 .map(|c| c.channels())
+                .filter(|&ch| ch <= 32)
                 .max()
                 .unwrap_or(2)
         }
@@ -149,9 +202,10 @@ pub fn find_output_config(
         .collect();
 
     if matching_configs.is_empty() {
-        // No exact match - list available channel counts
+        // No exact match - list available channel counts (capped for display)
         let available: Vec<_> = supported_configs.iter()
             .map(|c| c.channels())
+            .filter(|&ch| ch <= 32)
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -170,6 +224,7 @@ pub fn find_output_config(
     });
 
     // Find the best matching config for sample rate
+    // Prefer configs with reasonable sample rate ranges, but accept any if needed
     let best_config = matching_configs.iter()
         .filter(|c| {
             let min = c.min_sample_rate().0;
@@ -188,9 +243,13 @@ pub fn find_output_config(
             })
         }
         None => {
-            // Sample rate not directly supported - use any config and let cpal handle it
+            // Sample rate not directly supported - clamp to valid range
             let config_range = matching_configs[0];
-            let sample_rate = config_range.max_sample_rate().0.min(target_sample_rate.max(config_range.min_sample_rate().0));
+            let min_rate = config_range.min_sample_rate().0;
+            let max_rate = config_range.max_sample_rate().0;
+            // Clamp target to valid range, but also cap max at 384kHz for sanity
+            let capped_max = max_rate.min(384000);
+            let sample_rate = target_sample_rate.max(min_rate).min(capped_max);
             let config = config_range.with_sample_rate(SampleRate(sample_rate));
             Ok(cpal::StreamConfig {
                 channels: config.channels(),
