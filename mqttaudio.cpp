@@ -29,7 +29,19 @@
 using namespace std;
 using namespace rapidjson;
 
-const char *argp_program_version = "0.2.0";
+// Structure to track playback information for each channel
+struct ChannelPlaybackInfo {
+    Sample* sample;
+    float volume;
+    bool loop;
+    int maxPlayLength;
+    Mix_Chunk* seekChunk;  // Non-null if playing from a seek position
+};
+
+// Map of channel number to playback info
+std::unordered_map<int, ChannelPlaybackInfo> channelInfo;
+
+const char *argp_program_version = "0.3.0";
 const char *argp_program_bug_address = "contact@mofangheavyindustries.com";
 
 int frequency = 44100;
@@ -52,6 +64,23 @@ SampleManager manager;
 void handle_signal(int s)
 {
     run = false;
+}
+
+// Callback invoked when a channel finishes playback
+void channelFinished(int channel)
+{
+    auto it = channelInfo.find(channel);
+    if (it != channelInfo.end())
+    {
+        // Free the seek chunk if one was allocated
+        if (it->second.seekChunk != NULL)
+        {
+            // Only delete the chunk structure, not the audio buffer
+            // (allocated = 0 means the buffer is not owned by this chunk)
+            delete it->second.seekChunk;
+        }
+        channelInfo.erase(it);
+    }
 }
 
 void connect_callback(struct mosquitto *mosq, void *obj, int result)
@@ -102,7 +131,7 @@ Sample *precacheSample(const char *file)
     return manager.GetSample(filename.c_str());
 }
 
-void playSample(const char *file, bool loop, float volume, bool exclusive, bool isBgm, int maxPlayLength)
+int playSample(const char *file, bool loop, float volume, bool exclusive, bool isBgm, int maxPlayLength)
 {
     if (volume < 0.0f)
     {
@@ -131,13 +160,128 @@ void playSample(const char *file, bool loop, float volume, bool exclusive, bool 
     if (sample != NULL)
     {
         int channel = Mix_PlayChannelTimed(-1, sample->chunk, loop ? -1 : 0, maxPlayLength);
-        int mixVolume = (int)(((float)MIX_MAX_VOLUME) * volume);
-        Mix_Volume(channel, mixVolume);
+        if (channel >= 0)
+        {
+            int mixVolume = (int)(((float)MIX_MAX_VOLUME) * volume);
+            Mix_Volume(channel, mixVolume);
+
+            // Track channel playback info for seek support
+            ChannelPlaybackInfo info;
+            info.sample = sample;
+            info.volume = volume;
+            info.loop = loop;
+            info.maxPlayLength = maxPlayLength;
+            info.seekChunk = NULL;
+            channelInfo[channel] = info;
+        }
+        return channel;
     }
     else
     {
         printf("Error - could not load requested sample '%s'\n", file);
+        return -1;
     }
+}
+
+bool seekChannel(int channel, int positionMs)
+{
+    // Validate channel is currently playing and tracked
+    auto it = channelInfo.find(channel);
+    if (it == channelInfo.end())
+    {
+        fprintf(stderr, "Seek error: Channel %d is not currently tracked.\n", channel);
+        return false;
+    }
+
+    if (!Mix_Playing(channel))
+    {
+        fprintf(stderr, "Seek error: Channel %d is not currently playing.\n", channel);
+        return false;
+    }
+
+    ChannelPlaybackInfo &info = it->second;
+    Sample *sample = info.sample;
+
+    if (!sample || !sample->isValid())
+    {
+        fprintf(stderr, "Seek error: Invalid sample for channel %d.\n", channel);
+        return false;
+    }
+
+    // Get audio format info to calculate byte offset
+    int freq, channels;
+    Uint16 format;
+    Mix_QuerySpec(&freq, &format, &channels);
+
+    // Calculate bytes per sample frame
+    int bytesPerSample = (format & 0xFF) / 8;  // Bits to bytes
+    int bytesPerFrame = bytesPerSample * channels;
+
+    // Calculate byte offset from milliseconds
+    // bytes = (positionMs / 1000.0) * freq * bytesPerFrame
+    Uint32 byteOffset = (Uint32)((positionMs / 1000.0) * freq * bytesPerFrame);
+
+    // Ensure proper alignment for the audio format
+    byteOffset = byteOffset - (byteOffset % bytesPerFrame);
+
+    Mix_Chunk *originalChunk = sample->chunk;
+
+    // Bounds check
+    if (byteOffset >= originalChunk->alen)
+    {
+        fprintf(stderr, "Seek error: Position %d ms is beyond the end of the sample.\n", positionMs);
+        return false;
+    }
+
+    if (verbose)
+    {
+        printf("Seeking channel %d to position %d ms (byte offset %u of %u).\n",
+               channel, positionMs, byteOffset, originalChunk->alen);
+    }
+
+    // Free any previously allocated seek chunk for this channel
+    if (info.seekChunk != NULL)
+    {
+        delete info.seekChunk;
+        info.seekChunk = NULL;
+    }
+
+    // Stop current playback on this channel
+    Mix_HaltChannel(channel);
+
+    // Create a new Mix_Chunk that points to the offset position in the original audio
+    Mix_Chunk *seekChunk = new Mix_Chunk();
+    seekChunk->allocated = 0;  // We don't own the audio buffer
+    seekChunk->abuf = originalChunk->abuf + byteOffset;
+    seekChunk->alen = originalChunk->alen - byteOffset;
+    seekChunk->volume = originalChunk->volume;
+
+    // Store the seek chunk for later cleanup
+    info.seekChunk = seekChunk;
+
+    // Play the seek chunk on the same channel
+    int newChannel = Mix_PlayChannelTimed(channel, seekChunk, info.loop ? -1 : 0, info.maxPlayLength);
+
+    if (newChannel < 0)
+    {
+        fprintf(stderr, "Seek error: Failed to play from seek position: %s\n", Mix_GetError());
+        delete seekChunk;
+        info.seekChunk = NULL;
+        return false;
+    }
+
+    // Restore volume
+    int mixVolume = (int)(((float)MIX_MAX_VOLUME) * info.volume);
+    Mix_Volume(newChannel, mixVolume);
+
+    // Update tracking (channel might be the same, but update to be safe)
+    if (newChannel != channel)
+    {
+        channelInfo.erase(channel);
+    }
+    channelInfo[newChannel] = info;
+
+    return true;
 }
 
 bool processCommand(Document &d)
@@ -248,6 +392,38 @@ bool processCommand(Document &d)
         }
         return true;
     }
+    else if (0 == strcasecmp(command, "soundSeek") || 0 == strcasecmp(command, "seek"))
+    {
+        // Seek command requires a message object with channel and position
+        if (!d.HasMember("message") || !d["message"].IsObject())
+        {
+            fprintf(stderr, "Seek: Message does not have a 'message' property that is an object.\n");
+            return false;
+        }
+
+        if (!d["message"].HasMember("channel") || !d["message"]["channel"].IsInt())
+        {
+            fprintf(stderr, "Seek: Message does not have a 'message.channel' property that is an integer.\n");
+            return false;
+        }
+
+        if (!d["message"].HasMember("position") || !d["message"]["position"].IsInt())
+        {
+            fprintf(stderr, "Seek: Message does not have a 'message.position' property that is an integer.\n");
+            return false;
+        }
+
+        int channel = d["message"]["channel"].GetInt();
+        int position = d["message"]["position"].GetInt();
+
+        if (position < 0)
+        {
+            fprintf(stderr, "Seek: Position must be non-negative.\n");
+            return false;
+        }
+
+        return seekChannel(channel, position);
+    }
     return false;
 }
 
@@ -299,6 +475,9 @@ bool initSDLAudio(void)
         fprintf(stderr, "Unable to allocate mixing channels: %s\n", SDL_GetError());
         return false;
     }
+
+    // Register channel finished callback for cleanup of seek chunks
+    Mix_ChannelFinished(channelFinished);
 
     // set up HTTP/CURL library
     result = SDL_RWHttpInit();
