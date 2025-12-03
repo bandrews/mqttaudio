@@ -1,0 +1,48 @@
+Add startup precaching, MQTT log publishing, and verbose cache logging
+
+This commit adds three new features:
+
+1. **Startup Precaching**: Files can now be configured in the config file
+   to be precached automatically when the daemon starts. This ensures
+   commonly-used audio files are immediately available without needing
+   to send MQTT commands.
+
+   ```json
+   {
+     "cache": {
+       "precache": ["/sounds/startup.wav", "http://example.com/effect.mp3"]
+     }
+   }
+   ```
+
+2. **MQTT Log Publishing**: Log messages can now be published to an MQTT
+   topic for remote monitoring. This can be enabled via:
+   - CLI: `--log-topic audio/logs`
+   - Config: `"logging": {"mqtt_topic": "audio/logs"}`
+
+   Log entries are published as JSON with timestamp, level, target, and
+   message fields.
+
+3. **Verbose Cache Logging**: When `--verbose` is enabled, cache operations
+   now log size statistics showing memory and disk cache usage (entry
+   count and MB).
+
+Changes:
+- Added `precache` list to CacheConfig for startup precaching
+- Added `mqtt_topic` option to LoggingConfig and `--log-topic` CLI arg
+- Created mqtt/logger.rs with MqttLogLayer for publishing logs via MQTT
+- Added CacheStats struct and stats methods to CacheManager
+- Exposed memory/disk cache size methods for verbose logging
+- Added 6 new unit tests for the new config options
+- Updated README with documentation for all new features
+- Updated CLAUDE.md to require warning-free builds
+
+User prompts:
+- Add config file option to precache files on startup
+- Add logging on cache size if --verbose is enabled for cache operations
+- Add command line option and config setting to publish logs to MQTT topic
+- Add unit tests and update README
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>

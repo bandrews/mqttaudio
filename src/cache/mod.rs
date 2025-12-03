@@ -52,7 +52,10 @@ impl CacheManager {
             } else {
                 // Download and cache
                 tracing::info!("Cache miss, downloading: {}", file_path);
-                self.disk_cache.download_and_cache(file_path).await?
+                let path = self.disk_cache.download_and_cache(file_path).await?;
+                // Log stats after download
+                self.log_stats();
+                path
             }
         } else {
             // Local file path
@@ -69,6 +72,9 @@ impl CacheManager {
         // Store in memory cache
         let arc_buffer = Arc::new(buffer);
         self.memory_cache.put(file_path.to_string(), arc_buffer.clone());
+
+        // Log overall cache stats
+        self.log_stats();
 
         Ok(arc_buffer)
     }
@@ -98,5 +104,94 @@ impl CacheManager {
         self.disk_cache.remove_entry(file_path)?;
         tracing::info!("Invalidated cache for: {}", file_path);
         Ok(())
+    }
+
+    /// Get memory cache statistics
+    pub fn memory_stats(&self) -> CacheStats {
+        CacheStats {
+            entry_count: self.memory_cache.len(),
+            size_bytes: self.memory_cache.memory_usage_bytes() as u64,
+        }
+    }
+
+    /// Get disk cache statistics
+    pub fn disk_stats(&self) -> CacheStats {
+        CacheStats {
+            entry_count: self.disk_cache.entry_count(),
+            size_bytes: self.disk_cache.total_size_bytes(),
+        }
+    }
+
+    /// Log current cache statistics (for verbose mode)
+    pub fn log_stats(&self) {
+        let mem = self.memory_stats();
+        let disk = self.disk_stats();
+        tracing::debug!(
+            "Cache stats - Memory: {} entries ({:.2} MB), Disk: {} entries ({:.2} MB)",
+            mem.entry_count,
+            mem.size_bytes as f64 / (1024.0 * 1024.0),
+            disk.entry_count,
+            disk.size_bytes as f64 / (1024.0 * 1024.0)
+        );
+    }
+}
+
+/// Cache size statistics
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    pub entry_count: usize,
+    pub size_bytes: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_cache_manager_creation() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager = CacheManager::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let stats = cache_manager.memory_stats();
+        assert_eq!(stats.entry_count, 0);
+        assert_eq!(stats.size_bytes, 0);
+    }
+
+    #[test]
+    fn test_cache_stats_initial_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_manager = CacheManager::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let mem_stats = cache_manager.memory_stats();
+        let disk_stats = cache_manager.disk_stats();
+
+        assert_eq!(mem_stats.entry_count, 0);
+        assert_eq!(mem_stats.size_bytes, 0);
+        assert_eq!(disk_stats.entry_count, 0);
+        assert_eq!(disk_stats.size_bytes, 0);
+    }
+
+    #[test]
+    fn test_cache_stats_struct() {
+        let stats = CacheStats {
+            entry_count: 5,
+            size_bytes: 1024 * 1024 * 10, // 10 MB
+        };
+
+        assert_eq!(stats.entry_count, 5);
+        assert_eq!(stats.size_bytes, 10 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_cache_stats_clone() {
+        let stats = CacheStats {
+            entry_count: 3,
+            size_bytes: 12345,
+        };
+
+        let cloned = stats.clone();
+        assert_eq!(cloned.entry_count, 3);
+        assert_eq!(cloned.size_bytes, 12345);
     }
 }

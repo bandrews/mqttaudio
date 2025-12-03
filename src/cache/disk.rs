@@ -231,9 +231,15 @@ impl DiskCache {
     }
 
     /// Get number of cached entries
-    #[cfg(test)]
     pub fn entry_count(&self) -> usize {
         self.metadata.entries.len()
+    }
+
+    /// Get total size of cached files in bytes
+    pub fn total_size_bytes(&self) -> u64 {
+        self.metadata.entries.values()
+            .map(|e| e.file_size)
+            .sum()
     }
 
     /// Download a file from HTTP/HTTPS URL and store in cache

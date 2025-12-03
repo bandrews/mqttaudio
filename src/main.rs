@@ -76,6 +76,10 @@ struct Args {
     /// Crossover frequency (Hz) for bass management
     #[arg(long)]
     crossover_frequency: Option<f32>,
+
+    /// MQTT topic to publish log messages to
+    #[arg(long)]
+    log_topic: Option<String>,
 }
 
 #[tokio::main]
@@ -102,6 +106,7 @@ async fn main() {
         args.verbose,
         args.lfe_channel,
         args.crossover_frequency,
+        args.log_topic.clone(),
     );
 
     // Initialize logging based on config
@@ -114,9 +119,29 @@ async fn main() {
         _ => tracing::Level::INFO,
     };
 
-    tracing_subscriber::fmt()
-        .with_max_level(log_level)
-        .init();
+    // Create log channel for MQTT publishing (if configured)
+    let mqtt_log_receiver = if config.logging.mqtt_topic.is_some() {
+        let (sender, receiver) = mqtt::logger::create_log_channel(100);
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        use tracing_subscriber::Layer;
+
+        let mqtt_layer = mqtt::logger::MqttLogLayer::new(sender, log_level);
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_filter(tracing_subscriber::filter::LevelFilter::from_level(log_level));
+
+        tracing_subscriber::registry()
+            .with(fmt_layer)
+            .with(mqtt_layer)
+            .init();
+
+        Some(receiver)
+    } else {
+        tracing_subscriber::fmt()
+            .with_max_level(log_level)
+            .init();
+        None
+    };
 
     tracing::info!("mqttaudio {} starting", env!("CARGO_PKG_VERSION"));
     tracing::info!("Copyright © 2016-2025 Mo Fang Heavy Industries LLC");
@@ -253,12 +278,29 @@ async fn main() {
     tracing::info!("  Topic: {}", topic);
 
     // Connect to MQTT broker
-    let (_client, eventloop) = match mqtt::client::connect_mqtt(&config.mqtt.server, config.mqtt.port, &topic).await {
+    let (client, eventloop) = match mqtt::client::connect_mqtt(&config.mqtt.server, config.mqtt.port, &topic).await {
         Ok((c, el)) => (c, el),
         Err(e) => {
             tracing::error!("Failed to connect to MQTT broker: {}", e);
             std::process::exit(1);
         }
+    };
+
+    // Spawn MQTT log publisher if configured
+    let client = std::sync::Arc::new(client);
+    let _log_publisher_handle = if let Some(receiver) = mqtt_log_receiver {
+        if let Some(ref log_topic) = config.logging.mqtt_topic {
+            tracing::info!("MQTT log publishing enabled on topic: {}", log_topic);
+            Some(mqtt::logger::spawn_log_publisher(
+                client.clone(),
+                log_topic.clone(),
+                receiver,
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
     };
 
     // Set up audio device
@@ -406,6 +448,26 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Precache files from config on startup
+    if !config.cache.precache.is_empty() {
+        tracing::info!("Precaching {} files from config...", config.cache.precache.len());
+        for file_path in &config.cache.precache {
+            let mut cache_mgr = cache_manager.lock().unwrap();
+            match cache_mgr.precache(file_path, output_sample_rate).await {
+                Ok(()) => {
+                    if config.logging.verbose {
+                        cache_mgr.log_stats();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to precache {}: {}", file_path, e);
+                }
+            }
+            drop(cache_mgr);
+        }
+        tracing::info!("Startup precaching complete");
+    }
 
     let mixer_state_clone = mixer_state.clone();
     let active_voices_clone = active_voices.clone();
@@ -672,6 +734,9 @@ async fn main() {
                             match cache_mgr.precache(&file, output_sample_rate).await {
                                 Ok(()) => {
                                     tracing::info!("Precached: {}", file);
+                                    if config.logging.verbose {
+                                        cache_mgr.log_stats();
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!("Failed to precache {}: {}", file, e);
@@ -680,6 +745,17 @@ async fn main() {
                         }
                         mqtt::commands::AudioCommand::CacheClear => {
                             let mut cache_mgr = cache_manager.lock().unwrap();
+                            if config.logging.verbose {
+                                let mem = cache_mgr.memory_stats();
+                                let disk = cache_mgr.disk_stats();
+                                tracing::debug!(
+                                    "Clearing cache - Memory: {} entries ({:.2} MB), Disk: {} entries ({:.2} MB)",
+                                    mem.entry_count,
+                                    mem.size_bytes as f64 / (1024.0 * 1024.0),
+                                    disk.entry_count,
+                                    disk.size_bytes as f64 / (1024.0 * 1024.0)
+                                );
+                            }
                             match cache_mgr.clear_all() {
                                 Ok(()) => {
                                     tracing::info!("Cache cleared successfully");
@@ -694,6 +770,9 @@ async fn main() {
                             match cache_mgr.invalidate(&file) {
                                 Ok(()) => {
                                     tracing::info!("Invalidated cache for: {}", file);
+                                    if config.logging.verbose {
+                                        cache_mgr.log_stats();
+                                    }
                                 }
                                 Err(e) => {
                                     tracing::error!("Failed to invalidate {}: {}", file, e);

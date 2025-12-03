@@ -92,6 +92,7 @@ When asked to do something, just do it - including obvious follow-up actions nee
 ## Writing code
 
 - When submitting work, verify that you have FOLLOWED ALL RULES. (See Rule #1)
+- CODE MUST BUILD WITHOUT WARNINGS. This is non-negotiable. Run `cargo build --release` and fix all warnings before declaring work complete.
 - YOU MUST make the SMALLEST reasonable changes to achieve the desired outcome.
 - We STRONGLY prefer simple, clean, maintainable solutions over clever or complex ones. Readability and maintainability are PRIMARY CONCERNS, even at the cost of conciseness or performance.
 - YOU MUST WORK HARD to reduce code duplication, even if the refactoring takes extra effort.

@@ -50,31 +50,24 @@ impl MemoryCache {
     }
 
     /// Get the number of cached items
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.cache.len()
     }
 
     /// Check if the cache is empty
-    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.cache.is_empty()
     }
 
     /// Get memory usage estimate in bytes
     /// Calculates based on decoded PCM data size
-    #[cfg(test)]
     pub fn memory_usage_bytes(&self) -> usize {
         self.cache.values()
             .map(|buf| buf.data.len() * std::mem::size_of::<f32>())
             .sum()
     }
 
-    /// Get memory usage estimate in MB
-    #[cfg(test)]
-    pub fn memory_usage_mb(&self) -> f64 {
-        self.memory_usage_bytes() as f64 / (1024.0 * 1024.0)
-    }
 }
 
 impl Default for MemoryCache {
@@ -200,10 +193,6 @@ mod tests {
         // 2 channels * 48000 frames * 4 bytes per f32 = 384000 bytes
         let expected_bytes = 2 * 48000 * 4;
         assert_eq!(cache.memory_usage_bytes(), expected_bytes);
-
-        // Check MB calculation
-        let expected_mb = expected_bytes as f64 / (1024.0 * 1024.0);
-        assert!((cache.memory_usage_mb() - expected_mb).abs() < 0.001);
     }
 
     #[test]

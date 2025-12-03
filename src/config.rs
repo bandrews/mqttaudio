@@ -61,6 +61,9 @@ pub struct CacheConfig {
     pub enabled: bool,
     pub directory: String,
     pub revalidate_after_seconds: u64,
+    /// List of files to precache on startup
+    #[serde(default)]
+    pub precache: Vec<String>,
 }
 
 impl Default for CacheConfig {
@@ -69,6 +72,7 @@ impl Default for CacheConfig {
             enabled: true,
             directory: "~/.mqttaudio/cache".to_string(),
             revalidate_after_seconds: 300,
+            precache: Vec::new(),
         }
     }
 }
@@ -93,6 +97,9 @@ impl Default for SecurityConfig {
 pub struct LoggingConfig {
     pub level: String,
     pub verbose: bool,
+    /// MQTT topic to publish log messages to (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mqtt_topic: Option<String>,
 }
 
 impl Default for LoggingConfig {
@@ -100,6 +107,7 @@ impl Default for LoggingConfig {
         Self {
             level: "info".to_string(),
             verbose: false,
+            mqtt_topic: None,
         }
     }
 }
@@ -284,6 +292,7 @@ impl Config {
         verbose: bool,
         lfe_channel: Option<usize>,
         crossover_frequency: Option<f32>,
+        log_topic: Option<String>,
     ) {
         // Override MQTT settings
         if let Some(s) = server {
@@ -311,6 +320,9 @@ impl Config {
         if verbose {
             self.logging.verbose = true;
             self.logging.level = "debug".to_string();
+        }
+        if let Some(lt) = log_topic {
+            self.logging.mqtt_topic = Some(lt);
         }
 
         // Override bass management settings
@@ -649,6 +661,7 @@ mod tests {
             false,
             None,
             None,
+            None, // log_topic
         );
 
         assert_eq!(config.mqtt.server, "overridden");
@@ -668,6 +681,7 @@ mod tests {
             true,
             Some(5),
             Some(120.0),
+            Some("audio/logs".to_string()), // log_topic
         );
 
         assert_eq!(config.mqtt.server, "newserver");
@@ -678,6 +692,7 @@ mod tests {
         assert_eq!(config.audio.channels, Some(8));
         assert_eq!(config.logging.verbose, true);
         assert_eq!(config.logging.level, "debug");
+        assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
         assert_eq!(config.bass_management.lfe_channel, 5);
         assert_eq!(config.bass_management.crossover_frequency_hz, 120.0);
     }
@@ -699,6 +714,7 @@ mod tests {
             false,
             None,
             None,
+            None, // log_topic
         );
 
         assert_eq!(config.mqtt.server, "original");  // Unchanged
@@ -712,7 +728,7 @@ mod tests {
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.verbose, false);
 
-        config.merge_cli_args(None, None, None, None, None, None, true, None, None);
+        config.merge_cli_args(None, None, None, None, None, None, true, None, None, None);
 
         assert_eq!(config.logging.verbose, true);
         assert_eq!(config.logging.level, "debug");
@@ -898,5 +914,85 @@ mod tests {
 
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_cache_precache_default() {
+        let config = Config::default();
+        assert!(config.cache.precache.is_empty());
+    }
+
+    #[test]
+    fn test_cache_precache_parse() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "cache": {
+                "precache": [
+                    "/sounds/startup.wav",
+                    "https://example.com/welcome.mp3"
+                ]
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.cache.precache.len(), 2);
+        assert_eq!(config.cache.precache[0], "/sounds/startup.wav");
+        assert_eq!(config.cache.precache[1], "https://example.com/welcome.mp3");
+    }
+
+    #[test]
+    fn test_logging_mqtt_topic_default() {
+        let config = Config::default();
+        assert!(config.logging.mqtt_topic.is_none());
+    }
+
+    #[test]
+    fn test_logging_mqtt_topic_parse() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "logging": {
+                "level": "info",
+                "mqtt_topic": "audio/logs"
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
+    }
+
+    #[test]
+    fn test_merge_cli_args_log_topic() {
+        let mut config = Config::default();
+        assert!(config.logging.mqtt_topic.is_none());
+
+        config.merge_cli_args(
+            None, None, None, None, None, None, false, None, None,
+            Some("audio/logs".to_string()),
+        );
+
+        assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
+    }
+
+    #[test]
+    fn test_logging_config_serialization() {
+        let config = LoggingConfig {
+            level: "debug".to_string(),
+            verbose: true,
+            mqtt_topic: Some("test/logs".to_string()),
+        };
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("\"mqtt_topic\":\"test/logs\""));
+
+        // With no mqtt_topic, it should be omitted
+        let config_no_topic = LoggingConfig {
+            level: "info".to_string(),
+            verbose: false,
+            mqtt_topic: None,
+        };
+        let json_no_topic = serde_json::to_string(&config_no_topic).unwrap();
+        assert!(!json_no_topic.contains("mqtt_topic"));
     }
 }

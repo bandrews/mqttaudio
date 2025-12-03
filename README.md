@@ -674,6 +674,53 @@ mosquitto_pub -t audio/commands -m '{
 }'
 ```
 
+**Startup precaching:**
+
+You can configure files to be precached automatically when the daemon starts. This is useful for ensuring commonly-used audio files are immediately available without needing to send MQTT commands:
+
+```json
+{
+  "cache": {
+    "precache": [
+      "/opt/sounds/startup.wav",
+      "http://example.com/common-effect.mp3",
+      "/sounds/alert.ogg"
+    ]
+  }
+}
+```
+
+When `--verbose` is enabled, cache operations will log size statistics showing memory and disk cache usage.
+
+### MQTT Log Publishing
+
+Log messages can be published to an MQTT topic for remote monitoring:
+
+**Via command line:**
+```bash
+mqttaudio --topic audio/commands --log-topic audio/logs
+```
+
+**Via configuration file:**
+```json
+{
+  "logging": {
+    "level": "info",
+    "mqtt_topic": "audio/logs"
+  }
+}
+```
+
+Log entries are published as JSON objects:
+```json
+{
+  "timestamp": "2025-01-01T12:00:00.000000Z",
+  "level": "INFO",
+  "target": "mqttaudio",
+  "message": "Precached: /sounds/startup.wav"
+}
+```
+
 ## Complete Usage Scenario
 
 Here's a complete example showing how you might use mqttaudio for an interactive installation:
@@ -771,6 +818,7 @@ OPTIONS:
   --cache-dir <PATH>           HTTP cache directory [default: ~/.cache/mqttaudio]
   --config <FILE>              Load configuration from JSON file
   --verbose                    Enable verbose logging (debug level)
+  --log-topic <TOPIC>          MQTT topic to publish log messages to
   --help                       Print help information
   --version                    Print version information
 ```
@@ -794,7 +842,11 @@ Create `config.json`:
   },
   "cache": {
     "directory": "~/.cache/mqttaudio",
-    "max_memory_mb": 500
+    "max_memory_mb": 500,
+    "precache": [
+      "/opt/sounds/startup.wav",
+      "http://example.com/common-effect.mp3"
+    ]
   },
   "bass_management": {
     "enabled": true,
@@ -830,7 +882,8 @@ Create `config.json`:
     ]
   },
   "logging": {
-    "level": "info"
+    "level": "info",
+    "mqtt_topic": "audio/logs"
   }
 }
 ```
