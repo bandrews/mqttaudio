@@ -10,6 +10,7 @@ pub mod audio {
     pub mod ducking;
     pub mod bass_management;
     pub mod input;
+    pub mod pitch_correction;
 }
 
 pub mod cache {

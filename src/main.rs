@@ -806,10 +806,6 @@ async fn main() {
                             }
                         }
                         mqtt::commands::AudioCommand::Speed { selector, speed, pitch_correction } => {
-                            if pitch_correction {
-                                tracing::warn!("Pitch correction not yet implemented - using pitch-follows-speed mode");
-                            }
-
                             if selector.is_empty() {
                                 tracing::warn!("Speed command with empty selector - no samples targeted");
                             } else {
@@ -823,15 +819,24 @@ async fn main() {
                                         &sample.voice_id,
                                     ) {
                                         sample.set_speed(speed);
+
+                                        // Enable or disable pitch correction
+                                        if pitch_correction {
+                                            sample.enable_pitch_correction();
+                                        } else {
+                                            sample.disable_pitch_correction();
+                                        }
+
                                         updated_count += 1;
                                     }
                                 }
                                 drop(state);
 
                                 if updated_count > 0 {
+                                    let mode = if pitch_correction { "pitch-corrected" } else { "normal" };
                                     tracing::info!(
-                                        "Set speed to {}x for {} samples",
-                                        speed, updated_count
+                                        "Set speed to {}x ({}) for {} samples",
+                                        speed, mode, updated_count
                                     );
                                 } else {
                                     tracing::warn!("Speed command matched no active samples");

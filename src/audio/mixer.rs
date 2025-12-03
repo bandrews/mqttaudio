@@ -4,6 +4,7 @@
 use crate::audio::types::DecodedBuffer;
 use crate::audio::ducking::DuckingEngine;
 use crate::audio::bass_management::BassManagement;
+use crate::audio::pitch_correction::PitchCorrector;
 use ringbuf::HeapConsumer;
 use std::sync::Arc;
 
@@ -122,6 +123,9 @@ pub struct ActiveSample {
 
     /// Playback speed multiplier (1.0 = normal, 2.0 = double speed, 0.5 = half speed)
     pub speed: f32,
+
+    /// Pitch corrector for time-stretching without pitch change
+    pub pitch_corrector: Option<PitchCorrector>,
 }
 
 impl ActiveSample {
@@ -152,6 +156,7 @@ impl ActiveSample {
             channel_map,
             fade_state: FadeState::None,
             speed: 1.0,
+            pitch_corrector: None,
         }
     }
 
@@ -183,6 +188,7 @@ impl ActiveSample {
             channel_map,
             fade_state: FadeState::None,
             speed: 1.0,
+            pitch_corrector: None,
         }
     }
 
@@ -210,6 +216,7 @@ impl ActiveSample {
             channel_map,
             fade_state: FadeState::None,
             speed: 1.0,
+            pitch_corrector: None,
         }
     }
 
@@ -221,6 +228,34 @@ impl ActiveSample {
     /// Set the playback speed (clamped to 0.1 - 4.0)
     pub fn set_speed(&mut self, speed: f32) {
         self.speed = speed.clamp(0.1, 4.0);
+        // Also update pitch corrector speed if enabled
+        if let Some(ref mut pc) = self.pitch_corrector {
+            pc.set_speed(self.speed);
+        }
+    }
+
+    /// Enable pitch correction (preserves pitch when changing speed).
+    /// Creates a new PitchCorrector if one doesn't exist.
+    pub fn enable_pitch_correction(&mut self) {
+        if self.pitch_corrector.is_none() {
+            let mut pc = PitchCorrector::new(
+                self.buffer.channels,
+                self.buffer.sample_rate,
+            );
+            pc.set_speed(self.speed);
+            self.pitch_corrector = Some(pc);
+        }
+    }
+
+    /// Disable pitch correction (pitch follows speed).
+    pub fn disable_pitch_correction(&mut self) {
+        self.pitch_corrector = None;
+    }
+
+    /// Check if pitch correction is enabled.
+    #[allow(dead_code)]
+    pub fn has_pitch_correction(&self) -> bool {
+        self.pitch_corrector.is_some()
     }
 
     /// Check if this sample has finished playing
@@ -399,6 +434,12 @@ fn mix_sample_into_output(
     output_channels: usize,
     ducking_multiplier: f32,
 ) {
+    // Use pitch-corrected path if pitch corrector is enabled
+    if sample.pitch_corrector.is_some() {
+        mix_sample_with_pitch_correction(sample, output, frames, output_channels, ducking_multiplier);
+        return;
+    }
+
     let base_volume = sample.combined_volume();
     let speed = sample.speed as f64;
 
@@ -452,6 +493,72 @@ fn mix_sample_into_output(
         // Advance source position by speed
         src_pos += speed;
     }
+}
+
+/// Mix a sample with pitch correction using time-stretching.
+/// This preserves pitch when speed != 1.0.
+fn mix_sample_with_pitch_correction(
+    sample: &mut ActiveSample,
+    output: &mut [f32],
+    frames: usize,
+    output_channels: usize,
+    ducking_multiplier: f32,
+) {
+    let base_volume = sample.combined_volume();
+    let speed = sample.speed;
+    let src_channels = sample.buffer.channels;
+
+    // Calculate how many input frames we need (scaled by speed)
+    let input_frames_needed = ((frames as f32 * speed).ceil() as usize).max(1);
+
+    // Calculate how many input frames are available
+    let available_frames = sample.buffer.frames.saturating_sub(sample.position);
+    let input_frames = input_frames_needed.min(available_frames);
+
+    if input_frames == 0 {
+        return;
+    }
+
+    // Extract input samples from the buffer (interleaved)
+    let input_start = sample.position * src_channels;
+    let input_end = (sample.position + input_frames) * src_channels;
+    let input_slice = &sample.buffer.data[input_start..input_end];
+
+    // Create output buffer for the stretcher (interleaved, same channel count as source)
+    let output_samples = frames * src_channels;
+    let mut stretched = vec![0.0f32; output_samples];
+
+    // Process through the pitch corrector
+    if let Some(ref mut pc) = sample.pitch_corrector {
+        pc.process(input_slice, &mut stretched);
+    }
+
+    // Apply volume, fade, ducking and channel mapping
+    for frame_idx in 0..frames {
+        // Calculate fade multiplier for this frame
+        let fade_multiplier = sample.fade_state.multiplier();
+        let final_volume = base_volume * fade_multiplier * ducking_multiplier;
+
+        // Apply channel mapping and mix into output
+        for &(src_ch, dest_ch) in &sample.channel_map {
+            // Bounds check
+            if src_ch >= src_channels || dest_ch >= output_channels {
+                continue;
+            }
+
+            let src_idx = frame_idx * src_channels + src_ch;
+            let dest_idx = frame_idx * output_channels + dest_ch;
+
+            if src_idx < stretched.len() {
+                output[dest_idx] += stretched[src_idx] * final_volume;
+            }
+        }
+
+        // Advance fade state
+        sample.fade_state.advance();
+    }
+
+    // Note: position is advanced by advance_position() in mix_audio
 }
 
 /// Mix a live input (microphone) into the output buffer
@@ -1470,6 +1577,117 @@ mod tests {
 
         sample.set_speed(10.0); // Should clamp to maximum
         assert!(sample.speed <= 4.0); // Some reasonable maximum
+    }
+
+    // === Pitch Correction Tests ===
+
+    #[test]
+    fn test_pitch_correction_enable_disable() {
+        let buffer = create_test_buffer(100, 2, 0.5);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        assert!(!sample.has_pitch_correction());
+
+        sample.enable_pitch_correction();
+        assert!(sample.has_pitch_correction());
+
+        sample.disable_pitch_correction();
+        assert!(!sample.has_pitch_correction());
+    }
+
+    #[test]
+    fn test_pitch_correction_updates_speed() {
+        let buffer = create_test_buffer(100, 2, 0.5);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        sample.set_speed(2.0);
+        sample.enable_pitch_correction();
+
+        // Verify the pitch corrector was created with the current speed
+        assert!(sample.pitch_corrector.is_some());
+        if let Some(ref pc) = sample.pitch_corrector {
+            assert_eq!(pc.speed(), 2.0);
+        }
+
+        // Now set speed again and verify pitch corrector is updated
+        sample.set_speed(0.5);
+        if let Some(ref pc) = sample.pitch_corrector {
+            assert_eq!(pc.speed(), 0.5);
+        }
+    }
+
+    #[test]
+    fn test_pitch_correction_mixing() {
+        // Create buffer with 200 frames of constant value
+        let data = vec![0.5f32; 200 * 2]; // 200 stereo frames
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+
+        // Enable pitch correction at 2x speed
+        sample.set_speed(2.0);
+        sample.enable_pitch_correction();
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Request 50 output frames
+        let mut output = vec![0.0f32; 50 * 2];
+        mix_audio(&mut output, &mut state);
+
+        // With pitch correction, at 2x speed, we consume 100 input frames
+        // to produce 50 output frames
+        // Position should be 100 (the stretcher consumed that much)
+        assert_eq!(state.active_samples[0].position, 100);
+    }
+
+    #[test]
+    fn test_pitch_correction_slow_speed() {
+        let data = vec![0.5f32; 100 * 2]; // 100 stereo frames
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+
+        // Enable pitch correction at 0.5x speed
+        sample.set_speed(0.5);
+        sample.enable_pitch_correction();
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Request 50 output frames
+        let mut output = vec![0.0f32; 50 * 2];
+        mix_audio(&mut output, &mut state);
+
+        // At 0.5x speed, we consume 25 input frames to produce 50 output frames
+        assert_eq!(state.active_samples[0].position, 25);
+    }
+
+    #[test]
+    fn test_pitch_correction_output_not_silent() {
+        // Ensure the pitch-corrected path produces some output
+        // Use a larger buffer because the stretcher has latency
+        let data = vec![0.8f32; 48000 * 2]; // 48000 stereo frames (1 second at 48kHz)
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+
+        sample.set_speed(1.5);
+        sample.enable_pitch_correction();
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Run several passes to warm up the stretcher and accumulate output
+        // (stretcher has latency, so first few frames may be silent)
+        let mut all_output = Vec::new();
+        for _ in 0..20 {
+            let mut output = vec![0.0f32; 512 * 2];
+            mix_audio(&mut output, &mut state);
+            all_output.extend_from_slice(&output);
+        }
+
+        // After warming up, output should have some non-zero values
+        // (may not be exactly 0.8 due to stretcher processing)
+        let has_audio = all_output.iter().any(|&s| s.abs() > 0.01);
+        assert!(has_audio, "Output should have audio content");
     }
 }
 

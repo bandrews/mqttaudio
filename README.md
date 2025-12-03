@@ -10,7 +10,7 @@ mqttaudio is a high-performance, real-time audio engine that receives commands o
 - **Multichannel Routing**: Route audio to specific output channels (supports up to 16+ channels)
 - **Voice Grouping**: Group sounds together for coordinated control
 - **Sample Targeting**: Control individual sounds by ID, filename, or voice (seek, speed, stop, volume)
-- **Variable Speed Playback**: Change playback speed with linear interpolation (0.1x to 4.0x)
+- **Variable Speed Playback**: Change playback speed (0.1x to 4.0x) with optional pitch correction (time-stretching)
 - **Seek Control**: Jump to any position in a playing sample
 - **Audio Ducking**: Automatically reduce background audio when foreground voices play
 - **Bass Management**: Route low frequencies to subwoofer (LFE) channel with configurable crossover
@@ -904,7 +904,7 @@ These commands let you control specific playing samples by id, file, or voice.
 }
 ```
 
-Speed range: 0.1 to 4.0. When `pitch_correction` is false (default), faster playback = higher pitch.
+Speed range: 0.1 to 4.0. When `pitch_correction` is false (default), faster playback = higher pitch ("chipmunk effect"). When `pitch_correction` is true, the audio is time-stretched so pitch remains constant regardless of speed. This uses the signalsmith-stretch library for high-quality real-time time-stretching.
 
 **Stop specific samples:**
 ```json
@@ -1098,6 +1098,7 @@ mqttaudio/
 │   │   ├── mixer.rs         # Real-time mixer (audio callback)
 │   │   ├── ducking.rs       # Audio ducking engine
 │   │   ├── bass_management.rs # LFE/subwoofer crossover filtering
+│   │   ├── pitch_correction.rs # Time-stretching for pitch-corrected speed change
 │   │   ├── input.rs         # Microphone/input device handling
 │   │   ├── decoder.rs       # Audio file decoding
 │   │   ├── resampler.rs     # Sample rate conversion
@@ -1182,6 +1183,7 @@ Built with:
 - [cpal](https://github.com/RustAudio/cpal) - Cross-platform audio I/O
 - [symphonia](https://github.com/pdeljanov/Symphonia) - Audio decoding
 - [rubato](https://github.com/HEnquist/rubato) - Sample rate conversion
+- [signalsmith-stretch](https://signalsmith-audio.co.uk/code/stretch/) - Time-stretching for pitch correction
 - [rumqttc](https://github.com/bytebeamio/rumqtt) - MQTT client
 
 ## Contributing
