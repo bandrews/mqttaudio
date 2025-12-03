@@ -126,6 +126,12 @@ pub struct ActiveSample {
 
     /// Pitch corrector for time-stretching without pitch change
     pub pitch_corrector: Option<PitchCorrector>,
+
+    /// Loop playback continuously
+    pub loop_mode: bool,
+
+    /// Number of samples to crossfade at loop boundaries (0 = disabled)
+    pub crossfade_samples: usize,
 }
 
 impl ActiveSample {
@@ -157,6 +163,8 @@ impl ActiveSample {
             fade_state: FadeState::None,
             speed: 1.0,
             pitch_corrector: None,
+            loop_mode: false,
+            crossfade_samples: 0,
         }
     }
 
@@ -169,6 +177,8 @@ impl ActiveSample {
         voice_volume: f32,
         file_path: String,
         sample_id: Option<String>,
+        loop_mode: bool,
+        crossfade_samples: usize,
     ) -> Self {
         // Default channel mapping: 1:1 for available channels
         let channel_map = (0..buffer.channels)
@@ -189,6 +199,8 @@ impl ActiveSample {
             fade_state: FadeState::None,
             speed: 1.0,
             pitch_corrector: None,
+            loop_mode,
+            crossfade_samples,
         }
     }
 
@@ -202,6 +214,8 @@ impl ActiveSample {
         channel_map: Vec<(usize, usize)>,
         file_path: String,
         sample_id: Option<String>,
+        loop_mode: bool,
+        crossfade_samples: usize,
     ) -> Self {
         Self {
             id,
@@ -217,6 +231,8 @@ impl ActiveSample {
             fade_state: FadeState::None,
             speed: 1.0,
             pitch_corrector: None,
+            loop_mode,
+            crossfade_samples,
         }
     }
 
@@ -301,7 +317,23 @@ impl ActiveSample {
 
     /// Check if this sample has finished playing
     /// A sample is finished if it reached the end (or start for reverse) OR if fade out is complete
+    /// Looping samples only finish when fade out is complete
     pub fn is_finished(&self) -> bool {
+        // Fade out complete - always finishes, even for looping samples
+        match self.fade_state {
+            FadeState::Out { elapsed, duration } => {
+                if elapsed >= duration {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        // Looping samples never finish from buffer position
+        if self.loop_mode {
+            return false;
+        }
+
         // For forward playback, finished when position >= frames
         // For reverse playback, finished when position is 0 (or we've gone negative)
         if self.speed >= 0.0 {
@@ -316,11 +348,7 @@ impl ActiveSample {
             }
         }
 
-        // Fade out complete
-        match self.fade_state {
-            FadeState::Out { elapsed, duration } => elapsed >= duration,
-            _ => false,
-        }
+        false
     }
 
     /// Get the combined volume (sample volume * voice volume)
@@ -330,18 +358,39 @@ impl ActiveSample {
 
     /// Advance the playback position by the given number of output frames,
     /// accounting for playback speed (including negative for reverse).
+    /// Handles looping by wrapping position to other end of buffer.
     /// Returns the effective number of source frames consumed (absolute value).
     fn advance_position(&mut self, output_frames: usize) -> usize {
         let advance = output_frames as f64 * self.speed as f64;
         let new_pos = self.position as f64 + self.fractional_position + advance;
+        let buffer_frames = self.buffer.frames;
 
-        if new_pos < 0.0 {
-            // Reverse playback reached the start
-            self.position = 0;
-            self.fractional_position = 0.0;
+        if self.loop_mode && buffer_frames > 0 {
+            // Handle looping
+            if new_pos < 0.0 {
+                // Reverse playback wrapped past start - loop to end
+                let wrapped = new_pos % buffer_frames as f64 + buffer_frames as f64;
+                self.position = wrapped as usize % buffer_frames;
+                self.fractional_position = wrapped.fract();
+            } else if new_pos >= buffer_frames as f64 {
+                // Forward playback wrapped past end - loop to start
+                let wrapped = new_pos % buffer_frames as f64;
+                self.position = wrapped as usize;
+                self.fractional_position = wrapped.fract();
+            } else {
+                self.position = new_pos as usize;
+                self.fractional_position = new_pos.fract();
+            }
         } else {
-            self.position = new_pos as usize;
-            self.fractional_position = new_pos.fract();
+            // Non-looping behavior
+            if new_pos < 0.0 {
+                // Reverse playback reached the start
+                self.position = 0;
+                self.fractional_position = 0.0;
+            } else {
+                self.position = new_pos as usize;
+                self.fractional_position = new_pos.fract();
+            }
         }
 
         // Return effective frames consumed (absolute value)
@@ -499,28 +548,45 @@ fn mix_sample_into_output(
     let base_volume = sample.combined_volume();
     let speed = sample.speed as f64;
     let is_reverse = speed < 0.0;
+    let buffer_frames = sample.buffer.frames;
+    let loop_mode = sample.loop_mode;
 
     // Calculate current precise position (integer + fractional parts)
     let mut src_pos = sample.precise_position();
 
     for frame_idx in 0..frames {
-        // Check bounds based on direction
-        if is_reverse {
-            // For reverse playback, stop when we've gone past the start
+        // Handle looping wrap-around
+        if loop_mode && buffer_frames > 0 {
             if src_pos < 0.0 {
-                break;
+                // Wrap from start to end
+                src_pos = src_pos % buffer_frames as f64 + buffer_frames as f64;
+            } else if src_pos >= buffer_frames as f64 {
+                // Wrap from end to start
+                src_pos = src_pos % buffer_frames as f64;
             }
         } else {
-            // For forward playback, stop when we've reached the end
-            if src_pos as usize >= sample.buffer.frames {
-                break;
+            // Check bounds based on direction (non-looping)
+            if is_reverse {
+                // For reverse playback, stop when we've gone past the start
+                if src_pos < 0.0 {
+                    break;
+                }
+            } else {
+                // For forward playback, stop when we've reached the end
+                if src_pos as usize >= buffer_frames {
+                    break;
+                }
             }
         }
 
         let src_frame = src_pos as usize;
 
         // Safety check: ensure we're within bounds
-        if src_frame >= sample.buffer.frames {
+        if src_frame >= buffer_frames {
+            if loop_mode {
+                src_pos += speed;
+                continue;
+            }
             break;
         }
 
@@ -548,18 +614,33 @@ fn mix_sample_into_output(
             let interpolated_val = if frac > 0.001 {
                 if is_reverse {
                     // For reverse, interpolate with previous sample (lower index)
-                    if src_frame > 0 {
-                        let prev_idx = (src_frame - 1) * sample.buffer.channels + src_ch;
+                    // When looping, wrap to end of buffer
+                    let prev_frame = if src_frame > 0 {
+                        src_frame - 1
+                    } else if loop_mode {
+                        buffer_frames - 1
+                    } else {
+                        src_frame // No interpolation possible
+                    };
+                    if prev_frame != src_frame {
+                        let prev_idx = prev_frame * sample.buffer.channels + src_ch;
                         let prev_val = sample.buffer.data[prev_idx];
-                        // frac represents how far we are past src_frame toward prev
                         sample_val * (1.0 - frac) + prev_val * frac
                     } else {
                         sample_val
                     }
                 } else {
                     // For forward, interpolate with next sample (higher index)
-                    if src_frame + 1 < sample.buffer.frames {
-                        let next_idx = (src_frame + 1) * sample.buffer.channels + src_ch;
+                    // When looping, wrap to start of buffer
+                    let next_frame = if src_frame + 1 < buffer_frames {
+                        src_frame + 1
+                    } else if loop_mode {
+                        0
+                    } else {
+                        src_frame // No interpolation possible
+                    };
+                    if next_frame != src_frame {
+                        let next_idx = next_frame * sample.buffer.channels + src_ch;
                         let next_val = sample.buffer.data[next_idx];
                         sample_val * (1.0 - frac) + next_val * frac
                     } else {
@@ -570,8 +651,45 @@ fn mix_sample_into_output(
                 sample_val
             };
 
+            // Apply loop crossfade by blending samples from end and beginning
+            let blended_val = if loop_mode && sample.crossfade_samples > 0 && buffer_frames > sample.crossfade_samples * 2 {
+                let cf_samples = sample.crossfade_samples;
+
+                if is_reverse {
+                    // Reverse playback: crossfade when approaching start (frame 0)
+                    if src_frame < cf_samples {
+                        // Blend current position (near start) with end of buffer
+                        // progress goes from 0.0 (at cf_samples-1) to 1.0 (at frame 0)
+                        let progress = 1.0 - (src_frame as f32 / cf_samples as f32);
+                        let blend_frame = buffer_frames - cf_samples + src_frame;
+                        let blend_idx = blend_frame * sample.buffer.channels + src_ch;
+                        let blend_val = sample.buffer.data[blend_idx];
+                        interpolated_val * (1.0 - progress) + blend_val * progress
+                    } else {
+                        interpolated_val
+                    }
+                } else {
+                    // Forward playback: crossfade when approaching end
+                    let crossfade_start = buffer_frames - cf_samples;
+                    if src_frame >= crossfade_start {
+                        // Blend current position (near end) with start of buffer
+                        // progress goes from 0.0 (at crossfade_start) to 1.0 (at buffer_frames-1)
+                        let frames_into_crossfade = src_frame - crossfade_start;
+                        let progress = frames_into_crossfade as f32 / cf_samples as f32;
+                        let blend_frame = frames_into_crossfade;
+                        let blend_idx = blend_frame * sample.buffer.channels + src_ch;
+                        let blend_val = sample.buffer.data[blend_idx];
+                        interpolated_val * (1.0 - progress) + blend_val * progress
+                    } else {
+                        interpolated_val
+                    }
+                }
+            } else {
+                interpolated_val
+            };
+
             // Mix with combined volume and fade applied
-            output[dest_idx] += interpolated_val * final_volume;
+            output[dest_idx] += blended_val * final_volume;
         }
 
         // Advance fade state
@@ -821,7 +939,7 @@ mod tests {
 
         // Map: L→1, R→3 (4-channel output)
         let channel_map = vec![(0, 1), (1, 3)];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None);
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None, false, 0);
 
         let mut state = MixerState::new(4);
         state.active_samples.push(sample);
@@ -884,6 +1002,127 @@ mod tests {
         }
     }
 
+    // === Loop Tests ===
+
+    #[test]
+    fn test_looping_sample_does_not_finish_at_end() {
+        let buffer = create_test_buffer(5, 2, 0.5);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        sample.loop_mode = true;
+
+        // Position at the end of buffer
+        sample.position = 4;
+
+        // A looping sample should not be marked as finished even at the end
+        assert!(!sample.is_finished());
+
+        // Move past the end
+        sample.position = 5;
+        assert!(!sample.is_finished());
+    }
+
+    #[test]
+    fn test_looping_sample_wraps_forward() {
+        // Create buffer with identifiable pattern: first frame = 0.1, last frame = 0.9
+        let mut data = vec![0.1, 0.1]; // Frame 0
+        data.extend(vec![0.2, 0.2]);   // Frame 1
+        data.extend(vec![0.3, 0.3]);   // Frame 2
+        data.extend(vec![0.4, 0.4]);   // Frame 3
+        data.extend(vec![0.5, 0.5]);   // Frame 4
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        sample.loop_mode = true;
+        sample.position = 3; // Start near end
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Mix 4 frames - should wrap around to beginning
+        let mut output = vec![0.0f32; 8]; // 4 frames * 2 channels
+        mix_audio(&mut output, &mut state);
+
+        // Frame 0 from position 3 (0.4)
+        assert!((output[0] - 0.4).abs() < 0.01);
+        // Frame 1 from position 4 (0.5)
+        assert!((output[2] - 0.5).abs() < 0.01);
+        // Frame 2 from position 0 (wrapped, 0.1)
+        assert!((output[4] - 0.1).abs() < 0.01);
+        // Frame 3 from position 1 (0.2)
+        assert!((output[6] - 0.2).abs() < 0.01);
+
+        // Sample should not be finished
+        assert!(!state.active_samples[0].is_finished());
+    }
+
+    #[test]
+    fn test_looping_sample_finishes_on_fade_out() {
+        let buffer = create_test_buffer(100, 2, 0.5);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        sample.loop_mode = true;
+
+        // Not finished yet
+        assert!(!sample.is_finished());
+
+        // Apply a fade out that will complete immediately
+        sample.fade_state = FadeState::Out { elapsed: 100, duration: 100 };
+
+        // Now should be finished (fade out complete)
+        assert!(sample.is_finished());
+    }
+
+    #[test]
+    fn test_looping_reverse_wraps_to_end() {
+        // Create buffer with identifiable pattern
+        let mut data = vec![0.1, 0.1]; // Frame 0
+        data.extend(vec![0.2, 0.2]);   // Frame 1
+        data.extend(vec![0.3, 0.3]);   // Frame 2
+        data.extend(vec![0.4, 0.4]);   // Frame 3
+        data.extend(vec![0.5, 0.5]);   // Frame 4
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        sample.loop_mode = true;
+        sample.speed = -1.0; // Reverse playback
+        sample.position = 1; // Start near beginning
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Mix 4 frames - should wrap around to end
+        let mut output = vec![0.0f32; 8]; // 4 frames * 2 channels
+        mix_audio(&mut output, &mut state);
+
+        // Frame 0 from position 1 (0.2)
+        assert!((output[0] - 0.2).abs() < 0.01);
+        // Frame 1 from position 0 (0.1)
+        assert!((output[2] - 0.1).abs() < 0.01);
+        // Frame 2 from position 4 (wrapped from end, 0.5)
+        assert!((output[4] - 0.5).abs() < 0.01);
+        // Frame 3 from position 3 (0.4)
+        assert!((output[6] - 0.4).abs() < 0.01);
+
+        // Sample should not be finished
+        assert!(!state.active_samples[0].is_finished());
+    }
+
+    #[test]
+    fn test_non_looping_sample_finishes_at_end() {
+        let buffer = create_test_buffer(5, 2, 0.5);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        sample.loop_mode = false;
+
+        sample.position = 5;
+        assert!(sample.is_finished());
+    }
+
+    #[test]
+    fn test_loop_mode_defaults_to_false() {
+        let buffer = create_test_buffer(5, 2, 0.5);
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        assert!(!sample.loop_mode);
+    }
+
     #[test]
     fn test_mono_to_multichannel() {
         // Mono source to 8-channel output
@@ -892,7 +1131,7 @@ mod tests {
 
         // Route mono to channels 4 and 5
         let channel_map = vec![(0, 4), (0, 5)];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None);
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None, false, 0);
 
         let mut state = MixerState::new(8);
         state.active_samples.push(sample);
@@ -934,7 +1173,7 @@ mod tests {
             (2, 0), // Rear left → Left (mix)
             (3, 1), // Rear right → Right (mix)
         ];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None);
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None, false, 0);
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -954,7 +1193,7 @@ mod tests {
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
 
         let channel_map = vec![(0, 6), (1, 9)];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None);
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None, false, 0);
 
         let mut state = MixerState::new(12);
         state.active_samples.push(sample);
@@ -987,7 +1226,7 @@ mod tests {
             (1, 100), // Out of bounds (only 4 output channels)
             (99, 2),  // Invalid source
         ];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None);
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None, false, 0);
 
         let mut state = MixerState::new(4);
         state.active_samples.push(sample);
@@ -1403,6 +1642,8 @@ mod tests {
             1.0,
             "/path/to/audio.wav".to_string(),
             Some("my-sound-1".to_string()),
+            false,
+            0,
         );
 
         assert_eq!(sample.sample_id, Some("my-sound-1".to_string()));
@@ -1436,6 +1677,8 @@ mod tests {
             vec![(0, 0), (1, 1)],
             "/path/to/audio.wav".to_string(),
             None,
+            false,
+            0,
         );
 
         assert_eq!(sample.file_path, "/path/to/audio.wav");
@@ -1454,6 +1697,8 @@ mod tests {
             vec![(0, 2), (1, 3)],
             "/path/to/surround.wav".to_string(),
             Some("surround-effect".to_string()),
+            false,
+            0,
         );
 
         assert_eq!(sample.file_path, "/path/to/surround.wav");

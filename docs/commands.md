@@ -46,7 +46,8 @@ Play an audio file.
 | `id` | string | auto | Unique ID for targeting this sound later |
 | `voice` | string | auto | Voice group name |
 | `volume` | float | 1.0 | Volume (0.0 to 1.0) |
-| `loop` | boolean | false | Loop playback |
+| `loop` | boolean | false | Loop playback continuously |
+| `crossfade_ms` | integer | 0 | Crossfade duration at loop boundaries (0 = disabled) |
 | `fade_in` | integer | 0 | Fade-in duration (milliseconds) |
 | `start_position_ms` | integer | 0 | Start position (milliseconds) |
 | `channel_map` | array | auto | Channel routing (see below) |
@@ -328,7 +329,7 @@ TOPIC="audio/commands"
 mosquitto_pub -t $TOPIC -m '{"command": "precache", "message": {"file": "/sounds/music.mp3"}}'
 mosquitto_pub -t $TOPIC -m '{"command": "precache", "message": {"file": "/sounds/narration.wav"}}'
 
-# Start background music
+# Start background music with crossfade for smooth looping
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
   "message": {
@@ -336,6 +337,7 @@ mosquitto_pub -t $TOPIC -m '{
     "voice": "music",
     "volume": 0.3,
     "loop": true,
+    "crossfade_ms": 100,
     "fade_in": 2000
   }
 }'

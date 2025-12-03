@@ -82,9 +82,12 @@ pub struct PlayMessage {
     pub fade_in: Option<u32>, // Fade in duration in milliseconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_position_ms: Option<u64>, // Start playback at this offset
+    #[serde(rename = "loop")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_mode: Option<bool>, // Loop playback continuously
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crossfade_ms: Option<u32>, // Crossfade duration at loop boundaries (0 = disabled)
     // Future fields for later phases:
-    // #[serde(rename = "loop")]
-    // pub loop_mode: Option<bool>,         // Future
     // pub max_play_length: Option<i32>,    // Future
 }
 
@@ -215,6 +218,8 @@ pub enum AudioCommand {
         channel_map: Option<Vec<ChannelMapping>>,
         fade_in: Option<u32>, // Fade in duration in milliseconds
         start_position_ms: Option<u64>, // Start playback at this offset
+        loop_mode: bool, // Loop playback continuously
+        crossfade_ms: u32, // Crossfade duration at loop boundaries (0 = disabled)
     },
     StopAll,
     VoiceStop {
@@ -305,6 +310,8 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 channel_map: play_msg.channel_map,
                 fade_in: play_msg.fade_in,
                 start_position_ms: play_msg.start_position_ms,
+                loop_mode: play_msg.loop_mode.unwrap_or(false),
+                crossfade_ms: play_msg.crossfade_ms.unwrap_or(0),
             })
         }
         "stopall" | "soundStopAll" => {
@@ -1003,7 +1010,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, id, voice, volume, fade_in, start_position_ms, channel_map } => {
+            AudioCommand::Play { file, id, voice, volume, fade_in, start_position_ms, channel_map, .. } => {
                 assert_eq!(file, "background.mp3");
                 assert_eq!(id, Some("background-music".to_string()));
                 assert_eq!(voice, Some("music".to_string()));
@@ -1038,6 +1045,88 @@ mod tests {
         match cmd {
             AudioCommand::Play { start_position_ms, .. } => {
                 assert_eq!(start_position_ms, None);
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_with_loop_true() {
+        let json = r#"{"command": "play", "message": {"file": "ambient.mp3", "loop": true}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, loop_mode, .. } => {
+                assert_eq!(file, "ambient.mp3");
+                assert!(loop_mode);
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_with_loop_false() {
+        let json = r#"{"command": "play", "message": {"file": "effect.wav", "loop": false}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, loop_mode, .. } => {
+                assert_eq!(file, "effect.wav");
+                assert!(!loop_mode);
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_without_loop() {
+        let json = r#"{"command": "play", "message": {"file": "test.wav"}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { loop_mode, .. } => {
+                assert!(!loop_mode); // Defaults to false
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_with_crossfade() {
+        let json = r#"{"command": "play", "message": {"file": "ambient.mp3", "loop": true, "crossfade_ms": 100}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, loop_mode, crossfade_ms, .. } => {
+                assert_eq!(file, "ambient.mp3");
+                assert!(loop_mode);
+                assert_eq!(crossfade_ms, 100);
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_without_crossfade() {
+        let json = r#"{"command": "play", "message": {"file": "test.wav", "loop": true}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { crossfade_ms, .. } => {
+                assert_eq!(crossfade_ms, 0); // Defaults to 0 (disabled)
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_crossfade_zero() {
+        let json = r#"{"command": "play", "message": {"file": "test.wav", "loop": true, "crossfade_ms": 0}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { crossfade_ms, .. } => {
+                assert_eq!(crossfade_ms, 0);
             }
             _ => panic!("Expected Play command"),
         }

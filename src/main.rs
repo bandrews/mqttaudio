@@ -529,7 +529,7 @@ async fn main() {
                     tracing::info!("Processing command: {:?}", cmd);
 
                     match cmd {
-                        mqtt::commands::AudioCommand::Play { file, id, volume, voice, channel_map, fade_in, start_position_ms } => {
+                        mqtt::commands::AudioCommand::Play { file, id, volume, voice, channel_map, fade_in, start_position_ms, loop_mode, crossfade_ms } => {
                             // Load file (with caching)
                             let mut cache_mgr = cache_manager.lock().unwrap();
                             let buffer_result = cache_mgr.get_or_load(&file, output_sample_rate).await;
@@ -546,12 +546,14 @@ async fn main() {
                                     });
 
                                     tracing::info!(
-                                        "Loaded {}: {} channels, {} frames ({:.2}s) [voice: {}]",
+                                        "Loaded {}: {} channels, {} frames ({:.2}s) [voice: {}{}{}]",
                                         file,
                                         buffer.channels,
                                         buffer.frames,
                                         buffer.frames as f32 / buffer.sample_rate as f32,
-                                        voice_id
+                                        voice_id,
+                                        if loop_mode { ", looping" } else { "" },
+                                        if crossfade_ms > 0 { format!(", crossfade {}ms", crossfade_ms) } else { String::new() }
                                     );
 
                                     // Get sample ID and voice volume from voice manager
@@ -559,6 +561,9 @@ async fn main() {
                                     let sample_id = voice_mgr.add_sample_to_voice(&voice_id);
                                     let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
                                     drop(voice_mgr);
+
+                                    // Convert crossfade_ms to samples
+                                    let crossfade_samples = (crossfade_ms as usize * output_sample_rate as usize) / 1000;
 
                                     // Convert channel_map to mixer format
                                     let mut sample = if let Some(map) = channel_map {
@@ -576,6 +581,8 @@ async fn main() {
                                             mapping,
                                             file.clone(),
                                             id.clone(),
+                                            loop_mode,
+                                            crossfade_samples,
                                         )
                                     } else {
                                         // Default channel mapping (1:1)
@@ -587,6 +594,8 @@ async fn main() {
                                             voice_volume,
                                             file.clone(),
                                             id.clone(),
+                                            loop_mode,
+                                            crossfade_samples,
                                         )
                                     };
 
