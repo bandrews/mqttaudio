@@ -29,12 +29,12 @@ To control, send a valid JSON message to the topic specified:
 
     {"command": "precache", "message": {"file": "http://example.com/loadme.wav"}}
 
-    {"command": "seek", "message": {"channel": 0, "position": 5000}}
+    {"command": "seek", "message": {"file": "http://example.com/audio.wav", "position": 5000}}
 
 File paths can be local or remote.
 All times and positions in milliseconds.
 
-The `seek` command allows you to jump to a specific position within a currently playing sample. The `channel` parameter specifies which audio channel to seek (channels are assigned automatically when playing samples, starting from 0). The `position` parameter is the target position in milliseconds from the beginning of the sample.
+The `seek` command allows you to jump to a specific position within a currently playing sample. The `file` parameter must match the file path used in the original `play` command. The `position` parameter is the target position in milliseconds from the beginning of the sample.
 
 Supported formats: WAV, OGG.  MP3 and MOD may work but are untested
 

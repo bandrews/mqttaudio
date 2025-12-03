@@ -31,6 +31,7 @@ using namespace rapidjson;
 
 // Structure to track playback information for each channel
 struct ChannelPlaybackInfo {
+    std::string file;  // Original file path used to start playback
     Sample* sample;
     float volume;
     bool loop;
@@ -167,6 +168,7 @@ int playSample(const char *file, bool loop, float volume, bool exclusive, bool i
 
             // Track channel playback info for seek support
             ChannelPlaybackInfo info;
+            info.file = file;
             info.sample = sample;
             info.volume = volume;
             info.loop = loop;
@@ -181,6 +183,20 @@ int playSample(const char *file, bool loop, float volume, bool exclusive, bool i
         printf("Error - could not load requested sample '%s'\n", file);
         return -1;
     }
+}
+
+// Find a channel that is currently playing the specified file
+// Returns -1 if no channel is playing that file
+int findChannelByFile(const char *file)
+{
+    for (const auto &entry : channelInfo)
+    {
+        if (entry.second.file == file && Mix_Playing(entry.first))
+        {
+            return entry.first;
+        }
+    }
+    return -1;
 }
 
 bool seekChannel(int channel, int positionMs)
@@ -394,16 +410,16 @@ bool processCommand(Document &d)
     }
     else if (0 == strcasecmp(command, "soundSeek") || 0 == strcasecmp(command, "seek"))
     {
-        // Seek command requires a message object with channel and position
+        // Seek command requires a message object with file and position
         if (!d.HasMember("message") || !d["message"].IsObject())
         {
             fprintf(stderr, "Seek: Message does not have a 'message' property that is an object.\n");
             return false;
         }
 
-        if (!d["message"].HasMember("channel") || !d["message"]["channel"].IsInt())
+        if (!d["message"].HasMember("file") || !d["message"]["file"].IsString())
         {
-            fprintf(stderr, "Seek: Message does not have a 'message.channel' property that is an integer.\n");
+            fprintf(stderr, "Seek: Message does not have a 'message.file' property that is a string.\n");
             return false;
         }
 
@@ -413,12 +429,19 @@ bool processCommand(Document &d)
             return false;
         }
 
-        int channel = d["message"]["channel"].GetInt();
+        const char *file = d["message"]["file"].GetString();
         int position = d["message"]["position"].GetInt();
 
         if (position < 0)
         {
             fprintf(stderr, "Seek: Position must be non-negative.\n");
+            return false;
+        }
+
+        int channel = findChannelByFile(file);
+        if (channel < 0)
+        {
+            fprintf(stderr, "Seek: No channel is currently playing file '%s'.\n", file);
             return false;
         }
 
