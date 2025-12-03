@@ -1,44 +1,48 @@
-Extend speed range and add reverse playback support
+Rewrite documentation with clean structure and landing page
 
-The playback speed constraints were somewhat arbitrary and users wanted
-more flexibility. This change:
+Complete documentation rewrite for better organization and accessibility:
 
-Without pitch correction:
-- Extended speed range from 0.1-4.0 to 0.01-100.0
-- Added reverse playback via negative speed values (e.g., -1.0 = normal
-  speed backwards, -2.0 = double speed backwards)
-- Interpolation works correctly in both directions
+New Structure:
+- README.md: Concise landing page with quick start guide
+- docs/getting-started.md: Installation and first steps
+- docs/commands.md: Complete command reference
+- docs/configuration.md: Config file and CLI options
+- docs/troubleshooting.md: Common issues and solutions
+- docs/architecture.md: System internals for developers
+- docs/features/: Feature-specific guides
+  - channel-routing.md
+  - voice-management.md
+  - ducking.md
+  - bass-management.md
+  - microphone-input.md
+  - playback-control.md
+  - caching.md
 
-With pitch correction (time-stretching):
-- Extended speed range from 0.1-4.0 to 0.05-8.0
-- Negative speeds are rejected (time-stretching algorithms don't support
-  reverse natively, would require pre-reversing the buffer)
-- set_speed() now returns bool indicating if the speed was applied
+Improvements:
+- README now serves as a quick entry point, not a comprehensive manual
+- Documentation organized by topic with clear navigation
+- Feature guides provide focused, in-depth coverage
+- Consistent formatting with examples and tables
+- Troubleshooting guide for common problems
+- Architecture doc for contributors
 
-The signalsmith-stretch library recommends 0.75-1.5x for best quality,
-but the wider range lets users choose audio quality vs speed trade-offs.
+Accuracy fixes (removed unimplemented features from docs):
+- Removed global `fadeout` command (only `voice_fade_out` exists)
+- Removed `max_play_length` parameter (not yet implemented)
+- Removed legacy command aliases section
+- Fixed cache directory default to ~/.mqttaudio/cache
+- Removed non-existent CLI options (--buffer-size, --cache-dir)
+- Removed `max_memory_mb` config option (not yet implemented)
+- Note: `loop` parameter documented but not yet implemented
 
-Added comprehensive tests for:
-- Reverse playback at various speeds (1x, 2x, 0.5x)
-- Reverse playback reaching start of buffer (is_finished check)
-- Switching between forward and reverse mid-playback
-- Pitch correction rejecting negative speeds
-- Updated clamping bounds for both code paths
+Previous documentation preserved in README-old.md and docs-old/
 
-Updated README documentation with new speed ranges and reverse playback
-information.
-
-Added `set_speed_with_mode()` method to ActiveSample that handles the
-correct order of operations (change pitch correction mode before setting
-speed). This prevents bugs where switching from pitch-corrected to
-negative speed would fail on the first attempt. The command handler now
-uses this method, and it's properly tested.
+---
 
 Prompts:
-- Evaluate speed constraints for technical vs arbitrary limits
-- Implement wider speed ranges
-- Add reverse playback (negative speeds) for non-pitch-corrected path
-- Update tests and documentation
+- Rewrite the documentation with clean README landing page, organized
+  docs folder, and hyperlinked feature guides
+- Review Rust code and fix documentation accuracy issues
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
 
