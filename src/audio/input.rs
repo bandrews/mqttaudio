@@ -16,7 +16,38 @@ pub fn list_input_devices() {
                 if let Ok(name) = device.name() {
                     println!("  {}. {}", i, name);
 
-                    if let Ok(config) = device.default_input_config() {
+                    // Query all supported configs to find max channels
+                    if let Ok(configs) = device.supported_input_configs() {
+                        let mut max_channels = 0u16;
+                        let mut sample_rates: Vec<(u32, u32)> = Vec::new();
+
+                        for config in configs {
+                            max_channels = max_channels.max(config.channels());
+                            let min_rate = config.min_sample_rate().0;
+                            let max_rate = config.max_sample_rate().0;
+                            // Collect unique sample rate ranges
+                            if !sample_rates.iter().any(|(min, max)| *min == min_rate && *max == max_rate) {
+                                sample_rates.push((min_rate, max_rate));
+                            }
+                        }
+
+                        if max_channels > 0 {
+                            // Show sample rate range(s)
+                            if sample_rates.len() == 1 {
+                                let (min, max) = sample_rates[0];
+                                if min == max {
+                                    println!("     Sample rate: {} Hz", min);
+                                } else {
+                                    println!("     Sample rate: {}-{} Hz", min, max);
+                                }
+                            } else {
+                                // Multiple ranges, just show common rates
+                                println!("     Sample rates: (multiple configurations)");
+                            }
+                            println!("     Max channels: {}", max_channels);
+                        }
+                    } else if let Ok(config) = device.default_input_config() {
+                        // Fallback to default config if supported_input_configs fails
                         println!("     Sample rate: {} Hz", config.sample_rate().0);
                         println!("     Channels: {}", config.channels());
                     }

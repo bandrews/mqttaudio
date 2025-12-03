@@ -8,7 +8,7 @@ mod mqtt;
 mod voice;
 
 use clap::Parser;
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, StreamTrait};
 use tokio::sync::mpsc;
 use tracing_subscriber;
 
@@ -40,6 +40,10 @@ struct Args {
     /// Sample rate (Hz)
     #[arg(short = 'r', long)]
     sample_rate: Option<u32>,
+
+    /// Number of output channels (use max available if not specified)
+    #[arg(short = 'n', long)]
+    channels: Option<usize>,
 
     /// Enable verbose logging
     #[arg(short, long)]
@@ -94,6 +98,7 @@ async fn main() {
         args.topic.clone(),
         args.device.clone(),
         args.sample_rate,
+        args.channels,
         args.verbose,
         args.lfe_channel,
         args.crossover_frequency,
@@ -257,16 +262,19 @@ async fn main() {
     };
 
     // Set up audio device
-    let host = cpal::default_host();
-    let device = match host.default_output_device() {
-        Some(d) => d,
-        None => {
-            tracing::error!("No default output device available");
+    let device = match audio::engine::find_output_device(config.audio.device.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Failed to find output device: {}", e);
             std::process::exit(1);
         }
     };
 
-    let device_config = match device.default_output_config() {
+    let stream_config = match audio::engine::find_output_config(
+        &device,
+        config.audio.channels,
+        Some(config.audio.sample_rate),
+    ) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!("Failed to get device config: {}", e);
@@ -274,8 +282,8 @@ async fn main() {
         }
     };
 
-    let output_sample_rate = device_config.sample_rate().0;
-    let output_channels = device_config.channels() as usize;
+    let output_sample_rate = stream_config.sample_rate.0;
+    let output_channels = stream_config.channels as usize;
 
     tracing::info!("Audio device: {}", device.name().unwrap_or_else(|_| "Unknown".to_string()));
     tracing::info!("  Sample rate: {} Hz", output_sample_rate);
@@ -404,7 +412,7 @@ async fn main() {
 
     // Start audio stream
     let stream = device.build_output_stream(
-        &device_config.into(),
+        &stream_config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let mut state = mixer_state_clone.lock().unwrap();
                 audio::mixer::mix_audio(data, &mut state);

@@ -34,6 +34,7 @@ impl Default for MqttConfig {
 pub struct AudioConfig {
     pub device: Option<String>,
     pub sample_rate: u32,
+    pub channels: Option<usize>,
     pub buffer_size: u32,
     #[serde(default)]
     pub channel_names: HashMap<String, String>,
@@ -46,6 +47,7 @@ impl Default for AudioConfig {
         Self {
             device: None,
             sample_rate: 48000,
+            channels: None,
             buffer_size: 512,
             channel_names: HashMap::new(),
             channel_volumes: HashMap::new(),
@@ -278,6 +280,7 @@ impl Config {
         topic: Option<String>,
         device: Option<String>,
         sample_rate: Option<u32>,
+        channels: Option<usize>,
         verbose: bool,
         lfe_channel: Option<usize>,
         crossover_frequency: Option<f32>,
@@ -299,6 +302,9 @@ impl Config {
         }
         if let Some(sr) = sample_rate {
             self.audio.sample_rate = sr;
+        }
+        if let Some(ch) = channels {
+            self.audio.channels = Some(ch);
         }
 
         // Override logging settings
@@ -639,6 +645,7 @@ mod tests {
             None,
             None,
             None,
+            None, // channels
             false,
             None,
             None,
@@ -657,6 +664,7 @@ mod tests {
             Some("newtopic".to_string()),
             Some("newdevice".to_string()),
             Some(96000),
+            Some(8), // channels
             true,
             Some(5),
             Some(120.0),
@@ -667,6 +675,7 @@ mod tests {
         assert_eq!(config.mqtt.topic, Some("newtopic".to_string()));
         assert_eq!(config.audio.device, Some("newdevice".to_string()));
         assert_eq!(config.audio.sample_rate, 96000);
+        assert_eq!(config.audio.channels, Some(8));
         assert_eq!(config.logging.verbose, true);
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.bass_management.lfe_channel, 5);
@@ -686,6 +695,7 @@ mod tests {
             None,  // Don't override topic
             None,
             None,
+            None, // channels
             false,
             None,
             None,
@@ -702,7 +712,7 @@ mod tests {
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.verbose, false);
 
-        config.merge_cli_args(None, None, None, None, None, true, None, None);
+        config.merge_cli_args(None, None, None, None, None, None, true, None, None);
 
         assert_eq!(config.logging.verbose, true);
         assert_eq!(config.logging.level, "debug");

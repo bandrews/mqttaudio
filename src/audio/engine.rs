@@ -20,7 +20,38 @@ pub fn list_devices() {
                 if let Ok(name) = device.name() {
                     println!("  {}. {}", i, name);
 
-                    if let Ok(config) = device.default_output_config() {
+                    // Query all supported configs to find max channels
+                    if let Ok(configs) = device.supported_output_configs() {
+                        let mut max_channels = 0u16;
+                        let mut sample_rates: Vec<(u32, u32)> = Vec::new();
+
+                        for config in configs {
+                            max_channels = max_channels.max(config.channels());
+                            let min_rate = config.min_sample_rate().0;
+                            let max_rate = config.max_sample_rate().0;
+                            // Collect unique sample rate ranges
+                            if !sample_rates.iter().any(|(min, max)| *min == min_rate && *max == max_rate) {
+                                sample_rates.push((min_rate, max_rate));
+                            }
+                        }
+
+                        if max_channels > 0 {
+                            // Show sample rate range(s)
+                            if sample_rates.len() == 1 {
+                                let (min, max) = sample_rates[0];
+                                if min == max {
+                                    println!("     Sample rate: {} Hz", min);
+                                } else {
+                                    println!("     Sample rate: {}-{} Hz", min, max);
+                                }
+                            } else {
+                                // Multiple ranges, just show common rates
+                                println!("     Sample rates: (multiple configurations)");
+                            }
+                            println!("     Max channels: {}", max_channels);
+                        }
+                    } else if let Ok(config) = device.default_output_config() {
+                        // Fallback to default config if supported_output_configs fails
                         println!("     Sample rate: {} Hz", config.sample_rate().0);
                         println!("     Channels: {}", config.channels());
                     }
@@ -44,6 +75,116 @@ pub fn get_default_device_config() -> Result<DeviceConfig, Box<dyn std::error::E
         channels: config.channels() as usize,
         buffer_size: 512, // Default buffer size
     })
+}
+
+/// Find an output device by name (returns default if name is None)
+pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn std::error::Error>> {
+    let host = cpal::default_host();
+
+    match name {
+        Some(device_name) => {
+            let devices = host.output_devices()?;
+            for device in devices {
+                if let Ok(n) = device.name() {
+                    if n == device_name {
+                        return Ok(device);
+                    }
+                }
+            }
+            Err(format!("Output device not found: {}", device_name).into())
+        }
+        None => {
+            host.default_output_device()
+                .ok_or_else(|| "No default output device available".into())
+        }
+    }
+}
+
+/// Find a stream config for the device with the requested channel count
+/// If requested_channels is None, uses the maximum available
+/// If requested_sample_rate is None, uses the device's preferred sample rate
+pub fn find_output_config(
+    device: &cpal::Device,
+    requested_channels: Option<usize>,
+    requested_sample_rate: Option<u32>,
+) -> Result<cpal::StreamConfig, Box<dyn std::error::Error>> {
+    use cpal::SampleRate;
+
+    // Get all supported configs
+    let supported_configs: Vec<_> = device.supported_output_configs()?.collect();
+
+    if supported_configs.is_empty() {
+        return Err("No supported output configurations found".into());
+    }
+
+    // Determine target channels
+    let target_channels = match requested_channels {
+        Some(ch) => ch as u16,
+        None => {
+            // Find maximum available channels
+            supported_configs.iter()
+                .map(|c| c.channels())
+                .max()
+                .unwrap_or(2)
+        }
+    };
+
+    // Find configs that match the requested channel count
+    let matching_configs: Vec<_> = supported_configs.iter()
+        .filter(|c| c.channels() == target_channels)
+        .collect();
+
+    if matching_configs.is_empty() {
+        // No exact match - list available channel counts
+        let available: Vec<_> = supported_configs.iter()
+            .map(|c| c.channels())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        return Err(format!(
+            "No configuration found for {} channels. Available: {:?}",
+            target_channels, available
+        ).into());
+    }
+
+    // Determine target sample rate
+    let target_sample_rate = requested_sample_rate.unwrap_or_else(|| {
+        // Use the default config's sample rate if possible, otherwise pick a common rate
+        device.default_output_config()
+            .map(|c| c.sample_rate().0)
+            .unwrap_or(48000)
+    });
+
+    // Find the best matching config for sample rate
+    let best_config = matching_configs.iter()
+        .filter(|c| {
+            let min = c.min_sample_rate().0;
+            let max = c.max_sample_rate().0;
+            target_sample_rate >= min && target_sample_rate <= max
+        })
+        .next();
+
+    match best_config {
+        Some(config_range) => {
+            let config = config_range.with_sample_rate(SampleRate(target_sample_rate));
+            Ok(cpal::StreamConfig {
+                channels: config.channels(),
+                sample_rate: config.sample_rate(),
+                buffer_size: cpal::BufferSize::Default,
+            })
+        }
+        None => {
+            // Sample rate not directly supported - use any config and let cpal handle it
+            let config_range = matching_configs[0];
+            let sample_rate = config_range.max_sample_rate().0.min(target_sample_rate.max(config_range.min_sample_rate().0));
+            let config = config_range.with_sample_rate(SampleRate(sample_rate));
+            Ok(cpal::StreamConfig {
+                channels: config.channels(),
+                sample_rate: config.sample_rate(),
+                buffer_size: cpal::BufferSize::Default,
+            })
+        }
+    }
 }
 
 /// Initialize audio output stream with a test sine wave
