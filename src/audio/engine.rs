@@ -25,10 +25,19 @@ pub fn list_devices() {
                         let mut max_channels = 0u16;
                         let mut sample_rates: Vec<(u32, u32)> = Vec::new();
 
+                        // Filter configs: ignore those with absurd sample rates
+                        // (ALSA plugins report 4294967295 Hz which is clearly fake)
+                        const MAX_REASONABLE_SAMPLE_RATE: u32 = 384000;
+
                         for config in configs {
+                            let max_rate = config.max_sample_rate().0;
+                            // Skip configs from ALSA plugins that claim unrealistic capabilities
+                            if max_rate > MAX_REASONABLE_SAMPLE_RATE {
+                                continue;
+                            }
+
                             max_channels = max_channels.max(config.channels());
                             let min_rate = config.min_sample_rate().0;
-                            let max_rate = config.max_sample_rate().0;
                             // Collect unique sample rate ranges
                             if !sample_rates.iter().any(|(min, max)| *min == min_rate && *max == max_rate) {
                                 sample_rates.push((min_rate, max_rate));
@@ -44,11 +53,16 @@ pub fn list_devices() {
                                 } else {
                                     println!("     Sample rate: {}-{} Hz", min, max);
                                 }
-                            } else {
+                            } else if !sample_rates.is_empty() {
                                 // Multiple ranges, just show common rates
                                 println!("     Sample rates: (multiple configurations)");
                             }
                             println!("     Max channels: {}", max_channels);
+                        } else if let Ok(config) = device.default_output_config() {
+                            // All configs were filtered out - fall back to default
+                            // This happens with ALSA plugin devices
+                            println!("     Sample rate: {} Hz (plugin)", config.sample_rate().0);
+                            println!("     Channels: {} (plugin)", config.channels());
                         }
                     } else if let Ok(config) = device.default_output_config() {
                         // Fallback to default config if supported_output_configs fails
