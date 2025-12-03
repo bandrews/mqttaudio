@@ -9,6 +9,9 @@ mqttaudio is a high-performance, real-time audio engine that receives commands o
 - **Polyphonic Mixing**: Play multiple audio files simultaneously
 - **Multichannel Routing**: Route audio to specific output channels (supports up to 16+ channels)
 - **Voice Grouping**: Group sounds together for coordinated control
+- **Sample Targeting**: Control individual sounds by ID, filename, or voice (seek, speed, stop, volume)
+- **Variable Speed Playback**: Change playback speed with linear interpolation (0.1x to 4.0x)
+- **Seek Control**: Jump to any position in a playing sample
 - **Audio Ducking**: Automatically reduce background audio when foreground voices play
 - **Bass Management**: Route low frequencies to subwoofer (LFE) channel with configurable crossover
 - **Microphone Input**: Mix live audio inputs with matrix routing to output channels
@@ -848,6 +851,7 @@ All commands are JSON objects sent to the configured MQTT topic.
   "command": "play",
   "message": {
     "file": "http://example.com/audio.wav",
+    "id": "background-track-1",
     "voice": "effects",
     "channel_map": [
       {"src": 0, "dest": 2},
@@ -856,6 +860,7 @@ All commands are JSON objects sent to the configured MQTT topic.
     "volume": 0.8,
     "loop": false,
     "fade_in": 1000,
+    "start_position_ms": 30000,
     "max_play_length": 30000
   }
 }
@@ -863,12 +868,72 @@ All commands are JSON objects sent to the configured MQTT topic.
 
 **Parameters:**
 - `file` (required): URL (http/https) or local file path
+- `id` (optional): Unique identifier for this playback instance (for later targeting with seek/speed/stop/volume commands)
 - `voice` (optional): Voice name for grouping
 - `channel_map` (optional): Array of `{"src": N, "dest": M}` channel routes
 - `volume` (optional): 0.0 to 1.0, default 1.0
 - `loop` (optional): Loop playback, default false
 - `fade_in` (optional): Fade in duration in milliseconds
+- `start_position_ms` (optional): Start playback at this offset in milliseconds
 - `max_play_length` (optional): Maximum playback duration in milliseconds
+
+### Sample Targeting Commands
+
+These commands let you control specific playing samples by id, file, or voice.
+
+**Seek to position:**
+```json
+{
+  "command": "seek",
+  "message": {
+    "id": "background-track-1",
+    "position_ms": 60000
+  }
+}
+```
+
+**Change playback speed:**
+```json
+{
+  "command": "speed",
+  "message": {
+    "id": "background-track-1",
+    "speed": 1.5,
+    "pitch_correction": false
+  }
+}
+```
+
+Speed range: 0.1 to 4.0. When `pitch_correction` is false (default), faster playback = higher pitch.
+
+**Stop specific samples:**
+```json
+{
+  "command": "stop",
+  "message": {
+    "file": "music.mp3",
+    "fade_out_ms": 500
+  }
+}
+```
+
+**Adjust sample volume:**
+```json
+{
+  "command": "volume",
+  "message": {
+    "voice": "effects",
+    "volume": 0.3
+  }
+}
+```
+
+**Targeting options** (use any combination):
+- `id`: Target specific sample by its user-provided ID
+- `file`: Target all samples playing this file
+- `voice`: Target all samples in this voice
+
+Multiple selectors use OR logic (matches if ANY selector matches).
 
 ### Stop All Audio
 

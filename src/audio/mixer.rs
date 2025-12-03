@@ -87,17 +87,26 @@ impl FadeState {
 
 /// Active sample being played
 pub struct ActiveSample {
-    /// Unique sample ID
+    /// Unique internal sample ID (assigned by VoiceManager)
     pub id: u64,
+
+    /// User-provided sample identifier for targeting commands
+    pub sample_id: Option<String>,
 
     /// Voice ID this sample belongs to
     pub voice_id: String,
 
+    /// Source file path (for targeting by filename)
+    pub file_path: String,
+
     /// Pre-decoded audio buffer (shared, immutable)
     pub buffer: Arc<DecodedBuffer>,
 
-    /// Current playback position (in frames)
+    /// Current playback position (in frames, integer part)
     pub position: usize,
+
+    /// Fractional part of playback position for sub-sample interpolation
+    fractional_position: f64,
 
     /// Per-sample volume (0.0 - 1.0)
     pub volume: f32,
@@ -110,11 +119,21 @@ pub struct ActiveSample {
 
     /// Fade state (in/out/none)
     pub fade_state: FadeState,
+
+    /// Playback speed multiplier (1.0 = normal, 2.0 = double speed, 0.5 = half speed)
+    pub speed: f32,
 }
 
 impl ActiveSample {
     /// Create a new active sample with default stereo mapping
-    pub fn new(id: u64, voice_id: String, buffer: Arc<DecodedBuffer>, volume: f32, voice_volume: f32) -> Self {
+    pub fn new(
+        id: u64,
+        voice_id: String,
+        buffer: Arc<DecodedBuffer>,
+        volume: f32,
+        voice_volume: f32,
+        file_path: String,
+    ) -> Self {
         // Default channel mapping: 1:1 for available channels
         let channel_map = (0..buffer.channels)
             .map(|ch| (ch, ch))
@@ -122,13 +141,48 @@ impl ActiveSample {
 
         Self {
             id,
+            sample_id: None,
             voice_id,
+            file_path,
             buffer,
             position: 0,
+            fractional_position: 0.0,
             volume,
             voice_volume,
             channel_map,
             fade_state: FadeState::None,
+            speed: 1.0,
+        }
+    }
+
+    /// Create a new active sample with user-provided sample ID
+    pub fn new_with_id(
+        id: u64,
+        voice_id: String,
+        buffer: Arc<DecodedBuffer>,
+        volume: f32,
+        voice_volume: f32,
+        file_path: String,
+        sample_id: Option<String>,
+    ) -> Self {
+        // Default channel mapping: 1:1 for available channels
+        let channel_map = (0..buffer.channels)
+            .map(|ch| (ch, ch))
+            .collect();
+
+        Self {
+            id,
+            sample_id,
+            voice_id,
+            file_path,
+            buffer,
+            position: 0,
+            fractional_position: 0.0,
+            volume,
+            voice_volume,
+            channel_map,
+            fade_state: FadeState::None,
+            speed: 1.0,
         }
     }
 
@@ -140,22 +194,33 @@ impl ActiveSample {
         volume: f32,
         voice_volume: f32,
         channel_map: Vec<(usize, usize)>,
+        file_path: String,
+        sample_id: Option<String>,
     ) -> Self {
         Self {
             id,
+            sample_id,
             voice_id,
+            file_path,
             buffer,
             position: 0,
+            fractional_position: 0.0,
             volume,
             voice_volume,
             channel_map,
             fade_state: FadeState::None,
+            speed: 1.0,
         }
     }
 
     /// Set the fade state for this sample
     pub fn set_fade(&mut self, fade_state: FadeState) {
         self.fade_state = fade_state;
+    }
+
+    /// Set the playback speed (clamped to 0.1 - 4.0)
+    pub fn set_speed(&mut self, speed: f32) {
+        self.speed = speed.clamp(0.1, 4.0);
     }
 
     /// Check if this sample has finished playing
@@ -176,6 +241,25 @@ impl ActiveSample {
     /// Get the combined volume (sample volume * voice volume)
     pub fn combined_volume(&self) -> f32 {
         self.volume * self.voice_volume
+    }
+
+    /// Advance the playback position by the given number of output frames,
+    /// accounting for playback speed. Returns the effective number of source
+    /// frames consumed.
+    fn advance_position(&mut self, output_frames: usize) -> usize {
+        let advance = output_frames as f64 * self.speed as f64;
+        let new_pos = self.position as f64 + self.fractional_position + advance;
+
+        self.position = new_pos as usize;
+        self.fractional_position = new_pos.fract();
+
+        // Return effective frames consumed
+        advance.ceil() as usize
+    }
+
+    /// Get the current precise position as a float for interpolation
+    fn precise_position(&self) -> f64 {
+        self.position as f64 + self.fractional_position
     }
 }
 
@@ -280,8 +364,8 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
 
         mix_sample_into_output(sample, output, frames, state.output_channels, ducking_multiplier);
 
-        // Advance playback position
-        sample.position += frames;
+        // Advance playback position (accounting for speed)
+        sample.advance_position(frames);
     }
 
     // Mix each live input into the output
@@ -307,7 +391,7 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
     }
 }
 
-/// Mix a single sample into the output buffer
+/// Mix a single sample into the output buffer with linear interpolation for speed control
 fn mix_sample_into_output(
     sample: &mut ActiveSample,
     output: &mut [f32],
@@ -316,18 +400,25 @@ fn mix_sample_into_output(
     ducking_multiplier: f32,
 ) {
     let base_volume = sample.combined_volume();
+    let speed = sample.speed as f64;
+
+    // Calculate current precise position (integer + fractional parts)
+    let mut src_pos = sample.precise_position();
 
     for frame_idx in 0..frames {
-        let src_position = sample.position + frame_idx;
+        let src_frame = src_pos as usize;
 
         // Check if we've reached the end of the sample
-        if src_position >= sample.buffer.frames {
+        if src_frame >= sample.buffer.frames {
             break;
         }
 
         // Calculate fade multiplier for this frame
         let fade_multiplier = sample.fade_state.multiplier();
         let final_volume = base_volume * fade_multiplier * ducking_multiplier;
+
+        // Calculate fractional part for interpolation
+        let frac = (src_pos - src_frame as f64) as f32;
 
         // Apply channel mapping and mix into output
         for &(src_ch, dest_ch) in &sample.channel_map {
@@ -336,15 +427,30 @@ fn mix_sample_into_output(
                 continue;
             }
 
-            let src_idx = src_position * sample.buffer.channels + src_ch;
+            let src_idx = src_frame * sample.buffer.channels + src_ch;
             let dest_idx = frame_idx * output_channels + dest_ch;
 
+            // Get current sample value
+            let sample_val = sample.buffer.data[src_idx];
+
+            // Interpolate with next sample if available and speed != 1.0
+            let interpolated_val = if frac > 0.0 && src_frame + 1 < sample.buffer.frames {
+                let next_idx = (src_frame + 1) * sample.buffer.channels + src_ch;
+                let next_val = sample.buffer.data[next_idx];
+                sample_val * (1.0 - frac) + next_val * frac
+            } else {
+                sample_val
+            };
+
             // Mix with combined volume and fade applied
-            output[dest_idx] += sample.buffer.data[src_idx] * final_volume;
+            output[dest_idx] += interpolated_val * final_volume;
         }
 
         // Advance fade state
         sample.fade_state.advance();
+
+        // Advance source position by speed
+        src_pos += speed;
     }
 }
 
@@ -401,10 +507,12 @@ mod tests {
         Arc::new(DecodedBuffer::new(data, channels, 48000))
     }
 
+    const TEST_FILE: &str = "test.wav";
+
     #[test]
     fn test_single_sample_mixing() {
         let buffer = create_test_buffer(10, 2, 0.5);
-        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0);
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -423,8 +531,8 @@ mod tests {
         let buffer1 = create_test_buffer(10, 2, 0.3);
         let buffer2 = create_test_buffer(10, 2, 0.4);
 
-        let sample1 = ActiveSample::new(1, "test".to_string(), buffer1, 1.0, 1.0);
-        let sample2 = ActiveSample::new(2, "test".to_string(), buffer2, 1.0, 1.0);
+        let sample1 = ActiveSample::new(1, "test".to_string(), buffer1, 1.0, 1.0, TEST_FILE.to_string());
+        let sample2 = ActiveSample::new(2, "test".to_string(), buffer2, 1.0, 1.0, TEST_FILE.to_string());
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample1);
@@ -442,7 +550,7 @@ mod tests {
     #[test]
     fn test_volume_control() {
         let buffer = create_test_buffer(10, 2, 1.0);
-        let sample = ActiveSample::new(1, "test".to_string(), buffer, 0.5, 1.0); // 50% sample volume
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 0.5, 1.0, TEST_FILE.to_string()); // 50% sample volume
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -459,7 +567,7 @@ mod tests {
     #[test]
     fn test_voice_volume() {
         let buffer = create_test_buffer(10, 2, 1.0);
-        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 0.5); // 50% voice volume
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 0.5, TEST_FILE.to_string()); // 50% voice volume
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -476,7 +584,7 @@ mod tests {
     #[test]
     fn test_combined_volume() {
         let buffer = create_test_buffer(10, 2, 1.0);
-        let sample = ActiveSample::new(1, "test".to_string(), buffer, 0.5, 0.4); // 50% sample * 40% voice
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 0.5, 0.4, TEST_FILE.to_string()); // 50% sample * 40% voice
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -495,8 +603,8 @@ mod tests {
         let buffer1 = create_test_buffer(10, 2, 0.8);
         let buffer2 = create_test_buffer(10, 2, 0.8);
 
-        let sample1 = ActiveSample::new(1, "test".to_string(), buffer1, 1.0, 1.0);
-        let sample2 = ActiveSample::new(2, "test".to_string(), buffer2, 1.0, 1.0);
+        let sample1 = ActiveSample::new(1, "test".to_string(), buffer1, 1.0, 1.0, TEST_FILE.to_string());
+        let sample2 = ActiveSample::new(2, "test".to_string(), buffer2, 1.0, 1.0, TEST_FILE.to_string());
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample1);
@@ -519,7 +627,7 @@ mod tests {
 
         // Map: L→1, R→3 (4-channel output)
         let channel_map = vec![(0, 1), (1, 3)];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map);
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None);
 
         let mut state = MixerState::new(4);
         state.active_samples.push(sample);
@@ -543,7 +651,7 @@ mod tests {
     #[test]
     fn test_sample_completion() {
         let buffer = create_test_buffer(5, 2, 0.5);
-        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0);
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
 
         assert!(!sample.is_finished());
 
@@ -560,7 +668,7 @@ mod tests {
     #[test]
     fn test_partial_sample_playback() {
         let buffer = create_test_buffer(10, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
         sample.position = 8; // Start near the end
 
         let mut state = MixerState::new(2);
@@ -590,7 +698,7 @@ mod tests {
 
         // Route mono to channels 4 and 5
         let channel_map = vec![(0, 4), (0, 5)];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map);
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None);
 
         let mut state = MixerState::new(8);
         state.active_samples.push(sample);
@@ -632,7 +740,7 @@ mod tests {
             (2, 0), // Rear left → Left (mix)
             (3, 1), // Rear right → Right (mix)
         ];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map);
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None);
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -652,7 +760,7 @@ mod tests {
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
 
         let channel_map = vec![(0, 6), (1, 9)];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map);
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None);
 
         let mut state = MixerState::new(12);
         state.active_samples.push(sample);
@@ -685,7 +793,7 @@ mod tests {
             (1, 100), // Out of bounds (only 4 output channels)
             (99, 2),  // Invalid source
         ];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map);
+        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None);
 
         let mut state = MixerState::new(4);
         state.active_samples.push(sample);
@@ -780,7 +888,7 @@ mod tests {
     fn test_fade_in_mixing() {
         // Create a 10-frame buffer at 48kHz
         let buffer = create_test_buffer(10, 2, 1.0);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
 
         // Set 10-frame fade in (one frame per iteration)
         sample.set_fade(FadeState::In { elapsed: 0, duration: 10 });
@@ -813,7 +921,7 @@ mod tests {
     fn test_fade_out_mixing() {
         // Create a 10-frame buffer
         let buffer = create_test_buffer(10, 2, 1.0);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
 
         // Set 10-frame fade out
         sample.set_fade(FadeState::Out { elapsed: 0, duration: 10 });
@@ -845,7 +953,7 @@ mod tests {
     fn test_fade_out_completes_sample() {
         // Create a long buffer
         let buffer = create_test_buffer(100, 2, 1.0);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
 
         // Set short fade out
         sample.set_fade(FadeState::Out { elapsed: 0, duration: 5 });
@@ -997,7 +1105,7 @@ mod tests {
     fn test_live_input_mixed_with_samples() {
         // Create a sample and a live input, verify they mix together
         let buffer = create_test_buffer(10, 2, 0.3);
-        let sample = ActiveSample::new(1, "sfx".to_string(), buffer, 1.0, 1.0);
+        let sample = ActiveSample::new(1, "sfx".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
 
         let data = vec![0.4f32; 20]; // 10 stereo frames
         let consumer = create_test_ring_buffer_with_data(&data);
@@ -1071,6 +1179,297 @@ mod tests {
         for &s in &output {
             assert!((s - 0.5).abs() < 0.0001);
         }
+    }
+
+    // === Sample Identification Tests ===
+
+    #[test]
+    fn test_sample_stores_file_path() {
+        let buffer = create_test_buffer(10, 2, 0.5);
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            "/path/to/audio.wav".to_string(),
+        );
+
+        assert_eq!(sample.file_path, "/path/to/audio.wav");
+    }
+
+    #[test]
+    fn test_sample_with_user_id() {
+        let buffer = create_test_buffer(10, 2, 0.5);
+        let sample = ActiveSample::new_with_id(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            "/path/to/audio.wav".to_string(),
+            Some("my-sound-1".to_string()),
+        );
+
+        assert_eq!(sample.sample_id, Some("my-sound-1".to_string()));
+        assert_eq!(sample.file_path, "/path/to/audio.wav");
+    }
+
+    #[test]
+    fn test_sample_without_user_id() {
+        let buffer = create_test_buffer(10, 2, 0.5);
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            "/path/to/audio.wav".to_string(),
+        );
+
+        assert_eq!(sample.sample_id, None);
+    }
+
+    #[test]
+    fn test_sample_with_mapping_stores_file_path() {
+        let buffer = create_test_buffer(10, 2, 0.5);
+        let sample = ActiveSample::new_with_mapping(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            vec![(0, 0), (1, 1)],
+            "/path/to/audio.wav".to_string(),
+            None,
+        );
+
+        assert_eq!(sample.file_path, "/path/to/audio.wav");
+        assert_eq!(sample.sample_id, None);
+    }
+
+    #[test]
+    fn test_sample_with_mapping_and_id() {
+        let buffer = create_test_buffer(10, 2, 0.5);
+        let sample = ActiveSample::new_with_mapping(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            vec![(0, 2), (1, 3)],
+            "/path/to/surround.wav".to_string(),
+            Some("surround-effect".to_string()),
+        );
+
+        assert_eq!(sample.file_path, "/path/to/surround.wav");
+        assert_eq!(sample.sample_id, Some("surround-effect".to_string()));
+        assert_eq!(sample.channel_map, vec![(0, 2), (1, 3)]);
+    }
+
+    // === Seek Tests ===
+
+    #[test]
+    fn test_seek_to_position() {
+        // Create a buffer at 48000 Hz with 48000 frames (1 second)
+        let data = vec![0.5f32; 48000 * 2]; // 1 second stereo
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        // Initial position is 0
+        assert_eq!(sample.position, 0);
+
+        // Seek to 500ms (should be frame 24000)
+        let position_ms: u64 = 500;
+        let target_frame = ((position_ms * sample.buffer.sample_rate as u64) / 1000) as usize;
+        sample.position = target_frame;
+
+        assert_eq!(sample.position, 24000);
+    }
+
+    #[test]
+    fn test_seek_to_start() {
+        let data = vec![0.5f32; 48000 * 2];
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        // Advance position
+        sample.position = 10000;
+
+        // Seek to 0ms
+        let position_ms: u64 = 0;
+        let target_frame = ((position_ms * sample.buffer.sample_rate as u64) / 1000) as usize;
+        sample.position = target_frame;
+
+        assert_eq!(sample.position, 0);
+    }
+
+    #[test]
+    fn test_seek_clamps_to_buffer_end() {
+        let data = vec![0.5f32; 48000 * 2]; // 1 second stereo at 48kHz
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+
+        // Try to seek to 2 seconds (beyond buffer)
+        let position_ms: u64 = 2000;
+        let target_frame = ((position_ms * sample.buffer.sample_rate as u64) / 1000) as usize;
+        sample.position = target_frame.min(sample.buffer.frames.saturating_sub(1));
+
+        // Should be clamped to last valid frame
+        assert_eq!(sample.position, 47999); // frames - 1
+    }
+
+    #[test]
+    fn test_seek_with_different_sample_rates() {
+        // Test seek calculation at 44100 Hz
+        let data = vec![0.5f32; 44100 * 2]; // 1 second stereo at 44.1kHz
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 44100));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        // Seek to 1000ms (should be frame 44100)
+        let position_ms: u64 = 1000;
+        let target_frame = ((position_ms * sample.buffer.sample_rate as u64) / 1000) as usize;
+        sample.position = target_frame.min(sample.buffer.frames.saturating_sub(1));
+
+        // At 44100 Hz, 1000ms = 44100 frames, but clamped to 44099
+        assert_eq!(sample.position, 44099);
+    }
+
+    #[test]
+    fn test_seek_preserves_playback_state() {
+        let data = vec![0.5f32; 48000 * 2];
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 0.7, 0.8, TEST_FILE.to_string());
+        sample.fade_state = FadeState::In { elapsed: 100, duration: 200 };
+
+        // Seek to 250ms
+        let position_ms: u64 = 250;
+        let target_frame = ((position_ms * sample.buffer.sample_rate as u64) / 1000) as usize;
+        sample.position = target_frame;
+
+        // Volume and fade state should be preserved
+        assert_eq!(sample.volume, 0.7);
+        assert_eq!(sample.voice_volume, 0.8);
+        assert!(matches!(sample.fade_state, FadeState::In { elapsed: 100, duration: 200 }));
+        assert_eq!(sample.position, 12000); // 250ms at 48kHz
+    }
+
+    #[test]
+    fn test_seek_then_mix() {
+        // Create buffer with distinct values at different positions
+        let mut data = vec![0.0f32; 100 * 2]; // 100 stereo frames
+        // First 50 frames: 0.1
+        for i in 0..100 {
+            data[i] = 0.1;
+        }
+        // Last 50 frames: 0.9
+        for i in 100..200 {
+            data[i] = 0.9;
+        }
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        // Seek to frame 50 (the start of the 0.9 section)
+        sample.position = 50;
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 10]; // 5 stereo frames
+        mix_audio(&mut output, &mut state);
+
+        // Should get 0.9 values (from the second half)
+        for &s in &output {
+            assert_eq!(s, 0.9);
+        }
+    }
+
+    // === Speed Control Tests ===
+
+    #[test]
+    fn test_speed_default_is_normal() {
+        let buffer = create_test_buffer(10, 2, 0.5);
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        assert_eq!(sample.speed, 1.0);
+    }
+
+    #[test]
+    fn test_speed_double_plays_twice_as_fast() {
+        // Create buffer with 100 frames of constant value
+        let data = vec![0.5f32; 100 * 2]; // 100 stereo frames
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        sample.speed = 2.0;
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Request 50 output frames at 2x speed should consume 100 input frames
+        let mut output = vec![0.0f32; 50 * 2];
+        mix_audio(&mut output, &mut state);
+
+        // After mixing 50 output frames at 2x, effective position should be 100
+        // (meaning sample should be finished)
+        assert!(state.active_samples[0].is_finished());
+    }
+
+    #[test]
+    fn test_speed_half_plays_twice_as_slow() {
+        let data = vec![0.5f32; 100 * 2];
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        sample.speed = 0.5;
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Request 50 output frames at 0.5x speed should consume 25 input frames
+        let mut output = vec![0.0f32; 50 * 2];
+        mix_audio(&mut output, &mut state);
+
+        // After mixing 50 output frames at 0.5x, effective position should be 25
+        // Sample should NOT be finished (only 1/4 through)
+        assert!(!state.active_samples[0].is_finished());
+        // Check position is roughly 25
+        assert_eq!(state.active_samples[0].position, 25);
+    }
+
+    #[test]
+    fn test_speed_interpolation() {
+        // Create buffer with linear ramp: 0.0, 0.2, 0.4, 0.6, 0.8, 1.0
+        let data = vec![0.0, 0.0, 0.2, 0.2, 0.4, 0.4, 0.6, 0.6, 0.8, 0.8, 1.0, 1.0]; // 6 stereo frames
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        sample.speed = 0.5;
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // At 0.5x speed, reading 2 output frames should cover 1 input frame
+        // and we should see interpolated values
+        let mut output = vec![0.0f32; 4]; // 2 stereo frames
+        mix_audio(&mut output, &mut state);
+
+        // First output frame: position 0 -> value 0.0
+        assert!((output[0] - 0.0).abs() < 0.01);
+        // Second output frame: position 0.5 -> interpolate between 0.0 and 0.2 = 0.1
+        assert!((output[2] - 0.1).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_speed_set_via_method() {
+        let buffer = create_test_buffer(10, 2, 0.5);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        sample.set_speed(1.5);
+        assert_eq!(sample.speed, 1.5);
+
+        sample.set_speed(0.0); // Should clamp to minimum
+        assert!(sample.speed >= 0.1); // Some reasonable minimum
+
+        sample.set_speed(10.0); // Should clamp to maximum
+        assert!(sample.speed <= 4.0); // Some reasonable maximum
     }
 }
 

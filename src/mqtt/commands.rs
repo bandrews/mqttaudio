@@ -18,10 +18,60 @@ pub struct ChannelMapping {
     pub dest: usize,
 }
 
+/// Selector for targeting samples by id, file, or voice
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+pub struct SampleSelector {
+    /// Target specific sample by user-provided ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Target all samples playing this file
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Target all samples in this voice
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+}
+
+impl SampleSelector {
+    /// Check if a sample matches this selector
+    pub fn matches(&self, sample_id: Option<&str>, file_path: &str, voice_id: &str) -> bool {
+        // Check if selector specifies id and if it matches
+        if let Some(ref id) = self.id {
+            if sample_id == Some(id.as_str()) {
+                return true;
+            }
+        }
+
+        // Check if selector specifies file and if it matches
+        if let Some(ref file) = self.file {
+            if file_path == file {
+                return true;
+            }
+        }
+
+        // Check if selector specifies voice and if it matches
+        if let Some(ref voice) = self.voice {
+            if voice_id == voice {
+                return true;
+            }
+        }
+
+        // No matches
+        false
+    }
+
+    /// Check if this selector is empty (no criteria specified)
+    pub fn is_empty(&self) -> bool {
+        self.id.is_none() && self.file.is_none() && self.voice.is_none()
+    }
+}
+
 /// Play command parameters
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PlayMessage {
     pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>, // User-provided sample identifier for targeting commands
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -30,6 +80,8 @@ pub struct PlayMessage {
     pub channel_map: Option<Vec<ChannelMapping>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fade_in: Option<u32>, // Fade in duration in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_position_ms: Option<u64>, // Start playback at this offset
     // Future fields for later phases:
     // #[serde(rename = "loop")]
     // pub loop_mode: Option<bool>,         // Future
@@ -84,15 +136,85 @@ pub struct InputMuteMessage {
     pub mute: bool,
 }
 
+/// Seek command parameters
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SeekMessage {
+    /// Target specific sample by user-provided ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Target all samples playing this file
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Target all samples in this voice
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// Position to seek to in milliseconds
+    pub position_ms: u64,
+}
+
+/// Speed command parameters
+#[derive(Debug, Deserialize, Serialize)]
+pub struct SpeedMessage {
+    /// Target specific sample by user-provided ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Target all samples playing this file
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Target all samples in this voice
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// Playback speed multiplier (1.0 = normal, 2.0 = double speed)
+    pub speed: f32,
+    /// If true, maintain original pitch when changing speed (tempo only)
+    #[serde(default)]
+    pub pitch_correction: bool,
+}
+
+/// Stop command parameters (with sample selector)
+#[derive(Debug, Deserialize, Serialize)]
+pub struct StopMessage {
+    /// Target specific sample by user-provided ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Target all samples playing this file
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Target all samples in this voice
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// Optional fade out duration in milliseconds
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fade_out_ms: Option<u32>,
+}
+
+/// Volume command parameters (with sample selector)
+#[derive(Debug, Deserialize, Serialize)]
+pub struct VolumeMessage {
+    /// Target specific sample by user-provided ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Target all samples playing this file
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Target all samples in this voice
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<String>,
+    /// New volume level (0.0 - 1.0)
+    pub volume: f32,
+}
+
 /// Internal audio command after parsing
 #[derive(Debug, Clone)]
 pub enum AudioCommand {
     Play {
         file: String,
+        id: Option<String>, // User-provided sample identifier
         volume: f32,
         voice: Option<String>,
         channel_map: Option<Vec<ChannelMapping>>,
         fade_in: Option<u32>, // Fade in duration in milliseconds
+        start_position_ms: Option<u64>, // Start playback at this offset
     },
     StopAll,
     VoiceStop {
@@ -120,6 +242,23 @@ pub enum AudioCommand {
     InputMute {
         input: String,
         mute: bool,
+    },
+    Seek {
+        selector: SampleSelector,
+        position_ms: u64,
+    },
+    Speed {
+        selector: SampleSelector,
+        speed: f32,
+        pitch_correction: bool,
+    },
+    Stop {
+        selector: SampleSelector,
+        fade_out_ms: Option<u32>,
+    },
+    Volume {
+        selector: SampleSelector,
+        volume: f32,
     },
 }
 
@@ -160,10 +299,12 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
 
             Ok(AudioCommand::Play {
                 file: play_msg.file,
+                id: play_msg.id,
                 volume: play_msg.volume.unwrap_or(1.0),
                 voice: play_msg.voice,
                 channel_map: play_msg.channel_map,
                 fade_in: play_msg.fade_in,
+                start_position_ms: play_msg.start_position_ms,
             })
         }
         "stopall" | "soundStopAll" => {
@@ -230,6 +371,59 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             Ok(AudioCommand::InputMute {
                 input: input_msg.input,
                 mute: input_msg.mute,
+            })
+        }
+        "seek" => {
+            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
+            let seek_msg: SeekMessage = serde_json::from_value(message)?;
+
+            Ok(AudioCommand::Seek {
+                selector: SampleSelector {
+                    id: seek_msg.id,
+                    file: seek_msg.file,
+                    voice: seek_msg.voice,
+                },
+                position_ms: seek_msg.position_ms,
+            })
+        }
+        "speed" => {
+            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
+            let speed_msg: SpeedMessage = serde_json::from_value(message)?;
+
+            Ok(AudioCommand::Speed {
+                selector: SampleSelector {
+                    id: speed_msg.id,
+                    file: speed_msg.file,
+                    voice: speed_msg.voice,
+                },
+                speed: speed_msg.speed,
+                pitch_correction: speed_msg.pitch_correction,
+            })
+        }
+        "stop" => {
+            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
+            let stop_msg: StopMessage = serde_json::from_value(message)?;
+
+            Ok(AudioCommand::Stop {
+                selector: SampleSelector {
+                    id: stop_msg.id,
+                    file: stop_msg.file,
+                    voice: stop_msg.voice,
+                },
+                fade_out_ms: stop_msg.fade_out_ms,
+            })
+        }
+        "volume" => {
+            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
+            let vol_msg: VolumeMessage = serde_json::from_value(message)?;
+
+            Ok(AudioCommand::Volume {
+                selector: SampleSelector {
+                    id: vol_msg.id,
+                    file: vol_msg.file,
+                    voice: vol_msg.voice,
+                },
+                volume: vol_msg.volume,
             })
         }
         unknown => Err(ParseError::UnknownCommand(unknown.to_string())),
@@ -762,6 +956,413 @@ mod tests {
         match result.unwrap_err() {
             ParseError::MissingMessage => {}, // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
+        }
+    }
+
+    // === Sample ID Tests ===
+
+    #[test]
+    fn test_parse_play_with_sample_id() {
+        let json = r#"{"command": "play", "message": {"file": "test.wav", "id": "my-sound-1"}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, id, .. } => {
+                assert_eq!(file, "test.wav");
+                assert_eq!(id, Some("my-sound-1".to_string()));
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_without_sample_id() {
+        let json = r#"{"command": "play", "message": {"file": "test.wav"}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, id, .. } => {
+                assert_eq!(file, "test.wav");
+                assert_eq!(id, None);
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_with_all_fields() {
+        let json = r#"{"command": "play", "message": {
+            "file": "background.mp3",
+            "id": "background-music",
+            "voice": "music",
+            "volume": 0.5,
+            "fade_in": 2000,
+            "start_position_ms": 30000,
+            "channel_map": [{"src": 0, "dest": 2}, {"src": 1, "dest": 3}]
+        }}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, id, voice, volume, fade_in, start_position_ms, channel_map } => {
+                assert_eq!(file, "background.mp3");
+                assert_eq!(id, Some("background-music".to_string()));
+                assert_eq!(voice, Some("music".to_string()));
+                assert_eq!(volume, 0.5);
+                assert_eq!(fade_in, Some(2000));
+                assert_eq!(start_position_ms, Some(30000));
+                assert!(channel_map.is_some());
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_with_start_position() {
+        let json = r#"{"command": "play", "message": {"file": "long_track.mp3", "start_position_ms": 60000}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, start_position_ms, .. } => {
+                assert_eq!(file, "long_track.mp3");
+                assert_eq!(start_position_ms, Some(60000));
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_without_start_position() {
+        let json = r#"{"command": "play", "message": {"file": "test.wav"}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { start_position_ms, .. } => {
+                assert_eq!(start_position_ms, None);
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    // === SampleSelector Tests ===
+
+    #[test]
+    fn test_selector_matches_by_id() {
+        let selector = SampleSelector {
+            id: Some("my-sound".to_string()),
+            file: None,
+            voice: None,
+        };
+
+        assert!(selector.matches(Some("my-sound"), "test.wav", "voice1"));
+        assert!(!selector.matches(Some("other-sound"), "test.wav", "voice1"));
+        assert!(!selector.matches(None, "test.wav", "voice1"));
+    }
+
+    #[test]
+    fn test_selector_matches_by_file() {
+        let selector = SampleSelector {
+            id: None,
+            file: Some("music.mp3".to_string()),
+            voice: None,
+        };
+
+        assert!(selector.matches(None, "music.mp3", "voice1"));
+        assert!(selector.matches(Some("any-id"), "music.mp3", "voice1"));
+        assert!(!selector.matches(None, "other.mp3", "voice1"));
+    }
+
+    #[test]
+    fn test_selector_matches_by_voice() {
+        let selector = SampleSelector {
+            id: None,
+            file: None,
+            voice: Some("background".to_string()),
+        };
+
+        assert!(selector.matches(None, "any.wav", "background"));
+        assert!(!selector.matches(None, "any.wav", "foreground"));
+    }
+
+    #[test]
+    fn test_selector_matches_any_criterion() {
+        // Selector with multiple criteria matches if ANY matches
+        let selector = SampleSelector {
+            id: Some("specific-sound".to_string()),
+            file: Some("music.mp3".to_string()),
+            voice: None,
+        };
+
+        // Matches by id
+        assert!(selector.matches(Some("specific-sound"), "other.wav", "voice1"));
+        // Matches by file
+        assert!(selector.matches(Some("other-id"), "music.mp3", "voice1"));
+        // Matches neither
+        assert!(!selector.matches(Some("other-id"), "other.wav", "voice1"));
+    }
+
+    #[test]
+    fn test_selector_empty() {
+        let empty = SampleSelector {
+            id: None,
+            file: None,
+            voice: None,
+        };
+        assert!(empty.is_empty());
+        assert!(!empty.matches(Some("any"), "any", "any"));
+
+        let not_empty = SampleSelector {
+            id: Some("test".to_string()),
+            file: None,
+            voice: None,
+        };
+        assert!(!not_empty.is_empty());
+    }
+
+    #[test]
+    fn test_selector_parse_from_json() {
+        let json = r#"{"id": "my-sound"}"#;
+        let selector: SampleSelector = serde_json::from_str(json).unwrap();
+        assert_eq!(selector.id, Some("my-sound".to_string()));
+        assert_eq!(selector.file, None);
+        assert_eq!(selector.voice, None);
+
+        let json = r#"{"file": "test.wav", "voice": "effects"}"#;
+        let selector: SampleSelector = serde_json::from_str(json).unwrap();
+        assert_eq!(selector.id, None);
+        assert_eq!(selector.file, Some("test.wav".to_string()));
+        assert_eq!(selector.voice, Some("effects".to_string()));
+    }
+
+    // === Seek Command Tests ===
+
+    #[test]
+    fn test_parse_seek_by_id() {
+        let json = r#"{"command": "seek", "message": {"id": "my-sound", "position_ms": 5000}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Seek { selector, position_ms } => {
+                assert_eq!(selector.id, Some("my-sound".to_string()));
+                assert_eq!(selector.file, None);
+                assert_eq!(selector.voice, None);
+                assert_eq!(position_ms, 5000);
+            }
+            _ => panic!("Expected Seek command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_seek_by_file() {
+        let json = r#"{"command": "seek", "message": {"file": "music.mp3", "position_ms": 30000}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Seek { selector, position_ms } => {
+                assert_eq!(selector.id, None);
+                assert_eq!(selector.file, Some("music.mp3".to_string()));
+                assert_eq!(selector.voice, None);
+                assert_eq!(position_ms, 30000);
+            }
+            _ => panic!("Expected Seek command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_seek_by_voice() {
+        let json = r#"{"command": "seek", "message": {"voice": "background", "position_ms": 0}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Seek { selector, position_ms } => {
+                assert_eq!(selector.id, None);
+                assert_eq!(selector.file, None);
+                assert_eq!(selector.voice, Some("background".to_string()));
+                assert_eq!(position_ms, 0);
+            }
+            _ => panic!("Expected Seek command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_seek_multiple_selectors() {
+        let json = r#"{"command": "seek", "message": {"id": "bg-music", "file": "music.mp3", "position_ms": 15000}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Seek { selector, position_ms } => {
+                assert_eq!(selector.id, Some("bg-music".to_string()));
+                assert_eq!(selector.file, Some("music.mp3".to_string()));
+                assert_eq!(position_ms, 15000);
+            }
+            _ => panic!("Expected Seek command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_seek_missing_message() {
+        let json = r#"{"command": "seek"}"#;
+        let result = parse_command(json);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ParseError::MissingMessage => {}, // OK
+            e => panic!("Expected MissingMessage error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_seek_missing_position() {
+        let json = r#"{"command": "seek", "message": {"id": "my-sound"}}"#;
+        let result = parse_command(json);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ParseError::JsonError(_) => {}, // OK - position_ms is required
+            e => panic!("Expected JsonError, got: {:?}", e),
+        }
+    }
+
+    // === Stop Command Tests (with selector) ===
+
+    #[test]
+    fn test_parse_stop_by_id() {
+        let json = r#"{"command": "stop", "message": {"id": "effect-1"}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Stop { selector, fade_out_ms } => {
+                assert_eq!(selector.id, Some("effect-1".to_string()));
+                assert_eq!(fade_out_ms, None);
+            }
+            _ => panic!("Expected Stop command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stop_by_file_with_fade() {
+        let json = r#"{"command": "stop", "message": {"file": "music.mp3", "fade_out_ms": 500}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Stop { selector, fade_out_ms } => {
+                assert_eq!(selector.file, Some("music.mp3".to_string()));
+                assert_eq!(fade_out_ms, Some(500));
+            }
+            _ => panic!("Expected Stop command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_stop_by_voice() {
+        let json = r#"{"command": "stop", "message": {"voice": "effects"}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Stop { selector, .. } => {
+                assert_eq!(selector.voice, Some("effects".to_string()));
+            }
+            _ => panic!("Expected Stop command"),
+        }
+    }
+
+    // === Volume Command Tests (with selector) ===
+
+    #[test]
+    fn test_parse_volume_by_id() {
+        let json = r#"{"command": "volume", "message": {"id": "background-music", "volume": 0.5}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Volume { selector, volume } => {
+                assert_eq!(selector.id, Some("background-music".to_string()));
+                assert_eq!(volume, 0.5);
+            }
+            _ => panic!("Expected Volume command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_volume_by_file() {
+        let json = r#"{"command": "volume", "message": {"file": "ambient.wav", "volume": 0.3}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Volume { selector, volume } => {
+                assert_eq!(selector.file, Some("ambient.wav".to_string()));
+                assert_eq!(volume, 0.3);
+            }
+            _ => panic!("Expected Volume command"),
+        }
+    }
+
+    // === Speed Command Tests ===
+
+    #[test]
+    fn test_parse_speed_by_id() {
+        let json = r#"{"command": "speed", "message": {"id": "music-track", "speed": 1.5}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Speed { selector, speed, pitch_correction } => {
+                assert_eq!(selector.id, Some("music-track".to_string()));
+                assert_eq!(speed, 1.5);
+                assert_eq!(pitch_correction, false); // default
+            }
+            _ => panic!("Expected Speed command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_speed_by_voice() {
+        let json = r#"{"command": "speed", "message": {"voice": "background", "speed": 0.5}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Speed { selector, speed, pitch_correction } => {
+                assert_eq!(selector.voice, Some("background".to_string()));
+                assert_eq!(speed, 0.5);
+                assert_eq!(pitch_correction, false);
+            }
+            _ => panic!("Expected Speed command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_speed_with_pitch_correction() {
+        let json = r#"{"command": "speed", "message": {"file": "music.mp3", "speed": 2.0, "pitch_correction": true}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Speed { selector, speed, pitch_correction } => {
+                assert_eq!(selector.file, Some("music.mp3".to_string()));
+                assert_eq!(speed, 2.0);
+                assert_eq!(pitch_correction, true);
+            }
+            _ => panic!("Expected Speed command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_speed_missing_message() {
+        let json = r#"{"command": "speed"}"#;
+        let result = parse_command(json);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ParseError::MissingMessage => {}, // OK
+            e => panic!("Expected MissingMessage error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_speed_missing_speed_value() {
+        let json = r#"{"command": "speed", "message": {"id": "my-sound"}}"#;
+        let result = parse_command(json);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ParseError::JsonError(_) => {}, // OK - speed is required
+            e => panic!("Expected JsonError, got: {:?}", e),
         }
     }
 }

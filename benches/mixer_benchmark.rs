@@ -43,6 +43,7 @@ fn create_mixer_state(num_samples: usize, output_channels: usize) -> MixerState 
             buffer.clone(),
             0.8,
             1.0,
+            format!("bench_file_{}.wav", i),
         );
         state.active_samples.push(sample);
     }
@@ -75,6 +76,8 @@ fn create_mixer_state_with_routing(
             0.8,
             1.0,
             channel_map.clone(),
+            format!("bench_file_{}.wav", i),
+            None,
         );
         state.active_samples.push(sample);
     }

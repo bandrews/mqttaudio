@@ -467,7 +467,7 @@ async fn main() {
                     tracing::info!("Processing command: {:?}", cmd);
 
                     match cmd {
-                        mqtt::commands::AudioCommand::Play { file, volume, voice, channel_map, fade_in } => {
+                        mqtt::commands::AudioCommand::Play { file, id, volume, voice, channel_map, fade_in, start_position_ms } => {
                             // Load file (with caching)
                             let mut cache_mgr = cache_manager.lock().unwrap();
                             let buffer_result = cache_mgr.get_or_load(&file, output_sample_rate).await;
@@ -508,21 +508,32 @@ async fn main() {
                                         ActiveSample::new_with_mapping(
                                             sample_id,
                                             voice_id.clone(),
-                                            buffer,
+                                            buffer.clone(),
                                             volume,
                                             voice_volume,
                                             mapping,
+                                            file.clone(),
+                                            id.clone(),
                                         )
                                     } else {
                                         // Default channel mapping (1:1)
-                                        ActiveSample::new(
+                                        ActiveSample::new_with_id(
                                             sample_id,
                                             voice_id.clone(),
-                                            buffer,
+                                            buffer.clone(),
                                             volume,
                                             voice_volume,
+                                            file.clone(),
+                                            id.clone(),
                                         )
                                     };
+
+                                    // Apply start position if requested
+                                    if let Some(start_ms) = start_position_ms {
+                                        let target_frame = ((start_ms * buffer.sample_rate as u64) / 1000) as usize;
+                                        sample.position = target_frame.min(buffer.frames.saturating_sub(1));
+                                        tracing::debug!("Starting at position {}ms (frame {})", start_ms, sample.position);
+                                    }
 
                                     // Apply fade in if requested
                                     if let Some(fade_ms) = fade_in {
@@ -760,6 +771,132 @@ async fn main() {
 
                             if !found {
                                 tracing::warn!("Input '{}' not found", input);
+                            }
+                        }
+                        mqtt::commands::AudioCommand::Seek { selector, position_ms } => {
+                            if selector.is_empty() {
+                                tracing::warn!("Seek command with empty selector - no samples targeted");
+                            } else {
+                                let mut state = mixer_state.lock().unwrap();
+                                let mut updated_count = 0;
+
+                                for sample in state.active_samples.iter_mut() {
+                                    if selector.matches(
+                                        sample.sample_id.as_deref(),
+                                        &sample.file_path,
+                                        &sample.voice_id,
+                                    ) {
+                                        // Convert milliseconds to frames
+                                        let target_frame = ((position_ms as u64 * sample.buffer.sample_rate as u64) / 1000) as usize;
+                                        // Clamp to buffer bounds
+                                        sample.position = target_frame.min(sample.buffer.frames.saturating_sub(1));
+                                        updated_count += 1;
+                                    }
+                                }
+                                drop(state);
+
+                                if updated_count > 0 {
+                                    tracing::info!(
+                                        "Seeked {} samples to {}ms",
+                                        updated_count, position_ms
+                                    );
+                                } else {
+                                    tracing::warn!("Seek command matched no active samples");
+                                }
+                            }
+                        }
+                        mqtt::commands::AudioCommand::Speed { selector, speed, pitch_correction } => {
+                            if pitch_correction {
+                                tracing::warn!("Pitch correction not yet implemented - using pitch-follows-speed mode");
+                            }
+
+                            if selector.is_empty() {
+                                tracing::warn!("Speed command with empty selector - no samples targeted");
+                            } else {
+                                let mut state = mixer_state.lock().unwrap();
+                                let mut updated_count = 0;
+
+                                for sample in state.active_samples.iter_mut() {
+                                    if selector.matches(
+                                        sample.sample_id.as_deref(),
+                                        &sample.file_path,
+                                        &sample.voice_id,
+                                    ) {
+                                        sample.set_speed(speed);
+                                        updated_count += 1;
+                                    }
+                                }
+                                drop(state);
+
+                                if updated_count > 0 {
+                                    tracing::info!(
+                                        "Set speed to {}x for {} samples",
+                                        speed, updated_count
+                                    );
+                                } else {
+                                    tracing::warn!("Speed command matched no active samples");
+                                }
+                            }
+                        }
+                        mqtt::commands::AudioCommand::Stop { selector, fade_out_ms } => {
+                            if selector.is_empty() {
+                                tracing::warn!("Stop command with empty selector - no samples targeted");
+                            } else {
+                                // Default to 10ms fade for smooth stop if not specified
+                                let fade_ms = fade_out_ms.unwrap_or(10);
+
+                                let mut state = mixer_state.lock().unwrap();
+                                let mut updated_count = 0;
+
+                                for sample in state.active_samples.iter_mut() {
+                                    if selector.matches(
+                                        sample.sample_id.as_deref(),
+                                        &sample.file_path,
+                                        &sample.voice_id,
+                                    ) {
+                                        sample.set_fade(audio::mixer::FadeState::fade_out(fade_ms, output_sample_rate));
+                                        updated_count += 1;
+                                    }
+                                }
+                                drop(state);
+
+                                if updated_count > 0 {
+                                    tracing::info!(
+                                        "Stopping {} samples ({}ms fade-out)",
+                                        updated_count, fade_ms
+                                    );
+                                } else {
+                                    tracing::warn!("Stop command matched no active samples");
+                                }
+                            }
+                        }
+                        mqtt::commands::AudioCommand::Volume { selector, volume } => {
+                            if selector.is_empty() {
+                                tracing::warn!("Volume command with empty selector - no samples targeted");
+                            } else {
+                                let mut state = mixer_state.lock().unwrap();
+                                let mut updated_count = 0;
+
+                                for sample in state.active_samples.iter_mut() {
+                                    if selector.matches(
+                                        sample.sample_id.as_deref(),
+                                        &sample.file_path,
+                                        &sample.voice_id,
+                                    ) {
+                                        sample.volume = volume.clamp(0.0, 1.0);
+                                        updated_count += 1;
+                                    }
+                                }
+                                drop(state);
+
+                                if updated_count > 0 {
+                                    tracing::info!(
+                                        "Set volume to {:.2} for {} samples",
+                                        volume, updated_count
+                                    );
+                                } else {
+                                    tracing::warn!("Volume command matched no active samples");
+                                }
                             }
                         }
                     }

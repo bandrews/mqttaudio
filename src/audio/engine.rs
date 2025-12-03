@@ -461,6 +461,7 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
             buffer.clone(),
             volume,
             1.0, // Voice volume
+            format!("test_file_{}.wav", i + 1),
         );
         active_samples.push(sample);
         tracing::info!("Added sample {} to mixer at {}% volume", i + 1, (volume * 100.0) as u32);
