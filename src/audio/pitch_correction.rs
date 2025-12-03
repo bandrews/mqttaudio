@@ -24,8 +24,9 @@ impl PitchCorrector {
 
     /// Set the playback speed. Values > 1.0 = faster, < 1.0 = slower.
     /// Pitch is preserved regardless of speed.
+    /// Range: 0.05 to 8.0 (quality degrades at extremes).
     pub fn set_speed(&mut self, speed: f32) {
-        self.speed = speed.clamp(0.1, 4.0);
+        self.speed = speed.clamp(0.05, 8.0);
     }
 
     /// Get the current speed setting.
@@ -95,11 +96,13 @@ mod tests {
     fn test_pitch_corrector_speed_clamping() {
         let mut pc = PitchCorrector::new(2, 48000);
 
-        pc.set_speed(0.01); // Too slow
-        assert!(pc.speed() >= 0.1);
+        pc.set_speed(0.01); // Too slow - should clamp to 0.05
+        assert!(pc.speed() >= 0.05);
+        assert!((pc.speed() - 0.05).abs() < 0.001);
 
-        pc.set_speed(10.0); // Too fast
-        assert!(pc.speed() <= 4.0);
+        pc.set_speed(10.0); // Too fast - should clamp to 8.0
+        assert!(pc.speed() <= 8.0);
+        assert!((pc.speed() - 8.0).abs() < 0.001);
     }
 
     #[test]

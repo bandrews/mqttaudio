@@ -10,7 +10,7 @@ mqttaudio is a high-performance, real-time audio engine that receives commands o
 - **Multichannel Routing**: Route audio to specific output channels (supports up to 16+ channels)
 - **Voice Grouping**: Group sounds together for coordinated control
 - **Sample Targeting**: Control individual sounds by ID, filename, or voice (seek, speed, stop, volume)
-- **Variable Speed Playback**: Change playback speed (0.1x to 4.0x) with optional pitch correction (time-stretching)
+- **Variable Speed Playback**: Change playback speed with optional pitch correction (time-stretching), including reverse playback
 - **Seek Control**: Jump to any position in a playing sample
 - **Audio Ducking**: Automatically reduce background audio when foreground voices play
 - **Bass Management**: Route low frequencies to subwoofer (LFE) channel with configurable crossover
@@ -957,7 +957,11 @@ These commands let you control specific playing samples by id, file, or voice.
 }
 ```
 
-Speed range: 0.1 to 4.0. When `pitch_correction` is false (default), faster playback = higher pitch ("chipmunk effect"). When `pitch_correction` is true, the audio is time-stretched so pitch remains constant regardless of speed. This uses the signalsmith-stretch library for high-quality real-time time-stretching.
+**Speed Ranges:**
+- **Without pitch correction**: -100.0 to 100.0 (negative values = reverse playback)
+- **With pitch correction**: 0.05 to 8.0 (reverse not supported due to time-stretching algorithm limitations)
+
+When `pitch_correction` is false (default), faster playback = higher pitch ("chipmunk effect"), and negative speeds play audio in reverse. When `pitch_correction` is true, the audio is time-stretched so pitch remains constant regardless of speed, using the signalsmith-stretch library for high-quality real-time time-stretching.
 
 **Stop specific samples:**
 ```json

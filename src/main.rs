@@ -897,15 +897,7 @@ async fn main() {
                                         &sample.file_path,
                                         &sample.voice_id,
                                     ) {
-                                        sample.set_speed(speed);
-
-                                        // Enable or disable pitch correction
-                                        if pitch_correction {
-                                            sample.enable_pitch_correction();
-                                        } else {
-                                            sample.disable_pitch_correction();
-                                        }
-
+                                        sample.set_speed_with_mode(speed, pitch_correction);
                                         updated_count += 1;
                                     }
                                 }

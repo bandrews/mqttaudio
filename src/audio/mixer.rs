@@ -225,13 +225,37 @@ impl ActiveSample {
         self.fade_state = fade_state;
     }
 
-    /// Set the playback speed (clamped to 0.1 - 4.0)
-    pub fn set_speed(&mut self, speed: f32) {
-        self.speed = speed.clamp(0.1, 4.0);
-        // Also update pitch corrector speed if enabled
-        if let Some(ref mut pc) = self.pitch_corrector {
-            pc.set_speed(self.speed);
+    /// Set the playback speed.
+    ///
+    /// Without pitch correction: supports -100.0 to 100.0 (negative = reverse)
+    /// With pitch correction: supports 0.05 to 8.0 (no reverse)
+    ///
+    /// Returns true if the speed was set, false if it was rejected
+    /// (e.g., negative speed with pitch correction enabled).
+    pub fn set_speed(&mut self, speed: f32) -> bool {
+        if self.pitch_corrector.is_some() {
+            // Pitch correction: 0.05 to 8.0, no reverse
+            if speed < 0.0 {
+                tracing::warn!(
+                    "Negative speed ({}) not supported with pitch correction, ignoring",
+                    speed
+                );
+                return false;
+            }
+            self.speed = speed.clamp(0.05, 8.0);
+            if let Some(ref mut pc) = self.pitch_corrector {
+                pc.set_speed(self.speed);
+            }
+        } else {
+            // No pitch correction: -100.0 to 100.0, but not zero
+            if speed.abs() < 0.01 {
+                // Treat very small speeds as minimum
+                self.speed = if speed < 0.0 { -0.01 } else { 0.01 };
+            } else {
+                self.speed = speed.clamp(-100.0, 100.0);
+            }
         }
+        true
     }
 
     /// Enable pitch correction (preserves pitch when changing speed).
@@ -247,6 +271,23 @@ impl ActiveSample {
         }
     }
 
+    /// Set speed and pitch correction mode together.
+    /// This handles the correct order of operations: pitch correction mode
+    /// must be changed before setting speed (negative speeds are rejected
+    /// while pitch correction is enabled).
+    ///
+    /// Returns true if the speed was set, false if rejected.
+    pub fn set_speed_with_mode(&mut self, speed: f32, pitch_correction: bool) -> bool {
+        // Change pitch correction mode FIRST
+        if pitch_correction {
+            self.enable_pitch_correction();
+        } else {
+            self.disable_pitch_correction();
+        }
+        // Then set speed
+        self.set_speed(speed)
+    }
+
     /// Disable pitch correction (pitch follows speed).
     pub fn disable_pitch_correction(&mut self) {
         self.pitch_corrector = None;
@@ -259,11 +300,20 @@ impl ActiveSample {
     }
 
     /// Check if this sample has finished playing
-    /// A sample is finished if it reached the end OR if fade out is complete
+    /// A sample is finished if it reached the end (or start for reverse) OR if fade out is complete
     pub fn is_finished(&self) -> bool {
-        // Reached end of buffer
-        if self.position >= self.buffer.frames {
-            return true;
+        // For forward playback, finished when position >= frames
+        // For reverse playback, finished when position is 0 (or we've gone negative)
+        if self.speed >= 0.0 {
+            if self.position >= self.buffer.frames {
+                return true;
+            }
+        } else {
+            // Reverse playback: finished when we've reached/passed the start
+            // The fractional position going negative indicates we've exhausted the buffer
+            if self.position == 0 && self.fractional_position <= 0.0 {
+                return true;
+            }
         }
 
         // Fade out complete
@@ -279,17 +329,23 @@ impl ActiveSample {
     }
 
     /// Advance the playback position by the given number of output frames,
-    /// accounting for playback speed. Returns the effective number of source
-    /// frames consumed.
+    /// accounting for playback speed (including negative for reverse).
+    /// Returns the effective number of source frames consumed (absolute value).
     fn advance_position(&mut self, output_frames: usize) -> usize {
         let advance = output_frames as f64 * self.speed as f64;
         let new_pos = self.position as f64 + self.fractional_position + advance;
 
-        self.position = new_pos as usize;
-        self.fractional_position = new_pos.fract();
+        if new_pos < 0.0 {
+            // Reverse playback reached the start
+            self.position = 0;
+            self.fractional_position = 0.0;
+        } else {
+            self.position = new_pos as usize;
+            self.fractional_position = new_pos.fract();
+        }
 
-        // Return effective frames consumed
-        advance.ceil() as usize
+        // Return effective frames consumed (absolute value)
+        advance.abs().ceil() as usize
     }
 
     /// Get the current precise position as a float for interpolation
@@ -442,14 +498,28 @@ fn mix_sample_into_output(
 
     let base_volume = sample.combined_volume();
     let speed = sample.speed as f64;
+    let is_reverse = speed < 0.0;
 
     // Calculate current precise position (integer + fractional parts)
     let mut src_pos = sample.precise_position();
 
     for frame_idx in 0..frames {
+        // Check bounds based on direction
+        if is_reverse {
+            // For reverse playback, stop when we've gone past the start
+            if src_pos < 0.0 {
+                break;
+            }
+        } else {
+            // For forward playback, stop when we've reached the end
+            if src_pos as usize >= sample.buffer.frames {
+                break;
+            }
+        }
+
         let src_frame = src_pos as usize;
 
-        // Check if we've reached the end of the sample
+        // Safety check: ensure we're within bounds
         if src_frame >= sample.buffer.frames {
             break;
         }
@@ -459,7 +529,7 @@ fn mix_sample_into_output(
         let final_volume = base_volume * fade_multiplier * ducking_multiplier;
 
         // Calculate fractional part for interpolation
-        let frac = (src_pos - src_frame as f64) as f32;
+        let frac = (src_pos - src_frame as f64).abs() as f32;
 
         // Apply channel mapping and mix into output
         for &(src_ch, dest_ch) in &sample.channel_map {
@@ -474,11 +544,28 @@ fn mix_sample_into_output(
             // Get current sample value
             let sample_val = sample.buffer.data[src_idx];
 
-            // Interpolate with next sample if available and speed != 1.0
-            let interpolated_val = if frac > 0.0 && src_frame + 1 < sample.buffer.frames {
-                let next_idx = (src_frame + 1) * sample.buffer.channels + src_ch;
-                let next_val = sample.buffer.data[next_idx];
-                sample_val * (1.0 - frac) + next_val * frac
+            // Interpolate with adjacent sample if available
+            let interpolated_val = if frac > 0.001 {
+                if is_reverse {
+                    // For reverse, interpolate with previous sample (lower index)
+                    if src_frame > 0 {
+                        let prev_idx = (src_frame - 1) * sample.buffer.channels + src_ch;
+                        let prev_val = sample.buffer.data[prev_idx];
+                        // frac represents how far we are past src_frame toward prev
+                        sample_val * (1.0 - frac) + prev_val * frac
+                    } else {
+                        sample_val
+                    }
+                } else {
+                    // For forward, interpolate with next sample (higher index)
+                    if src_frame + 1 < sample.buffer.frames {
+                        let next_idx = (src_frame + 1) * sample.buffer.channels + src_ch;
+                        let next_val = sample.buffer.data[next_idx];
+                        sample_val * (1.0 - frac) + next_val * frac
+                    } else {
+                        sample_val
+                    }
+                }
             } else {
                 sample_val
             };
@@ -490,7 +577,7 @@ fn mix_sample_into_output(
         // Advance fade state
         sample.fade_state.advance();
 
-        // Advance source position by speed
+        // Advance source position by speed (negative speed moves backward)
         src_pos += speed;
     }
 }
@@ -1569,14 +1656,21 @@ mod tests {
         let buffer = create_test_buffer(10, 2, 0.5);
         let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
 
+        // Without pitch correction: -100 to 100 range
         sample.set_speed(1.5);
         assert_eq!(sample.speed, 1.5);
 
-        sample.set_speed(0.0); // Should clamp to minimum
-        assert!(sample.speed >= 0.1); // Some reasonable minimum
+        sample.set_speed(0.0); // Should clamp to minimum (0.01)
+        assert!((sample.speed - 0.01).abs() < 0.001);
 
-        sample.set_speed(10.0); // Should clamp to maximum
-        assert!(sample.speed <= 4.0); // Some reasonable maximum
+        sample.set_speed(150.0); // Should clamp to 100.0
+        assert!((sample.speed - 100.0).abs() < 0.001);
+
+        sample.set_speed(-50.0); // Negative for reverse
+        assert_eq!(sample.speed, -50.0);
+
+        sample.set_speed(-150.0); // Should clamp to -100.0
+        assert!((sample.speed - (-100.0)).abs() < 0.001);
     }
 
     // === Pitch Correction Tests ===
@@ -1688,6 +1782,271 @@ mod tests {
         // (may not be exactly 0.8 due to stretcher processing)
         let has_audio = all_output.iter().any(|&s| s.abs() > 0.01);
         assert!(has_audio, "Output should have audio content");
+    }
+
+    // === Reverse Playback Tests ===
+
+    #[test]
+    fn test_reverse_playback_basic() {
+        // Create buffer with distinct values: frame 0 = 0.1, frame 1 = 0.3, frame 2 = 0.5, etc.
+        let mut data = Vec::new();
+        for i in 0..10 {
+            let val = 0.1 + (i as f32 * 0.1); // 0.1, 0.2, 0.3, ...
+            data.push(val); // L
+            data.push(val); // R
+        }
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+
+        // Start at end of buffer for reverse playback
+        sample.position = 9; // Last frame
+        sample.set_speed(-1.0); // Reverse at normal speed
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Mix 5 frames
+        let mut output = vec![0.0f32; 10]; // 5 frames * 2 channels
+        mix_audio(&mut output, &mut state);
+
+        // First output should be from position 9 (value ~1.0)
+        assert!((output[0] - 1.0).abs() < 0.1, "First frame should be ~1.0, got {}", output[0]);
+        // Position should move backwards
+        assert_eq!(state.active_samples[0].position, 4);
+    }
+
+    #[test]
+    fn test_reverse_playback_finishes_at_start() {
+        let data = vec![0.5f32; 20]; // 10 stereo frames
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+
+        // Start at position 5, play backwards
+        sample.position = 5;
+        sample.set_speed(-1.0);
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Mix 10 frames (more than we have going backwards)
+        let mut output = vec![0.0f32; 20];
+        mix_audio(&mut output, &mut state);
+
+        // Sample should be finished (reached start)
+        assert!(state.active_samples[0].is_finished());
+    }
+
+    #[test]
+    fn test_reverse_double_speed() {
+        let data = vec![0.5f32; 200]; // 100 stereo frames
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+
+        // Start at position 50, play backwards at 2x
+        sample.position = 50;
+        sample.set_speed(-2.0);
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Mix 20 output frames at -2x speed should consume 40 source frames
+        let mut output = vec![0.0f32; 40];
+        mix_audio(&mut output, &mut state);
+
+        // Position should be 50 - 40 = 10
+        assert_eq!(state.active_samples[0].position, 10);
+    }
+
+    #[test]
+    fn test_reverse_half_speed() {
+        let data = vec![0.5f32; 200]; // 100 stereo frames
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+
+        // Start at position 50, play backwards at 0.5x
+        sample.position = 50;
+        sample.set_speed(-0.5);
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Mix 20 output frames at -0.5x speed should consume 10 source frames
+        let mut output = vec![0.0f32; 40];
+        mix_audio(&mut output, &mut state);
+
+        // Position should be 50 - 10 = 40
+        assert_eq!(state.active_samples[0].position, 40);
+    }
+
+    #[test]
+    fn test_reverse_with_volume_and_fade() {
+        let data = vec![1.0f32; 20]; // 10 stereo frames
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 0.5, 1.0, TEST_FILE.to_string());
+
+        sample.position = 9;
+        sample.set_speed(-1.0);
+        sample.set_fade(FadeState::In { elapsed: 5, duration: 10 }); // 50% fade
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 4]; // 2 frames
+        mix_audio(&mut output, &mut state);
+
+        // First frame: 1.0 * 0.5 (volume) * 0.5 (fade) = 0.25
+        assert!((output[0] - 0.25).abs() < 0.1, "Expected ~0.25, got {}", output[0]);
+    }
+
+    #[test]
+    fn test_pitch_correction_rejects_negative_speed() {
+        let buffer = create_test_buffer(100, 2, 0.5);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        sample.enable_pitch_correction();
+
+        // Try to set negative speed - should be rejected
+        let result = sample.set_speed(-1.0);
+        assert!(!result, "set_speed should return false for negative speed with pitch correction");
+
+        // Speed should remain at 1.0 (the default)
+        assert_eq!(sample.speed, 1.0);
+    }
+
+    #[test]
+    fn test_pitch_correction_speed_limits() {
+        let buffer = create_test_buffer(100, 2, 0.5);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        sample.enable_pitch_correction();
+
+        // Test lower bound (0.05)
+        sample.set_speed(0.01);
+        assert!((sample.speed - 0.05).abs() < 0.001);
+
+        // Test upper bound (8.0)
+        sample.set_speed(20.0);
+        assert!((sample.speed - 8.0).abs() < 0.001);
+
+        // Test normal range
+        sample.set_speed(3.5);
+        assert_eq!(sample.speed, 3.5);
+    }
+
+    #[test]
+    fn test_forward_then_reverse() {
+        // Test switching between forward and reverse playback
+        let data = vec![0.5f32; 200]; // 100 stereo frames
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+
+        // Start at position 50
+        sample.position = 50;
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Mix forward 10 frames
+        let mut output = vec![0.0f32; 20];
+        mix_audio(&mut output, &mut state);
+        assert_eq!(state.active_samples[0].position, 60);
+
+        // Switch to reverse
+        state.active_samples[0].set_speed(-1.0);
+
+        // Mix reverse 10 frames
+        mix_audio(&mut output, &mut state);
+        assert_eq!(state.active_samples[0].position, 50);
+    }
+
+    // === set_speed_with_mode Tests ===
+    // These test the actual method that command handling uses
+
+    #[test]
+    fn test_set_speed_with_mode_pitch_corrected_to_reverse() {
+        // Regression test: using set_speed_with_mode to switch from
+        // pitch-corrected to negative speed in a single call
+        let buffer = create_test_buffer(100, 2, 0.5);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        // Start with pitch correction enabled at 1.5x
+        sample.set_speed_with_mode(1.5, true);
+        assert!(sample.has_pitch_correction());
+        assert_eq!(sample.speed, 1.5);
+
+        // Switch to reverse with no pitch correction - this is what
+        // the command handler does when receiving:
+        // {"command": "speed", "message": {"speed": -1.5, "pitch_correction": false}}
+        let result = sample.set_speed_with_mode(-1.5, false);
+
+        // Should succeed in a single call
+        assert!(result, "set_speed_with_mode should handle pitch-corrected to reverse");
+        assert_eq!(sample.speed, -1.5);
+        assert!(!sample.has_pitch_correction());
+    }
+
+    #[test]
+    fn test_set_speed_with_mode_reverse_to_pitch_corrected() {
+        // Test switching from reverse playback to pitch-corrected
+        let buffer = create_test_buffer(100, 2, 0.5);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        // Start in reverse
+        sample.set_speed_with_mode(-2.0, false);
+        assert_eq!(sample.speed, -2.0);
+        assert!(!sample.has_pitch_correction());
+
+        // Switch to pitch-corrected
+        let result = sample.set_speed_with_mode(1.5, true);
+
+        assert!(result);
+        assert!(sample.has_pitch_correction());
+        assert_eq!(sample.speed, 1.5);
+    }
+
+    #[test]
+    fn test_set_speed_with_mode_negative_with_pitch_correction_rejected() {
+        // Attempting negative speed WITH pitch_correction=true should fail
+        // (the method enables pitch correction, then rejects negative speed)
+        let buffer = create_test_buffer(100, 2, 0.5);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        sample.set_speed(1.0);
+        let result = sample.set_speed_with_mode(-1.5, true);
+
+        // Should fail - you can't have negative speed with pitch correction
+        assert!(!result);
+        // Pitch correction is enabled but speed was rejected
+        assert!(sample.has_pitch_correction());
+        // Speed remains at previous value
+        assert_eq!(sample.speed, 1.0);
+    }
+
+    #[test]
+    fn test_set_speed_with_mode_multiple_transitions() {
+        // Test multiple mode transitions
+        let buffer = create_test_buffer(100, 2, 0.5);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        // Forward normal -> Forward pitch-corrected
+        sample.set_speed_with_mode(2.0, true);
+        assert!(sample.has_pitch_correction());
+        assert_eq!(sample.speed, 2.0);
+
+        // Forward pitch-corrected -> Reverse normal
+        sample.set_speed_with_mode(-1.0, false);
+        assert!(!sample.has_pitch_correction());
+        assert_eq!(sample.speed, -1.0);
+
+        // Reverse normal -> Forward pitch-corrected
+        sample.set_speed_with_mode(0.5, true);
+        assert!(sample.has_pitch_correction());
+        assert_eq!(sample.speed, 0.5);
+
+        // Forward pitch-corrected -> Forward normal
+        sample.set_speed_with_mode(3.0, false);
+        assert!(!sample.has_pitch_correction());
+        assert_eq!(sample.speed, 3.0);
     }
 }
 
