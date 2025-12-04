@@ -1,12 +1,12 @@
 # mqttaudio
 
-A high-performance audio player controlled via MQTT and built in Rust for speed and reliability. 
+A high-performance audio player controlled via MQTT or HTTP and built in Rust for speed and reliability. 
 
 Originally built for interactive installations, escape rooms, and immersive entertainment, but potentially useful to all!
 
 ## What It Does
 
-mqttaudio listens for JSON commands over MQTT and plays audio with:
+mqttaudio listens for JSON commands over MQTT or a REST endpoint, and plays audio with:
 
 - **Multichannel routing** — Route any audio channel to any output (up to 16+ channels)
 - **Voice grouping** — Control related sounds together (fade, stop, adjust volume)
