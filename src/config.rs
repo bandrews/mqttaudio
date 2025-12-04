@@ -280,6 +280,92 @@ impl Default for InputConfig {
     }
 }
 
+/// Resampler quality preset
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResamplerQuality {
+    /// Fastest resampling, acceptable quality for most content.
+    /// sinc_len=64, oversample=64. ~60ms for 1 min stereo.
+    Fast,
+    /// Balanced quality and speed.
+    /// sinc_len=128, oversample=128. ~95ms for 1 min stereo.
+    Medium,
+    /// High quality, slower processing.
+    /// sinc_len=256, oversample=128. ~190ms for 1 min stereo.
+    High,
+    /// Maximum quality, slowest processing.
+    /// sinc_len=256, oversample=256. ~230ms for 1 min stereo.
+    /// Only recommended when precaching everything on startup.
+    Maximum,
+}
+
+impl Default for ResamplerQuality {
+    fn default() -> Self {
+        ResamplerQuality::Fast
+    }
+}
+
+impl ResamplerQuality {
+    /// Get the sinc filter length for this quality setting
+    pub fn sinc_len(&self) -> usize {
+        match self {
+            ResamplerQuality::Fast => 64,
+            ResamplerQuality::Medium => 128,
+            ResamplerQuality::High => 256,
+            ResamplerQuality::Maximum => 256,
+        }
+    }
+
+    /// Get the oversampling factor for this quality setting
+    pub fn oversampling_factor(&self) -> usize {
+        match self {
+            ResamplerQuality::Fast => 64,
+            ResamplerQuality::Medium => 128,
+            ResamplerQuality::High => 128,
+            ResamplerQuality::Maximum => 256,
+        }
+    }
+}
+
+/// Advanced configuration settings.
+/// Most users will never need to change these.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AdvancedConfig {
+    /// Quality level for sample rate conversion.
+    ///
+    /// When audio files have a different sample rate than the output device,
+    /// they must be resampled. Higher quality settings produce better audio
+    /// but take longer to process.
+    ///
+    /// Options:
+    /// - "fast": Best for real-time playback. ~60ms to resample 1 minute of audio.
+    ///   Sounds great for most content (games, sound effects, music).
+    ///
+    /// - "medium": Balanced option. ~95ms per minute.
+    ///   Slightly better quality, still good for interactive use.
+    ///
+    /// - "high": ~190ms per minute.
+    ///   Noticeable quality improvement for critical listening.
+    ///
+    /// - "maximum": ~230ms per minute.
+    ///   Best quality, but significantly slower. Only recommended when:
+    ///   - All audio is precached on startup
+    ///   - You're running on a powerful system
+    ///   - Audio quality is more important than latency
+    ///
+    /// Default: "fast" (optimized for real-time immersive applications)
+    pub resampler_quality: ResamplerQuality,
+}
+
+impl Default for AdvancedConfig {
+    fn default() -> Self {
+        Self {
+            resampler_quality: ResamplerQuality::Fast,
+        }
+    }
+}
+
 /// Configuration for the optional HTTP server
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -328,6 +414,8 @@ pub struct Config {
     pub bass_management: BassManagementConfig,
     #[serde(default)]
     pub inputs: Vec<InputConfig>,
+    #[serde(default)]
+    pub advanced: AdvancedConfig,
 }
 
 impl Default for Config {
@@ -342,6 +430,7 @@ impl Default for Config {
             ducking_rules: Vec::new(),
             bass_management: BassManagementConfig::default(),
             inputs: Vec::new(),
+            advanced: AdvancedConfig::default(),
         }
     }
 }
@@ -1766,5 +1855,63 @@ mod tests {
         // Setting http_port should enable HTTP and set the port
         assert!(config.http.enabled);
         assert_eq!(config.http.port, 9000);
+    }
+
+    #[test]
+    fn test_resampler_quality_default() {
+        let config = Config::default();
+        assert_eq!(config.advanced.resampler_quality, ResamplerQuality::Fast);
+    }
+
+    #[test]
+    fn test_resampler_quality_parse() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "advanced": {
+                "resampler_quality": "medium"
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.advanced.resampler_quality, ResamplerQuality::Medium);
+    }
+
+    #[test]
+    fn test_resampler_quality_all_values() {
+        for (json_value, expected) in [
+            ("fast", ResamplerQuality::Fast),
+            ("medium", ResamplerQuality::Medium),
+            ("high", ResamplerQuality::High),
+            ("maximum", ResamplerQuality::Maximum),
+        ] {
+            let json = format!(r#"{{"mqtt": {{"topic": "test"}}, "advanced": {{"resampler_quality": "{}"}}}}"#, json_value);
+            let config: Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(config.advanced.resampler_quality, expected, "Failed for {}", json_value);
+        }
+    }
+
+    #[test]
+    fn test_resampler_quality_methods() {
+        // Fast
+        assert_eq!(ResamplerQuality::Fast.sinc_len(), 64);
+        assert_eq!(ResamplerQuality::Fast.oversampling_factor(), 64);
+
+        // Medium
+        assert_eq!(ResamplerQuality::Medium.sinc_len(), 128);
+        assert_eq!(ResamplerQuality::Medium.oversampling_factor(), 128);
+
+        // High
+        assert_eq!(ResamplerQuality::High.sinc_len(), 256);
+        assert_eq!(ResamplerQuality::High.oversampling_factor(), 128);
+
+        // Maximum
+        assert_eq!(ResamplerQuality::Maximum.sinc_len(), 256);
+        assert_eq!(ResamplerQuality::Maximum.oversampling_factor(), 256);
+    }
+
+    #[test]
+    fn test_advanced_config_default() {
+        let config = AdvancedConfig::default();
+        assert_eq!(config.resampler_quality, ResamplerQuality::Fast);
     }
 }

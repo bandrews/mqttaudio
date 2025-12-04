@@ -3,6 +3,7 @@
 
 use crate::audio::resampler;
 use crate::audio::types::DecodedBuffer;
+use crate::config::ResamplerQuality;
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -59,7 +60,12 @@ impl From<resampler::ResampleError> for DecodeError {
 /// # Arguments
 /// * `path` - Path to the audio file
 /// * `target_sample_rate` - If Some, resample to this rate. If None, use file's native rate
-pub fn decode_file(path: &str, target_sample_rate: Option<u32>) -> Result<DecodedBuffer, DecodeError> {
+/// * `resampler_quality` - Quality preset for resampling (Fast, Medium, High, Maximum)
+pub fn decode_file(
+    path: &str,
+    target_sample_rate: Option<u32>,
+    resampler_quality: ResamplerQuality,
+) -> Result<DecodedBuffer, DecodeError> {
     tracing::debug!("Decoding file: {}", path);
 
     // Open the file
@@ -147,7 +153,13 @@ pub fn decode_file(path: &str, target_sample_rate: Option<u32>) -> Result<Decode
     // Resample if needed
     let (final_data, final_sample_rate) = if let Some(target_rate) = target_sample_rate {
         if sample_rate != target_rate {
-            let resampled = resampler::resample(samples, sample_rate, target_rate, channels)?;
+            let resampled = resampler::resample(
+                samples,
+                sample_rate,
+                target_rate,
+                channels,
+                resampler_quality,
+            )?;
             (resampled, target_rate)
         } else {
             (samples, sample_rate)

@@ -104,6 +104,9 @@ Specify with `--config`, or mqttaudio searches these locations:
   "logging": {
     "level": "info",
     "mqtt_topic": "audio/logs"
+  },
+  "advanced": {
+    "resampler_quality": "fast"
   }
 }
 ```
@@ -358,6 +361,39 @@ When `mqtt_topic` is set, log entries are published as JSON:
   "message": "Playing: /sounds/effect.wav"
 }
 ```
+
+### advanced
+
+Performance tuning and advanced settings. Most users won't need to change these.
+
+```json
+"advanced": {
+  "resampler_quality": "fast"
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `resampler_quality` | string | `"fast"` | Sample rate conversion quality preset |
+
+#### Resampler Quality
+
+When audio files have a different sample rate than the output device (e.g., a 44.1kHz MP3 played on a 48kHz device), mqttaudio resamples them. The quality setting controls the tradeoff between speed and audio fidelity.
+
+| Preset | Speed | Quality | Use Case |
+|--------|-------|---------|----------|
+| `"fast"` | ~60ms/min | Good | **Default.** Real-time playback, games, interactive installations |
+| `"medium"` | ~95ms/min | Better | Balanced option when you want slightly better quality |
+| `"high"` | ~190ms/min | High | Critical listening, when all content is precached |
+| `"maximum"` | ~230ms/min | Best | Studio quality, when latency doesn't matter |
+
+**Notes:**
+- Times shown are for resampling 1 minute of stereo audio (44.1kHz → 48kHz) on a typical system
+- The "fast" preset is optimized for interactive use with <100ms cold start targets
+- If all your audio files already match the output device sample rate, this setting has no effect
+- For best latency, precache audio files that must start instantly (see `cache.precache`)
+
+**Recommendation:** Leave at `"fast"` unless you have specific quality requirements AND your use case can tolerate longer loading times. If quality is critical, precache your audio files at startup.
 
 ---
 

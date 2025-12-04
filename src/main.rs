@@ -476,9 +476,11 @@ async fn main() {
 
     // Create cache manager using config
     let cache_dir = config.cache_directory();
+    let resampler_quality = config.advanced.resampler_quality;
     tracing::info!("Cache directory: {}", cache_dir.display());
+    tracing::info!("Resampler quality: {:?}", resampler_quality);
 
-    let cache_manager = match cache::CacheManager::new(cache_dir) {
+    let cache_manager = match cache::CacheManager::with_quality(cache_dir, resampler_quality) {
         Ok(cm) => Arc::new(Mutex::new(cm)),
         Err(e) => {
             tracing::error!("Failed to initialize cache: {}", e);

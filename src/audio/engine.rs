@@ -4,6 +4,7 @@
 use crate::audio::decoder;
 use crate::audio::mixer::{ActiveSample, MixerState};
 use crate::audio::types::DeviceConfig;
+use crate::config::ResamplerQuality;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -422,7 +423,7 @@ pub fn play_file(path: &str) -> Result<Stream, Box<dyn std::error::Error>> {
 
     // Decode the audio file with automatic resampling to device sample rate
     tracing::info!("Loading audio file: {}", path);
-    let buffer = decoder::decode_file(path, Some(output_sample_rate))?;
+    let buffer = decoder::decode_file(path, Some(output_sample_rate), ResamplerQuality::default())?;
 
     tracing::info!(
         "Loaded: {} channels, {} Hz, {} frames ({:.2}s)",
@@ -524,7 +525,7 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
 
     let mut buffers = Vec::new();
     for (i, file_path) in test_files.iter().enumerate() {
-        match decoder::decode_file(file_path, Some(output_sample_rate)) {
+        match decoder::decode_file(file_path, Some(output_sample_rate), ResamplerQuality::default()) {
             Ok(buffer) => {
                 tracing::info!(
                     "Loaded sample {}: {} channels, {} frames ({:.2}s)",

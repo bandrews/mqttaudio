@@ -2,6 +2,7 @@
 // ABOUTME: Converts audio to match output device sample rate.
 
 use rubato::{Resampler, ResamplerConstructionError, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use crate::config::ResamplerQuality;
 
 #[derive(Debug)]
 pub enum ResampleError {
@@ -41,6 +42,7 @@ impl From<ResamplerConstructionError> for ResampleError {
 /// * `input_rate` - Source sample rate
 /// * `output_rate` - Target sample rate
 /// * `channels` - Number of audio channels
+/// * `quality` - Resampler quality preset (affects speed and audio quality)
 ///
 /// # Returns
 /// Resampled interleaved PCM samples
@@ -49,6 +51,7 @@ pub fn resample(
     input_rate: u32,
     output_rate: u32,
     channels: usize,
+    quality: ResamplerQuality,
 ) -> Result<Vec<f32>, ResampleError> {
     // Fast path: no resampling needed
     if input_rate == output_rate {
@@ -65,21 +68,22 @@ pub fn resample(
     }
 
     tracing::info!(
-        "Resampling: {} Hz → {} Hz ({} channels)",
+        "Resampling: {} Hz → {} Hz ({} channels, quality={:?})",
         input_rate,
         output_rate,
-        channels
+        channels,
+        quality
     );
 
     let ratio = output_rate as f64 / input_rate as f64;
     let frames = input.len() / channels;
 
-    // Create resampler with high-quality settings
+    // Create resampler with quality-based settings
     let params = SincInterpolationParameters {
-        sinc_len: 256,
+        sinc_len: quality.sinc_len(),
         f_cutoff: 0.95,
         interpolation: SincInterpolationType::Linear,
-        oversampling_factor: 256,
+        oversampling_factor: quality.oversampling_factor(),
         window: WindowFunction::BlackmanHarris2,
     };
 
@@ -130,14 +134,14 @@ mod tests {
     #[test]
     fn test_no_resampling_needed() {
         let input = vec![0.1, 0.2, 0.3, 0.4];
-        let result = resample(input.clone(), 44100, 44100, 2).unwrap();
+        let result = resample(input.clone(), 44100, 44100, 2, ResamplerQuality::Fast).unwrap();
         assert_eq!(result, input);
     }
 
     #[test]
     fn test_empty_input() {
         let input = vec![];
-        let result = resample(input, 44100, 48000, 2).unwrap();
+        let result = resample(input, 44100, 48000, 2, ResamplerQuality::Fast).unwrap();
         assert_eq!(result.len(), 0);
     }
 
@@ -156,7 +160,7 @@ mod tests {
             input.push(sample); // Right
         }
 
-        let result = resample(input, 44100, 48000, 2).unwrap();
+        let result = resample(input, 44100, 48000, 2, ResamplerQuality::Fast).unwrap();
 
         // Output should have ~8.8% more samples
         let expected_frames = (frames as f32 * 48000.0 / 44100.0) as usize;
@@ -185,7 +189,7 @@ mod tests {
             input.push(sample);
         }
 
-        let result = resample(input, 48000, 44100, 2).unwrap();
+        let result = resample(input, 48000, 44100, 2, ResamplerQuality::Fast).unwrap();
 
         // Output should have ~8.2% fewer samples
         let expected_frames = (frames as f32 * 44100.0 / 48000.0) as usize;
@@ -205,7 +209,7 @@ mod tests {
         let frames = 1000;
         let input: Vec<f32> = (0..frames).map(|i| (i as f32) / frames as f32).collect();
 
-        let result = resample(input, 44100, 48000, 1).unwrap();
+        let result = resample(input, 44100, 48000, 1, ResamplerQuality::Fast).unwrap();
 
         // Mono should work correctly - expected ~1088 frames with some latency
         // Allow wider bounds due to resampler buffering
@@ -216,7 +220,25 @@ mod tests {
     #[test]
     fn test_invalid_channel_count() {
         let input = vec![0.1, 0.2, 0.3, 0.4];
-        let result = resample(input, 44100, 48000, 0);
+        let result = resample(input, 44100, 48000, 0, ResamplerQuality::Fast);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_all_quality_presets() {
+        // Verify all quality presets work correctly
+        let input: Vec<f32> = (0..1000).map(|i| (i as f32 * 0.01).sin()).collect();
+
+        for quality in [
+            ResamplerQuality::Fast,
+            ResamplerQuality::Medium,
+            ResamplerQuality::High,
+            ResamplerQuality::Maximum,
+        ] {
+            let result = resample(input.clone(), 44100, 48000, 1, quality);
+            assert!(result.is_ok(), "Quality {:?} failed", quality);
+            let output = result.unwrap();
+            assert!(output.len() > 800, "Quality {:?} produced too few samples", quality);
+        }
     }
 }

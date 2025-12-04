@@ -51,7 +51,7 @@ ctrlc = "3.4"
 # HTTP server
 axum = { version = "0.7", features = ["ws"] }
 tower = { version = "0.4", features = ["util"] }
-tower-http = { version = "0.5", features = ["cors"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
 
 # Async utilities
 futures = "0.3"
@@ -75,6 +75,10 @@ tempfile = "3.8"
 
 [[bench]]
 name = "mixer_benchmark"
+harness = false
+
+[[bench]]
+name = "loading_benchmark"
 harness = false
 
 [profile.release]

@@ -6,6 +6,7 @@ pub mod memory;
 
 use crate::audio::decoder;
 use crate::audio::types::DecodedBuffer;
+use crate::config::ResamplerQuality;
 use disk::{CacheError, DiskCache};
 use memory::MemoryCache;
 use std::path::PathBuf;
@@ -15,18 +16,27 @@ use std::sync::Arc;
 pub struct CacheManager {
     memory_cache: MemoryCache,
     disk_cache: DiskCache,
+    resampler_quality: ResamplerQuality,
 }
 
 impl CacheManager {
-    /// Create a new cache manager
-    pub fn new(cache_dir: PathBuf) -> Result<Self, CacheError> {
+    /// Create a new cache manager with specified resampler quality
+    pub fn with_quality(cache_dir: PathBuf, resampler_quality: ResamplerQuality) -> Result<Self, CacheError> {
         let disk_cache = DiskCache::new(cache_dir)?;
         let memory_cache = MemoryCache::new();
 
         Ok(Self {
             memory_cache,
             disk_cache,
+            resampler_quality,
         })
+    }
+
+    /// Create a new cache manager with default (Fast) resampler quality.
+    /// Primarily used by tests and benchmarks.
+    #[allow(dead_code)]
+    pub fn new(cache_dir: PathBuf) -> Result<Self, CacheError> {
+        Self::with_quality(cache_dir, ResamplerQuality::default())
     }
 
     /// Get or load an audio file, handling both HTTP URLs and local files
@@ -67,6 +77,7 @@ impl CacheManager {
         let buffer = decoder::decode_file(
             local_path.to_str().unwrap(),
             Some(target_sample_rate),
+            self.resampler_quality,
         )?;
 
         // Store in memory cache
