@@ -12,6 +12,8 @@ OPTIONS:
   -s, --server <HOST>          MQTT server hostname [default: localhost]
   -p, --port <PORT>            MQTT server port [default: 1883]
   -t, --topic <TOPIC>          MQTT topic to subscribe to
+  --mqtt-username <USER>       MQTT broker username for authentication
+  --mqtt-password <PASS>       MQTT broker password for authentication
   -d, --device <NAME>          Audio output device name
   -r, --sample-rate <RATE>     Output sample rate [default: 48000]
   -n, --channels <COUNT>       Number of output channels [default: auto-detect]
@@ -118,7 +120,9 @@ MQTT broker connection settings.
 "mqtt": {
   "server": "localhost",
   "port": 1883,
-  "topic": "audio/commands"
+  "topic": "audio/commands",
+  "username": "myuser",
+  "password": "mypassword"
 }
 ```
 
@@ -127,6 +131,10 @@ MQTT broker connection settings.
 | `server` | string | `"localhost"` | MQTT broker hostname or IP |
 | `port` | integer | `1883` | MQTT broker port |
 | `topic` | string | *required* | Topic to subscribe to (supports `#` and `+` wildcards) |
+| `username` | string | — | Username for MQTT authentication |
+| `password` | string | — | Password for MQTT authentication |
+
+**Authentication:** If your MQTT broker requires authentication, provide both `username` and `password`. These can also be passed via command line with `--mqtt-username` and `--mqtt-password`.
 
 ### audio
 

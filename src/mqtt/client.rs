@@ -25,6 +25,8 @@ pub async fn connect_mqtt(
     server: &str,
     port: u16,
     topic: &str,
+    username: Option<&str>,
+    password: Option<&str>,
 ) -> Result<(AsyncClient, EventLoop), MqttError> {
     tracing::info!("Connecting to MQTT broker: {}:{}", server, port);
 
@@ -36,6 +38,12 @@ pub async fn connect_mqtt(
     let mut mqttoptions = MqttOptions::new(client_id, server, port);
     mqttoptions.set_keep_alive(Duration::from_secs(60));
     mqttoptions.set_clean_session(true);
+
+    // Set credentials if provided
+    if let (Some(user), Some(pass)) = (username, password) {
+        tracing::info!("Using MQTT authentication for user: {}", user);
+        mqttoptions.set_credentials(user, pass);
+    }
 
     let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
 
@@ -93,13 +101,20 @@ mod tests {
 
     #[tokio::test]
     async fn test_connect_mqtt() {
-        let result = connect_mqtt("localhost", 1883, "test/topic").await;
+        let result = connect_mqtt("localhost", 1883, "test/topic", None, None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_connect_mqtt_with_credentials() {
+        // Test that credentials are accepted (actual authentication requires a configured broker)
+        let result = connect_mqtt("localhost", 1883, "test/topic", Some("user"), Some("pass")).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_mqtt_event_processing() {
-        let (client, eventloop) = connect_mqtt("localhost", 1883, "test/topic")
+        let (client, eventloop) = connect_mqtt("localhost", 1883, "test/topic", None, None)
             .await
             .unwrap();
 

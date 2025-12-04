@@ -80,6 +80,14 @@ struct Args {
     /// MQTT topic to publish log messages to
     #[arg(long)]
     log_topic: Option<String>,
+
+    /// MQTT broker username for authentication
+    #[arg(long)]
+    mqtt_username: Option<String>,
+
+    /// MQTT broker password for authentication
+    #[arg(long)]
+    mqtt_password: Option<String>,
 }
 
 #[tokio::main]
@@ -107,6 +115,8 @@ async fn main() {
         args.lfe_channel,
         args.crossover_frequency,
         args.log_topic.clone(),
+        args.mqtt_username.clone(),
+        args.mqtt_password.clone(),
     );
 
     // Initialize logging based on config
@@ -278,7 +288,13 @@ async fn main() {
     tracing::info!("  Topic: {}", topic);
 
     // Connect to MQTT broker
-    let (client, eventloop) = match mqtt::client::connect_mqtt(&config.mqtt.server, config.mqtt.port, &topic).await {
+    let (client, eventloop) = match mqtt::client::connect_mqtt(
+        &config.mqtt.server,
+        config.mqtt.port,
+        &topic,
+        config.mqtt.username.as_deref(),
+        config.mqtt.password.as_deref(),
+    ).await {
         Ok((c, el)) => (c, el),
         Err(e) => {
             tracing::error!("Failed to connect to MQTT broker: {}", e);

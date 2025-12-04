@@ -15,6 +15,12 @@ pub struct MqttConfig {
     pub topic: Option<String>,
     pub client_id: Option<String>,
     pub reconnect_delay_seconds: u64,
+    /// MQTT broker username for authentication
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    /// MQTT broker password for authentication
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 impl Default for MqttConfig {
@@ -25,6 +31,8 @@ impl Default for MqttConfig {
             topic: None,
             client_id: None,
             reconnect_delay_seconds: 10,
+            username: None,
+            password: None,
         }
     }
 }
@@ -393,6 +401,8 @@ impl Config {
         lfe_channel: Option<usize>,
         crossover_frequency: Option<f32>,
         log_topic: Option<String>,
+        mqtt_username: Option<String>,
+        mqtt_password: Option<String>,
     ) {
         // Override MQTT settings
         if let Some(s) = server {
@@ -403,6 +413,12 @@ impl Config {
         }
         if let Some(t) = topic {
             self.mqtt.topic = Some(t);
+        }
+        if let Some(u) = mqtt_username {
+            self.mqtt.username = Some(u);
+        }
+        if let Some(p) = mqtt_password {
+            self.mqtt.password = Some(p);
         }
 
         // Override audio settings
@@ -621,11 +637,78 @@ mod tests {
         assert_eq!(config.mqtt.server, "localhost");
         assert_eq!(config.mqtt.port, 1883);
         assert_eq!(config.mqtt.topic, None);
+        assert_eq!(config.mqtt.username, None);
+        assert_eq!(config.mqtt.password, None);
         assert_eq!(config.audio.sample_rate, 48000);
         assert_eq!(config.audio.buffer_size, 512);
         assert_eq!(config.cache.enabled, true);
         assert_eq!(config.cache.revalidate_after_seconds, 300);
         assert_eq!(config.logging.level, "info");
+    }
+
+    #[test]
+    fn test_parse_mqtt_credentials() {
+        let json = r#"{
+            "mqtt": {
+                "topic": "audio/test",
+                "username": "myuser",
+                "password": "mypassword"
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.mqtt.username, Some("myuser".to_string()));
+        assert_eq!(config.mqtt.password, Some("mypassword".to_string()));
+    }
+
+    #[test]
+    fn test_mqtt_credentials_not_serialized_when_none() {
+        let config = MqttConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+
+        // username and password should not appear in JSON when None
+        assert!(!json.contains("username"));
+        assert!(!json.contains("password"));
+    }
+
+    #[test]
+    fn test_merge_cli_args_mqtt_credentials() {
+        let mut config = Config::default();
+        assert!(config.mqtt.username.is_none());
+        assert!(config.mqtt.password.is_none());
+
+        config.merge_cli_args(
+            None, None, None, None, None, None, false, None, None, None,
+            Some("cli_user".to_string()),
+            Some("cli_pass".to_string()),
+        );
+
+        assert_eq!(config.mqtt.username, Some("cli_user".to_string()));
+        assert_eq!(config.mqtt.password, Some("cli_pass".to_string()));
+    }
+
+    #[test]
+    fn test_cli_args_override_config_credentials() {
+        let json = r#"{
+            "mqtt": {
+                "topic": "audio/test",
+                "username": "config_user",
+                "password": "config_pass"
+            }
+        }"#;
+
+        let mut config: Config = serde_json::from_str(json).unwrap();
+
+        config.merge_cli_args(
+            None, None, None, None, None, None, false, None, None, None,
+            Some("cli_user".to_string()),
+            Some("cli_pass".to_string()),
+        );
+
+        // CLI should override config
+        assert_eq!(config.mqtt.username, Some("cli_user".to_string()));
+        assert_eq!(config.mqtt.password, Some("cli_pass".to_string()));
     }
 
     #[test]
@@ -855,6 +938,8 @@ mod tests {
             None,
             None,
             None, // log_topic
+            None, // mqtt_username
+            None, // mqtt_password
         );
 
         assert_eq!(config.mqtt.server, "overridden");
@@ -875,11 +960,15 @@ mod tests {
             Some(5),
             Some(120.0),
             Some("audio/logs".to_string()), // log_topic
+            Some("testuser".to_string()),   // mqtt_username
+            Some("testpass".to_string()),   // mqtt_password
         );
 
         assert_eq!(config.mqtt.server, "newserver");
         assert_eq!(config.mqtt.port, 8883);
         assert_eq!(config.mqtt.topic, Some("newtopic".to_string()));
+        assert_eq!(config.mqtt.username, Some("testuser".to_string()));
+        assert_eq!(config.mqtt.password, Some("testpass".to_string()));
         assert_eq!(config.audio.device, Some("newdevice".to_string()));
         assert_eq!(config.audio.sample_rate, 96000);
         assert_eq!(config.audio.channels, Some(8));
@@ -908,6 +997,8 @@ mod tests {
             None,
             None,
             None, // log_topic
+            None, // mqtt_username
+            None, // mqtt_password
         );
 
         assert_eq!(config.mqtt.server, "original");  // Unchanged
@@ -921,7 +1012,7 @@ mod tests {
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.verbose, false);
 
-        config.merge_cli_args(None, None, None, None, None, None, true, None, None, None);
+        config.merge_cli_args(None, None, None, None, None, None, true, None, None, None, None, None);
 
         assert_eq!(config.logging.verbose, true);
         assert_eq!(config.logging.level, "debug");
@@ -1163,6 +1254,7 @@ mod tests {
         config.merge_cli_args(
             None, None, None, None, None, None, false, None, None,
             Some("audio/logs".to_string()),
+            None, None,
         );
 
         assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
