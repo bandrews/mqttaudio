@@ -144,9 +144,22 @@ impl VoiceManager {
     }
 
     /// Get total number of voices
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn voice_count(&self) -> usize {
         self.voices.len()
+    }
+
+    /// List all voices with their details
+    pub fn list_voices(&self) -> Vec<serde_json::Value> {
+        self.voices
+            .iter()
+            .map(|(id, voice)| {
+                serde_json::json!({
+                    "id": id,
+                    "sample_count": voice.sample_count(),
+                    "volume": voice.volume
+                })
+            })
+            .collect()
     }
 
     /// Get total number of samples across all voices

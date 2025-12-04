@@ -15,6 +15,7 @@ mqttaudio listens for JSON commands over MQTT and plays audio with:
 - **HTTP caching** — Stream audio from URLs with automatic caching
 - **Variable speed** — Speed up, slow down, or reverse playback with optional pitch correction
 - **Software LFE** — Extract low frequencies with configurable crossover and route them to a designated channel, allowing fine grained control over subwoofer output
+- **REST API** — Optional HTTP server with REST endpoints mirroring MQTT commands, plus WebSocket for log streaming
 
 ## Quick Start
 
@@ -159,6 +160,22 @@ Then run with:
 ./mqttaudio --config config.json
 ```
 
+## HTTP REST API (Optional)
+
+mqttaudio includes an optional HTTP server that provides REST endpoints mirroring all MQTT commands.  This server can be used in addition to or instead of an MQTT connection.
+
+Enable it with `--http-port 8080` or via config file. See [HTTP API](docs/http-api.md) for full documentation.
+
+```bash
+# Quick start
+./mqttaudio --server localhost --topic audio/commands --http-port 8080
+
+# Play via HTTP
+curl -X POST http://localhost:8080/play \
+  -H "Content-Type: application/json" \
+  -d '{"file": "/sounds/effect.wav"}'
+```
+
 ## Documentation
 
 | Document                                   | Description                               |
@@ -166,6 +183,7 @@ Then run with:
 | [Getting Started](docs/getting-started.md) | Installation, first steps, basic concepts |
 | [Commands](docs/commands.md)               | Complete command reference                |
 | [Configuration](docs/configuration.md)     | Config file and CLI options               |
+| [HTTP API](docs/http-api.md)               | REST endpoints and WebSocket streaming    |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues and solutions               |
 
 ### Feature Guides
@@ -182,9 +200,10 @@ Then run with:
 
 ### For Developers
 
-| Document                             | Description                 |
-| ------------------------------------ | --------------------------- |
-| [Architecture](docs/architecture.md) | System design and internals |
+| Document                             | Description                       |
+| ------------------------------------ | --------------------------------- |
+| [Architecture](docs/architecture.md) | System design and internals       |
+| [Contributing](CONTRIBUTING.md)      | Building and testing instructions |
 
 ## Supported Formats
 
@@ -210,12 +229,18 @@ Files are automatically resampled to match your output device.
 
 ## License
 
-MIT
+[MIT License](LICENSE)
+
+## AI Statement
+
+While this tool is human designed, reviewed, tested and maintained, the bulk of core development was performed by Claude Opus 4.5 or later.  
+
+If you prefer a purely human developed alternative, the much simpler 1.0 version hand-built in C++ is still available.  Be aware the legacy version is end-of-life and all further development and maintenance will take place on the 2.0 branch.
 
 ## Contributing
 
-Contributions welcome! Please:
+Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, testing, and guidelines.
 
-1. Run tests: `cargo test`
-2. Check formatting: `cargo fmt`
-3. Run lints: `cargo clippy`
+## Copyright
+
+Copyright (c) 2016-2025 Mo Fang Heavy Industries LLC.  All Rights Reserved.

@@ -48,6 +48,14 @@ ringbuf = "0.3"
 # Signal handling
 ctrlc = "3.4"
 
+# HTTP server
+axum = { version = "0.7", features = ["ws"] }
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Async utilities
+futures = "0.3"
+
 # Random number generation
 rand = "0.8"
 

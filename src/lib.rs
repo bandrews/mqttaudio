@@ -17,15 +17,14 @@ pub mod audio {
     pub mod alsa_probe;
 }
 
-pub mod cache {
-    pub mod disk;
-    pub mod memory;
-}
+pub mod cache;
 
 pub mod mqtt {
     pub mod commands;
     pub mod client;
 }
+
+pub mod http;
 
 pub mod voice;
 pub mod config;

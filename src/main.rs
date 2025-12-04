@@ -4,6 +4,7 @@
 mod audio;
 mod cache;
 mod config;
+mod http;
 mod mqtt;
 mod voice;
 
@@ -88,6 +89,10 @@ struct Args {
     /// MQTT broker password for authentication
     #[arg(long)]
     mqtt_password: Option<String>,
+
+    /// Enable HTTP server on specified port (enables REST API and WebSocket)
+    #[arg(long)]
+    http_port: Option<u16>,
 }
 
 #[tokio::main]
@@ -117,6 +122,7 @@ async fn main() {
         args.log_topic.clone(),
         args.mqtt_username.clone(),
         args.mqtt_password.clone(),
+        args.http_port,
     );
 
     // Initialize logging based on config
@@ -264,7 +270,7 @@ async fn main() {
         return;
     }
 
-    // MQTT mode - validate config first
+    // Validate config
     if let Err(errors) = config.validate() {
         eprintln!("Configuration validation failed:");
         for error in errors {
@@ -273,45 +279,59 @@ async fn main() {
         std::process::exit(1);
     }
 
-    // Check if MQTT topic is configured
-    let topic = match &config.mqtt.topic {
-        Some(t) => t.clone(),
-        None => {
-            eprintln!("Error: MQTT topic is required. Specify via --topic or in config file.");
-            eprintln!("Run with --help for usage information.");
-            std::process::exit(1);
+    // Determine operating mode
+    let mqtt_enabled = config.mqtt.topic.is_some();
+    let http_enabled = config.http.enabled;
+
+    if mqtt_enabled {
+        tracing::info!("MQTT mode enabled");
+        tracing::info!("  Server: {}:{}", config.mqtt.server, config.mqtt.port);
+        tracing::info!("  Topic: {}", config.mqtt.topic.as_ref().unwrap());
+    }
+    if http_enabled {
+        tracing::info!("HTTP mode enabled");
+        tracing::info!("  Bind: {}:{}", config.http.bind_address, config.http.port);
+    }
+
+    // Connect to MQTT broker if enabled
+    let mqtt_connection = if mqtt_enabled {
+        let topic = config.mqtt.topic.as_ref().unwrap();
+        match mqtt::client::connect_mqtt(
+            &config.mqtt.server,
+            config.mqtt.port,
+            topic,
+            config.mqtt.username.as_deref(),
+            config.mqtt.password.as_deref(),
+        ).await {
+            Ok((c, el)) => Some((c, el)),
+            Err(e) => {
+                tracing::error!("Failed to connect to MQTT broker: {}", e);
+                if !http_enabled {
+                    // MQTT was the only mode, so we must exit
+                    std::process::exit(1);
+                }
+                tracing::warn!("Continuing with HTTP-only mode");
+                None
+            }
         }
+    } else {
+        None
     };
 
-    tracing::info!("Starting MQTT mode");
-    tracing::info!("  Server: {}:{}", config.mqtt.server, config.mqtt.port);
-    tracing::info!("  Topic: {}", topic);
-
-    // Connect to MQTT broker
-    let (client, eventloop) = match mqtt::client::connect_mqtt(
-        &config.mqtt.server,
-        config.mqtt.port,
-        &topic,
-        config.mqtt.username.as_deref(),
-        config.mqtt.password.as_deref(),
-    ).await {
-        Ok((c, el)) => (c, el),
-        Err(e) => {
-            tracing::error!("Failed to connect to MQTT broker: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    // Spawn MQTT log publisher if configured
-    let client = std::sync::Arc::new(client);
-    let _log_publisher_handle = if let Some(receiver) = mqtt_log_receiver {
-        if let Some(ref log_topic) = config.logging.mqtt_topic {
-            tracing::info!("MQTT log publishing enabled on topic: {}", log_topic);
-            Some(mqtt::logger::spawn_log_publisher(
-                client.clone(),
-                log_topic.clone(),
-                receiver,
-            ))
+    // Spawn MQTT log publisher if configured and connected
+    let _log_publisher_handle = if let Some((ref client, _)) = mqtt_connection {
+        let client = std::sync::Arc::new(client.clone());
+        if let Some(receiver) = mqtt_log_receiver {
+            if let Some(ref log_topic) = config.logging.mqtt_topic {
+                tracing::info!("MQTT log publishing enabled on topic: {}", log_topic);
+                Some(mqtt::logger::spawn_log_publisher(
+                    client,
+                    log_topic.clone(),
+                    receiver,
+                ))
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -533,13 +553,45 @@ async fn main() {
         // Create command channel
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(100);
 
-        // Spawn MQTT event processor
-        tokio::spawn(async move {
-            mqtt::client::process_mqtt_events(eventloop, cmd_tx).await;
-        });
+        // Start HTTP server if enabled
+        if config.http.enabled {
+            let http_cmd_tx = cmd_tx.clone();
+            match http::start_server(
+                &config.http,
+                http_cmd_tx,
+                mixer_state.clone(),
+                voice_manager.clone(),
+                cache_manager.clone(),
+            ).await {
+                Ok(addr) => {
+                    tracing::info!("HTTP REST API available at http://{}", addr);
+                    if config.http.websocket_enabled {
+                        tracing::info!("WebSocket logs available at ws://{}/ws", addr);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start HTTP server: {}", e);
+                    // Continue without HTTP server - not fatal
+                }
+            }
+        }
+
+        // Spawn MQTT event processor if connected
+        if let Some((_, eventloop)) = mqtt_connection {
+            let mqtt_cmd_tx = cmd_tx.clone();
+            tokio::spawn(async move {
+                mqtt::client::process_mqtt_events(eventloop, mqtt_cmd_tx).await;
+            });
+            tracing::info!("Ready to receive MQTT commands on topic: {}", config.mqtt.topic.as_ref().unwrap());
+        }
+
+        // Keep cmd_tx alive if only HTTP is running (no MQTT)
+        let _cmd_tx_keepalive = cmd_tx;
 
         // Main command processing loop
-        tracing::info!("Ready to receive MQTT commands on topic: {}", topic);
+        if mqtt_enabled || http_enabled {
+            tracing::info!("Command processing loop started");
+        }
 
         while let Some(payload) = cmd_rx.recv().await {
             match mqtt::commands::parse_command(&payload) {

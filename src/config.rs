@@ -280,6 +280,38 @@ impl Default for InputConfig {
     }
 }
 
+/// Configuration for the optional HTTP server
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct HttpConfig {
+    /// Enable the HTTP server
+    pub enabled: bool,
+    /// Port to listen on (0 = auto-select available port)
+    pub port: u16,
+    /// Bind address (default: 127.0.0.1 for security)
+    pub bind_address: String,
+    /// Optional Bearer token for authentication (if set, all requests require it)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// Enable WebSocket endpoint for log streaming
+    pub websocket_enabled: bool,
+    /// Allow CORS from any origin (useful for web admin panels)
+    pub cors_permissive: bool,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 0, // Auto-select available port
+            bind_address: "127.0.0.1".to_string(),
+            auth_token: None,
+            websocket_enabled: true,
+            cors_permissive: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -288,6 +320,8 @@ pub struct Config {
     pub cache: CacheConfig,
     pub security: SecurityConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub http: HttpConfig,
     #[serde(default)]
     pub ducking_rules: Vec<DuckingRule>,
     #[serde(default)]
@@ -304,6 +338,7 @@ impl Default for Config {
             cache: CacheConfig::default(),
             security: SecurityConfig::default(),
             logging: LoggingConfig::default(),
+            http: HttpConfig::default(),
             ducking_rules: Vec::new(),
             bass_management: BassManagementConfig::default(),
             inputs: Vec::new(),
@@ -389,6 +424,7 @@ impl Config {
     }
 
     /// Merge CLI arguments into this config (CLI args override config file)
+    #[allow(clippy::too_many_arguments)]
     pub fn merge_cli_args(
         &mut self,
         server: Option<String>,
@@ -403,6 +439,7 @@ impl Config {
         log_topic: Option<String>,
         mqtt_username: Option<String>,
         mqtt_password: Option<String>,
+        http_port: Option<u16>,
     ) {
         // Override MQTT settings
         if let Some(s) = server {
@@ -447,6 +484,12 @@ impl Config {
         }
         if let Some(freq) = crossover_frequency {
             self.bass_management.crossover_frequency_hz = freq;
+        }
+
+        // Override HTTP settings
+        if let Some(hp) = http_port {
+            self.http.enabled = true;
+            self.http.port = hp;
         }
     }
 
@@ -529,9 +572,9 @@ impl Config {
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
-        // MQTT topic is required
-        if self.mqtt.topic.is_none() {
-            errors.push("mqtt.topic is required".to_string());
+        // Either MQTT topic or HTTP must be enabled
+        if self.mqtt.topic.is_none() && !self.http.enabled {
+            errors.push("Either mqtt.topic or http.enabled is required".to_string());
         }
 
         // Sample rate must be reasonable
@@ -595,6 +638,20 @@ impl Config {
                 }
                 if let Err(e) = self.resolve_channel(&route.dest_channel) {
                     errors.push(format!("inputs[{}].routes[{}].dest_channel: {}", i, j, e));
+                }
+            }
+        }
+
+        // HTTP validation
+        if self.http.enabled {
+            // Validate bind address is not empty
+            if self.http.bind_address.is_empty() {
+                errors.push("http.bind_address must not be empty".to_string());
+            }
+            // Auth token should be reasonably long if set
+            if let Some(ref token) = self.http.auth_token {
+                if token.len() < 8 {
+                    errors.push("http.auth_token should be at least 8 characters for security".to_string());
                 }
             }
         }
@@ -682,6 +739,7 @@ mod tests {
             None, None, None, None, None, None, false, None, None, None,
             Some("cli_user".to_string()),
             Some("cli_pass".to_string()),
+            None,
         );
 
         assert_eq!(config.mqtt.username, Some("cli_user".to_string()));
@@ -704,6 +762,7 @@ mod tests {
             None, None, None, None, None, None, false, None, None, None,
             Some("cli_user".to_string()),
             Some("cli_pass".to_string()),
+            None,
         );
 
         // CLI should override config
@@ -856,13 +915,34 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_missing_topic() {
+    fn test_validate_missing_topic_and_http() {
         let config = Config::default();
         let result = config.validate();
 
         assert!(result.is_err());
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| e.contains("mqtt.topic")));
+        assert!(errors.iter().any(|e| e.contains("mqtt.topic") || e.contains("http.enabled")));
+    }
+
+    #[test]
+    fn test_validate_http_only_mode() {
+        let mut config = Config::default();
+        config.http.enabled = true;
+        config.http.port = 8080;
+
+        // HTTP-only mode should be valid (no MQTT topic needed)
+        let result = config.validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_mqtt_only_mode() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test/topic".to_string());
+
+        // MQTT-only mode should be valid
+        let result = config.validate();
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -940,6 +1020,7 @@ mod tests {
             None, // log_topic
             None, // mqtt_username
             None, // mqtt_password
+            None, // http_port
         );
 
         assert_eq!(config.mqtt.server, "overridden");
@@ -962,6 +1043,7 @@ mod tests {
             Some("audio/logs".to_string()), // log_topic
             Some("testuser".to_string()),   // mqtt_username
             Some("testpass".to_string()),   // mqtt_password
+            None, // http_port
         );
 
         assert_eq!(config.mqtt.server, "newserver");
@@ -999,6 +1081,7 @@ mod tests {
             None, // log_topic
             None, // mqtt_username
             None, // mqtt_password
+            None, // http_port
         );
 
         assert_eq!(config.mqtt.server, "original");  // Unchanged
@@ -1012,7 +1095,7 @@ mod tests {
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.verbose, false);
 
-        config.merge_cli_args(None, None, None, None, None, None, true, None, None, None, None, None);
+        config.merge_cli_args(None, None, None, None, None, None, true, None, None, None, None, None, None);
 
         assert_eq!(config.logging.verbose, true);
         assert_eq!(config.logging.level, "debug");
@@ -1254,7 +1337,7 @@ mod tests {
         config.merge_cli_args(
             None, None, None, None, None, None, false, None, None,
             Some("audio/logs".to_string()),
-            None, None,
+            None, None, None,
         );
 
         assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
@@ -1584,5 +1667,104 @@ mod tests {
         assert!(Config::AUDIO_EXTENSIONS.contains(&"ogg"));
         assert!(Config::AUDIO_EXTENSIONS.contains(&"flac"));
         assert!(!Config::AUDIO_EXTENSIONS.contains(&"txt"));
+    }
+
+    #[test]
+    fn test_http_config_default() {
+        let config = HttpConfig::default();
+
+        assert_eq!(config.enabled, false);
+        assert_eq!(config.port, 0);
+        assert_eq!(config.bind_address, "127.0.0.1");
+        assert!(config.auth_token.is_none());
+        assert_eq!(config.websocket_enabled, true);
+        assert_eq!(config.cors_permissive, false);
+    }
+
+    #[test]
+    fn test_http_config_parse() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "http": {
+                "enabled": true,
+                "port": 8080,
+                "bind_address": "0.0.0.0",
+                "auth_token": "secrettoken123",
+                "websocket_enabled": true,
+                "cors_permissive": true
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.http.enabled, true);
+        assert_eq!(config.http.port, 8080);
+        assert_eq!(config.http.bind_address, "0.0.0.0");
+        assert_eq!(config.http.auth_token, Some("secrettoken123".to_string()));
+        assert_eq!(config.http.websocket_enabled, true);
+        assert_eq!(config.http.cors_permissive, true);
+    }
+
+    #[test]
+    fn test_http_config_auth_token_not_serialized_when_none() {
+        let config = HttpConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+
+        // auth_token should not appear in JSON when None
+        assert!(!json.contains("auth_token"));
+    }
+
+    #[test]
+    fn test_http_validation_empty_bind_address() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.http.enabled = true;
+        config.http.bind_address = "".to_string();
+
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("bind_address")));
+    }
+
+    #[test]
+    fn test_http_validation_short_auth_token() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.http.enabled = true;
+        config.http.auth_token = Some("short".to_string());
+
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("auth_token")));
+    }
+
+    #[test]
+    fn test_http_validation_valid_config() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.http.enabled = true;
+        config.http.port = 8080;
+        config.http.auth_token = Some("longenoughtoken".to_string());
+
+        let result = config.validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_merge_cli_args_http_port() {
+        let mut config = Config::default();
+        assert!(!config.http.enabled);
+        assert_eq!(config.http.port, 0);
+
+        config.merge_cli_args(
+            None, None, None, None, None, None, false, None, None, None, None, None,
+            Some(9000),
+        );
+
+        // Setting http_port should enable HTTP and set the port
+        assert!(config.http.enabled);
+        assert_eq!(config.http.port, 9000);
     }
 }
