@@ -1,6 +1,6 @@
 # Contributing to mqttaudio
 
-Contributions are welcome!  All contributors are expected to abide by the [Contributor Covenant](#Contributor Covenant 3.0 Code of Conduct).
+Contributions are welcome!  All contributors are expected to abide by the [Contributor Covenant](#contributor-covenant-30-code-of-conduct).
 
 This document explains how to set up your development environment and run tests.
 
