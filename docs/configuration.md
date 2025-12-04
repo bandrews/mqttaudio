@@ -48,20 +48,29 @@ Specify with `--config`, or mqttaudio searches these locations:
     "device": "USB Audio Interface",
     "sample_rate": 48000,
     "buffer_size": 512,
-    "channels": 8
+    "channels": 8,
+    "channel_aliases": {
+      "front_left": 0,
+      "front_right": 1,
+      "center": 2,
+      "lfe": 3,
+      "surround_left": 4,
+      "surround_right": 5
+    }
   },
   "cache": {
     "directory": "~/.mqttaudio/cache",
     "precache": [
       "/opt/sounds/startup.wav",
+      "/opt/sounds/effects",
       "https://example.com/common-effect.mp3"
     ]
   },
   "bass_management": {
     "enabled": true,
-    "lfe_channel": 3,
+    "lfe_channel": "lfe",
     "crossover_frequency_hz": 80,
-    "source_channels": [0, 1, 2, 4, 5],
+    "source_channels": ["front_left", "front_right", "center", "surround_left", "surround_right"],
     "remove_bass_from_sources": false
   },
   "inputs": [
@@ -70,8 +79,8 @@ Specify with `--config`, or mqttaudio searches these locations:
       "volume": 0.8,
       "voice_id": "mic_1",
       "routes": [
-        {"source_channel": 0, "dest_channel": 4},
-        {"source_channel": 0, "dest_channel": 5}
+        {"source_channel": 0, "dest_channel": "surround_left"},
+        {"source_channel": 0, "dest_channel": "surround_right"}
       ],
       "latency_ms": 25
     }
@@ -128,7 +137,13 @@ Audio output settings.
   "device": "USB Audio Interface",
   "sample_rate": 48000,
   "buffer_size": 512,
-  "channels": 8
+  "channels": 8,
+  "channel_aliases": {
+    "front_left": 0,
+    "front_right": 1,
+    "lfe": 3,
+    "gamemaster_speakers": 4
+  }
 }
 ```
 
@@ -138,6 +153,36 @@ Audio output settings.
 | `sample_rate` | integer | `48000` | Output sample rate in Hz |
 | `buffer_size` | integer | `512` | Buffer size in frames (lower = less latency, more CPU) |
 | `channels` | integer | auto-detect | Number of output channels |
+| `channel_aliases` | object | `{}` | Named aliases for channel numbers |
+
+#### Channel Aliases
+
+The `channel_aliases` field lets you define meaningful names for channel numbers. These aliases can then be used anywhere a channel is referenced in the config file (bass management, input routes):
+
+```json
+"audio": {
+  "channel_aliases": {
+    "front_left": 0,
+    "front_right": 1,
+    "center": 2,
+    "lfe": 3,
+    "surround_left": 4,
+    "surround_right": 5
+  }
+},
+"bass_management": {
+  "lfe_channel": "lfe",
+  "source_channels": ["front_left", "front_right", "center"]
+},
+"inputs": [{
+  "routes": [
+    {"source_channel": 0, "dest_channel": "front_left"},
+    {"source_channel": 0, "dest_channel": "front_right"}
+  ]
+}]
+```
+
+This makes configurations more readable and less error-prone. Channel aliases can also be used in MQTT play commands (see [Commands](commands.md)).
 
 ### cache
 
@@ -147,7 +192,9 @@ File caching settings.
 "cache": {
   "directory": "~/.mqttaudio/cache",
   "precache": [
-    "/sounds/startup.wav"
+    "/sounds/startup.wav",
+    "/opt/effects",
+    "https://example.com/common.mp3"
   ]
 }
 ```
@@ -155,7 +202,24 @@ File caching settings.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `directory` | string | `~/.mqttaudio/cache` | Disk cache directory |
-| `precache` | array | `[]` | Files to cache on startup |
+| `precache` | array | `[]` | Files or directories to cache on startup |
+
+#### Precaching
+
+The `precache` array accepts:
+- **Individual files**: Exact paths to audio files
+- **Directories**: All supported audio files (WAV, MP3, OGG, FLAC) in the folder are cached
+- **HTTP URLs**: Remote files are downloaded and cached
+
+```json
+"precache": [
+  "/sounds/critical-effect.wav",
+  "/opt/installation/ambient",
+  "https://cdn.example.com/intro.mp3"
+]
+```
+
+Directory precaching is not recursive — only files directly in the specified folder are cached. Subdirectories must be listed separately if needed.
 
 ### bass_management
 
@@ -174,10 +238,12 @@ LFE/subwoofer routing.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable bass management |
-| `lfe_channel` | integer | — | Output channel for subwoofer (0-indexed) |
+| `lfe_channel` | integer or string | — | Output channel for subwoofer (number or alias) |
 | `crossover_frequency_hz` | integer | `80` | Crossover frequency in Hz |
-| `source_channels` | array | — | Channels to extract bass from |
+| `source_channels` | array | — | Channels to extract bass from (numbers or aliases) |
 | `remove_bass_from_sources` | boolean | `false` | Remove bass from source channels after extraction |
+
+Channel aliases from `audio.channel_aliases` can be used for `lfe_channel` and `source_channels`.
 
 See [Bass Management](features/bass-management.md) for details.
 
@@ -205,8 +271,10 @@ Microphone/input device configuration.
 | `device` | string | *required* | Input device name (use `--list-inputs`) |
 | `volume` | float | `1.0` | Input volume (0.0 to 1.0) |
 | `voice_id` | string | — | Voice name for ducking integration |
-| `routes` | array | *required* | Channel routing (source → dest) |
+| `routes` | array | *required* | Channel routing (source → dest, can use aliases) |
 | `latency_ms` | integer | `25` | Buffer latency (5-500ms) |
+
+The `dest_channel` in routes can use channel aliases defined in `audio.channel_aliases`.
 
 See [Microphone Input](features/microphone-input.md) for details.
 

@@ -2,6 +2,7 @@
 // ABOUTME: Converts JSON messages to internal command types.
 
 use serde::{Deserialize, Serialize};
+use crate::config::ChannelRef;
 
 /// MQTT command envelope
 #[derive(Debug, Deserialize, Serialize)]
@@ -11,11 +12,12 @@ pub struct MqttCommand {
     pub message: Option<serde_json::Value>,
 }
 
-/// Channel mapping for routing source channels to destination channels
+/// Channel mapping for routing source channels to destination channels.
+/// Channels can be specified as numbers or as aliases defined in config.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct ChannelMapping {
-    pub src: usize,
-    pub dest: usize,
+    pub src: ChannelRef,
+    pub dest: ChannelRef,
 }
 
 /// Selector for targeting samples by id, file, or voice
@@ -681,8 +683,8 @@ mod tests {
 
                 let map = channel_map.unwrap();
                 assert_eq!(map.len(), 2);
-                assert_eq!(map[0], ChannelMapping { src: 0, dest: 6 });
-                assert_eq!(map[1], ChannelMapping { src: 1, dest: 7 });
+                assert_eq!(map[0], ChannelMapping { src: ChannelRef::Index(0), dest: ChannelRef::Index(6) });
+                assert_eq!(map[1], ChannelMapping { src: ChannelRef::Index(1), dest: ChannelRef::Index(7) });
             }
             _ => panic!("Expected Play command"),
         }
@@ -707,10 +709,10 @@ mod tests {
 
                 let map = channel_map.unwrap();
                 assert_eq!(map.len(), 4);
-                assert_eq!(map[0], ChannelMapping { src: 0, dest: 0 });
-                assert_eq!(map[1], ChannelMapping { src: 1, dest: 1 });
-                assert_eq!(map[2], ChannelMapping { src: 2, dest: 2 });
-                assert_eq!(map[3], ChannelMapping { src: 3, dest: 3 });
+                assert_eq!(map[0], ChannelMapping { src: ChannelRef::Index(0), dest: ChannelRef::Index(0) });
+                assert_eq!(map[1], ChannelMapping { src: ChannelRef::Index(1), dest: ChannelRef::Index(1) });
+                assert_eq!(map[2], ChannelMapping { src: ChannelRef::Index(2), dest: ChannelRef::Index(2) });
+                assert_eq!(map[3], ChannelMapping { src: ChannelRef::Index(3), dest: ChannelRef::Index(3) });
             }
             _ => panic!("Expected Play command"),
         }
@@ -739,10 +741,10 @@ mod tests {
 
                 let map = channel_map.unwrap();
                 assert_eq!(map.len(), 4);
-                assert_eq!(map[0], ChannelMapping { src: 0, dest: 8 });
-                assert_eq!(map[1], ChannelMapping { src: 1, dest: 9 });
-                assert_eq!(map[2], ChannelMapping { src: 2, dest: 10 });
-                assert_eq!(map[3], ChannelMapping { src: 3, dest: 11 });
+                assert_eq!(map[0], ChannelMapping { src: ChannelRef::Index(0), dest: ChannelRef::Index(8) });
+                assert_eq!(map[1], ChannelMapping { src: ChannelRef::Index(1), dest: ChannelRef::Index(9) });
+                assert_eq!(map[2], ChannelMapping { src: ChannelRef::Index(2), dest: ChannelRef::Index(10) });
+                assert_eq!(map[3], ChannelMapping { src: ChannelRef::Index(3), dest: ChannelRef::Index(11) });
             }
             _ => panic!("Expected Play command"),
         }
@@ -764,8 +766,8 @@ mod tests {
             AudioCommand::Play { channel_map, .. } => {
                 let map = channel_map.unwrap();
                 assert_eq!(map.len(), 2);
-                assert_eq!(map[0], ChannelMapping { src: 0, dest: 0 });
-                assert_eq!(map[1], ChannelMapping { src: 0, dest: 1 });
+                assert_eq!(map[0], ChannelMapping { src: ChannelRef::Index(0), dest: ChannelRef::Index(0) });
+                assert_eq!(map[1], ChannelMapping { src: ChannelRef::Index(0), dest: ChannelRef::Index(1) });
             }
             _ => panic!("Expected Play command"),
         }
@@ -780,6 +782,64 @@ mod tests {
             AudioCommand::Play { channel_map, .. } => {
                 let map = channel_map.unwrap();
                 assert_eq!(map.len(), 0);
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_channel_map_with_aliases() {
+        // Channel map can use string aliases instead of numbers
+        let json = r#"{"command": "play", "message": {
+            "file": "test.wav",
+            "channel_map": [
+                {"src": 0, "dest": "front_left"},
+                {"src": 1, "dest": "front_right"}
+            ]
+        }}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { channel_map, .. } => {
+                let map = channel_map.unwrap();
+                assert_eq!(map.len(), 2);
+                assert_eq!(map[0], ChannelMapping {
+                    src: ChannelRef::Index(0),
+                    dest: ChannelRef::Alias("front_left".to_string())
+                });
+                assert_eq!(map[1], ChannelMapping {
+                    src: ChannelRef::Index(1),
+                    dest: ChannelRef::Alias("front_right".to_string())
+                });
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_channel_map_all_aliases() {
+        // Both src and dest can be aliases
+        let json = r#"{"command": "play", "message": {
+            "file": "test.wav",
+            "channel_map": [
+                {"src": "left", "dest": "speaker_1"},
+                {"src": "right", "dest": "speaker_2"}
+            ]
+        }}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { channel_map, .. } => {
+                let map = channel_map.unwrap();
+                assert_eq!(map.len(), 2);
+                assert_eq!(map[0], ChannelMapping {
+                    src: ChannelRef::Alias("left".to_string()),
+                    dest: ChannelRef::Alias("speaker_1".to_string())
+                });
+                assert_eq!(map[1], ChannelMapping {
+                    src: ChannelRef::Alias("right".to_string()),
+                    dest: ChannelRef::Alias("speaker_2".to_string())
+                });
             }
             _ => panic!("Expected Play command"),
         }

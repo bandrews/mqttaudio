@@ -44,6 +44,7 @@ impl fmt::Display for DeviceCategory {
 
 /// Native sample format supported by hardware
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum NativeSampleFormat {
     S16LE,
     S24LE,      // 24-bit in 4-byte container
@@ -160,6 +161,7 @@ impl DeviceInfo {
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_unavailable_reason(mut self, reason: impl Into<String>) -> Self {
         self.unavailable_reason = Some(reason.into());
         self.category = DeviceCategory::Unavailable;

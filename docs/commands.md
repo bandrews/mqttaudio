@@ -63,6 +63,15 @@ Without `channel_map`, audio plays on sequential channels starting from 0. With 
 ]
 ```
 
+You can use channel aliases (defined in config) instead of numbers:
+
+```json
+"channel_map": [
+  {"src": 0, "dest": "front_left"},
+  {"src": 1, "dest": "front_right"}
+]
+```
+
 You can route one source to multiple destinations:
 
 ```json

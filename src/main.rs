@@ -347,12 +347,14 @@ async fn main() {
 
     // Create bass management from config
     let bass_management = if config.bass_management.enabled {
+        let resolved = config.resolve_bass_management()
+            .expect("Channel alias resolution failed (should have been caught during validation)");
         let bm_config = audio::bass_management::BassManagementConfig {
-            enabled: config.bass_management.enabled,
-            lfe_channel: config.bass_management.lfe_channel,
-            crossover_frequency_hz: config.bass_management.crossover_frequency_hz,
-            source_channels: config.bass_management.source_channels.clone(),
-            remove_bass_from_sources: config.bass_management.remove_bass_from_sources,
+            enabled: resolved.enabled,
+            lfe_channel: resolved.lfe_channel,
+            crossover_frequency_hz: resolved.crossover_frequency_hz,
+            source_channels: resolved.source_channels.clone(),
+            remove_bass_from_sources: resolved.remove_bass_from_sources,
         };
         tracing::info!(
             "Bass management enabled: LFE channel {}, crossover {} Hz, sources {:?}",
@@ -393,10 +395,17 @@ async fn main() {
 
                 // Take ownership of the consumer for the mixer
                 if let Some(consumer) = active_input.take_consumer() {
-                    // Build channel map from routes config
-                    let channel_map: Vec<(usize, usize)> = input_config.routes.iter()
-                        .map(|r| (r.source_channel, r.dest_channel))
-                        .collect();
+                    // Build channel map from routes config (resolve aliases)
+                    let channel_map: Vec<(usize, usize)> = config.resolve_input_routes(&input_config.routes)
+                        .expect("Channel alias resolution failed (should have been caught during validation)");
+
+                    tracing::info!(
+                        "Input {} routed: {:?}",
+                        idx,
+                        channel_map.iter()
+                            .map(|(src, dest)| format!("{}→{}", src, dest))
+                            .collect::<Vec<_>>()
+                    );
 
                     // Create LiveInput for the mixer
                     let live_input = audio::mixer::LiveInput::new(
@@ -409,14 +418,6 @@ async fn main() {
 
                     // Add to mixer state
                     mixer_state.lock().unwrap().live_inputs.push(live_input);
-
-                    tracing::info!(
-                        "Input {} routed: {:?}",
-                        idx,
-                        input_config.routes.iter()
-                            .map(|r| format!("{}→{}", r.source_channel, r.dest_channel))
-                            .collect::<Vec<_>>()
-                    );
                 }
 
                 // Keep the stream alive by storing it
@@ -449,10 +450,11 @@ async fn main() {
         }
     };
 
-    // Precache files from config on startup
-    if !config.cache.precache.is_empty() {
-        tracing::info!("Precaching {} files from config...", config.cache.precache.len());
-        for file_path in &config.cache.precache {
+    // Precache files from config on startup (expands directories to audio files)
+    let precache_files = config.expand_precache_entries();
+    if !precache_files.is_empty() {
+        tracing::info!("Precaching {} files from config...", precache_files.len());
+        for file_path in &precache_files {
             let mut cache_mgr = cache_manager.lock().unwrap();
             match cache_mgr.precache(file_path, output_sample_rate).await {
                 Ok(()) => {
@@ -565,12 +567,24 @@ async fn main() {
                                     // Convert crossfade_ms to samples
                                     let crossfade_samples = (crossfade_ms as usize * output_sample_rate as usize) / 1000;
 
-                                    // Convert channel_map to mixer format
+                                    // Convert channel_map to mixer format (resolve any aliases)
                                     let mut sample = if let Some(map) = channel_map {
-                                        // Custom channel mapping
-                                        let mapping: Vec<(usize, usize)> = map.iter()
-                                            .map(|m| (m.src, m.dest))
+                                        // Custom channel mapping - resolve aliases
+                                        let mapping_result: Result<Vec<(usize, usize)>, String> = map.iter()
+                                            .map(|m| {
+                                                let src = config.resolve_channel(&m.src)?;
+                                                let dest = config.resolve_channel(&m.dest)?;
+                                                Ok((src, dest))
+                                            })
                                             .collect();
+
+                                        let mapping = match mapping_result {
+                                            Ok(m) => m,
+                                            Err(e) => {
+                                                tracing::error!("Failed to resolve channel alias: {}", e);
+                                                continue;
+                                            }
+                                        };
                                         tracing::debug!("Using custom channel mapping: {:?}", mapping);
                                         ActiveSample::new_with_mapping(
                                             sample_id,

@@ -40,6 +40,95 @@ pub struct AudioConfig {
     pub channel_names: HashMap<String, String>,
     #[serde(default)]
     pub channel_volumes: HashMap<String, f32>,
+    /// Maps alias names to channel numbers (e.g., "front_left" -> 0)
+    #[serde(default)]
+    pub channel_aliases: HashMap<String, usize>,
+}
+
+/// A channel reference that can be either a numeric index or a string alias.
+/// Used in config fields that reference channels.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChannelRef {
+    Index(usize),
+    Alias(String),
+}
+
+impl ChannelRef {
+    /// Resolve this channel reference to a numeric index using the alias map.
+    /// Returns an error if the alias is not found.
+    pub fn resolve(&self, aliases: &HashMap<String, usize>) -> Result<usize, String> {
+        match self {
+            ChannelRef::Index(idx) => Ok(*idx),
+            ChannelRef::Alias(name) => {
+                aliases.get(name)
+                    .copied()
+                    .ok_or_else(|| format!("Unknown channel alias: '{}'", name))
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ChannelRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{self, Visitor};
+
+        struct ChannelRefVisitor;
+
+        impl<'de> Visitor<'de> for ChannelRefVisitor {
+            type Value = ChannelRef;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a channel number or alias string")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(ChannelRef::Index(value as usize))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                if value < 0 {
+                    Err(de::Error::custom("channel index cannot be negative"))
+                } else {
+                    Ok(ChannelRef::Index(value as usize))
+                }
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                // First try to parse as a number for backwards compatibility
+                if let Ok(idx) = value.parse::<usize>() {
+                    Ok(ChannelRef::Index(idx))
+                } else {
+                    Ok(ChannelRef::Alias(value.to_string()))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(ChannelRefVisitor)
+    }
+}
+
+impl Serialize for ChannelRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            ChannelRef::Index(idx) => serializer.serialize_u64(*idx as u64),
+            ChannelRef::Alias(name) => serializer.serialize_str(name),
+        }
+    }
 }
 
 impl Default for AudioConfig {
@@ -51,6 +140,7 @@ impl Default for AudioConfig {
             buffer_size: 512,
             channel_names: HashMap::new(),
             channel_volumes: HashMap::new(),
+            channel_aliases: HashMap::new(),
         }
     }
 }
@@ -116,10 +206,10 @@ impl Default for LoggingConfig {
 #[serde(default)]
 pub struct BassManagementConfig {
     pub enabled: bool,
-    pub lfe_channel: usize,
+    pub lfe_channel: ChannelRef,
     pub crossover_frequency_hz: f32,
     #[serde(default)]
-    pub source_channels: Vec<usize>,
+    pub source_channels: Vec<ChannelRef>,
     pub remove_bass_from_sources: bool,
 }
 
@@ -127,7 +217,7 @@ impl Default for BassManagementConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            lfe_channel: 3, // Standard 5.1 LFE position
+            lfe_channel: ChannelRef::Index(3), // Standard 5.1 LFE position
             crossover_frequency_hz: 80.0,
             source_channels: Vec::new(),
             remove_bass_from_sources: false,
@@ -135,13 +225,23 @@ impl Default for BassManagementConfig {
     }
 }
 
+/// Resolved bass management configuration with numeric channel indices
+#[derive(Debug, Clone)]
+pub struct ResolvedBassManagement {
+    pub enabled: bool,
+    pub lfe_channel: usize,
+    pub crossover_frequency_hz: f32,
+    pub source_channels: Vec<usize>,
+    pub remove_bass_from_sources: bool,
+}
+
 /// Configuration for a single input-to-output route
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InputRouteConfig {
-    /// Source channel on the input device (0-indexed)
-    pub source_channel: usize,
-    /// Destination channel on the output device (0-indexed)
-    pub dest_channel: usize,
+    /// Source channel on the input device (0-indexed, or alias)
+    pub source_channel: ChannelRef,
+    /// Destination channel on the output device (0-indexed, or alias)
+    pub dest_channel: ChannelRef,
 }
 
 /// Configuration for a single audio input (microphone)
@@ -327,11 +427,86 @@ impl Config {
 
         // Override bass management settings
         if let Some(ch) = lfe_channel {
-            self.bass_management.lfe_channel = ch;
+            self.bass_management.lfe_channel = ChannelRef::Index(ch);
         }
         if let Some(freq) = crossover_frequency {
             self.bass_management.crossover_frequency_hz = freq;
         }
+    }
+
+    /// Resolve a channel reference to a numeric index using this config's aliases
+    pub fn resolve_channel(&self, channel: &ChannelRef) -> Result<usize, String> {
+        channel.resolve(&self.audio.channel_aliases)
+    }
+
+    /// Resolve bass management channel references to numeric indices
+    pub fn resolve_bass_management(&self) -> Result<ResolvedBassManagement, String> {
+        let lfe = self.resolve_channel(&self.bass_management.lfe_channel)?;
+        let sources: Result<Vec<usize>, String> = self.bass_management.source_channels
+            .iter()
+            .map(|ch| self.resolve_channel(ch))
+            .collect();
+        Ok(ResolvedBassManagement {
+            enabled: self.bass_management.enabled,
+            lfe_channel: lfe,
+            crossover_frequency_hz: self.bass_management.crossover_frequency_hz,
+            source_channels: sources?,
+            remove_bass_from_sources: self.bass_management.remove_bass_from_sources,
+        })
+    }
+
+    /// Resolve input route channel references to numeric indices
+    pub fn resolve_input_routes(&self, routes: &[InputRouteConfig]) -> Result<Vec<(usize, usize)>, String> {
+        routes.iter()
+            .map(|r| {
+                let src = self.resolve_channel(&r.source_channel)?;
+                let dest = self.resolve_channel(&r.dest_channel)?;
+                Ok((src, dest))
+            })
+            .collect()
+    }
+
+    /// Supported audio file extensions for precaching
+    const AUDIO_EXTENSIONS: &'static [&'static str] = &["wav", "mp3", "ogg", "flac"];
+
+    /// Expand precache entries, converting directories to lists of audio files
+    pub fn expand_precache_entries(&self) -> Vec<String> {
+        let mut result = Vec::new();
+
+        for entry in &self.cache.precache {
+            let expanded = Self::expand_tilde(entry);
+            let path = Path::new(&expanded);
+
+            if path.is_dir() {
+                // Scan directory for audio files
+                match fs::read_dir(path) {
+                    Ok(entries) => {
+                        let mut files: Vec<String> = entries
+                            .filter_map(|e| e.ok())
+                            .filter(|e| {
+                                if let Some(ext) = e.path().extension() {
+                                    let ext_lower = ext.to_string_lossy().to_lowercase();
+                                    Self::AUDIO_EXTENSIONS.contains(&ext_lower.as_str())
+                                } else {
+                                    false
+                                }
+                            })
+                            .map(|e| e.path().to_string_lossy().to_string())
+                            .collect();
+                        files.sort(); // Sort for deterministic order
+                        result.extend(files);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to read precache directory '{}': {}", expanded, e);
+                    }
+                }
+            } else {
+                // It's a file (or doesn't exist yet - let precache handle the error)
+                result.push(expanded);
+            }
+        }
+
+        result
     }
 
     /// Validate configuration
@@ -375,6 +550,15 @@ impl Config {
             if self.bass_management.source_channels.is_empty() {
                 errors.push("bass_management.source_channels must not be empty when enabled".to_string());
             }
+            // Validate channel aliases resolve
+            if let Err(e) = self.resolve_channel(&self.bass_management.lfe_channel) {
+                errors.push(format!("bass_management.lfe_channel: {}", e));
+            }
+            for (i, ch) in self.bass_management.source_channels.iter().enumerate() {
+                if let Err(e) = self.resolve_channel(ch) {
+                    errors.push(format!("bass_management.source_channels[{}]: {}", i, e));
+                }
+            }
         }
 
         // Input validation
@@ -387,6 +571,15 @@ impl Config {
             }
             if input.latency_ms < 5 || input.latency_ms > 500 {
                 errors.push(format!("inputs[{}].latency_ms must be between 5 and 500", i));
+            }
+            // Validate channel aliases in routes
+            for (j, route) in input.routes.iter().enumerate() {
+                if let Err(e) = self.resolve_channel(&route.source_channel) {
+                    errors.push(format!("inputs[{}].routes[{}].source_channel: {}", i, j, e));
+                }
+                if let Err(e) = self.resolve_channel(&route.dest_channel) {
+                    errors.push(format!("inputs[{}].routes[{}].dest_channel: {}", i, j, e));
+                }
             }
         }
 
@@ -693,7 +886,7 @@ mod tests {
         assert_eq!(config.logging.verbose, true);
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
-        assert_eq!(config.bass_management.lfe_channel, 5);
+        assert_eq!(config.bass_management.lfe_channel, ChannelRef::Index(5));
         assert_eq!(config.bass_management.crossover_frequency_hz, 120.0);
     }
 
@@ -739,7 +932,7 @@ mod tests {
         let config = Config::default();
 
         assert_eq!(config.bass_management.enabled, false);
-        assert_eq!(config.bass_management.lfe_channel, 3);
+        assert_eq!(config.bass_management.lfe_channel, ChannelRef::Index(3));
         assert_eq!(config.bass_management.crossover_frequency_hz, 80.0);
         assert!(config.bass_management.source_channels.is_empty());
         assert_eq!(config.bass_management.remove_bass_from_sources, false);
@@ -750,7 +943,7 @@ mod tests {
         let mut config = Config::default();
         config.mqtt.topic = Some("test".to_string());
         config.bass_management.enabled = true;
-        config.bass_management.source_channels = vec![0, 1];
+        config.bass_management.source_channels = vec![ChannelRef::Index(0), ChannelRef::Index(1)];
         config.bass_management.crossover_frequency_hz = 5.0; // Too low
 
         let result = config.validate();
@@ -777,7 +970,7 @@ mod tests {
         let mut config = Config::default();
         config.mqtt.topic = Some("test".to_string());
         config.bass_management.enabled = true;
-        config.bass_management.source_channels = vec![0, 1];
+        config.bass_management.source_channels = vec![ChannelRef::Index(0), ChannelRef::Index(1)];
         config.bass_management.crossover_frequency_hz = 80.0;
 
         let result = config.validate();
@@ -821,9 +1014,9 @@ mod tests {
         assert_eq!(input.volume, 0.8);
         assert_eq!(input.voice_id, "gamemaster_mic");
         assert_eq!(input.routes.len(), 2);
-        assert_eq!(input.routes[0].source_channel, 0);
-        assert_eq!(input.routes[0].dest_channel, 4);
-        assert_eq!(input.routes[1].dest_channel, 5);
+        assert_eq!(input.routes[0].source_channel, ChannelRef::Index(0));
+        assert_eq!(input.routes[0].dest_channel, ChannelRef::Index(4));
+        assert_eq!(input.routes[1].dest_channel, ChannelRef::Index(5));
         assert_eq!(input.latency_ms, 30);
     }
 
@@ -856,7 +1049,7 @@ mod tests {
         config.mqtt.topic = Some("test".to_string());
         config.inputs.push(InputConfig {
             volume: 1.5, // Invalid
-            routes: vec![InputRouteConfig { source_channel: 0, dest_channel: 0 }],
+            routes: vec![InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) }],
             ..Default::default()
         });
 
@@ -887,7 +1080,7 @@ mod tests {
         config.mqtt.topic = Some("test".to_string());
         config.inputs.push(InputConfig {
             latency_ms: 1000, // Invalid - too high
-            routes: vec![InputRouteConfig { source_channel: 0, dest_channel: 0 }],
+            routes: vec![InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) }],
             ..Default::default()
         });
 
@@ -906,8 +1099,8 @@ mod tests {
             volume: 0.8,
             voice_id: "mic".to_string(),
             routes: vec![
-                InputRouteConfig { source_channel: 0, dest_channel: 0 },
-                InputRouteConfig { source_channel: 0, dest_channel: 1 },
+                InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) },
+                InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(1) },
             ],
             latency_ms: 25,
         });
@@ -994,5 +1187,310 @@ mod tests {
         };
         let json_no_topic = serde_json::to_string(&config_no_topic).unwrap();
         assert!(!json_no_topic.contains("mqtt_topic"));
+    }
+
+    #[test]
+    fn test_channel_ref_resolve_index() {
+        let aliases = HashMap::new();
+        let channel = ChannelRef::Index(5);
+        assert_eq!(channel.resolve(&aliases), Ok(5));
+    }
+
+    #[test]
+    fn test_channel_ref_resolve_alias() {
+        let mut aliases = HashMap::new();
+        aliases.insert("front_left".to_string(), 0);
+        aliases.insert("front_right".to_string(), 1);
+
+        let channel = ChannelRef::Alias("front_left".to_string());
+        assert_eq!(channel.resolve(&aliases), Ok(0));
+
+        let channel2 = ChannelRef::Alias("front_right".to_string());
+        assert_eq!(channel2.resolve(&aliases), Ok(1));
+    }
+
+    #[test]
+    fn test_channel_ref_resolve_unknown_alias() {
+        let aliases = HashMap::new();
+        let channel = ChannelRef::Alias("unknown".to_string());
+        assert!(channel.resolve(&aliases).is_err());
+    }
+
+    #[test]
+    fn test_channel_aliases_parse() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "audio": {
+                "channel_aliases": {
+                    "front_left": 0,
+                    "front_right": 1,
+                    "lfe": 3
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.audio.channel_aliases.len(), 3);
+        assert_eq!(config.audio.channel_aliases.get("front_left"), Some(&0));
+        assert_eq!(config.audio.channel_aliases.get("front_right"), Some(&1));
+        assert_eq!(config.audio.channel_aliases.get("lfe"), Some(&3));
+    }
+
+    #[test]
+    fn test_channel_ref_deserialize_from_number() {
+        let json = r#"{"source_channel": 5, "dest_channel": 3}"#;
+        let route: InputRouteConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(route.source_channel, ChannelRef::Index(5));
+        assert_eq!(route.dest_channel, ChannelRef::Index(3));
+    }
+
+    #[test]
+    fn test_channel_ref_deserialize_from_string_alias() {
+        let json = r#"{"source_channel": "mic_left", "dest_channel": "front_left"}"#;
+        let route: InputRouteConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(route.source_channel, ChannelRef::Alias("mic_left".to_string()));
+        assert_eq!(route.dest_channel, ChannelRef::Alias("front_left".to_string()));
+    }
+
+    #[test]
+    fn test_channel_ref_deserialize_string_number_as_index() {
+        // A string containing a number should parse as an index
+        let json = r#"{"source_channel": "0", "dest_channel": "5"}"#;
+        let route: InputRouteConfig = serde_json::from_str(json).unwrap();
+
+        assert_eq!(route.source_channel, ChannelRef::Index(0));
+        assert_eq!(route.dest_channel, ChannelRef::Index(5));
+    }
+
+    #[test]
+    fn test_bass_management_with_aliases() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "audio": {
+                "channel_aliases": {
+                    "front_left": 0,
+                    "front_right": 1,
+                    "lfe": 3
+                }
+            },
+            "bass_management": {
+                "enabled": true,
+                "lfe_channel": "lfe",
+                "source_channels": ["front_left", "front_right"],
+                "crossover_frequency_hz": 80.0
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        // Check that aliases are stored as ChannelRef::Alias
+        assert_eq!(config.bass_management.lfe_channel, ChannelRef::Alias("lfe".to_string()));
+
+        // Resolve and check values
+        let resolved = config.resolve_bass_management().unwrap();
+        assert_eq!(resolved.lfe_channel, 3);
+        assert_eq!(resolved.source_channels, vec![0, 1]);
+
+        // Validation should pass
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_input_routes_with_aliases() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "audio": {
+                "channel_aliases": {
+                    "front_left": 0,
+                    "front_right": 1
+                }
+            },
+            "inputs": [{
+                "voice_id": "mic",
+                "routes": [
+                    {"source_channel": 0, "dest_channel": "front_left"},
+                    {"source_channel": 0, "dest_channel": "front_right"}
+                ]
+            }]
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        let routes = config.resolve_input_routes(&config.inputs[0].routes).unwrap();
+        assert_eq!(routes, vec![(0, 0), (0, 1)]);
+    }
+
+    #[test]
+    fn test_validation_fails_on_unknown_alias() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "audio": {
+                "channel_aliases": {}
+            },
+            "bass_management": {
+                "enabled": true,
+                "lfe_channel": "unknown_alias",
+                "source_channels": [0, 1],
+                "crossover_frequency_hz": 80.0
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        let result = config.validate();
+
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("unknown_alias")));
+    }
+
+    #[test]
+    fn test_validation_fails_on_unknown_route_alias() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "audio": {
+                "channel_aliases": {}
+            },
+            "inputs": [{
+                "voice_id": "mic",
+                "routes": [
+                    {"source_channel": 0, "dest_channel": "unknown"}
+                ]
+            }]
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        let result = config.validate();
+
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("unknown")));
+    }
+
+    #[test]
+    fn test_channel_ref_serialize() {
+        let route = InputRouteConfig {
+            source_channel: ChannelRef::Index(0),
+            dest_channel: ChannelRef::Alias("front_left".to_string()),
+        };
+
+        let json = serde_json::to_string(&route).unwrap();
+        assert!(json.contains("\"source_channel\":0"));
+        assert!(json.contains("\"dest_channel\":\"front_left\""));
+    }
+
+    #[test]
+    fn test_expand_precache_entries_file() {
+        let mut config = Config::default();
+        config.cache.precache = vec!["/some/file.wav".to_string()];
+
+        let expanded = config.expand_precache_entries();
+        assert_eq!(expanded, vec!["/some/file.wav"]);
+    }
+
+    #[test]
+    fn test_expand_precache_entries_nonexistent_file() {
+        let mut config = Config::default();
+        config.cache.precache = vec!["/nonexistent/path/to/file.wav".to_string()];
+
+        // Non-existent files are passed through (precache will handle the error)
+        let expanded = config.expand_precache_entries();
+        assert_eq!(expanded, vec!["/nonexistent/path/to/file.wav"]);
+    }
+
+    #[test]
+    fn test_expand_precache_entries_directory() {
+        // Create a temporary directory with some audio files
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path();
+
+        // Create some audio files
+        std::fs::write(temp_path.join("sound1.wav"), b"fake wav").unwrap();
+        std::fs::write(temp_path.join("sound2.mp3"), b"fake mp3").unwrap();
+        std::fs::write(temp_path.join("sound3.ogg"), b"fake ogg").unwrap();
+        std::fs::write(temp_path.join("sound4.flac"), b"fake flac").unwrap();
+        std::fs::write(temp_path.join("readme.txt"), b"not audio").unwrap();
+        std::fs::write(temp_path.join("data.json"), b"not audio").unwrap();
+
+        let mut config = Config::default();
+        config.cache.precache = vec![temp_path.to_string_lossy().to_string()];
+
+        let expanded = config.expand_precache_entries();
+
+        // Should only include audio files, sorted alphabetically
+        assert_eq!(expanded.len(), 4);
+        assert!(expanded[0].ends_with("sound1.wav"));
+        assert!(expanded[1].ends_with("sound2.mp3"));
+        assert!(expanded[2].ends_with("sound3.ogg"));
+        assert!(expanded[3].ends_with("sound4.flac"));
+    }
+
+    #[test]
+    fn test_expand_precache_entries_mixed() {
+        // Create a temporary directory with some audio files
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path();
+
+        std::fs::write(temp_path.join("ambient.wav"), b"fake wav").unwrap();
+        std::fs::write(temp_path.join("music.mp3"), b"fake mp3").unwrap();
+
+        let mut config = Config::default();
+        config.cache.precache = vec![
+            "/specific/file.wav".to_string(),
+            temp_path.to_string_lossy().to_string(),
+            "http://example.com/sound.mp3".to_string(),
+        ];
+
+        let expanded = config.expand_precache_entries();
+
+        // Should have the specific file, the expanded directory, and the URL
+        assert_eq!(expanded.len(), 4);
+        assert_eq!(expanded[0], "/specific/file.wav");
+        assert!(expanded[1].ends_with("ambient.wav"));
+        assert!(expanded[2].ends_with("music.mp3"));
+        assert_eq!(expanded[3], "http://example.com/sound.mp3");
+    }
+
+    #[test]
+    fn test_expand_precache_entries_empty_directory() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path();
+
+        // Empty directory - no files
+        let mut config = Config::default();
+        config.cache.precache = vec![temp_path.to_string_lossy().to_string()];
+
+        let expanded = config.expand_precache_entries();
+        assert!(expanded.is_empty());
+    }
+
+    #[test]
+    fn test_expand_precache_entries_case_insensitive_extensions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let temp_path = temp_dir.path();
+
+        // Create files with various case extensions
+        std::fs::write(temp_path.join("sound1.WAV"), b"fake wav").unwrap();
+        std::fs::write(temp_path.join("sound2.Mp3"), b"fake mp3").unwrap();
+        std::fs::write(temp_path.join("sound3.OGG"), b"fake ogg").unwrap();
+
+        let mut config = Config::default();
+        config.cache.precache = vec![temp_path.to_string_lossy().to_string()];
+
+        let expanded = config.expand_precache_entries();
+
+        // Should find all files regardless of extension case
+        assert_eq!(expanded.len(), 3);
+    }
+
+    #[test]
+    fn test_audio_extensions_constant() {
+        assert!(Config::AUDIO_EXTENSIONS.contains(&"wav"));
+        assert!(Config::AUDIO_EXTENSIONS.contains(&"mp3"));
+        assert!(Config::AUDIO_EXTENSIONS.contains(&"ogg"));
+        assert!(Config::AUDIO_EXTENSIONS.contains(&"flac"));
+        assert!(!Config::AUDIO_EXTENSIONS.contains(&"txt"));
     }
 }
