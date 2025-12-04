@@ -57,6 +57,10 @@ chrono = "0.4"
 # Directory utilities
 dirs = "5.0"
 
+# Linux-specific: ALSA bindings for device probing
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"
+
 [dev-dependencies]
 criterion = "0.5"
 tempfile = "3.8"

@@ -11,69 +11,86 @@ use std::sync::{Arc, Mutex};
 
 /// List available audio output devices
 pub fn list_devices() {
-    let host = cpal::default_host();
+    #[cfg(target_os = "linux")]
+    {
+        list_devices_linux();
+    }
 
-    println!("Available audio output devices:");
+    #[cfg(not(target_os = "linux"))]
+    {
+        list_devices_cpal_only();
+    }
+}
+
+/// Linux-specific device listing with ALSA probing
+#[cfg(target_os = "linux")]
+fn list_devices_linux() {
+    use super::alsa_probe::probe_alsa_devices;
+    use super::device::format_device_list;
+
+    let list = probe_alsa_devices();
+    print!("{}", format_device_list(&list));
+}
+
+/// Fallback device listing using only cpal (for macOS, Windows, etc.)
+#[cfg(not(target_os = "linux"))]
+fn list_devices_cpal_only() {
+    use super::device::{DeviceCategory, DeviceInfo, DeviceList, format_device_list};
+
+    let host = cpal::default_host();
+    let mut list = DeviceList::new();
+
     match host.output_devices() {
         Ok(devices) => {
-            for (i, device) in devices.enumerate() {
+            for device in devices {
                 if let Ok(name) = device.name() {
-                    println!("  {}. {}", i, name);
+                    let mut info = DeviceInfo::new(name.clone(), DeviceCategory::Hardware);
 
-                    // Query all supported configs to find max channels
+                    // Query supported configs
                     if let Ok(configs) = device.supported_output_configs() {
                         let mut max_channels = 0u16;
-                        let mut sample_rates: Vec<(u32, u32)> = Vec::new();
+                        let mut min_rate = u32::MAX;
+                        let mut max_rate = 0u32;
 
-                        // Filter configs: ignore those with absurd sample rates
-                        // (ALSA plugins report 4294967295 Hz which is clearly fake)
                         const MAX_REASONABLE_SAMPLE_RATE: u32 = 384000;
 
                         for config in configs {
-                            let max_rate = config.max_sample_rate().0;
-                            // Skip configs from ALSA plugins that claim unrealistic capabilities
-                            if max_rate > MAX_REASONABLE_SAMPLE_RATE {
+                            let config_max_rate = config.max_sample_rate().0;
+                            if config_max_rate > MAX_REASONABLE_SAMPLE_RATE {
                                 continue;
                             }
 
                             max_channels = max_channels.max(config.channels());
-                            let min_rate = config.min_sample_rate().0;
-                            // Collect unique sample rate ranges
-                            if !sample_rates.iter().any(|(min, max)| *min == min_rate && *max == max_rate) {
-                                sample_rates.push((min_rate, max_rate));
-                            }
+                            min_rate = min_rate.min(config.min_sample_rate().0);
+                            max_rate = max_rate.max(config_max_rate);
                         }
 
                         if max_channels > 0 {
-                            // Show sample rate range(s)
-                            if sample_rates.len() == 1 {
-                                let (min, max) = sample_rates[0];
-                                if min == max {
-                                    println!("     Sample rate: {} Hz", min);
-                                } else {
-                                    println!("     Sample rate: {}-{} Hz", min, max);
-                                }
-                            } else if !sample_rates.is_empty() {
-                                // Multiple ranges, just show common rates
-                                println!("     Sample rates: (multiple configurations)");
-                            }
-                            println!("     Max channels: {}", max_channels);
-                        } else if let Ok(config) = device.default_output_config() {
-                            // All configs were filtered out - fall back to default
-                            // This happens with ALSA plugin devices
-                            println!("     Sample rate: {} Hz (plugin)", config.sample_rate().0);
-                            println!("     Channels: {} (plugin)", config.channels());
+                            info.cpal_channels = Some(max_channels);
+                            info.cpal_sample_rate_min = Some(min_rate);
+                            info.cpal_sample_rate_max = Some(max_rate);
                         }
-                    } else if let Ok(config) = device.default_output_config() {
-                        // Fallback to default config if supported_output_configs fails
-                        println!("     Sample rate: {} Hz", config.sample_rate().0);
-                        println!("     Channels: {}", config.channels());
                     }
+
+                    // Fallback to default config
+                    if info.cpal_channels.is_none() {
+                        if let Ok(config) = device.default_output_config() {
+                            info.cpal_channels = Some(config.channels());
+                            info.cpal_sample_rate_min = Some(config.sample_rate().0);
+                            info.cpal_sample_rate_max = Some(config.sample_rate().0);
+                        }
+                    }
+
+                    list.devices.push(info);
                 }
             }
         }
-        Err(e) => eprintln!("Error listing devices: {}", e),
+        Err(e) => {
+            list.discovery_notes.push(format!("Error listing devices: {}", e));
+        }
     }
+
+    print!("{}", format_device_list(&list));
 }
 
 /// Get default device configuration
@@ -110,26 +127,20 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
                 }
             }
 
-            // On ALSA, try to construct the device directly even if not enumerated
-            // This handles cases like hw:CARD=X,DEV=0 which may not appear in enumeration
+            // On ALSA, try partial matching for device names
+            // This handles cases like "hw:1,0" matching "hw:CARD=UMC1820,DEV=0"
+            // or "plughw:1,0" matching "plughw:CARD=UMC1820,DEV=0"
             #[cfg(target_os = "linux")]
             {
-                // Try partial matching for ALSA device names
                 if let Ok(devices) = host.output_devices() {
                     for device in devices {
                         if let Ok(n) = device.name() {
-                            // Try partial matching for ALSA device names
-                            // e.g., if user requests "hw:1,0", match "hw:CARD=UMC1820,DEV=0"
-                            if device_name.starts_with("hw:") && n.starts_with("hw:") {
-                                // Extract card number from both
-                                if let (Some(req_card), Some(dev_card)) = (
-                                    extract_alsa_card_number(device_name),
-                                    extract_alsa_card_number(&n)
-                                ) {
-                                    if req_card == dev_card {
-                                        tracing::info!("Matched ALSA device '{}' to '{}'", device_name, n);
-                                        return Ok(device);
-                                    }
+                            // Try matching ALSA device names by card number
+                            // Supports hw:, plughw:, sysdefault:
+                            if let Some(matched) = try_match_alsa_device(device_name, &n) {
+                                if matched {
+                                    tracing::info!("Matched ALSA device '{}' to '{}'", device_name, n);
+                                    return Ok(device);
                                 }
                             }
                         }
@@ -146,23 +157,106 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
     }
 }
 
-/// Extract card number from ALSA device name (e.g., "hw:1,0" -> 1, "hw:CARD=UMC1820,DEV=0" -> None)
+/// Try to match two ALSA device names
+/// Returns Some(true) if they match, Some(false) if same prefix but different card, None if not comparable
 #[cfg(target_os = "linux")]
-fn extract_alsa_card_number(name: &str) -> Option<u32> {
-    if name.starts_with("hw:") {
-        let rest = &name[3..];
-        // Try "hw:N,M" format
-        if let Some(comma_pos) = rest.find(',') {
-            if let Ok(num) = rest[..comma_pos].parse::<u32>() {
-                return Some(num);
+fn try_match_alsa_device(requested: &str, enumerated: &str) -> Option<bool> {
+    // Get prefix (hw:, plughw:, sysdefault:, etc.)
+    let prefixes = ["plughw:", "hw:", "sysdefault:", "dmix:", "front:", "surround"];
+
+    for prefix in prefixes {
+        if requested.starts_with(prefix) && enumerated.starts_with(prefix) {
+            // Both have the same prefix, compare by card number
+            let req_card = extract_alsa_card_from_name(requested);
+            let enum_card = extract_alsa_card_from_name(enumerated);
+
+            match (req_card, enum_card) {
+                (Some(r), Some(e)) => return Some(r == e),
+                _ => continue,
             }
         }
-        // Try just "hw:N" format
-        if let Ok(num) = rest.parse::<u32>() {
-            return Some(num);
+    }
+
+    None
+}
+
+/// Extract card identifier from ALSA device name
+/// Handles both numeric (hw:1,0) and named (hw:CARD=UMC1820,DEV=0) formats
+#[cfg(target_os = "linux")]
+fn extract_alsa_card_from_name(name: &str) -> Option<AlsaCardId> {
+    // Find prefix end
+    let prefixes = ["plughw:", "hw:", "sysdefault:", "dmix:", "front:", "surround"];
+
+    for prefix in prefixes {
+        if name.starts_with(prefix) {
+            let rest = &name[prefix.len()..];
+
+            // Try "CARD=name" format first
+            if rest.starts_with("CARD=") {
+                let card_part = &rest[5..];
+                let card_name = if let Some(comma_pos) = card_part.find(',') {
+                    &card_part[..comma_pos]
+                } else {
+                    card_part
+                };
+                return Some(AlsaCardId::Name(card_name.to_string()));
+            }
+
+            // Try numeric format "N,M" or just "N"
+            let num_part = if let Some(comma_pos) = rest.find(',') {
+                &rest[..comma_pos]
+            } else {
+                rest
+            };
+
+            if let Ok(num) = num_part.parse::<u32>() {
+                return Some(AlsaCardId::Index(num));
+            }
         }
     }
+
     None
+}
+
+/// ALSA card identifier - can be either index or name
+#[cfg(target_os = "linux")]
+#[derive(Debug)]
+enum AlsaCardId {
+    Index(u32),
+    Name(String),
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for AlsaCardId {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (AlsaCardId::Index(a), AlsaCardId::Index(b)) => a == b,
+            (AlsaCardId::Name(a), AlsaCardId::Name(b)) => a == b,
+            // Cross-compare by looking up card index from name
+            (AlsaCardId::Index(idx), AlsaCardId::Name(name)) |
+            (AlsaCardId::Name(name), AlsaCardId::Index(idx)) => {
+                // Try to match card name to index by checking /proc/asound/cards
+                if let Ok(cards) = std::fs::read_to_string("/proc/asound/cards") {
+                    for line in cards.lines() {
+                        // Format: " 1 [UMC1820        ]: USB-Audio - UMC1820"
+                        if let Some(bracket_start) = line.find('[') {
+                            if let Some(bracket_end) = line.find(']') {
+                                let card_id = line[bracket_start + 1..bracket_end].trim();
+                                if card_id == name {
+                                    // Found the card name, extract index
+                                    let idx_str = line[..bracket_start].trim();
+                                    if let Ok(card_idx) = idx_str.parse::<u32>() {
+                                        return card_idx == *idx;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                false
+            }
+        }
+    }
 }
 
 /// Find a stream config for the device with the requested channel count

@@ -1260,6 +1260,7 @@ dependencies = [
 name = "mqttaudio"
 version = "2.0.0"
 dependencies = [
+ "alsa",
  "chrono",
  "clap",
  "cpal",

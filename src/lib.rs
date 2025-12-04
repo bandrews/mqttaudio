@@ -2,15 +2,19 @@
 // ABOUTME: Provides public access to core audio processing and command structures.
 
 pub mod audio {
-    pub mod mixer;
-    pub mod types;
-    pub mod decoder;
-    pub mod resampler;
-    pub mod engine;
-    pub mod ducking;
     pub mod bass_management;
+    pub mod decoder;
+    pub mod device;
+    pub mod ducking;
+    pub mod engine;
     pub mod input;
+    pub mod mixer;
     pub mod pitch_correction;
+    pub mod resampler;
+    pub mod types;
+
+    #[cfg(target_os = "linux")]
+    pub mod alsa_probe;
 }
 
 pub mod cache {
