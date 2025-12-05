@@ -101,10 +101,8 @@ Route a microphone to all player earpiece channels:
 ```json
 {
   "command": "input_volume",
-  "message": {
-    "input": "presenter_mic",
-    "volume": 0.5
-  }
+  "input": "presenter_mic",
+  "volume": 0.5
 }
 ```
 
@@ -115,10 +113,8 @@ The `input` field can be the `voice_id` or the input index (0, 1, 2...).
 ```json
 {
   "command": "input_mute",
-  "message": {
-    "input": "presenter_mic",
-    "mute": true
-  }
+  "input": "presenter_mic",
+  "mute": true
 }
 ```
 

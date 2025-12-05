@@ -21,11 +21,9 @@ Assign an ID when playing:
 ```json
 {
   "command": "play",
-  "message": {
-    "file": "/sounds/music.mp3",
-    "id": "background-track",
-    "loop": true
-  }
+  "file": "/sounds/music.mp3",
+  "id": "background-track",
+  "loop": true
 }
 ```
 
@@ -34,10 +32,8 @@ Then control by ID:
 ```json
 {
   "command": "speed",
-  "message": {
-    "id": "background-track",
-    "speed": 0.5
-  }
+  "id": "background-track",
+  "speed": 0.5
 }
 ```
 
@@ -48,10 +44,8 @@ Jump to a specific position:
 ```json
 {
   "command": "seek",
-  "message": {
-    "id": "background-track",
-    "position_ms": 60000
-  }
+  "id": "background-track",
+  "position_ms": 60000
 }
 ```
 
@@ -69,10 +63,8 @@ Change playback speed in real-time:
 ```json
 {
   "command": "speed",
-  "message": {
-    "id": "background-track",
-    "speed": 1.5
-  }
+  "id": "background-track",
+  "speed": 1.5
 }
 ```
 
@@ -106,11 +98,9 @@ Enable pitch correction to maintain the original pitch when changing speed:
 ```json
 {
   "command": "speed",
-  "message": {
-    "id": "background-track",
-    "speed": 0.5,
-    "pitch_correction": true
-  }
+  "id": "background-track",
+  "speed": 0.5,
+  "pitch_correction": true
 }
 ```
 
@@ -133,10 +123,8 @@ Play audio backwards (without pitch correction only):
 ```json
 {
   "command": "speed",
-  "message": {
-    "id": "effect-1",
-    "speed": -1.0
-  }
+  "id": "effect-1",
+  "speed": -1.0
 }
 ```
 
@@ -152,10 +140,8 @@ Adjust volume of specific samples:
 ```json
 {
   "command": "volume",
-  "message": {
-    "id": "background-track",
-    "volume": 0.3
-  }
+  "id": "background-track",
+  "volume": 0.3
 }
 ```
 
@@ -168,10 +154,8 @@ Stop samples with optional fade-out:
 ```json
 {
   "command": "stop",
-  "message": {
-    "id": "background-track",
-    "fade_out_ms": 1000
-  }
+  "id": "background-track",
+  "fade_out_ms": 1000
 }
 ```
 
@@ -180,9 +164,7 @@ Or stop by file:
 ```json
 {
   "command": "stop",
-  "message": {
-    "file": "/sounds/music.mp3"
-  }
+  "file": "/sounds/music.mp3"
 }
 ```
 
@@ -191,10 +173,8 @@ Or by voice:
 ```json
 {
   "command": "stop",
-  "message": {
-    "voice": "effects",
-    "fade_out_ms": 500
-  }
+  "voice": "effects",
+  "fade_out_ms": 500
 }
 ```
 
@@ -207,10 +187,8 @@ Start playback from a specific position:
 ```json
 {
   "command": "play",
-  "message": {
-    "file": "/sounds/long-track.mp3",
-    "start_position_ms": 120000
-  }
+  "file": "/sounds/long-track.mp3",
+  "start_position_ms": 120000
 }
 ```
 
@@ -222,29 +200,30 @@ Start playback from a specific position:
 # Start a track
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {
-    "file": "/music/track.mp3",
-    "id": "deck-a",
-    "loop": true
-  }
+  "file": "/music/track.mp3",
+  "id": "deck-a",
+  "loop": true
 }'
 
 # Slow down for transition
 mosquitto_pub -t audio/commands -m '{
   "command": "speed",
-  "message": {"id": "deck-a", "speed": 0.95}
+  "id": "deck-a",
+  "speed": 0.95
 }'
 
 # Speed up
 mosquitto_pub -t audio/commands -m '{
   "command": "speed",
-  "message": {"id": "deck-a", "speed": 1.05}
+  "id": "deck-a",
+  "speed": 1.05
 }'
 
 # Back to normal
 mosquitto_pub -t audio/commands -m '{
   "command": "speed",
-  "message": {"id": "deck-a", "speed": 1.0}
+  "id": "deck-a",
+  "speed": 1.0
 }'
 ```
 
@@ -254,19 +233,15 @@ mosquitto_pub -t audio/commands -m '{
 # Play sound and slow it down dramatically
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/explosion.wav",
-    "id": "slowmo"
-  }
+  "file": "/sounds/explosion.wav",
+  "id": "slowmo"
 }'
 
 mosquitto_pub -t audio/commands -m '{
   "command": "speed",
-  "message": {
-    "id": "slowmo",
-    "speed": 0.25,
-    "pitch_correction": true
-  }
+  "id": "slowmo",
+  "speed": 0.25,
+  "pitch_correction": true
 }'
 ```
 
@@ -276,10 +251,8 @@ mosquitto_pub -t audio/commands -m '{
 # Play in reverse for a "rewind" effect
 mosquitto_pub -t audio/commands -m '{
   "command": "speed",
-  "message": {
-    "id": "music",
-    "speed": -3.0
-  }
+  "id": "music",
+  "speed": -3.0
 }'
 ```
 
@@ -289,9 +262,7 @@ mosquitto_pub -t audio/commands -m '{
 # Skip to a specific section
 mosquitto_pub -t audio/commands -m '{
   "command": "seek",
-  "message": {
-    "id": "background-music",
-    "position_ms": 90000
-  }
+  "id": "background-music",
+  "position_ms": 90000
 }'
 ```

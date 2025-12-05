@@ -35,13 +35,11 @@ Use `channel_map` in the play command to route audio to specific outputs:
 ```json
 {
   "command": "play",
-  "message": {
-    "file": "/sounds/stereo.wav",
-    "channel_map": [
-      {"src": 0, "dest": 4},
-      {"src": 1, "dest": 5}
-    ]
-  }
+  "file": "/sounds/stereo.wav",
+  "channel_map": [
+    {"src": 0, "dest": 4},
+    {"src": 1, "dest": 5}
+  ]
 }
 ```
 
@@ -54,17 +52,15 @@ Route a single source channel to multiple outputs (useful for PA announcements):
 ```json
 {
   "command": "play",
-  "message": {
-    "file": "/sounds/announcement.wav",
-    "channel_map": [
-      {"src": 0, "dest": 0},
-      {"src": 0, "dest": 1},
-      {"src": 0, "dest": 2},
-      {"src": 0, "dest": 3},
-      {"src": 0, "dest": 4},
-      {"src": 0, "dest": 5}
-    ]
-  }
+  "file": "/sounds/announcement.wav",
+  "channel_map": [
+    {"src": 0, "dest": 0},
+    {"src": 0, "dest": 1},
+    {"src": 0, "dest": 2},
+    {"src": 0, "dest": 3},
+    {"src": 0, "dest": 4},
+    {"src": 0, "dest": 5}
+  ]
 }
 ```
 
@@ -75,12 +71,10 @@ You don't need to map all source channels. To play only the left channel of a st
 ```json
 {
   "command": "play",
-  "message": {
-    "file": "/sounds/stereo.wav",
-    "channel_map": [
-      {"src": 0, "dest": 0}
-    ]
-  }
+  "file": "/sounds/stereo.wav",
+  "channel_map": [
+    {"src": 0, "dest": 0}
+  ]
 }
 ```
 
@@ -93,16 +87,14 @@ Route a 4-channel ambient file to specific speakers:
 ```bash
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/forest-quad.wav",
-    "channel_map": [
-      {"src": 0, "dest": 0},
-      {"src": 1, "dest": 1},
-      {"src": 2, "dest": 4},
-      {"src": 3, "dest": 5}
-    ],
-    "loop": true
-  }
+  "file": "/sounds/forest-quad.wav",
+  "channel_map": [
+    {"src": 0, "dest": 0},
+    {"src": 1, "dest": 1},
+    {"src": 2, "dest": 4},
+    {"src": 3, "dest": 5}
+  ],
+  "loop": true
 }'
 ```
 
@@ -117,17 +109,15 @@ Play the same mono file to multiple zones:
 
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/announcement.wav",
-    "channel_map": [
-      {"src": 0, "dest": 0},
-      {"src": 0, "dest": 1},
-      {"src": 0, "dest": 2},
-      {"src": 0, "dest": 3},
-      {"src": 0, "dest": 4},
-      {"src": 0, "dest": 5}
-    ]
-  }
+  "file": "/sounds/announcement.wav",
+  "channel_map": [
+    {"src": 0, "dest": 0},
+    {"src": 0, "dest": 1},
+    {"src": 0, "dest": 2},
+    {"src": 0, "dest": 3},
+    {"src": 0, "dest": 4},
+    {"src": 0, "dest": 5}
+  ]
 }'
 ```
 
@@ -138,15 +128,13 @@ Route stereo music to a headphone output on channels 6-7:
 ```bash
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/music.mp3",
-    "channel_map": [
-      {"src": 0, "dest": 6},
-      {"src": 1, "dest": 7}
-    ],
-    "voice": "headphones",
-    "loop": true
-  }
+  "file": "/sounds/music.mp3",
+  "channel_map": [
+    {"src": 0, "dest": 6},
+    {"src": 1, "dest": 7}
+  ],
+  "voice": "headphones",
+  "loop": true
 }'
 ```
 

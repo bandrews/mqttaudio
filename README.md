@@ -69,7 +69,7 @@ cargo build --release
 ### 3. Play Your First Sound
 
 ```bash
-mosquitto_pub -t audio/commands -m '{"command": "play", "message": {"file": "/path/to/sound.wav"}}'
+mosquitto_pub -t audio/commands -m '{"command": "play", "file": "/path/to/sound.wav"}'
 ```
 
 ## Common Commands
@@ -82,19 +82,17 @@ A full reference is available at [Commands](docs/commands.md) ;  the commands li
 # Simple playback
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {"file": "/sounds/effect.wav"}
+  "file": "/sounds/effect.wav"
 }'
 
 # With options
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {
-    "file": "https://example.com/music.mp3",
-    "voice": "background",
-    "volume": 0.5,
-    "loop": true,
-    "fade_in": 2000
-  }
+  "file": "https://example.com/music.mp3",
+  "voice": "background",
+  "volume": 0.5,
+  "loop": true,
+  "fade_in": 2000
 }'
 ```
 
@@ -107,13 +105,15 @@ mosquitto_pub -t audio/commands -m '{"command": "stopall"}'
 # Fade out a voice group
 mosquitto_pub -t audio/commands -m '{
   "command": "voice_fade_out",
-  "message": {"voice": "background", "time": 3000}
+  "voice": "background",
+  "time": 3000
 }'
 
 # Adjust volume
 mosquitto_pub -t audio/commands -m '{
   "command": "voice_volume",
-  "message": {"voice": "music", "volume": 0.3}
+  "voice": "music",
+  "volume": 0.3
 }'
 ```
 
@@ -123,13 +123,11 @@ mosquitto_pub -t audio/commands -m '{
 # Play stereo audio on outputs 4 and 5
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/stereo.wav",
-    "channel_map": [
-      {"src": 0, "dest": 4},
-      {"src": 1, "dest": 5}
-    ]
-  }
+  "file": "/sounds/stereo.wav",
+  "channel_map": [
+    {"src": 0, "dest": 4},
+    {"src": 1, "dest": 5}
+  ]
 }'
 ```
 

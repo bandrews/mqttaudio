@@ -65,7 +65,7 @@ In a third terminal:
 ```bash
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {"file": "/path/to/your/audio.wav"}
+  "file": "/path/to/your/audio.wav"
 }'
 ```
 
@@ -86,13 +86,12 @@ All interaction happens through JSON messages sent to an MQTT topic. Every comma
 ```json
 {
   "command": "command_name",
-  "message": {
-    // command-specific parameters
-  }
+  "param1": "value1",
+  "param2": "value2"
 }
 ```
 
-Some commands (like `stopall`) don't need a message body.
+Some commands (like `stopall`) don't require any parameters.
 
 ### Voices
 
@@ -102,18 +101,22 @@ A **voice** is a named group of sounds you can control together. When you play a
 # Add two sounds to the "ambience" voice
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {"file": "/sounds/rain.wav", "voice": "ambience", "loop": true}
+  "file": "/sounds/rain.wav",
+  "voice": "ambience",
+  "loop": true
 }'
 
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {"file": "/sounds/wind.wav", "voice": "ambience", "loop": true}
+  "file": "/sounds/wind.wav",
+  "voice": "ambience",
+  "loop": true
 }'
 
 # Stop both at once
 mosquitto_pub -t audio/commands -m '{
   "command": "voice_stop",
-  "message": {"voice": "ambience"}
+  "voice": "ambience"
 }'
 ```
 
@@ -129,13 +132,11 @@ By default, audio plays on the first available channels (stereo files play on ch
 ```json
 {
   "command": "play",
-  "message": {
-    "file": "/sounds/alert.wav",
-    "channel_map": [
-      {"src": 0, "dest": 4},
-      {"src": 1, "dest": 5}
-    ]
-  }
+  "file": "/sounds/alert.wav",
+  "channel_map": [
+    {"src": 0, "dest": 4},
+    {"src": 1, "dest": 5}
+  ]
 }
 ```
 
@@ -161,41 +162,40 @@ TOPIC="audio/commands"
 # Start looping background music
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/background-music.mp3",
-    "voice": "music",
-    "volume": 0.4,
-    "loop": true,
-    "fade_in": 3000
-  }
+  "file": "/sounds/background-music.mp3",
+  "voice": "music",
+  "volume": 0.4,
+  "loop": true,
+  "fade_in": 3000
 }'
 
 # Play a one-shot sound effect
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/doorbell.wav",
-    "voice": "effects",
-    "volume": 1.0
-  }
+  "file": "/sounds/doorbell.wav",
+  "voice": "effects",
+  "volume": 1.0
 }'
 
 # Lower music volume temporarily
 mosquitto_pub -t $TOPIC -m '{
   "command": "voice_volume",
-  "message": {"voice": "music", "volume": 0.1}
+  "voice": "music",
+  "volume": 0.1
 }'
 
 # Restore music volume
 mosquitto_pub -t $TOPIC -m '{
   "command": "voice_volume",
-  "message": {"voice": "music", "volume": 0.4}
+  "voice": "music",
+  "volume": 0.4
 }'
 
 # Fade out music at the end
 mosquitto_pub -t $TOPIC -m '{
   "command": "voice_fade_out",
-  "message": {"voice": "music", "time": 5000}
+  "voice": "music",
+  "time": 5000
 }'
 
 # Stop all remaining audio

@@ -22,10 +22,8 @@ Make sure volume is set in your play command:
 ```json
 {
   "command": "play",
-  "message": {
-    "file": "/sounds/test.wav",
-    "volume": 1.0
-  }
+  "file": "/sounds/test.wav",
+  "volume": 1.0
 }
 ```
 
@@ -204,9 +202,7 @@ If a file on your server changed but mqttaudio plays the old version:
 ```json
 {
   "command": "cache_invalidate",
-  "message": {
-    "file": "https://example.com/updated.wav"
-  }
+  "file": "https://example.com/updated.wav"
 }
 ```
 
@@ -281,10 +277,8 @@ Then play audio with matching voice names:
 ```json
 {
   "command": "play",
-  "message": {
-    "file": "/sounds/speech.wav",
-    "voice": "narration"
-  }
+  "file": "/sounds/speech.wav",
+  "voice": "narration"
 }
 ```
 

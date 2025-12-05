@@ -57,21 +57,17 @@ Duck music and effects when narration plays:
 # Start background music
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/music.mp3",
-    "voice": "music",
-    "loop": true,
-    "volume": 0.7
-  }
+  "file": "/sounds/music.mp3",
+  "voice": "music",
+  "loop": true,
+  "volume": 0.7
 }'
 
 # Play narration - music automatically ducks to 15%
 mosquitto_pub -t audio/commands -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/narration.wav",
-    "voice": "narration"
-  }
+  "file": "/sounds/narration.wav",
+  "voice": "narration"
 }'
 
 # When narration finishes, music automatically restores to 70%

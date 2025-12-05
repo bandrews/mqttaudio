@@ -4,12 +4,38 @@
 use serde::{Deserialize, Serialize};
 use crate::config::ChannelRef;
 
-/// MQTT command envelope
+/// MQTT command envelope supporting both flattened and nested formats.
+/// Flattened: {"command": "play", "file": "test.wav", "volume": 0.8}
+/// Nested (legacy): {"command": "play", "message": {"file": "test.wav", "volume": 0.8}}
 #[derive(Debug, Deserialize, Serialize)]
 pub struct MqttCommand {
     pub command: String,
+    /// Legacy nested format - parameters wrapped in a "message" object
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<serde_json::Value>,
+    /// Capture all other fields for the flattened format
+    #[serde(flatten)]
+    pub params: serde_json::Map<String, serde_json::Value>,
+}
+
+impl MqttCommand {
+    /// Get the parameters for this command, supporting both formats.
+    /// If `message` field exists (legacy format), use those parameters.
+    /// Otherwise, use the flattened parameters from the root object.
+    pub fn get_params(&self) -> serde_json::Value {
+        if let Some(ref message) = self.message {
+            message.clone()
+        } else if self.params.is_empty() {
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::Value::Object(self.params.clone())
+        }
+    }
+
+    /// Check if this command has parameters (either format).
+    pub fn has_params(&self) -> bool {
+        self.message.is_some() || !self.params.is_empty()
+    }
 }
 
 /// Channel mapping for routing source channels to destination channels.
@@ -318,15 +344,20 @@ impl From<serde_json::Error> for ParseError {
     }
 }
 
-/// Parse MQTT JSON payload into an audio command
+/// Parse MQTT JSON payload into an audio command.
+/// Supports both flattened and nested (legacy) formats:
+/// - Flattened: {"command": "play", "file": "test.wav", "volume": 0.8}
+/// - Nested: {"command": "play", "message": {"file": "test.wav", "volume": 0.8}}
 pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
     let mqtt_cmd: MqttCommand = serde_json::from_str(json)?;
 
     match mqtt_cmd.command.as_str() {
         "play" | "soundPlay" => {
-            // Require message field for play command
-            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
-            let play_msg: PlayMessage = serde_json::from_value(message)?;
+            // Require parameters for play command
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let play_msg: PlayMessage = serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::Play {
                 file: play_msg.file,
@@ -344,16 +375,20 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             Ok(AudioCommand::StopAll)
         }
         "voice_stop" => {
-            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
-            let voice_msg: VoiceStopMessage = serde_json::from_value(message)?;
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let voice_msg: VoiceStopMessage = serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::VoiceStop {
                 voice: voice_msg.voice,
             })
         }
         "voice_fade_out" => {
-            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
-            let voice_msg: VoiceFadeOutMessage = serde_json::from_value(message)?;
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let voice_msg: VoiceFadeOutMessage = serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::VoiceFadeOut {
                 voice: voice_msg.voice,
@@ -361,8 +396,10 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             })
         }
         "voice_volume" => {
-            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
-            let voice_msg: VoiceVolumeMessage = serde_json::from_value(message)?;
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let voice_msg: VoiceVolumeMessage = serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::VoiceVolume {
                 voice: voice_msg.voice,
@@ -370,8 +407,10 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             })
         }
         "precache" | "soundPrecache" => {
-            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
-            let precache_msg: PrecacheMessage = serde_json::from_value(message)?;
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let precache_msg: PrecacheMessage = serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::Precache {
                 file: precache_msg.file,
@@ -381,16 +420,20 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             Ok(AudioCommand::CacheClear)
         }
         "cache_invalidate" => {
-            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
-            let invalidate_msg: CacheInvalidateMessage = serde_json::from_value(message)?;
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let invalidate_msg: CacheInvalidateMessage = serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::CacheInvalidate {
                 file: invalidate_msg.file,
             })
         }
         "input_volume" => {
-            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
-            let input_msg: InputVolumeMessage = serde_json::from_value(message)?;
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let input_msg: InputVolumeMessage = serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::InputVolume {
                 input: input_msg.input,
@@ -398,8 +441,10 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             })
         }
         "input_mute" => {
-            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
-            let input_msg: InputMuteMessage = serde_json::from_value(message)?;
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let input_msg: InputMuteMessage = serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::InputMute {
                 input: input_msg.input,
@@ -407,8 +452,10 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             })
         }
         "seek" => {
-            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
-            let seek_msg: SeekMessage = serde_json::from_value(message)?;
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let seek_msg: SeekMessage = serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::Seek {
                 selector: SampleSelector {
@@ -421,8 +468,10 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             })
         }
         "speed" => {
-            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
-            let speed_msg: SpeedMessage = serde_json::from_value(message)?;
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let speed_msg: SpeedMessage = serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::Speed {
                 selector: SampleSelector {
@@ -436,8 +485,10 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             })
         }
         "stop" => {
-            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
-            let stop_msg: StopMessage = serde_json::from_value(message)?;
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let stop_msg: StopMessage = serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::Stop {
                 selector: SampleSelector {
@@ -450,8 +501,10 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             })
         }
         "volume" => {
-            let message = mqtt_cmd.message.ok_or(ParseError::MissingMessage)?;
-            let vol_msg: VolumeMessage = serde_json::from_value(message)?;
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let vol_msg: VolumeMessage = serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::Volume {
                 selector: SampleSelector {
@@ -1567,6 +1620,286 @@ mod tests {
         match result.unwrap_err() {
             ParseError::JsonError(_) => {}, // OK - speed is required
             e => panic!("Expected JsonError, got: {:?}", e),
+        }
+    }
+
+    // ==========================================================================
+    // Flattened Format Tests
+    // ==========================================================================
+    // These tests verify that the flattened JSON format (parameters at root level)
+    // works alongside the legacy nested format (parameters in "message" object).
+
+    #[test]
+    fn test_flat_play_command_minimal() {
+        let json = r#"{"command": "play", "file": "test.wav"}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, volume, voice, .. } => {
+                assert_eq!(file, "test.wav");
+                assert_eq!(volume, 1.0);
+                assert!(voice.is_none());
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_play_command_with_all_fields() {
+        let json = r#"{
+            "command": "play",
+            "file": "music.mp3",
+            "id": "bg-music",
+            "voice": "background",
+            "volume": 0.5,
+            "fade_in": 2000,
+            "loop": true,
+            "crossfade_ms": 100
+        }"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, id, voice, volume, fade_in, loop_mode, crossfade_ms, .. } => {
+                assert_eq!(file, "music.mp3");
+                assert_eq!(id, Some("bg-music".to_string()));
+                assert_eq!(voice, Some("background".to_string()));
+                assert_eq!(volume, 0.5);
+                assert_eq!(fade_in, Some(2000));
+                assert!(loop_mode);
+                assert_eq!(crossfade_ms, 100);
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_stopall_command() {
+        let json = r#"{"command": "stopall"}"#;
+        let cmd = parse_command(json).unwrap();
+        assert!(matches!(cmd, AudioCommand::StopAll));
+    }
+
+    #[test]
+    fn test_flat_voice_stop() {
+        let json = r#"{"command": "voice_stop", "voice": "music"}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::VoiceStop { voice } => {
+                assert_eq!(voice, "music");
+            }
+            _ => panic!("Expected VoiceStop command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_voice_fade_out() {
+        let json = r#"{"command": "voice_fade_out", "voice": "ambient", "time": 3000}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::VoiceFadeOut { voice, time_ms } => {
+                assert_eq!(voice, "ambient");
+                assert_eq!(time_ms, 3000);
+            }
+            _ => panic!("Expected VoiceFadeOut command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_voice_volume() {
+        let json = r#"{"command": "voice_volume", "voice": "effects", "volume": 0.3}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::VoiceVolume { voice, volume } => {
+                assert_eq!(voice, "effects");
+                assert_eq!(volume, 0.3);
+            }
+            _ => panic!("Expected VoiceVolume command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_precache() {
+        let json = r#"{"command": "precache", "file": "https://example.com/audio.mp3"}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Precache { file } => {
+                assert_eq!(file, "https://example.com/audio.mp3");
+            }
+            _ => panic!("Expected Precache command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_cache_clear() {
+        let json = r#"{"command": "cache_clear"}"#;
+        let cmd = parse_command(json).unwrap();
+        assert!(matches!(cmd, AudioCommand::CacheClear));
+    }
+
+    #[test]
+    fn test_flat_cache_invalidate() {
+        let json = r#"{"command": "cache_invalidate", "file": "/sounds/old.wav"}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::CacheInvalidate { file } => {
+                assert_eq!(file, "/sounds/old.wav");
+            }
+            _ => panic!("Expected CacheInvalidate command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_input_volume() {
+        let json = r#"{"command": "input_volume", "input": "mic1", "volume": 0.8}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::InputVolume { input, volume } => {
+                assert_eq!(input, "mic1");
+                assert_eq!(volume, 0.8);
+            }
+            _ => panic!("Expected InputVolume command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_input_mute() {
+        let json = r#"{"command": "input_mute", "input": "0", "mute": true}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::InputMute { input, mute } => {
+                assert_eq!(input, "0");
+                assert!(mute);
+            }
+            _ => panic!("Expected InputMute command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_seek() {
+        let json = r#"{"command": "seek", "id": "track1", "position_ms": 60000}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Seek { selector, position_ms } => {
+                assert_eq!(selector.id, Some("track1".to_string()));
+                assert_eq!(position_ms, 60000);
+            }
+            _ => panic!("Expected Seek command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_speed() {
+        let json = r#"{"command": "speed", "id": "playback", "speed": 1.5, "pitch_correction": true}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Speed { selector, speed, pitch_correction } => {
+                assert_eq!(selector.id, Some("playback".to_string()));
+                assert_eq!(speed, 1.5);
+                assert!(pitch_correction);
+            }
+            _ => panic!("Expected Speed command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_stop() {
+        let json = r#"{"command": "stop", "voice": "effects", "fade_out_ms": 500}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Stop { selector, fade_out_ms } => {
+                assert_eq!(selector.voice, Some("effects".to_string()));
+                assert_eq!(fade_out_ms, Some(500));
+            }
+            _ => panic!("Expected Stop command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_volume() {
+        let json = r#"{"command": "volume", "file": "music.mp3", "volume": 0.4}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Volume { selector, volume } => {
+                assert_eq!(selector.file, Some("music.mp3".to_string()));
+                assert_eq!(volume, 0.4);
+            }
+            _ => panic!("Expected Volume command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_play_with_channel_map() {
+        let json = r#"{
+            "command": "play",
+            "file": "stereo.wav",
+            "channel_map": [
+                {"src": 0, "dest": 2},
+                {"src": 1, "dest": 3}
+            ]
+        }"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, channel_map, .. } => {
+                assert_eq!(file, "stereo.wav");
+                let map = channel_map.unwrap();
+                assert_eq!(map.len(), 2);
+                assert_eq!(map[0], ChannelMapping { src: ChannelRef::Index(0), dest: ChannelRef::Index(2) });
+                assert_eq!(map[1], ChannelMapping { src: ChannelRef::Index(1), dest: ChannelRef::Index(3) });
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_nested_format_takes_precedence() {
+        // When both "message" and flat params exist, "message" should be used
+        let json = r#"{
+            "command": "play",
+            "file": "flat.wav",
+            "volume": 0.1,
+            "message": {"file": "nested.wav", "volume": 0.9}
+        }"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, volume, .. } => {
+                assert_eq!(file, "nested.wav");
+                assert_eq!(volume, 0.9);
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_both_formats_produce_same_result() {
+        let nested = r#"{"command": "play", "message": {"file": "test.wav", "volume": 0.7, "voice": "fx"}}"#;
+        let flat = r#"{"command": "play", "file": "test.wav", "volume": 0.7, "voice": "fx"}"#;
+
+        let cmd_nested = parse_command(nested).unwrap();
+        let cmd_flat = parse_command(flat).unwrap();
+
+        match (cmd_nested, cmd_flat) {
+            (
+                AudioCommand::Play { file: f1, volume: v1, voice: voice1, .. },
+                AudioCommand::Play { file: f2, volume: v2, voice: voice2, .. }
+            ) => {
+                assert_eq!(f1, f2);
+                assert_eq!(v1, v2);
+                assert_eq!(voice1, voice2);
+            }
+            _ => panic!("Expected matching Play commands"),
         }
     }
 }

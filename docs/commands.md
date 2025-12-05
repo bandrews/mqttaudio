@@ -1,15 +1,14 @@
 # Command Reference
 
-All commands are JSON messages published to the configured MQTT topic.
+All commands are JSON messages published to the configured MQTT topic or sent via HTTP.
 
 ## Command Format
 
 ```json
 {
   "command": "command_name",
-  "message": {
-    // parameters (if any)
-  }
+  "param1": "value1",
+  "param2": "value2"
 }
 ```
 
@@ -24,19 +23,17 @@ Play an audio file.
 ```json
 {
   "command": "play",
-  "message": {
-    "file": "/path/to/sound.wav",
-    "id": "my-sound-id",
-    "voice": "effects",
-    "volume": 0.8,
-    "loop": false,
-    "fade_in": 1000,
-    "start_position_ms": 0,
-    "channel_map": [
-      {"src": 0, "dest": 2},
-      {"src": 1, "dest": 3}
-    ]
-  }
+  "file": "/path/to/sound.wav",
+  "id": "my-sound-id",
+  "voice": "effects",
+  "volume": 0.8,
+  "loop": false,
+  "fade_in": 1000,
+  "start_position_ms": 0,
+  "channel_map": [
+    {"src": 0, "dest": 2},
+    {"src": 1, "dest": 3}
+  ]
 }
 ```
 
@@ -57,29 +54,41 @@ Play an audio file.
 Without `channel_map`, audio plays on sequential channels starting from 0. With `channel_map`, you specify exactly where each source channel goes:
 
 ```json
-"channel_map": [
-  {"src": 0, "dest": 4},
-  {"src": 1, "dest": 5}
-]
+{
+  "command": "play",
+  "file": "/sound.wav",
+  "channel_map": [
+    {"src": 0, "dest": 4},
+    {"src": 1, "dest": 5}
+  ]
+}
 ```
 
 You can use channel aliases (defined in config) instead of numbers:
 
 ```json
-"channel_map": [
-  {"src": 0, "dest": "front_left"},
-  {"src": 1, "dest": "front_right"}
-]
+{
+  "command": "play",
+  "file": "/sound.wav",
+  "channel_map": [
+    {"src": 0, "dest": "front_left"},
+    {"src": 1, "dest": "front_right"}
+  ]
+}
 ```
 
 You can route one source to multiple destinations:
 
 ```json
-"channel_map": [
-  {"src": 0, "dest": 0},
-  {"src": 0, "dest": 1},
-  {"src": 0, "dest": 2}
-]
+{
+  "command": "play",
+  "file": "/mono.wav",
+  "channel_map": [
+    {"src": 0, "dest": 0},
+    {"src": 0, "dest": 1},
+    {"src": 0, "dest": 2}
+  ]
+}
 ```
 
 ### stopall
@@ -103,10 +112,8 @@ Stop specific samples.
 ```json
 {
   "command": "stop",
-  "message": {
-    "id": "my-sound-id",
-    "fade_out_ms": 500
-  }
+  "id": "my-sound-id",
+  "fade_out_ms": 500
 }
 ```
 
@@ -126,10 +133,8 @@ Jump to a position in a playing sample.
 ```json
 {
   "command": "seek",
-  "message": {
-    "id": "my-sound-id",
-    "position_ms": 60000
-  }
+  "id": "my-sound-id",
+  "position_ms": 60000
 }
 ```
 
@@ -147,11 +152,9 @@ Change playback speed.
 ```json
 {
   "command": "speed",
-  "message": {
-    "id": "my-sound-id",
-    "speed": 1.5,
-    "pitch_correction": false
-  }
+  "id": "my-sound-id",
+  "speed": 1.5,
+  "pitch_correction": false
 }
 ```
 
@@ -174,10 +177,8 @@ Adjust volume of specific samples.
 ```json
 {
   "command": "volume",
-  "message": {
-    "id": "my-sound-id",
-    "volume": 0.5
-  }
+  "id": "my-sound-id",
+  "volume": 0.5
 }
 ```
 
@@ -199,9 +200,7 @@ Stop all samples in a voice immediately.
 ```json
 {
   "command": "voice_stop",
-  "message": {
-    "voice": "background"
-  }
+  "voice": "background"
 }
 ```
 
@@ -212,10 +211,8 @@ Fade out all samples in a voice.
 ```json
 {
   "command": "voice_fade_out",
-  "message": {
-    "voice": "background",
-    "time": 2000
-  }
+  "voice": "background",
+  "time": 2000
 }
 ```
 
@@ -231,10 +228,8 @@ Adjust volume for all samples in a voice.
 ```json
 {
   "command": "voice_volume",
-  "message": {
-    "voice": "music",
-    "volume": 0.5
-  }
+  "voice": "music",
+  "volume": 0.5
 }
 ```
 
@@ -254,9 +249,7 @@ Download and decode a file without playing it.
 ```json
 {
   "command": "precache",
-  "message": {
-    "file": "https://example.com/large-file.wav"
-  }
+  "file": "https://example.com/large-file.wav"
 }
 ```
 
@@ -277,9 +270,7 @@ Remove a specific file from cache.
 ```json
 {
   "command": "cache_invalidate",
-  "message": {
-    "file": "https://example.com/updated-file.wav"
-  }
+  "file": "https://example.com/updated-file.wav"
 }
 ```
 
@@ -294,10 +285,8 @@ Adjust volume for a microphone/input device.
 ```json
 {
   "command": "input_volume",
-  "message": {
-    "input": "gamemaster_mic",
-    "volume": 0.5
-  }
+  "input": "gamemaster_mic",
+  "volume": 0.5
 }
 ```
 
@@ -313,10 +302,8 @@ Mute or unmute an input.
 ```json
 {
   "command": "input_mute",
-  "message": {
-    "input": "0",
-    "mute": true
-  }
+  "input": "0",
+  "mute": true
 }
 ```
 
@@ -335,55 +322,52 @@ Mute or unmute an input.
 TOPIC="audio/commands"
 
 # Precache files for instant playback
-mosquitto_pub -t $TOPIC -m '{"command": "precache", "message": {"file": "/sounds/music.mp3"}}'
-mosquitto_pub -t $TOPIC -m '{"command": "precache", "message": {"file": "/sounds/narration.wav"}}'
+mosquitto_pub -t $TOPIC -m '{"command": "precache", "file": "/sounds/music.mp3"}'
+mosquitto_pub -t $TOPIC -m '{"command": "precache", "file": "/sounds/narration.wav"}'
 
 # Start background music with crossfade for smooth looping
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/music.mp3",
-    "voice": "music",
-    "volume": 0.3,
-    "loop": true,
-    "crossfade_ms": 100,
-    "fade_in": 2000
-  }
+  "file": "/sounds/music.mp3",
+  "voice": "music",
+  "volume": 0.3,
+  "loop": true,
+  "crossfade_ms": 100,
+  "fade_in": 2000
 }'
 
 # Play a sound effect
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/doorbell.wav",
-    "voice": "effects"
-  }
+  "file": "/sounds/doorbell.wav",
+  "voice": "effects"
 }'
 
 # Duck music and play narration
 mosquitto_pub -t $TOPIC -m '{
   "command": "voice_volume",
-  "message": {"voice": "music", "volume": 0.1}
+  "voice": "music",
+  "volume": 0.1
 }'
 
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/narration.wav",
-    "voice": "narration"
-  }
+  "file": "/sounds/narration.wav",
+  "voice": "narration"
 }'
 
 # Restore music (after narration finishes)
 mosquitto_pub -t $TOPIC -m '{
   "command": "voice_volume",
-  "message": {"voice": "music", "volume": 0.3}
+  "voice": "music",
+  "volume": 0.3
 }'
 
 # Fade out music
 mosquitto_pub -t $TOPIC -m '{
   "command": "voice_fade_out",
-  "message": {"voice": "music", "time": 5000}
+  "voice": "music",
+  "time": 5000
 }'
 
 # Stop all audio
@@ -396,15 +380,13 @@ mosquitto_pub -t $TOPIC -m '{"command": "stopall"}'
 # Play 4-channel audio to rear speakers (channels 4-7)
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/quad-ambience.wav",
-    "channel_map": [
-      {"src": 0, "dest": 4},
-      {"src": 1, "dest": 5},
-      {"src": 2, "dest": 6},
-      {"src": 3, "dest": 7}
-    ]
-  }
+  "file": "/sounds/quad-ambience.wav",
+  "channel_map": [
+    {"src": 0, "dest": 4},
+    {"src": 1, "dest": 5},
+    {"src": 2, "dest": 6},
+    {"src": 3, "dest": 7}
+  ]
 }'
 ```
 
@@ -414,27 +396,39 @@ mosquitto_pub -t $TOPIC -m '{
 # Play at double speed (chipmunk effect)
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/speech.wav",
-    "id": "speech-1"
-  }
+  "file": "/sounds/speech.wav",
+  "id": "speech-1"
 }'
 
 mosquitto_pub -t $TOPIC -m '{
   "command": "speed",
-  "message": {
-    "id": "speech-1",
-    "speed": 2.0
-  }
+  "id": "speech-1",
+  "speed": 2.0
 }'
 
 # Slow down to half speed with pitch correction
 mosquitto_pub -t $TOPIC -m '{
   "command": "speed",
-  "message": {
-    "id": "speech-1",
-    "speed": 0.5,
-    "pitch_correction": true
-  }
+  "id": "speech-1",
+  "speed": 0.5,
+  "pitch_correction": true
 }'
 ```
+
+---
+
+## Legacy Format
+
+For backward compatibility, commands also accept parameters wrapped in a `message` object:
+
+```json
+{
+  "command": "play",
+  "message": {
+    "file": "/path/to/sound.wav",
+    "volume": 0.8
+  }
+}
+```
+
+This format is equivalent to the flattened format shown throughout this document. When both formats are present in the same message, the `message` object takes precedence.

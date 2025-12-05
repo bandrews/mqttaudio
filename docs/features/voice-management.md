@@ -9,19 +9,17 @@ A voice is created automatically when you play audio with a voice name:
 ```json
 {
   "command": "play",
-  "message": {
-    "file": "/sounds/rain.wav",
-    "voice": "ambience"
-  }
+  "file": "/sounds/rain.wav",
+  "voice": "ambience"
 }
 ```
 
 Multiple sounds can belong to the same voice:
 
 ```json
-{"command": "play", "message": {"file": "/sounds/rain.wav", "voice": "ambience", "loop": true}}
-{"command": "play", "message": {"file": "/sounds/wind.wav", "voice": "ambience", "loop": true}}
-{"command": "play", "message": {"file": "/sounds/thunder.wav", "voice": "ambience"}}
+{"command": "play", "file": "/sounds/rain.wav", "voice": "ambience", "loop": true}
+{"command": "play", "file": "/sounds/wind.wav", "voice": "ambience", "loop": true}
+{"command": "play", "file": "/sounds/thunder.wav", "voice": "ambience"}
 ```
 
 All three sounds are now in the "ambience" voice.
@@ -35,7 +33,7 @@ Stop all sounds in a voice immediately:
 ```json
 {
   "command": "voice_stop",
-  "message": {"voice": "ambience"}
+  "voice": "ambience"
 }
 ```
 
@@ -46,10 +44,8 @@ Fade out all sounds in a voice smoothly:
 ```json
 {
   "command": "voice_fade_out",
-  "message": {
-    "voice": "ambience",
-    "time": 3000
-  }
+  "voice": "ambience",
+  "time": 3000
 }
 ```
 
@@ -62,10 +58,8 @@ Change the volume of all sounds in a voice:
 ```json
 {
   "command": "voice_volume",
-  "message": {
-    "voice": "music",
-    "volume": 0.5
-  }
+  "voice": "music",
+  "volume": 0.5
 }
 ```
 
@@ -81,33 +75,31 @@ TOPIC="audio/commands"
 # Start background music
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/music.mp3",
-    "voice": "music",
-    "loop": true,
-    "volume": 0.4
-  }
+  "file": "/sounds/music.mp3",
+  "voice": "music",
+  "loop": true,
+  "volume": 0.4
 }'
 
 # Play sound effects as needed
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/doorbell.wav",
-    "voice": "effects"
-  }
+  "file": "/sounds/doorbell.wav",
+  "voice": "effects"
 }'
 
 # Lower music for an announcement
 mosquitto_pub -t $TOPIC -m '{
   "command": "voice_volume",
-  "message": {"voice": "music", "volume": 0.1}
+  "voice": "music",
+  "volume": 0.1
 }'
 
 # Restore music volume after announcement
 mosquitto_pub -t $TOPIC -m '{
   "command": "voice_volume",
-  "message": {"voice": "music", "volume": 0.4}
+  "voice": "music",
+  "volume": 0.4
 }'
 ```
 
@@ -119,40 +111,35 @@ Build up complex soundscapes by layering:
 # Base layer
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/forest-base.wav",
-    "voice": "ambience",
-    "loop": true,
-    "volume": 0.3
-  }
+  "file": "/sounds/forest-base.wav",
+  "voice": "ambience",
+  "loop": true,
+  "volume": 0.3
 }'
 
 # Add birds
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/birds.wav",
-    "voice": "ambience",
-    "loop": true,
-    "volume": 0.5
-  }
+  "file": "/sounds/birds.wav",
+  "voice": "ambience",
+  "loop": true,
+  "volume": 0.5
 }'
 
 # Add stream
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/stream.wav",
-    "voice": "ambience",
-    "loop": true,
-    "volume": 0.4
-  }
+  "file": "/sounds/stream.wav",
+  "voice": "ambience",
+  "loop": true,
+  "volume": 0.4
 }'
 
 # Stop everything at once
 mosquitto_pub -t $TOPIC -m '{
   "command": "voice_fade_out",
-  "message": {"voice": "ambience", "time": 5000}
+  "voice": "ambience",
+  "time": 5000
 }'
 ```
 
@@ -162,18 +149,17 @@ mosquitto_pub -t $TOPIC -m '{
 # Fade out current scene
 mosquitto_pub -t $TOPIC -m '{
   "command": "voice_fade_out",
-  "message": {"voice": "scene1", "time": 2000}
+  "voice": "scene1",
+  "time": 2000
 }'
 
 # Start next scene (fading in)
 mosquitto_pub -t $TOPIC -m '{
   "command": "play",
-  "message": {
-    "file": "/sounds/scene2-music.mp3",
-    "voice": "scene2",
-    "loop": true,
-    "fade_in": 2000
-  }
+  "file": "/sounds/scene2-music.mp3",
+  "voice": "scene2",
+  "loop": true,
+  "fade_in": 2000
 }'
 ```
 
@@ -199,7 +185,7 @@ If you don't specify a voice, an anonymous voice is created:
 ```json
 {
   "command": "play",
-  "message": {"file": "/sounds/effect.wav"}
+  "file": "/sounds/effect.wav"
 }
 ```
 

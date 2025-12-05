@@ -60,9 +60,7 @@ Precache files before you need them:
 ```json
 {
   "command": "precache",
-  "message": {
-    "file": "https://example.com/large-file.wav"
-  }
+  "file": "https://example.com/large-file.wav"
 }
 ```
 
@@ -85,9 +83,7 @@ Force re-download of a specific file:
 ```json
 {
   "command": "cache_invalidate",
-  "message": {
-    "file": "https://example.com/updated-file.wav"
-  }
+  "file": "https://example.com/updated-file.wav"
 }
 ```
 

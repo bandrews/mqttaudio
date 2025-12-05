@@ -122,7 +122,7 @@ curl http://localhost:8080/status
 # Send raw command (same format as MQTT)
 curl -X POST http://localhost:8080/command \
   -H "Content-Type: application/json" \
-  -d '{"command": "play", "message": {"file": "/sounds/music.mp3", "loop": true}}'
+  -d '{"command": "play", "file": "/sounds/music.mp3", "loop": true}'
 
 # Fade out a voice
 curl -X POST http://localhost:8080/voice/fade_out \
