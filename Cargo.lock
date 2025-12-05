@@ -1523,6 +1523,7 @@ version = "2.0.0"
 dependencies = [
  "alsa",
  "axum",
+ "bytes",
  "chrono",
  "clap",
  "cpal",
@@ -1531,6 +1532,7 @@ dependencies = [
  "dasp",
  "dirs",
  "futures",
+ "futures-util",
  "rand",
  "reqwest",
  "ringbuf",

@@ -9,9 +9,9 @@
 | Phase 2: StreamingBuffer Foundation | **COMPLETE** | SampleBuffer enum, mixer integration |
 | Phase 3: Chunked Resampler | **COMPLETE** | ChunkedResampler with 14 tests |
 | Phase 4: Streaming Decoder | **COMPLETE** | StreamingDecoder with 7 tests |
-| Phase 5: HTTP Streaming | Pending | |
+| Phase 5: HTTP Streaming | **COMPLETE** | HttpStreamReader with 15 unit tests + 4 integration tests |
 | Phase 6: Mixer Integration | **COMPLETE** | Done as part of Phase 2 |
-| Phase 7: Cache Manager Updates | Pending | |
+| Phase 7: Cache Manager Updates | **COMPLETE** | get_or_load_streaming, active load tracking, 4 integration tests |
 | Phase 8: LRU Eviction | Pending | |
 | Phase 9: Seek Support | Pending | |
 | Phase 10: Integration & Polish | Pending | |
@@ -162,11 +162,47 @@ impl Iterator for StreamingDecoder {
 }
 ```
 
+### Phase 5: HTTP Streaming Integration
+
+**Files created/modified:**
+- `src/cache/http_stream.rs` (new) - HttpStreamReader implementing MediaSource
+- `src/cache/disk.rs` - Added `start_streaming_download()` method
+- `tests/http_streaming_integration.rs` (new) - End-to-end integration tests
+
+**Key implementations:**
+- `HttpStreamReader` struct implementing Symphonia's `MediaSource` trait (Read + Seek)
+- Thread-safe shared buffer using `Mutex<SharedBuffer>` and `Condvar` for synchronization
+- Background download task using reqwest's `bytes_stream()` for chunked downloads
+- `DownloadHandles` for safe communication between download task and reader
+- Seeking support within buffered region, with blocking for forward seeks beyond buffer
+- Progress tracking via `AtomicUsize` for bytes downloaded
+- Cancellation support for aborting downloads
+- 15 unit tests covering: basic read/write, seeking, multi-threaded producer/consumer, error handling
+- 4 integration tests with embedded HTTP server testing StreamingDecoder integration
+
+**API:**
+```rust
+impl HttpStreamReader {
+    pub fn new(content_length: Option<u64>) -> Self;
+    pub fn download_handles(&self) -> DownloadHandles;
+    pub fn cancel(&self);
+    pub fn is_complete(&self) -> bool;
+    pub fn bytes_downloaded(&self) -> usize;
+    pub fn progress(&self) -> (usize, Option<usize>);
+}
+
+impl MediaSource for HttpStreamReader { ... }
+impl Read for HttpStreamReader { ... }
+impl Seek for HttpStreamReader { ... }
+
+pub async fn start_http_stream(url: &str) -> Result<HttpStreamReader, HttpStreamError>;
+```
+
 ---
 
 ## Remaining Implementation Plan
 
-### Phase 5: HTTP Streaming Integration
+### ~~Phase 5: HTTP Streaming Integration~~ — **COMPLETE**
 **Files:** `src/cache/disk.rs` (modify), `src/cache/http_stream.rs` (new)
 
 **Goal:** Stream HTTP downloads directly to `StreamingDecoder` so playback can begin
@@ -336,9 +372,10 @@ Handle seeking within streaming buffers:
 | `src/audio/chunked_resampler.rs` | **DONE** | Incremental resampling for streaming |
 | `src/audio/streaming_decoder.rs` | **DONE** | Iterator-based decoder with ChunkedResampler |
 | `src/audio/mixer.rs` | **DONE** | Uses SampleBuffer, get_sample_or_silence() |
-| `src/cache/mod.rs` | Pending | Streaming load orchestration |
+| `src/cache/http_stream.rs` | **DONE** | HttpStreamReader implementing MediaSource |
+| `src/cache/disk.rs` | **DONE** | HTTP streaming download via start_streaming_download() |
+| `src/cache/mod.rs` | **DONE** | get_or_load_streaming, active load tracking |
 | `src/cache/memory.rs` | Pending | LRU eviction, access tracking |
-| `src/cache/disk.rs` | Pending | HTTP streaming download |
 | `src/main.rs` | **DONE** | Uses SampleBuffer methods |
 | `src/http/handlers.rs` | **DONE** | Uses SampleBuffer methods |
 

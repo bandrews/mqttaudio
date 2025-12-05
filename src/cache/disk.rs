@@ -307,6 +307,19 @@ impl DiskCache {
 
         Ok(cache_path)
     }
+
+    /// Start a streaming download from HTTP/HTTPS URL.
+    /// Returns an HttpStreamReader that can be used immediately for decoding
+    /// while the download continues in the background.
+    ///
+    /// Note: This does NOT cache to disk. Use download_and_cache() for caching.
+    pub async fn start_streaming_download(
+        url: &str,
+    ) -> Result<super::http_stream::HttpStreamReader, CacheError> {
+        super::http_stream::start_http_stream(url)
+            .await
+            .map_err(|e| CacheError::HttpError(format!("Streaming download failed: {}", e)))
+    }
 }
 
 #[cfg(test)]

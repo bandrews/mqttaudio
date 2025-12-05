@@ -124,6 +124,12 @@ impl StreamingBuffer {
         matches!(self.state, LoadingState::Error(_))
     }
 
+    /// Get a reference to the raw sample data.
+    /// Used for promoting streaming buffer to memory cache.
+    pub fn data(&self) -> &[f32] {
+        &self.data
+    }
+
     /// Convert to a DecodedBuffer once loading is complete.
     /// Returns None if still loading or if there was an error.
     pub fn into_decoded_buffer(self) -> Option<DecodedBuffer> {

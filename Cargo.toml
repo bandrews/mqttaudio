@@ -55,6 +55,10 @@ tower-http = { version = "0.5", features = ["cors", "fs"] }
 
 # Async utilities
 futures = "0.3"
+futures-util = "0.3"
+
+# Byte buffer types
+bytes = "1.0"
 
 # Random number generation
 rand = "0.8"
