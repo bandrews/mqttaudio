@@ -426,6 +426,11 @@ pub struct Config {
     pub inputs: Vec<InputConfig>,
     #[serde(default)]
     pub advanced: AdvancedConfig,
+    /// Command macros for parameter presets.
+    /// Each macro name maps to an object of default parameters that will be merged
+    /// into commands that reference the macro.
+    #[serde(default)]
+    pub macros: HashMap<String, serde_json::Value>,
 }
 
 impl Default for Config {
@@ -441,6 +446,7 @@ impl Default for Config {
             bass_management: BassManagementConfig::default(),
             inputs: Vec::new(),
             advanced: AdvancedConfig::default(),
+            macros: HashMap::new(),
         }
     }
 }
@@ -2014,5 +2020,83 @@ mod tests {
     fn test_advanced_config_default() {
         let config = AdvancedConfig::default();
         assert_eq!(config.resampler_quality, ResamplerQuality::Fast);
+    }
+
+    #[test]
+    fn test_macros_default_empty() {
+        let config = Config::default();
+        assert!(config.macros.is_empty());
+    }
+
+    #[test]
+    fn test_macros_parse() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "macros": {
+                "wholeroom": {
+                    "channel_map": [{"src": 0, "dest": "left"}, {"src": 1, "dest": "right"}],
+                    "volume": 0.2
+                },
+                "quiet": {
+                    "volume": 0.1
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        assert_eq!(config.macros.len(), 2);
+        assert!(config.macros.contains_key("wholeroom"));
+        assert!(config.macros.contains_key("quiet"));
+
+        let wholeroom = &config.macros["wholeroom"];
+        assert_eq!(wholeroom["volume"], 0.2);
+        assert!(wholeroom["channel_map"].is_array());
+
+        let quiet = &config.macros["quiet"];
+        assert_eq!(quiet["volume"], 0.1);
+    }
+
+    #[test]
+    fn test_macros_with_complex_values() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "macros": {
+                "surround": {
+                    "channel_map": [
+                        {"src": 0, "dest": 0},
+                        {"src": 1, "dest": 1},
+                        {"src": 0, "dest": 4},
+                        {"src": 1, "dest": 5}
+                    ],
+                    "volume": 0.5,
+                    "voice": "surround_effects",
+                    "fade_in": 1000
+                }
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+
+        let surround = &config.macros["surround"];
+        assert_eq!(surround["volume"], 0.5);
+        assert_eq!(surround["voice"], "surround_effects");
+        assert_eq!(surround["fade_in"], 1000);
+        assert_eq!(surround["channel_map"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_macros_serialization() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.macros.insert(
+            "test_macro".to_string(),
+            serde_json::json!({"volume": 0.5}),
+        );
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains("macros"));
+        assert!(json.contains("test_macro"));
+        assert!(json.contains("0.5"));
     }
 }

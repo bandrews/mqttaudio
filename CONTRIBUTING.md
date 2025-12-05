@@ -51,7 +51,7 @@ cargo test --test http_api_test
 For comprehensive testing including audio playback verification:
 
 ```bash
-node tests/scripts/http_interactive_test.js
+node tests/scripts/interactive_test.js
 ```
 
 This will:

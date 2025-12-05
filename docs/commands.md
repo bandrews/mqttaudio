@@ -417,6 +417,35 @@ mosquitto_pub -t $TOPIC -m '{
 
 ---
 
+## Macros
+
+Commands can reference macros defined in the config file to apply preset parameters.
+
+```json
+{
+  "command": "play",
+  "file": "/sounds/music.mp3",
+  "macro": "wholeroom"
+}
+```
+
+Parameters specified in the command take precedence over macro values. Multiple macros can be specified as an array, with earlier macros taking precedence over later ones:
+
+```json
+{
+  "command": "play",
+  "file": "/sounds/music.mp3",
+  "macro": ["quiet", "wholeroom"],
+  "voice": "background"
+}
+```
+
+In this example: `voice` comes from the command, `volume` from the "quiet" macro, and `channel_map` from "wholeroom".
+
+See [Configuration](configuration.md#macros) for defining macros.
+
+---
+
 ## Legacy Format
 
 For backward compatibility, commands also accept parameters wrapped in a `message` object:

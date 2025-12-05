@@ -344,6 +344,73 @@ impl From<serde_json::Error> for ParseError {
     }
 }
 
+/// Expand macros in a command JSON string.
+/// Macros are referenced via the "macro" field, which can be a single string or array of strings.
+/// Parameters are merged with precedence: command params > earlier macros > later macros.
+/// The "macro" field is removed from the output.
+///
+/// # Arguments
+/// * `json` - The raw JSON command string
+/// * `macros` - Map of macro names to their parameter values
+///
+/// # Returns
+/// The expanded JSON string with macro parameters merged in
+pub fn expand_macros(
+    json: &str,
+    macros: &std::collections::HashMap<String, serde_json::Value>,
+) -> Result<String, ParseError> {
+    // Parse the input JSON
+    let mut value: serde_json::Value = serde_json::from_str(json)?;
+
+    // Only process if it's an object
+    let obj = match value.as_object_mut() {
+        Some(o) => o,
+        None => return Ok(json.to_string()),
+    };
+
+    // Check for macro field
+    let macro_names = match obj.remove("macro") {
+        None => return serde_json::to_string(&value).map_err(ParseError::from),
+        Some(serde_json::Value::String(s)) => vec![s],
+        Some(serde_json::Value::Array(arr)) => {
+            arr.into_iter()
+                .filter_map(|v| {
+                    if let serde_json::Value::String(s) = v {
+                        Some(s)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        }
+        Some(_) => return serde_json::to_string(&value).map_err(ParseError::from),
+    };
+
+    // Build merged parameters: process macros in forward order, earlier macros take precedence
+    let mut merged = serde_json::Map::new();
+
+    for macro_name in macro_names.iter() {
+        if let Some(macro_params) = macros.get(macro_name) {
+            if let Some(macro_obj) = macro_params.as_object() {
+                for (k, v) in macro_obj {
+                    // Only set if not already present (earlier macros take precedence)
+                    if !merged.contains_key(k) {
+                        merged.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // Finally merge command parameters (highest priority)
+    for (k, v) in obj.iter() {
+        merged.insert(k.clone(), v.clone());
+    }
+
+    let result = serde_json::Value::Object(merged);
+    serde_json::to_string(&result).map_err(ParseError::from)
+}
+
 /// Parse MQTT JSON payload into an audio command.
 /// Supports both flattened and nested (legacy) formats:
 /// - Flattened: {"command": "play", "file": "test.wav", "volume": 0.8}
@@ -1901,5 +1968,231 @@ mod tests {
             }
             _ => panic!("Expected matching Play commands"),
         }
+    }
+
+    // ==========================================================================
+    // Macro Expansion Tests
+    // ==========================================================================
+
+    use std::collections::HashMap;
+
+    fn make_macros() -> HashMap<String, serde_json::Value> {
+        let mut macros = HashMap::new();
+        macros.insert(
+            "wholeroom".to_string(),
+            serde_json::json!({
+                "channel_map": [{"src": 0, "dest": "left"}, {"src": 1, "dest": "right"}],
+                "volume": 0.2
+            }),
+        );
+        macros.insert(
+            "quiet".to_string(),
+            serde_json::json!({
+                "volume": 0.1
+            }),
+        );
+        macros.insert(
+            "music_voice".to_string(),
+            serde_json::json!({
+                "voice": "music"
+            }),
+        );
+        macros
+    }
+
+    #[test]
+    fn test_expand_macros_single_macro() {
+        let macros = make_macros();
+        let json = r#"{"command": "play", "file": "test.mp3", "macro": "wholeroom"}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+
+        assert_eq!(value["command"], "play");
+        assert_eq!(value["file"], "test.mp3");
+        assert_eq!(value["volume"], 0.2);
+        assert!(value["channel_map"].is_array());
+        assert!(value.get("macro").is_none()); // macro field should be removed
+    }
+
+    #[test]
+    fn test_expand_macros_command_overrides_macro() {
+        let macros = make_macros();
+        let json = r#"{"command": "play", "file": "test.mp3", "macro": "wholeroom", "volume": 0.3}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+
+        assert_eq!(value["volume"], 0.3); // Command value takes precedence
+        assert!(value["channel_map"].is_array()); // Macro value still applied
+    }
+
+    #[test]
+    fn test_expand_macros_multiple_macros_precedence() {
+        let macros = make_macros();
+        // Earlier macros take precedence over later ones
+        let json = r#"{"command": "play", "file": "test.mp3", "macro": ["quiet", "wholeroom"]}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+
+        assert_eq!(value["volume"], 0.1); // "quiet" macro takes precedence (first in array)
+        assert!(value["channel_map"].is_array()); // "wholeroom" channel_map still applied
+    }
+
+    #[test]
+    fn test_expand_macros_later_macro_fills_gaps() {
+        let macros = make_macros();
+        // music_voice has voice, wholeroom has volume and channel_map
+        let json = r#"{"command": "play", "file": "test.mp3", "macro": ["music_voice", "wholeroom"]}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+
+        assert_eq!(value["voice"], "music"); // From music_voice
+        assert_eq!(value["volume"], 0.2); // From wholeroom
+        assert!(value["channel_map"].is_array()); // From wholeroom
+    }
+
+    #[test]
+    fn test_expand_macros_no_macro_field() {
+        let macros = make_macros();
+        let json = r#"{"command": "play", "file": "test.mp3"}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+
+        assert_eq!(value["command"], "play");
+        assert_eq!(value["file"], "test.mp3");
+        assert!(value.get("volume").is_none());
+    }
+
+    #[test]
+    fn test_expand_macros_unknown_macro_ignored() {
+        let macros = make_macros();
+        let json = r#"{"command": "play", "file": "test.mp3", "macro": "nonexistent"}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+
+        assert_eq!(value["command"], "play");
+        assert_eq!(value["file"], "test.mp3");
+        assert!(value.get("volume").is_none()); // No macro params added
+    }
+
+    #[test]
+    fn test_expand_macros_empty_macros_map() {
+        let macros = HashMap::new();
+        let json = r#"{"command": "play", "file": "test.mp3", "macro": "anything"}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+
+        assert_eq!(value["command"], "play");
+        assert_eq!(value["file"], "test.mp3");
+        assert!(value.get("macro").is_none()); // macro field still removed
+    }
+
+    #[test]
+    fn test_expand_macros_invalid_json() {
+        let macros = make_macros();
+        let json = r#"not valid json"#;
+
+        let result = expand_macros(json, &macros);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_expand_macros_preserves_nested_message() {
+        let macros = make_macros();
+        // Macro should work with legacy nested format too
+        let json = r#"{"command": "play", "message": {"file": "test.mp3"}, "macro": "quiet"}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+
+        assert_eq!(value["command"], "play");
+        assert!(value["message"].is_object());
+        assert_eq!(value["volume"], 0.1); // Macro param added at top level
+    }
+
+    #[test]
+    fn test_expand_macros_integration_with_parse() {
+        let macros = make_macros();
+        let json = r#"{"command": "play", "file": "test.mp3", "macro": "quiet"}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let cmd = parse_command(&expanded).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, volume, .. } => {
+                assert_eq!(file, "test.mp3");
+                assert_eq!(volume, 0.1); // From quiet macro
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_expand_macros_command_override_integration() {
+        let macros = make_macros();
+        let json = r#"{"command": "play", "file": "test.mp3", "macro": "quiet", "volume": 0.5}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let cmd = parse_command(&expanded).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, volume, .. } => {
+                assert_eq!(file, "test.mp3");
+                assert_eq!(volume, 0.5); // Command override
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_expand_macros_multiple_integration() {
+        let macros = make_macros();
+        let json = r#"{"command": "play", "file": "test.mp3", "macro": ["music_voice", "quiet"]}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let cmd = parse_command(&expanded).unwrap();
+
+        match cmd {
+            AudioCommand::Play { file, volume, voice, .. } => {
+                assert_eq!(file, "test.mp3");
+                assert_eq!(volume, 0.1); // From quiet macro
+                assert_eq!(voice, Some("music".to_string())); // From music_voice macro
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_expand_macros_array_with_invalid_entries() {
+        let macros = make_macros();
+        // Mix of valid strings and invalid entries in array
+        let json = r#"{"command": "play", "file": "test.mp3", "macro": ["quiet", 123, "music_voice", null]}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+
+        assert_eq!(value["volume"], 0.1); // quiet still applied
+        assert_eq!(value["voice"], "music"); // music_voice still applied
+    }
+
+    #[test]
+    fn test_expand_macros_invalid_macro_type() {
+        let macros = make_macros();
+        // macro field is neither string nor array
+        let json = r#"{"command": "play", "file": "test.mp3", "macro": 123}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+
+        // Should just remove the invalid macro field and continue
+        assert_eq!(value["command"], "play");
+        assert_eq!(value["file"], "test.mp3");
+        assert!(value.get("macro").is_none());
     }
 }

@@ -380,6 +380,29 @@ When `mqtt_topic` is set, log entries are published as JSON:
 }
 ```
 
+### macros
+
+Reusable parameter presets for commands. Useful for defining common channel mappings, volume levels, or other settings that you frequently use together.
+
+```json
+"macros": {
+  "wholeroom": {
+    "channel_map": [{"src": 0, "dest": "left"}, {"src": 1, "dest": "right"}],
+    "volume": 0.2
+  },
+  "quiet": {
+    "volume": 0.1
+  },
+  "music_defaults": {
+    "voice": "music",
+    "volume": 0.3,
+    "fade_in": 2000
+  }
+}
+```
+
+Macros can be referenced in commands using the `macro` field. See [Commands](commands.md#macros) for usage details.
+
 ### advanced
 
 Performance tuning and advanced settings. Most users won't need to change these.

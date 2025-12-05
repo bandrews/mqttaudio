@@ -633,7 +633,16 @@ async fn main() {
         }
 
         while let Some(payload) = cmd_rx.recv().await {
-            match mqtt::commands::parse_command(&payload) {
+            // Expand macros before parsing
+            let expanded = match mqtt::commands::expand_macros(&payload, &config.macros) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!("Macro expansion error: {}", e);
+                    continue;
+                }
+            };
+
+            match mqtt::commands::parse_command(&expanded) {
                 Ok(cmd) => {
                     tracing::info!("Processing command: {:?}", cmd);
 

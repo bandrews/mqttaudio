@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// ABOUTME: Interactive integration test for HTTP REST API.
-// ABOUTME: Walks user through testing each endpoint with audio confirmation.
+// ABOUTME: Interactive integration test for mqttaudio.
+// ABOUTME: Walks user through testing features with audio confirmation.
 
 const http = require('http');
 const { spawn, execSync } = require('child_process');
@@ -15,6 +15,54 @@ const BASE_URL = `http://${HTTP_HOST}:${HTTP_PORT}`;
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const TEST_AUDIO_DIR = path.join(PROJECT_ROOT, 'tests/audio');
 const MQTTAUDIO_BIN = path.join(PROJECT_ROOT, 'target/release/mqttaudio');
+const TEST_CONFIG_FILE = path.join(PROJECT_ROOT, 'tests/test_config.json');
+
+// Parse command line arguments
+function parseArgs() {
+  const args = {
+    device: null,
+    verbose: false,
+    help: false,
+  };
+
+  for (let i = 2; i < process.argv.length; i++) {
+    const arg = process.argv[i];
+    if (arg === '--device' || arg === '-d') {
+      args.device = process.argv[++i];
+    } else if (arg === '--verbose' || arg === '-v') {
+      args.verbose = true;
+    } else if (arg === '--help' || arg === '-h') {
+      args.help = true;
+    } else if (arg.startsWith('--device=')) {
+      args.device = arg.split('=')[1];
+    }
+  }
+
+  return args;
+}
+
+const cliArgs = parseArgs();
+
+if (cliArgs.help) {
+  console.log(`
+Usage: interactive_test.js [OPTIONS]
+
+Options:
+  -d, --device <name>   Audio output device name (use --list-devices to see options)
+  -v, --verbose         Show mqttaudio output
+  -h, --help            Show this help message
+
+Environment variables:
+  HTTP_PORT             HTTP server port (default: 8765)
+  HTTP_HOST             HTTP server host (default: 127.0.0.1)
+
+Examples:
+  node interactive_test.js
+  node interactive_test.js --device "Built-in Output"
+  node interactive_test.js -d "USB Audio" -v
+`);
+  process.exit(0);
+}
 
 // Colors for terminal output
 const colors = {
@@ -22,6 +70,7 @@ const colors = {
   green: '\x1b[32m',
   yellow: '\x1b[33m',
   blue: '\x1b[34m',
+  cyan: '\x1b[36m',
   reset: '\x1b[0m',
 };
 
@@ -153,24 +202,98 @@ async function cleanup() {
       mqttaudioProcess.kill('SIGKILL');
     }
   }
+
+  // Remove test config file
+  if (fs.existsSync(TEST_CONFIG_FILE)) {
+    fs.unlinkSync(TEST_CONFIG_FILE);
+  }
+
   rl.close();
   console.log('Done.');
 }
 
+// Generate test config file with macros
+function generateTestConfig() {
+  const config = {
+    http: {
+      enabled: true,
+      port: HTTP_PORT,
+      bind_address: HTTP_HOST,
+    },
+    security: {
+      allowed_directories: [TEST_AUDIO_DIR, '/tmp'],
+    },
+    macros: {
+      quiet: {
+        volume: 0.2,
+      },
+      loud: {
+        volume: 0.9,
+      },
+      music_defaults: {
+        voice: 'music',
+        volume: 0.5,
+        fade_in: 500,
+      },
+      effects_defaults: {
+        voice: 'effects',
+        volume: 0.7,
+      },
+      left_only: {
+        channel_map: [{ src: 0, dest: 0 }],
+        volume: 0.8,
+      },
+      right_only: {
+        channel_map: [{ src: 0, dest: 1 }],
+        volume: 0.8,
+      },
+    },
+  };
+
+  // Add device if specified
+  if (cliArgs.device) {
+    config.audio = {
+      device: cliArgs.device,
+    };
+  }
+
+  fs.writeFileSync(TEST_CONFIG_FILE, JSON.stringify(config, null, 2));
+  console.log(`  Config file: ${TEST_CONFIG_FILE}`);
+
+  if (cliArgs.device) {
+    console.log(`  Audio device: ${cliArgs.device}`);
+  }
+
+  return config;
+}
+
 // Setup functions
 function checkTestAudio() {
-  const testFile = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
+  const testFile2s = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
   const testFile5s = path.join(TEST_AUDIO_DIR, 'test_beep_5s.wav');
+  const testFile200hz = path.join(TEST_AUDIO_DIR, 'music_200hz.wav');
 
   if (!fs.existsSync(TEST_AUDIO_DIR)) {
     fs.mkdirSync(TEST_AUDIO_DIR, { recursive: true });
   }
 
-  if (!fs.existsSync(testFile)) {
-    console.log('Creating test audio file (2s)...');
+  // Generate test files using frequencies that divide evenly into 44100Hz sample rate
+  // for seamless looping (exact integer samples per cycle).
+  // No fade-out since these files may be looped.
+  // Short fade-in (5ms) to avoid any initial click from playback start.
+  //
+  // 441Hz at 44100Hz = exactly 100 samples per cycle (vs 440Hz = 100.227...)
+  // 882Hz at 44100Hz = exactly 50 samples per cycle
+  // 210Hz at 44100Hz = exactly 210 samples per cycle
+
+  if (!fs.existsSync(testFile2s)) {
+    console.log('Creating test audio file (441Hz, 2s)...');
     try {
-      execSync(`ffmpeg -f lavfi -i "sine=frequency=440:duration=2" -ar 44100 -ac 2 -y "${testFile}"`,
-        { stdio: 'pipe' });
+      // 441Hz (divides evenly into 44100) for 2s with 5ms fade-in only
+      execSync(
+        `ffmpeg -f lavfi -i "sine=frequency=441:duration=2" -af "afade=t=in:st=0:d=0.005" -ar 44100 -ac 2 -y "${testFile2s}"`,
+        { stdio: 'pipe' }
+      );
     } catch (e) {
       console.log(`${colors.red}Warning: Could not create test audio with ffmpeg.${colors.reset}`);
       console.log('Please ensure ffmpeg is installed or create test audio manually.');
@@ -179,12 +302,28 @@ function checkTestAudio() {
   }
 
   if (!fs.existsSync(testFile5s)) {
-    console.log('Creating test audio file (5s)...');
+    console.log('Creating test audio file (882Hz, 5s)...');
     try {
-      execSync(`ffmpeg -f lavfi -i "sine=frequency=880:duration=5" -ar 44100 -ac 2 -y "${testFile5s}"`,
-        { stdio: 'pipe' });
+      // 882Hz (divides evenly into 44100) for 5s with 5ms fade-in only
+      execSync(
+        `ffmpeg -f lavfi -i "sine=frequency=882:duration=5" -af "afade=t=in:st=0:d=0.005" -ar 44100 -ac 2 -y "${testFile5s}"`,
+        { stdio: 'pipe' }
+      );
     } catch (e) {
       console.log(`${colors.yellow}Warning: Could not create 5s test audio.${colors.reset}`);
+    }
+  }
+
+  if (!fs.existsSync(testFile200hz)) {
+    console.log('Creating test audio file (210Hz, 3s)...');
+    try {
+      // 210Hz (divides evenly into 44100) for 3s with 5ms fade-in only
+      execSync(
+        `ffmpeg -f lavfi -i "sine=frequency=210:duration=3" -af "afade=t=in:st=0:d=0.005" -ar 44100 -ac 2 -y "${testFile200hz}"`,
+        { stdio: 'pipe' }
+      );
+    } catch (e) {
+      console.log(`${colors.yellow}Warning: Could not create 210Hz test audio.${colors.reset}`);
     }
   }
 }
@@ -205,23 +344,27 @@ function buildProject() {
 }
 
 async function startServer() {
-  printHeader('Starting mqttaudio in HTTP-only mode');
-  console.log(`  Port: ${HTTP_PORT}`);
+  printHeader('Starting mqttaudio');
+
+  // Generate config file
+  const config = generateTestConfig();
 
   return new Promise((resolve, reject) => {
-    mqttaudioProcess = spawn(MQTTAUDIO_BIN, ['--http-port', String(HTTP_PORT)], {
+    const args = ['--config', TEST_CONFIG_FILE];
+
+    mqttaudioProcess = spawn(MQTTAUDIO_BIN, args, {
       cwd: PROJECT_ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
 
     mqttaudioProcess.stdout.on('data', data => {
-      if (process.env.VERBOSE) {
+      if (cliArgs.verbose) {
         console.log(`  [mqttaudio] ${data.toString().trim()}`);
       }
     });
 
     mqttaudioProcess.stderr.on('data', data => {
-      if (process.env.VERBOSE) {
+      if (cliArgs.verbose) {
         console.log(`  [mqttaudio stderr] ${data.toString().trim()}`);
       }
     });
@@ -255,7 +398,10 @@ async function startServer() {
   });
 }
 
+// =============================================================================
 // Test functions
+// =============================================================================
+
 async function testHealthEndpoint() {
   printTest('Health Endpoint');
   printCommand(`curl ${BASE_URL}/health`);
@@ -294,7 +440,7 @@ async function testStatusEndpoint() {
 
 async function testPlayBasic() {
   printTest('Basic Play Command');
-  printExpect('You should hear a 440Hz tone for 2 seconds');
+  printExpect('You should hear a 441Hz tone for 2 seconds');
 
   const testFile = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
   printCommand(`POST ${BASE_URL}/play with file: ${testFile}`);
@@ -306,7 +452,7 @@ async function testPlayBasic() {
 
 async function testPlayWithVolume() {
   printTest('Play with Volume');
-  printExpect('You should hear a QUIET 440Hz tone (volume at 30%)');
+  printExpect('You should hear a QUIET 441Hz tone (volume at 30%)');
 
   const testFile = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
   await post('/play', { file: testFile, volume: 0.3 });
@@ -498,9 +644,129 @@ async function testCacheClear() {
   }
 }
 
-// ============================================================================
+// =============================================================================
+// Macro Tests
+// =============================================================================
+
+async function testMacroQuiet() {
+  printTest('Macro: quiet');
+  printExpect('Playing with "quiet" macro - should be at 20% volume');
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
+  printCommand(`POST /command with macro: "quiet"`);
+
+  await post('/command', {
+    command: 'play',
+    file: testFile,
+    macro: 'quiet'
+  });
+
+  await sleep(2500);
+  console.log('  Sound should have been quiet (20% volume from macro)');
+  await askConfirmation();
+}
+
+async function testMacroLoud() {
+  printTest('Macro: loud');
+  printExpect('Playing with "loud" macro - should be at 90% volume');
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
+  printCommand(`POST /command with macro: "loud"`);
+
+  await post('/command', {
+    command: 'play',
+    file: testFile,
+    macro: 'loud'
+  });
+
+  await sleep(2500);
+  console.log('  Sound should have been loud (90% volume from macro)');
+  await askConfirmation();
+}
+
+async function testMacroMusicDefaults() {
+  printTest('Macro: music_defaults');
+  printExpect('Playing with music_defaults macro - should fade in over 500ms on "music" voice');
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
+  printCommand(`POST /command with macro: "music_defaults"`);
+
+  await post('/command', {
+    command: 'play',
+    file: testFile,
+    macro: 'music_defaults'
+  });
+
+  await sleep(2500);
+
+  // Check that it was on the music voice
+  const { data: voices } = await get('/status/voices');
+  console.log(`  Voices: ${JSON.stringify(voices.voices)}`);
+
+  console.log('  Sound should have faded in on "music" voice');
+  await askConfirmation();
+}
+
+async function testMacroOverride() {
+  printTest('Macro Override');
+  printExpect('Using "quiet" macro but overriding volume to 80% - should be LOUD');
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
+  printCommand(`POST /command with macro: "quiet", volume: 0.8`);
+
+  await post('/command', {
+    command: 'play',
+    file: testFile,
+    macro: 'quiet',
+    volume: 0.8  // Override the macro's 0.2 volume
+  });
+
+  await sleep(2500);
+  console.log('  Sound should have been LOUD (command volume 80% overrides macro 20%)');
+  await askConfirmation();
+}
+
+async function testMacroMultiple() {
+  printTest('Multiple Macros');
+  printExpect('Using ["quiet", "music_defaults"] - quiet takes precedence for volume');
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
+  printCommand(`POST /command with macro: ["quiet", "music_defaults"]`);
+
+  await post('/command', {
+    command: 'play',
+    file: testFile,
+    macro: ['quiet', 'music_defaults']  // quiet: vol=0.2, music_defaults: vol=0.5, voice=music, fade_in=500
+  });
+
+  await sleep(2500);
+
+  console.log('  Sound should be quiet (20% from "quiet"), fading in (from "music_defaults")');
+  console.log('  "quiet" is first so its volume (0.2) overrides music_defaults (0.5)');
+  await askConfirmation();
+}
+
+async function testMacroUnknown() {
+  printTest('Unknown Macro (should be ignored)');
+  printExpect('Using unknown macro "nonexistent" - should play normally');
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
+  printCommand(`POST /command with macro: "nonexistent"`);
+
+  await post('/command', {
+    command: 'play',
+    file: testFile,
+    macro: 'nonexistent'
+  });
+
+  await sleep(2500);
+  console.log('  Sound should have played at default volume (unknown macro ignored)');
+  await askConfirmation();
+}
+
+// =============================================================================
 // Streaming and Performance Tests
-// ============================================================================
+// =============================================================================
 
 async function testColdLoadTiming() {
   printTest('Cold Load Timing');
@@ -677,7 +943,6 @@ async function testCacheMemoryStatus() {
   const { data: after } = await get('/status/cache');
   console.log(`  After: ${JSON.stringify(after.memory)}`);
 
-  // Field is "entries" not "entry_count"
   if (after.memory.entries > before.memory.entries) {
     printPass('Memory cache shows entries');
   } else {
@@ -778,14 +1043,22 @@ async function testSeekDuringPlayback() {
   await askConfirmation();
 }
 
+// =============================================================================
 // Main
+// =============================================================================
+
 async function main() {
-  printHeader('mqttaudio HTTP Interactive Integration Test');
+  printHeader('mqttaudio Interactive Integration Test');
   console.log('');
-  console.log('This test will walk you through testing the HTTP REST API.');
+  console.log('This test walks you through testing mqttaudio features.');
   console.log('You will need to listen and confirm that audio plays correctly.');
   console.log('');
   console.log('Make sure your audio output is working and at a reasonable volume.');
+
+  if (cliArgs.device) {
+    console.log(`\n${colors.cyan}Using audio device: ${cliArgs.device}${colors.reset}`);
+  }
+
   console.log('');
 
   await askQuestion('Press Enter to begin...');
@@ -814,6 +1087,15 @@ async function main() {
     await testStopWithFade();
     await testVolumeChange();
     await testGenericCommand();
+
+    // Macro tests
+    printHeader('Macro Tests');
+    await testMacroQuiet();
+    await testMacroLoud();
+    await testMacroMusicDefaults();
+    await testMacroOverride();
+    await testMacroMultiple();
+    await testMacroUnknown();
 
     // Cache and status tests
     printHeader('Cache and Status Tests');
@@ -849,7 +1131,7 @@ async function main() {
 
   } catch (e) {
     console.log(`${colors.red}Error: ${e.message}${colors.reset}`);
-    if (process.env.VERBOSE) {
+    if (cliArgs.verbose) {
       console.log(e.stack);
     }
   } finally {
