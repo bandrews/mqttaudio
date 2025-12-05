@@ -8,7 +8,7 @@
 | Quick Win: Configurable Resampler | **COMPLETE** | 4x speedup with Fast default |
 | Phase 2: StreamingBuffer Foundation | **COMPLETE** | SampleBuffer enum, mixer integration |
 | Phase 3: Chunked Resampler | **COMPLETE** | ChunkedResampler with 14 tests |
-| Phase 4: Streaming Decoder | Pending | |
+| Phase 4: Streaming Decoder | **COMPLETE** | StreamingDecoder with 7 tests |
 | Phase 5: HTTP Streaming | Pending | |
 | Phase 6: Mixer Integration | **COMPLETE** | Done as part of Phase 2 |
 | Phase 7: Cache Manager Updates | Pending | |
@@ -133,65 +133,110 @@ impl ChunkedResampler {
 }
 ```
 
+### Phase 4: Streaming Decoder
+
+**Files created:**
+- `src/audio/streaming_decoder.rs` (new)
+
+**Key implementations:**
+- `StreamingDecoder` struct implementing `Iterator` for progressive decoding
+- Accepts any `MediaSource` (files, network streams, etc.)
+- Integrates `ChunkedResampler` for optional real-time sample rate conversion
+- Yields interleaved f32 chunks as decoded
+- Exposes metadata: channels, sample rate, estimated frames
+- 7 unit tests including comparison with full-file decode
+
+**API:**
+```rust
+impl StreamingDecoder {
+    pub fn new<R: MediaSource>(reader: R, hint: Option<&Hint>, target_rate: Option<u32>, quality: ResamplerQuality) -> Result<Self, Error>;
+    pub fn channels(&self) -> usize;
+    pub fn sample_rate(&self) -> u32;
+    pub fn source_sample_rate(&self) -> u32;
+    pub fn estimated_frames(&self) -> Option<u64>;
+    pub fn is_finished(&self) -> bool;
+}
+
+impl Iterator for StreamingDecoder {
+    type Item = Result<Vec<f32>, StreamingDecodeError>;
+}
+```
+
 ---
 
 ## Remaining Implementation Plan
 
-### Phase 4: Streaming Decoder
-**Files:** `src/audio/decoder.rs` (modify), `src/audio/streaming_decoder.rs` (new)
-
-Create an iterator-based decoder that yields chunks:
-
-```rust
-pub struct StreamingDecoder<R: Read> {
-    format: Box<dyn FormatReader>,
-    decoder: Box<dyn Decoder>,
-    resampler: Option<ChunkedResampler>,
-    target_sample_rate: u32,
-}
-
-impl StreamingDecoder {
-    pub fn new(reader: R, target_rate: u32, quality: ResamplerQuality) -> Result<Self, DecodeError>;
-    pub fn channels(&self) -> usize;
-    pub fn sample_rate(&self) -> u32;
-    pub fn estimated_frames(&self) -> Option<usize>;
-}
-
-impl Iterator for StreamingDecoder {
-    type Item = Result<Vec<f32>, DecodeError>;  // Chunk of interleaved samples
-}
-```
-
-**Tasks:**
-1. Extract packet-decode loop from `decode_file()` into reusable iterator
-2. Create `StreamingDecoder` that yields decoded+resampled chunks
-3. Integrate with `ChunkedResampler`
-4. Handle format probing (Symphonia needs some data before it knows the format)
-5. Expose channel count and sample rate after probing
-
 ### Phase 5: HTTP Streaming Integration
-**Files:** `src/cache/disk.rs` (modify), `src/cache/streaming.rs` (new)
+**Files:** `src/cache/disk.rs` (modify), `src/cache/http_stream.rs` (new)
 
-Stream HTTP downloads directly to decoder:
+**Goal:** Stream HTTP downloads directly to `StreamingDecoder` so playback can begin
+before the full file downloads.
+
+**Challenge:** Symphonia's `MediaSource` trait requires `Read + Seek`. HTTP streams
+don't support seeking. Two approaches:
+
+1. **Buffer-based (recommended):** Accumulate downloaded bytes in a growing buffer.
+   Implement `Seek` by returning to buffered positions only. Forward seeks beyond
+   buffer wait for more data. This is simpler and works with Symphonia unchanged.
+
+2. **Fork Symphonia:** Modify to not require seeking. More complex, maintenance burden.
+
+**Proposed Implementation:**
 
 ```rust
+/// HTTP stream adapter that implements MediaSource.
+/// Buffers downloaded data to support limited seeking within buffered region.
 pub struct HttpStreamReader {
-    stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>>>>,
-    buffer: BytesMut,
+    /// Accumulated downloaded bytes
+    buffer: Vec<u8>,
+    /// Current read position
+    position: usize,
+    /// Total content length (from header, if known)
     content_length: Option<u64>,
+    /// Whether download is complete
+    complete: bool,
+    /// Channel to receive more bytes from background download task
+    receiver: mpsc::Receiver<Bytes>,
+    /// Handle to background download task
+    download_handle: JoinHandle<Result<(), reqwest::Error>>,
+}
+
+impl MediaSource for HttpStreamReader {
+    fn is_seekable(&self) -> bool { true }  // Within buffered region
+    fn byte_len(&self) -> Option<u64> { self.content_length }
 }
 
 impl Read for HttpStreamReader {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+    // Read from buffer, block/wait if position beyond buffered data
+}
+
+impl Seek for HttpStreamReader {
+    // Seek within buffered region OK
+    // Forward seek beyond buffer: wait for data
+    // Backward seek always OK (data is buffered)
 }
 ```
 
 **Tasks:**
-1. Use reqwest streaming with `bytes_stream()`
-2. Create buffered adapter implementing `std::io::Read` for Symphonia
-3. Estimate duration from Content-Length header
-4. Handle chunked transfer encoding (no Content-Length) gracefully
-5. Handle network errors mid-stream
+1. Create `HttpStreamReader` implementing `MediaSource` (Read + Seek)
+2. Use reqwest streaming with `bytes_stream()` in background task
+3. Buffer bytes as they arrive, notify waiters
+4. Handle Content-Length for progress estimation
+5. Handle chunked transfer encoding (no Content-Length)
+6. Handle network errors mid-stream (mark buffer as error state)
+7. Update `DiskCache::download_and_cache()` or add streaming variant
+8. Write tests with embedded HTTP server (see `benches/test_support/mod.rs`)
+
+**Key Files to Reference:**
+- `src/cache/disk.rs` - Current download logic (line ~150, `download_and_cache()`)
+- `benches/test_support/mod.rs` - Embedded HTTP server for testing
+- `src/audio/streaming_decoder.rs` - Uses `MediaSource` trait
+
+**Testing Strategy:**
+- Unit tests for buffer management and seeking
+- Integration test with embedded HTTP server
+- Test slow downloads (throttled server)
+- Test connection failures mid-download
 
 ### Phase 6: Mixer Integration — **COMPLETE** (done with Phase 2)
 
@@ -289,8 +334,8 @@ Handle seeking within streaming buffers:
 |------|--------|---------|
 | `src/audio/streaming.rs` | **DONE** | SampleBuffer enum, StreamingBuffer struct |
 | `src/audio/chunked_resampler.rs` | **DONE** | Incremental resampling for streaming |
+| `src/audio/streaming_decoder.rs` | **DONE** | Iterator-based decoder with ChunkedResampler |
 | `src/audio/mixer.rs` | **DONE** | Uses SampleBuffer, get_sample_or_silence() |
-| `src/audio/decoder.rs` | Pending | Extract streaming decode iterator |
 | `src/cache/mod.rs` | Pending | Streaming load orchestration |
 | `src/cache/memory.rs` | Pending | LRU eviction, access tracking |
 | `src/cache/disk.rs` | Pending | HTTP streaming download |
