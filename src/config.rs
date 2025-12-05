@@ -162,6 +162,10 @@ pub struct CacheConfig {
     /// List of files to precache on startup
     #[serde(default)]
     pub precache: Vec<String>,
+    /// Maximum memory cache size in megabytes.
+    /// When exceeded, least-recently-used entries are evicted.
+    /// Set to 0 for unlimited (default: 512 MB).
+    pub max_memory_mb: u32,
 }
 
 impl Default for CacheConfig {
@@ -171,6 +175,7 @@ impl Default for CacheConfig {
             directory: "~/.mqttaudio/cache".to_string(),
             revalidate_after_seconds: 300,
             precache: Vec::new(),
+            max_memory_mb: 512,
         }
     }
 }
@@ -529,6 +534,7 @@ impl Config {
         mqtt_username: Option<String>,
         mqtt_password: Option<String>,
         http_port: Option<u16>,
+        max_cache_mb: Option<u32>,
     ) {
         // Override MQTT settings
         if let Some(s) = server {
@@ -579,6 +585,11 @@ impl Config {
         if let Some(hp) = http_port {
             self.http.enabled = true;
             self.http.port = hp;
+        }
+
+        // Override cache settings
+        if let Some(max_mb) = max_cache_mb {
+            self.cache.max_memory_mb = max_mb;
         }
     }
 
@@ -829,6 +840,7 @@ mod tests {
             Some("cli_user".to_string()),
             Some("cli_pass".to_string()),
             None,
+            None,
         );
 
         assert_eq!(config.mqtt.username, Some("cli_user".to_string()));
@@ -851,6 +863,7 @@ mod tests {
             None, None, None, None, None, None, false, None, None, None,
             Some("cli_user".to_string()),
             Some("cli_pass".to_string()),
+            None,
             None,
         );
 
@@ -1110,6 +1123,7 @@ mod tests {
             None, // mqtt_username
             None, // mqtt_password
             None, // http_port
+            None, // max_cache_mb
         );
 
         assert_eq!(config.mqtt.server, "overridden");
@@ -1133,6 +1147,7 @@ mod tests {
             Some("testuser".to_string()),   // mqtt_username
             Some("testpass".to_string()),   // mqtt_password
             None, // http_port
+            None, // max_cache_mb
         );
 
         assert_eq!(config.mqtt.server, "newserver");
@@ -1171,6 +1186,7 @@ mod tests {
             None, // mqtt_username
             None, // mqtt_password
             None, // http_port
+            None, // max_cache_mb
         );
 
         assert_eq!(config.mqtt.server, "original");  // Unchanged
@@ -1184,7 +1200,7 @@ mod tests {
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.verbose, false);
 
-        config.merge_cli_args(None, None, None, None, None, None, true, None, None, None, None, None, None);
+        config.merge_cli_args(None, None, None, None, None, None, true, None, None, None, None, None, None, None);
 
         assert_eq!(config.logging.verbose, true);
         assert_eq!(config.logging.level, "debug");
@@ -1398,6 +1414,38 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_max_memory_mb_default() {
+        let config = Config::default();
+        assert_eq!(config.cache.max_memory_mb, 512);
+    }
+
+    #[test]
+    fn test_cache_max_memory_mb_parse() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "cache": {
+                "max_memory_mb": 1024
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.cache.max_memory_mb, 1024);
+    }
+
+    #[test]
+    fn test_cache_max_memory_mb_unlimited() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "cache": {
+                "max_memory_mb": 0
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.cache.max_memory_mb, 0);
+    }
+
+    #[test]
     fn test_logging_mqtt_topic_default() {
         let config = Config::default();
         assert!(config.logging.mqtt_topic.is_none());
@@ -1426,7 +1474,7 @@ mod tests {
         config.merge_cli_args(
             None, None, None, None, None, None, false, None, None,
             Some("audio/logs".to_string()),
-            None, None, None,
+            None, None, None, None,
         );
 
         assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
@@ -1850,11 +1898,26 @@ mod tests {
         config.merge_cli_args(
             None, None, None, None, None, None, false, None, None, None, None, None,
             Some(9000),
+            None,
         );
 
         // Setting http_port should enable HTTP and set the port
         assert!(config.http.enabled);
         assert_eq!(config.http.port, 9000);
+    }
+
+    #[test]
+    fn test_merge_cli_args_max_cache_mb() {
+        let mut config = Config::default();
+        assert_eq!(config.cache.max_memory_mb, 512); // default
+
+        config.merge_cli_args(
+            None, None, None, None, None, None, false, None, None, None, None, None,
+            None,
+            Some(1024),
+        );
+
+        assert_eq!(config.cache.max_memory_mb, 1024);
     }
 
     #[test]

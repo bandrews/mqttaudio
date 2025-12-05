@@ -40,10 +40,29 @@ pub struct CacheManager {
 }
 
 impl CacheManager {
-    /// Create a new cache manager with specified resampler quality
-    pub fn with_quality(cache_dir: PathBuf, resampler_quality: ResamplerQuality) -> Result<Self, CacheError> {
+    /// Create a new cache manager with specified resampler quality and memory limit.
+    /// max_memory_mb of 0 means unlimited.
+    pub fn with_options(
+        cache_dir: PathBuf,
+        resampler_quality: ResamplerQuality,
+        max_memory_mb: u32,
+    ) -> Result<Self, CacheError> {
         let disk_cache = DiskCache::new(cache_dir)?;
-        let memory_cache = MemoryCache::new();
+        let max_bytes = if max_memory_mb == 0 {
+            0 // 0 means unlimited in MemoryCache::with_max_size
+        } else {
+            (max_memory_mb as usize) * 1024 * 1024
+        };
+        let memory_cache = MemoryCache::with_max_size(max_bytes);
+
+        tracing::info!(
+            "Cache manager initialized (memory limit: {})",
+            if max_memory_mb == 0 {
+                "unlimited".to_string()
+            } else {
+                format!("{} MB", max_memory_mb)
+            }
+        );
 
         Ok(Self {
             memory_cache,
@@ -53,7 +72,12 @@ impl CacheManager {
         })
     }
 
-    /// Create a new cache manager with default (Fast) resampler quality.
+    /// Create a new cache manager with specified resampler quality and no memory limit.
+    pub fn with_quality(cache_dir: PathBuf, resampler_quality: ResamplerQuality) -> Result<Self, CacheError> {
+        Self::with_options(cache_dir, resampler_quality, 0)
+    }
+
+    /// Create a new cache manager with default (Fast) resampler quality and no memory limit.
     /// Primarily used by tests and benchmarks.
     #[allow(dead_code)]
     pub fn new(cache_dir: PathBuf) -> Result<Self, CacheError> {

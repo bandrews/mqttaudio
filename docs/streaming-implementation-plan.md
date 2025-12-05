@@ -12,7 +12,7 @@
 | Phase 5: HTTP Streaming | **COMPLETE** | HttpStreamReader with 15 unit tests + 4 integration tests |
 | Phase 6: Mixer Integration | **COMPLETE** | Done as part of Phase 2 |
 | Phase 7: Cache Manager Updates | **COMPLETE** | get_or_load_streaming, active load tracking, 4 integration tests |
-| Phase 8: LRU Eviction | Pending | |
+| Phase 8: LRU Eviction | **COMPLETE** | MemoryCacheEntry with timestamps, configurable limit, playing protection |
 | Phase 9: Seek Support | Pending | |
 | Phase 10: Integration & Polish | Pending | |
 
@@ -306,33 +306,27 @@ impl CacheManager {
 4. Return `SampleBuffer` from new method, keep old method for precache
 5. Handle concurrent requests for same file (share single load)
 
-### Phase 8: LRU Eviction
-**Files:** `src/cache/memory.rs`
+### ~~Phase 8: LRU Eviction~~ — **COMPLETE**
+**Files:** `src/cache/memory.rs`, `src/config.rs`, `src/cache/mod.rs`, `src/main.rs`
 
-Add memory management with LRU eviction:
+Added memory management with LRU eviction:
 
-```rust
-pub struct MemoryCacheEntry {
-    buffer: Arc<DecodedBuffer>,
-    last_access: Instant,
-    size_bytes: usize,
-}
+**Implementation:**
+- `MemoryCacheEntry` struct with `buffer`, `last_access: Instant`, `size_bytes`
+- `MemoryCache.with_max_size(bytes)` constructor for configurable limits
+- LRU eviction on `put()` when limit exceeded
+- `mark_playing()` / `mark_not_playing()` / `is_playing()` for eviction protection
+- `cache.max_memory_mb` config option (default: 512 MB, 0 = unlimited)
+- `--max-cache-mb` CLI option
+- 11 new unit tests covering eviction behavior
 
-pub struct MemoryCache {
-    entries: HashMap<String, MemoryCacheEntry>,
-    max_size_bytes: usize,
-    current_size_bytes: usize,
-    playing: HashSet<String>,  // Never evict these
-}
-```
-
-**Tasks:**
-1. Add access timestamps to cache entries
-2. Track currently-playing samples (never evict)
-3. Add configurable memory limit (`cache.max_memory_mb` in config)
-4. Evict LRU entries when limit exceeded
-5. Never evict mid-load streaming buffers
-6. Add CLI option `--max-cache-mb`
+**Tasks completed:**
+1. ✅ Add access timestamps to cache entries
+2. ✅ Track currently-playing samples (never evict)
+3. ✅ Add configurable memory limit (`cache.max_memory_mb` in config)
+4. ✅ Evict LRU entries when limit exceeded
+5. ✅ Never evict mid-load streaming buffers (via playing set)
+6. ✅ Add CLI option `--max-cache-mb`
 
 ### Phase 9: Seek Support
 **Files:** `src/main.rs`, `src/audio/mixer.rs`
@@ -375,7 +369,7 @@ Handle seeking within streaming buffers:
 | `src/cache/http_stream.rs` | **DONE** | HttpStreamReader implementing MediaSource |
 | `src/cache/disk.rs` | **DONE** | HTTP streaming download via start_streaming_download() |
 | `src/cache/mod.rs` | **DONE** | get_or_load_streaming, active load tracking |
-| `src/cache/memory.rs` | Pending | LRU eviction, access tracking |
+| `src/cache/memory.rs` | **DONE** | LRU eviction, access tracking, playing protection |
 | `src/main.rs` | **DONE** | Uses SampleBuffer methods |
 | `src/http/handlers.rs` | **DONE** | Uses SampleBuffer methods |
 

@@ -93,6 +93,10 @@ struct Args {
     /// Enable HTTP server on specified port (enables REST API and WebSocket)
     #[arg(long)]
     http_port: Option<u16>,
+
+    /// Maximum memory cache size in MB (0 = unlimited)
+    #[arg(long)]
+    max_cache_mb: Option<u32>,
 }
 
 #[tokio::main]
@@ -123,6 +127,7 @@ async fn main() {
         args.mqtt_username.clone(),
         args.mqtt_password.clone(),
         args.http_port,
+        args.max_cache_mb,
     );
 
     // Initialize logging based on config
@@ -477,10 +482,11 @@ async fn main() {
     // Create cache manager using config
     let cache_dir = config.cache_directory();
     let resampler_quality = config.advanced.resampler_quality;
+    let max_memory_mb = config.cache.max_memory_mb;
     tracing::info!("Cache directory: {}", cache_dir.display());
     tracing::info!("Resampler quality: {:?}", resampler_quality);
 
-    let cache_manager = match cache::CacheManager::with_quality(cache_dir, resampler_quality) {
+    let cache_manager = match cache::CacheManager::with_options(cache_dir, resampler_quality, max_memory_mb) {
         Ok(cm) => Arc::new(Mutex::new(cm)),
         Err(e) => {
             tracing::error!("Failed to initialize cache: {}", e);
