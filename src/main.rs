@@ -179,7 +179,9 @@ async fn main() {
         return;
     }
 
-    // Get device configuration
+    // Get default device configuration (informational only - not fatal if it fails)
+    // On Linux/ALSA, the "default" device may not be usable, but a user-specified
+    // device might work fine. We'll validate the actual device later.
     match audio::engine::get_default_device_config() {
         Ok(device_config) => {
             tracing::info!(
@@ -190,8 +192,13 @@ async fn main() {
             );
         }
         Err(e) => {
-            tracing::error!("Failed to get device config: {}", e);
-            std::process::exit(1);
+            // Only warn here - we'll fail later if the actual device can't be configured
+            tracing::warn!("Could not probe default audio device: {}", e);
+            if config.audio.device.is_some() {
+                tracing::info!("Will attempt to use specified device: {:?}", config.audio.device);
+            } else {
+                tracing::warn!("No device specified and default device unavailable - audio may fail");
+            }
         }
     }
 
@@ -353,6 +360,7 @@ async fn main() {
         }
     };
 
+    let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
     let stream_config = match audio::engine::find_output_config(
         &device,
         config.audio.channels,
@@ -360,7 +368,15 @@ async fn main() {
     ) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!("Failed to get device config: {}", e);
+            tracing::error!(
+                "Failed to configure output device '{}': {}",
+                device_name, e
+            );
+            tracing::error!(
+                "Requested: {} channels, {} Hz sample rate",
+                config.audio.channels.map_or("default".to_string(), |c| c.to_string()),
+                config.audio.sample_rate
+            );
             std::process::exit(1);
         }
     };
@@ -368,7 +384,7 @@ async fn main() {
     let output_sample_rate = stream_config.sample_rate.0;
     let output_channels = stream_config.channels as usize;
 
-    tracing::info!("Audio device: {}", device.name().unwrap_or_else(|_| "Unknown".to_string()));
+    tracing::info!("Audio device: {}", device_name);
     tracing::info!("  Sample rate: {} Hz", output_sample_rate);
     tracing::info!("  Channels: {}", output_channels);
 
