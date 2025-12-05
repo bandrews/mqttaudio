@@ -50,7 +50,6 @@ ctrlc = "3.4"
 
 # HTTP server
 axum = { version = "0.7", features = ["ws"] }
-tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "fs"] }
 
 # Async utilities
