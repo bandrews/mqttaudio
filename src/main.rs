@@ -874,20 +874,31 @@ async fn main() {
                             drop(voice_mgr);
 
                             if success {
-                                // Update all active samples in this voice
+                                // Update all active samples and live inputs in this voice with smooth ramping
                                 let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
+                                let mut sample_count = 0;
+                                let mut input_count = 0;
+
                                 for sample in state.active_samples.iter_mut() {
                                     if sample.voice_id == voice {
-                                        sample.voice_volume = actual_volume;
-                                        updated_count += 1;
+                                        // Set target for smooth ramping (avoids pops)
+                                        sample.set_target_voice_volume(actual_volume);
+                                        sample_count += 1;
+                                    }
+                                }
+
+                                for input in state.live_inputs.iter_mut() {
+                                    if input.voice_id == voice {
+                                        // Set target for smooth ramping (avoids pops)
+                                        input.set_target_voice_volume(actual_volume);
+                                        input_count += 1;
                                     }
                                 }
                                 drop(state);
 
                                 tracing::info!(
-                                    "Set voice '{}' volume to {:.2} (updated {} samples)",
-                                    voice, actual_volume, updated_count
+                                    "Set voice '{}' volume to {:.2} (updated {} samples, {} inputs)",
+                                    voice, actual_volume, sample_count, input_count
                                 );
                             } else {
                                 tracing::warn!("Voice '{}' not found", voice);

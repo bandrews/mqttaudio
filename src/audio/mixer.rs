@@ -111,8 +111,11 @@ pub struct ActiveSample {
     /// Per-sample volume (0.0 - 1.0)
     pub volume: f32,
 
-    /// Voice-level volume (0.0 - 1.0)
+    /// Voice-level volume (0.0 - 1.0) - current smoothed value
     pub voice_volume: f32,
+
+    /// Target voice volume for smooth ramping (0.0 - 1.0)
+    pub target_voice_volume: f32,
 
     /// Channel routing: vec![(src_channel, dest_channel), ...]
     pub channel_map: Vec<(usize, usize)>,
@@ -159,6 +162,7 @@ impl ActiveSample {
             fractional_position: 0.0,
             volume,
             voice_volume,
+            target_voice_volume: voice_volume,
             channel_map,
             fade_state: FadeState::None,
             speed: 1.0,
@@ -196,6 +200,7 @@ impl ActiveSample {
             fractional_position: 0.0,
             volume,
             voice_volume,
+            target_voice_volume: voice_volume,
             channel_map,
             fade_state: FadeState::None,
             speed: 1.0,
@@ -228,6 +233,7 @@ impl ActiveSample {
             fractional_position: 0.0,
             volume,
             voice_volume,
+            target_voice_volume: voice_volume,
             channel_map,
             fade_state: FadeState::None,
             speed: 1.0,
@@ -353,8 +359,32 @@ impl ActiveSample {
     }
 
     /// Get the combined volume (sample volume * voice volume)
+    #[allow(dead_code)]
     pub fn combined_volume(&self) -> f32 {
         self.volume * self.voice_volume
+    }
+
+    /// Set target voice volume for smooth ramping
+    pub fn set_target_voice_volume(&mut self, target: f32) {
+        self.target_voice_volume = target.clamp(0.0, 1.0);
+    }
+
+    /// Advance voice volume toward target by one frame.
+    /// Uses linear ramping with a fixed rate that provides ~20ms transition at 44.1kHz.
+    /// Returns true if volume is still ramping, false if at target.
+    pub fn advance_voice_volume(&mut self) -> bool {
+        const RAMP_RATE: f32 = 0.001; // ~22ms for full 0-1 transition at 44.1kHz
+
+        if (self.voice_volume - self.target_voice_volume).abs() < RAMP_RATE {
+            self.voice_volume = self.target_voice_volume;
+            false
+        } else if self.voice_volume < self.target_voice_volume {
+            self.voice_volume += RAMP_RATE;
+            true
+        } else {
+            self.voice_volume -= RAMP_RATE;
+            true
+        }
     }
 
     /// Advance the playback position by the given number of output frames,
@@ -418,8 +448,11 @@ pub struct LiveInput {
     /// Per-input volume (0.0 - 1.0)
     pub volume: f32,
 
-    /// Voice-level volume (0.0 - 1.0)
+    /// Voice-level volume (0.0 - 1.0) - current smoothed value
     pub voice_volume: f32,
+
+    /// Target voice volume for smooth ramping (0.0 - 1.0)
+    pub target_voice_volume: f32,
 
     /// Channel routing: vec![(src_channel, dest_channel), ...]
     pub channel_map: Vec<(usize, usize)>,
@@ -440,13 +473,35 @@ impl LiveInput {
             input_channels,
             volume,
             voice_volume: 1.0,
+            target_voice_volume: 1.0,
             channel_map,
         }
     }
 
     /// Get the combined volume (input volume * voice volume)
+    #[allow(dead_code)]
     pub fn combined_volume(&self) -> f32 {
         self.volume * self.voice_volume
+    }
+
+    /// Set target voice volume for smooth ramping
+    #[allow(dead_code)]
+    pub fn set_target_voice_volume(&mut self, target: f32) {
+        self.target_voice_volume = target.clamp(0.0, 1.0);
+    }
+
+    /// Advance voice volume toward target by one frame.
+    /// Uses linear ramping with a fixed rate that provides ~20ms transition at 44.1kHz.
+    pub fn advance_voice_volume(&mut self) {
+        const RAMP_RATE: f32 = 0.001; // ~22ms for full 0-1 transition at 44.1kHz
+
+        if (self.voice_volume - self.target_voice_volume).abs() < RAMP_RATE {
+            self.voice_volume = self.target_voice_volume;
+        } else if self.voice_volume < self.target_voice_volume {
+            self.voice_volume += RAMP_RATE;
+        } else {
+            self.voice_volume -= RAMP_RATE;
+        }
     }
 }
 
@@ -547,17 +602,20 @@ fn mix_sample_into_output(
         return;
     }
 
-    let base_volume = sample.combined_volume();
     let speed = sample.speed as f64;
     let is_reverse = speed < 0.0;
     let buffer_frames = sample.buffer.frames();
     let buffer_channels = sample.buffer.channels();
     let loop_mode = sample.loop_mode;
+    let sample_volume = sample.volume;
 
     // Calculate current precise position (integer + fractional parts)
     let mut src_pos = sample.precise_position();
 
     for frame_idx in 0..frames {
+        // Advance voice volume toward target (smooth ramping to avoid pops)
+        sample.advance_voice_volume();
+
         // Handle looping wrap-around
         if loop_mode && buffer_frames > 0 {
             if src_pos < 0.0 {
@@ -595,6 +653,7 @@ fn mix_sample_into_output(
 
         // Calculate fade multiplier for this frame
         let fade_multiplier = sample.fade_state.multiplier();
+        let base_volume = sample_volume * sample.voice_volume;
         let final_volume = base_volume * fade_multiplier * ducking_multiplier;
 
         // Calculate fractional part for interpolation
@@ -714,7 +773,7 @@ fn mix_sample_with_pitch_correction(
         None => return, // Streaming buffer - skip pitch correction
     };
 
-    let base_volume = sample.combined_volume();
+    let sample_volume = sample.volume;
     let speed = sample.speed;
     let src_channels = decoded_buffer.channels;
 
@@ -745,8 +804,12 @@ fn mix_sample_with_pitch_correction(
 
     // Apply volume, fade, ducking and channel mapping
     for frame_idx in 0..frames {
+        // Advance voice volume toward target (smooth ramping to avoid pops)
+        sample.advance_voice_volume();
+
         // Calculate fade multiplier for this frame
         let fade_multiplier = sample.fade_state.multiplier();
+        let base_volume = sample_volume * sample.voice_volume;
         let final_volume = base_volume * fade_multiplier * ducking_multiplier;
 
         // Apply channel mapping and mix into output
@@ -779,12 +842,15 @@ fn mix_live_input_into_output(
     output_channels: usize,
     ducking_multiplier: f32,
 ) {
-    let final_volume = input.combined_volume() * ducking_multiplier;
     let input_channels = input.input_channels;
+    let base_volume = input.volume;
 
     // Read available samples from the ring buffer
     // Process frame by frame to handle underruns gracefully
     for frame_idx in 0..frames {
+        // Advance voice volume toward target (smooth ramping to avoid pops)
+        input.advance_voice_volume();
+
         // Read one frame worth of samples
         let samples_needed = input_channels;
         let samples_available = input.consumer.len();
@@ -802,6 +868,9 @@ fn mix_live_input_into_output(
                 frame_samples[ch] = sample;
             }
         }
+
+        // Calculate volume per-frame to handle smooth ramping
+        let final_volume = base_volume * input.voice_volume * ducking_multiplier;
 
         // Apply channel mapping
         for &(src_ch, dest_ch) in &input.channel_map {
@@ -1583,7 +1652,9 @@ mod tests {
             0.5, // 50% input volume
             vec![(0, 0)],
         );
+        // Set both current and target volume to avoid ramping during test
         live_input.voice_volume = 0.6; // 60% voice volume
+        live_input.target_voice_volume = 0.6;
 
         let mut state = MixerState::new(1);
         state.live_inputs.push(live_input);
@@ -2299,6 +2370,158 @@ mod tests {
         sample.set_speed_with_mode(3.0, false);
         assert!(!sample.has_pitch_correction());
         assert_eq!(sample.speed, 3.0);
+    }
+
+    // === Volume Ramping Tests ===
+
+    #[test]
+    fn test_voice_volume_ramping_smooth_transition() {
+        // Verify that volume changes happen smoothly frame-by-frame
+        let buffer = create_test_buffer(1000, 2, 1.0);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        // Change target volume from 1.0 to 0.5
+        sample.set_target_voice_volume(0.5);
+
+        // Track volume changes frame-by-frame
+        let mut last_volume = sample.voice_volume;
+        let mut frame_count = 0;
+
+        // Ramp until we reach target
+        while (sample.voice_volume - sample.target_voice_volume).abs() > 0.0001 {
+            sample.advance_voice_volume();
+            let current = sample.voice_volume;
+
+            // Verify volume changed by at most RAMP_RATE (0.001)
+            let delta = (current - last_volume).abs();
+            assert!(delta <= 0.0011, "Volume changed too quickly: {} -> {} (delta {})", last_volume, current, delta);
+
+            // Verify monotonic decrease
+            assert!(current < last_volume, "Volume should decrease: {} -> {}", last_volume, current);
+
+            last_volume = current;
+            frame_count += 1;
+        }
+
+        // Should take roughly 500 frames to go from 1.0 to 0.5 (0.5 / 0.001 = 500)
+        assert!(frame_count > 400 && frame_count < 600, "Unexpected frame count: {}", frame_count);
+        assert!((sample.voice_volume - 0.5).abs() < 0.01, "Final volume should be ~0.5");
+    }
+
+    #[test]
+    fn test_voice_volume_ramping_rapid_changes() {
+        // Verify that rapid volume changes don't cause issues -
+        // the system should smoothly transition to the newest target
+        let buffer = create_test_buffer(2000, 2, 1.0);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        // Change target to 0.5 and start ramping
+        sample.set_target_voice_volume(0.5);
+        for _ in 0..100 {
+            sample.advance_voice_volume();
+        }
+        // After 100 frames at 0.001/frame = 0.1 change
+        // Volume should be 1.0 - 0.1 = 0.9 (still above 0.5)
+        let vol_after_first = sample.voice_volume;
+        assert!(vol_after_first < 1.0 && vol_after_first > 0.5,
+            "Volume {} should be between 0.5 and 1.0", vol_after_first);
+
+        // Interrupt: change target to 0.2 before reaching 0.5
+        sample.set_target_voice_volume(0.2);
+        assert_eq!(sample.target_voice_volume, 0.2);
+
+        // Continue ramping toward 0.2
+        for _ in 0..200 {
+            sample.advance_voice_volume();
+        }
+        // After 200 more frames at 0.001/frame = 0.2 change
+        // Volume should be ~0.9 - 0.2 = 0.7
+        let vol_after_second = sample.voice_volume;
+        assert!(vol_after_second < vol_after_first,
+            "Volume should decrease: {} -> {}", vol_after_first, vol_after_second);
+
+        // Interrupt again: change target to 0.9 (going back up)
+        sample.set_target_voice_volume(0.9);
+
+        // Volume should start increasing
+        let vol_before_third = sample.voice_volume;
+        for _ in 0..100 {
+            sample.advance_voice_volume();
+        }
+        assert!(sample.voice_volume > vol_before_third,
+            "Volume should increase toward 0.9: {} -> {}", vol_before_third, sample.voice_volume);
+
+        // Key behavior: rapid target changes don't cause discontinuities -
+        // the volume always smoothly ramps toward whatever the current target is
+    }
+
+    #[test]
+    fn test_voice_volume_ramping_in_mix() {
+        // Verify that mixing with volume ramping produces smooth output
+        let buffer = create_test_buffer(100, 1, 1.0); // Mono, all 1.0 samples
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        // Set target to 0.5 - will ramp during mixing
+        sample.set_target_voice_volume(0.5);
+
+        let mut state = MixerState::new(1);
+        state.active_samples.push(sample);
+
+        // Mix 50 frames
+        let mut output = vec![0.0f32; 50];
+        mix_audio(&mut output, &mut state);
+
+        // Verify output ramps smoothly - each sample should be slightly less than previous
+        for i in 1..50 {
+            let delta = output[i-1] - output[i];
+            // Delta should be roughly 0.001 (the ramp rate)
+            assert!(delta > 0.0, "Output should decrease frame {} to {}: {} -> {}", i-1, i, output[i-1], output[i]);
+            assert!(delta < 0.002, "Output change too large at frame {}: delta = {}", i, delta);
+        }
+
+        // First sample should be close to 1.0 (just started ramping)
+        assert!(output[0] > 0.99, "First sample should be near 1.0");
+        // Last sample should be lower
+        assert!(output[49] < output[0], "Last sample should be lower than first");
+    }
+
+    #[test]
+    fn test_live_input_volume_ramping() {
+        // Verify LiveInput also supports smooth volume ramping
+        let data = vec![1.0f32; 100];
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let mut input = LiveInput::new("mic".to_string(), consumer, 1, 1.0, vec![(0, 0)]);
+
+        // Set target volume
+        input.set_target_voice_volume(0.3);
+
+        // Verify ramping works
+        let initial = input.voice_volume;
+        input.advance_voice_volume();
+        assert!(input.voice_volume < initial, "Voice volume should decrease toward target");
+
+        // Continue ramping
+        for _ in 0..1000 {
+            input.advance_voice_volume();
+        }
+        assert!((input.voice_volume - 0.3).abs() < 0.01, "Should reach target of 0.3");
+    }
+
+    #[test]
+    fn test_volume_ramping_no_change_when_at_target() {
+        // Verify no ramping occurs when current == target
+        let buffer = create_test_buffer(10, 2, 1.0);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 0.7, TEST_FILE.to_string());
+
+        // Current and target are both 0.7
+        assert_eq!(sample.voice_volume, 0.7);
+        assert_eq!(sample.target_voice_volume, 0.7);
+
+        // Advancing should not change anything
+        let result = sample.advance_voice_volume();
+        assert!(!result, "Should return false when at target");
+        assert_eq!(sample.voice_volume, 0.7);
     }
 }
 
