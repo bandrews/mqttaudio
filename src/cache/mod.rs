@@ -18,13 +18,12 @@ use std::sync::{Arc, RwLock};
 use symphonia::core::probe::Hint;
 
 /// Tracks an active streaming load operation
-// Allow dead_code until Phase 10 connects streaming to main.rs
-#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ActiveLoad {
     /// The streaming buffer being filled
     pub buffer: Arc<RwLock<StreamingBuffer>>,
     /// URL/path being loaded
+    #[allow(dead_code)] // Used for logging in cleanup_completed_loads
     pub path: String,
 }
 
@@ -34,8 +33,6 @@ pub struct CacheManager {
     disk_cache: DiskCache,
     resampler_quality: ResamplerQuality,
     /// Currently active streaming loads (path -> ActiveLoad)
-    // Allow dead_code until Phase 10 connects streaming to main.rs
-    #[allow(dead_code)]
     active_loads: HashMap<String, ActiveLoad>,
 }
 
@@ -88,8 +85,6 @@ impl CacheManager {
     /// Returns a SampleBuffer that may be either complete (from cache) or
     /// streaming (still loading). For streaming buffers, playback can begin
     /// as soon as MIN_BUFFER_FRAMES are available.
-    // Allow dead_code until Phase 10 connects streaming to main.rs
-    #[allow(dead_code)]
     pub async fn get_or_load_streaming(
         &mut self,
         file_path: &str,
@@ -145,8 +140,6 @@ impl CacheManager {
     }
 
     /// Start a streaming load for an HTTP URL
-    // Allow dead_code until Phase 10 connects streaming to main.rs
-    #[allow(dead_code)]
     async fn start_streaming_load(
         &mut self,
         url: &str,
@@ -198,8 +191,6 @@ impl CacheManager {
     }
 
     /// Background decode task - runs in spawn_blocking
-    // Allow dead_code until Phase 10 connects streaming to main.rs
-    #[allow(dead_code)]
     fn decode_streaming(
         reader: http_stream::HttpStreamReader,
         hint: Hint,
@@ -381,7 +372,8 @@ impl CacheManager {
         Ok(arc_buffer)
     }
 
-    /// Precache a file (download and decode) without playing it
+    /// Precache a file (download and decode) without playing it.
+    /// Blocks until the file is fully loaded.
     pub async fn precache(
         &mut self,
         file_path: &str,
@@ -389,6 +381,23 @@ impl CacheManager {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let _ = self.get_or_load(file_path, target_sample_rate).await?;
         tracing::info!("Precached: {}", file_path);
+        Ok(())
+    }
+
+    /// Start precaching a file without blocking.
+    /// Returns immediately after initiating the load. The file loads in background.
+    /// If the file is already cached or loading, this is a no-op.
+    pub async fn precache_streaming(
+        &mut self,
+        file_path: &str,
+        target_sample_rate: u32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let buffer = self.get_or_load_streaming(file_path, target_sample_rate).await?;
+        if buffer.is_complete() {
+            tracing::info!("Precache started (already cached): {}", file_path);
+        } else {
+            tracing::info!("Precache started (loading in background): {}", file_path);
+        }
         Ok(())
     }
 

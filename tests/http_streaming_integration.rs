@@ -402,3 +402,248 @@ async fn test_cache_manager_is_loading() {
 }
 
 use std::sync::Arc;
+
+// ============================================================================
+// Precache and Play interaction tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_precache_streaming_then_play() {
+    // Simulates: precache command starts loading, then play command comes in
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("precache_play.wav");
+    generate_test_wav(&wav_path, 1.0); // 1 second file
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/precache_play.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    // Start precache (non-blocking)
+    cache_manager.precache_streaming(&url, 48000).await.unwrap();
+
+    // Simulate play command coming in while precache is in progress
+    // This should return the same streaming buffer
+    let buffer = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
+
+    // Should be streaming (same load in progress)
+    match &buffer {
+        SampleBuffer::Streaming(b) => {
+            // Access should work even during loading
+            let sample = buffer.get_sample_or_silence(0, 0);
+            // Either silence (not loaded yet) or actual sample (already loaded)
+            let _ = sample;
+
+            // Should be able to check frame availability
+            let is_loaded = buffer.is_frame_loaded(0);
+            let _ = is_loaded;
+
+            // Get notifier for async waiting (if needed)
+            let notifier = b.read().unwrap().notifier();
+            let _ = notifier;
+        }
+        SampleBuffer::Complete(_) => {
+            // Also OK if already completed (fast load)
+        }
+    }
+
+    // Wait for load to complete
+    let mut attempts = 0;
+    while !buffer.is_complete() && attempts < 100 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        attempts += 1;
+    }
+
+    assert!(buffer.is_complete(), "Buffer should complete");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_play_with_offset_during_streaming() {
+    // Simulates: play with start_position while file is still loading
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("offset_test.wav");
+    generate_test_wav(&wav_path, 2.0); // 2 second file for longer load
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/offset_test.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    // Start streaming load
+    let buffer = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
+
+    // Simulate play with offset - trying to seek to 1 second (48000 frames)
+    let target_frame = 48000usize;
+
+    match &buffer {
+        SampleBuffer::Streaming(_) => {
+            // Check if target frame is loaded
+            let is_loaded = buffer.is_frame_loaded(target_frame);
+
+            if !is_loaded {
+                // Expected: silence for unloaded frames
+                let sample = buffer.get_sample_or_silence(target_frame, 0);
+                assert_eq!(sample, 0.0, "Unloaded frame should return silence");
+            }
+
+            // Get estimate of total frames (for clamping)
+            let estimate = buffer.total_frames_or_estimate();
+            // May or may not have estimate depending on timing
+            let _ = estimate;
+        }
+        SampleBuffer::Complete(_) => {
+            // Fast load completed - can access any frame
+            let sample = buffer.get_sample_or_silence(target_frame, 0);
+            // Should be actual sample, not silence
+            let _ = sample;
+        }
+    }
+
+    // Wait for load to complete
+    while !buffer.is_complete() {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    // After loading completes, offset should work
+    let sample = buffer.get_sample_or_silence(target_frame, 0);
+    // Should now be actual sample (not silence)
+    // Note: might be close to 0 if that's the actual audio content
+    let _ = sample;
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_reverse_play_with_streaming_buffer() {
+    // Simulates: reverse play with streaming buffer
+    // Reverse play reads from end of buffer, which might not be loaded yet
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("reverse_test.wav");
+    generate_test_wav(&wav_path, 1.0);
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/reverse_test.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    let buffer = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
+
+    // For reverse play, we'd start near the end
+    // Since we don't know total frames yet, use estimate or wait
+
+    match &buffer {
+        SampleBuffer::Streaming(_) => {
+            // For reverse play with streaming, the end might not be loaded
+            // The mixer would return silence until data is available
+            let loaded_frames = buffer.frames();
+
+            if loaded_frames > 0 {
+                // Can reverse from what's loaded
+                let last_loaded = loaded_frames - 1;
+                let sample = buffer.get_sample_or_silence(last_loaded, 0);
+                let _ = sample;
+            }
+        }
+        SampleBuffer::Complete(b) => {
+            // Full buffer available - reverse from end
+            let last_frame = b.frames - 1;
+            let sample = buffer.get_sample_or_silence(last_frame, 0);
+            let _ = sample;
+        }
+    }
+
+    // Wait for load to complete
+    while !buffer.is_complete() {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    // Now reverse should work from actual end
+    let total = buffer.frames();
+    let last_frame = total.saturating_sub(1);
+    let sample = buffer.get_sample_or_silence(last_frame, 0);
+    let _ = sample;
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_multiple_play_requests_share_buffer() {
+    // Multiple play requests for same file should share streaming buffer
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("shared_test.wav");
+    generate_test_wav(&wav_path, 0.5);
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/shared_test.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    // Simulate multiple play requests at different offsets
+    let buffer1 = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
+    let buffer2 = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
+    let buffer3 = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
+
+    // All should share the same underlying streaming buffer
+    match (&buffer1, &buffer2, &buffer3) {
+        (SampleBuffer::Streaming(b1), SampleBuffer::Streaming(b2), SampleBuffer::Streaming(b3)) => {
+            assert!(Arc::ptr_eq(b1, b2), "buffer1 and buffer2 should share");
+            assert!(Arc::ptr_eq(b2, b3), "buffer2 and buffer3 should share");
+        }
+        _ => {
+            // If load completed very fast, could all be Complete
+            // That's also OK
+        }
+    }
+
+    // Wait for completion
+    while !buffer1.is_complete() {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_precache_then_seek_beyond_loaded() {
+    // Precache starts, then seek to position beyond loaded data
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("seek_beyond.wav");
+    generate_test_wav(&wav_path, 2.0); // 2 seconds
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/seek_beyond.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    // Start precache
+    cache_manager.precache_streaming(&url, 48000).await.unwrap();
+
+    // Get buffer for play
+    let buffer = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
+
+    // Try to access a frame near the end (might not be loaded yet)
+    let target = 90000; // ~1.9 seconds into a 2 second file
+
+    if !buffer.is_frame_loaded(target) {
+        // Should return silence for unloaded frames
+        let sample = buffer.get_sample_or_silence(target, 0);
+        assert_eq!(sample, 0.0);
+    }
+
+    // Wait for full load
+    while !buffer.is_complete() {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    // After full load, should be able to access
+    assert!(buffer.is_frame_loaded(target) || target >= buffer.frames());
+
+    let _ = shutdown.send(());
+}

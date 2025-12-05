@@ -166,6 +166,10 @@ pub struct CacheConfig {
     /// When exceeded, least-recently-used entries are evicted.
     /// Set to 0 for unlimited (default: 512 MB).
     pub max_memory_mb: u32,
+    /// Block startup until all precache files are loaded.
+    /// When true (default): App waits for all files to load before accepting commands.
+    /// When false: App starts immediately, files load in background (lazy-load).
+    pub precache_blocking: bool,
 }
 
 impl Default for CacheConfig {
@@ -176,6 +180,7 @@ impl Default for CacheConfig {
             revalidate_after_seconds: 300,
             precache: Vec::new(),
             max_memory_mb: 512,
+            precache_blocking: true,
         }
     }
 }
@@ -1411,6 +1416,39 @@ mod tests {
         assert_eq!(config.cache.precache.len(), 2);
         assert_eq!(config.cache.precache[0], "/sounds/startup.wav");
         assert_eq!(config.cache.precache[1], "https://example.com/welcome.mp3");
+    }
+
+    #[test]
+    fn test_cache_precache_blocking_default() {
+        let config = Config::default();
+        // Default is blocking (true) - wait for all files before accepting commands
+        assert!(config.cache.precache_blocking);
+    }
+
+    #[test]
+    fn test_cache_precache_blocking_false() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "cache": {
+                "precache_blocking": false
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(!config.cache.precache_blocking);
+    }
+
+    #[test]
+    fn test_cache_precache_blocking_true() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "cache": {
+                "precache_blocking": true
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.cache.precache_blocking);
     }
 
     #[test]

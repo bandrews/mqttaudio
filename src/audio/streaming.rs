@@ -1,10 +1,6 @@
 // ABOUTME: Streaming audio buffer types for progressive loading.
 // ABOUTME: Enables playback to begin before full file is loaded.
 
-// Allow dead_code until Phase 10 connects streaming to main.rs.
-// This code is tested via integration tests and will be integrated soon.
-#![allow(dead_code)]
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Notify;
@@ -98,8 +94,14 @@ impl StreamingBuffer {
     }
 
     /// Check if the specified frame range is available.
+    #[allow(dead_code)] // Used by tests
     pub fn is_range_available(&self, start_frame: usize, end_frame: usize) -> bool {
         start_frame < self.frames_available() && end_frame <= self.frames_available()
+    }
+
+    /// Check if a specific frame is loaded and ready for playback.
+    pub fn is_frame_loaded(&self, frame: usize) -> bool {
+        frame < self.frames_available()
     }
 
     /// Get a sample value if available, or None if not yet loaded.
@@ -114,6 +116,7 @@ impl StreamingBuffer {
     }
 
     /// Get the Notify handle for waiting on data availability.
+    #[allow(dead_code)] // Used for wait_for_frame pattern
     pub fn notifier(&self) -> Arc<Notify> {
         Arc::clone(&self.data_available)
     }
@@ -136,6 +139,7 @@ impl StreamingBuffer {
 
     /// Convert to a DecodedBuffer once loading is complete.
     /// Returns None if still loading or if there was an error.
+    #[allow(dead_code)] // Used for cache promotion
     pub fn into_decoded_buffer(self) -> Option<DecodedBuffer> {
         if !matches!(self.state, LoadingState::Complete) {
             return None;
@@ -152,6 +156,7 @@ impl From<Arc<DecodedBuffer>> for SampleBuffer {
 
 impl SampleBuffer {
     /// Create a complete buffer from a DecodedBuffer.
+    #[allow(dead_code)] // Used by tests
     pub fn complete(buffer: Arc<DecodedBuffer>) -> Self {
         SampleBuffer::Complete(buffer)
     }
@@ -214,6 +219,41 @@ impl SampleBuffer {
         }
     }
 
+    /// Check if a specific frame is loaded and ready for playback.
+    /// For complete buffers, returns true if frame is within bounds.
+    /// For streaming buffers, returns true if frame has been decoded.
+    pub fn is_frame_loaded(&self, frame: usize) -> bool {
+        match self {
+            SampleBuffer::Complete(buf) => frame < buf.frames,
+            SampleBuffer::Streaming(buf) => {
+                buf.try_read().map(|b| b.is_frame_loaded(frame)).unwrap_or(false)
+            }
+        }
+    }
+
+    /// Get total frames (for complete) or estimated total (for streaming).
+    /// Returns None for streaming buffers with unknown total.
+    pub fn total_frames_or_estimate(&self) -> Option<usize> {
+        match self {
+            SampleBuffer::Complete(buf) => Some(buf.frames),
+            SampleBuffer::Streaming(buf) => {
+                buf.try_read().ok().and_then(|b| b.total_frames)
+            }
+        }
+    }
+
+    /// Get the Notify handle for streaming buffers.
+    /// Returns None for complete buffers (no need to wait).
+    #[allow(dead_code)] // Used for wait_for_frame pattern
+    pub fn notifier(&self) -> Option<Arc<Notify>> {
+        match self {
+            SampleBuffer::Complete(_) => None,
+            SampleBuffer::Streaming(buf) => {
+                buf.try_read().map(|b| b.notifier()).ok()
+            }
+        }
+    }
+
     /// Try to convert to Arc<DecodedBuffer> if complete.
     /// Returns None if streaming or if streaming buffer isn't complete yet.
     pub fn as_complete(&self) -> Option<Arc<DecodedBuffer>> {
@@ -226,6 +266,7 @@ impl SampleBuffer {
 
 /// Minimum frames of data required before starting playback.
 /// At 48kHz, 2560 frames = ~53ms = ~5 callback buffers at 512 frames/callback.
+#[allow(dead_code)] // Used by tests and future buffering logic
 pub const MIN_BUFFER_FRAMES: usize = 2560;
 
 #[cfg(test)]
@@ -444,5 +485,119 @@ mod tests {
 
         // try_read should return TryLockError
         assert!(buffer.try_read().is_err());
+    }
+
+    #[test]
+    fn test_streaming_buffer_is_frame_loaded() {
+        let mut buf = StreamingBuffer::new(2, 48000, None);
+
+        // No frames loaded yet
+        assert!(!buf.is_frame_loaded(0));
+        assert!(!buf.is_frame_loaded(10));
+
+        // Append 10 frames
+        buf.append(&[0.0; 20]);
+        assert!(buf.is_frame_loaded(0));
+        assert!(buf.is_frame_loaded(9));
+        assert!(!buf.is_frame_loaded(10));
+
+        // Append 10 more frames
+        buf.append(&[0.0; 20]);
+        assert!(buf.is_frame_loaded(19));
+        assert!(!buf.is_frame_loaded(20));
+    }
+
+    #[test]
+    fn test_sample_buffer_is_frame_loaded_complete() {
+        let decoded = Arc::new(DecodedBuffer::new(vec![0.0; 20], 2, 48000));
+        let buf = SampleBuffer::Complete(decoded);
+
+        // 20 samples / 2 channels = 10 frames
+        assert!(buf.is_frame_loaded(0));
+        assert!(buf.is_frame_loaded(9));
+        assert!(!buf.is_frame_loaded(10));
+    }
+
+    #[test]
+    fn test_sample_buffer_is_frame_loaded_streaming() {
+        let mut streaming = StreamingBuffer::new(2, 48000, None);
+        streaming.append(&[0.0; 20]); // 10 frames
+        let buf = SampleBuffer::Streaming(Arc::new(RwLock::new(streaming)));
+
+        assert!(buf.is_frame_loaded(0));
+        assert!(buf.is_frame_loaded(9));
+        assert!(!buf.is_frame_loaded(10));
+    }
+
+    #[test]
+    fn test_sample_buffer_total_frames_or_estimate() {
+        // Complete buffer has exact frame count
+        let decoded = Arc::new(DecodedBuffer::new(vec![0.0; 20], 2, 48000));
+        let complete = SampleBuffer::Complete(decoded);
+        assert_eq!(complete.total_frames_or_estimate(), Some(10));
+
+        // Streaming buffer with estimate
+        let streaming = StreamingBuffer::new(2, 48000, Some(1000));
+        let streaming_buf = SampleBuffer::Streaming(Arc::new(RwLock::new(streaming)));
+        assert_eq!(streaming_buf.total_frames_or_estimate(), Some(1000));
+
+        // Streaming buffer without estimate
+        let streaming_no_est = StreamingBuffer::new(2, 48000, None);
+        let streaming_buf_no_est = SampleBuffer::Streaming(Arc::new(RwLock::new(streaming_no_est)));
+        assert_eq!(streaming_buf_no_est.total_frames_or_estimate(), None);
+    }
+
+    #[test]
+    fn test_sample_buffer_notifier() {
+        // Complete buffer has no notifier
+        let decoded = Arc::new(DecodedBuffer::new(vec![0.0; 20], 2, 48000));
+        let complete = SampleBuffer::Complete(decoded);
+        assert!(complete.notifier().is_none());
+
+        // Streaming buffer has notifier
+        let streaming = StreamingBuffer::new(2, 48000, None);
+        let streaming_buf = SampleBuffer::Streaming(Arc::new(RwLock::new(streaming)));
+        assert!(streaming_buf.notifier().is_some());
+    }
+
+    #[test]
+    fn test_seek_behavior_complete_buffer() {
+        // Complete buffer can "seek" to any frame in bounds
+        let decoded = Arc::new(DecodedBuffer::new(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 2, 48000));
+        let buf = SampleBuffer::Complete(decoded);
+
+        // 6 samples / 2 channels = 3 frames
+        assert!(buf.is_frame_loaded(0));
+        assert!(buf.is_frame_loaded(2));
+        assert!(!buf.is_frame_loaded(3));
+
+        // Can read any loaded frame
+        assert_eq!(buf.get_sample_or_silence(0, 0), 0.1);
+        assert_eq!(buf.get_sample_or_silence(2, 0), 0.5);
+
+        // Out of bounds returns silence
+        assert_eq!(buf.get_sample_or_silence(3, 0), 0.0);
+    }
+
+    #[test]
+    fn test_seek_behavior_streaming_buffer() {
+        let mut streaming = StreamingBuffer::new(2, 48000, Some(100));
+        // Only load first 10 frames
+        streaming.append(&[0.5; 20]);
+        let buf = SampleBuffer::Streaming(Arc::new(RwLock::new(streaming)));
+
+        // First 10 frames are loaded
+        assert!(buf.is_frame_loaded(0));
+        assert!(buf.is_frame_loaded(9));
+        assert!(!buf.is_frame_loaded(10));
+        assert!(!buf.is_frame_loaded(50));
+
+        // Can read loaded frames
+        assert_eq!(buf.get_sample_or_silence(0, 0), 0.5);
+        assert_eq!(buf.get_sample_or_silence(9, 0), 0.5);
+
+        // Unloaded frames return silence (no blocking)
+        assert_eq!(buf.get_sample_or_silence(10, 0), 0.0);
+        assert_eq!(buf.get_sample_or_silence(99, 0), 0.0);
     }
 }

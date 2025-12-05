@@ -214,6 +214,8 @@ File caching settings.
 |-------|------|---------|-------------|
 | `directory` | string | `~/.mqttaudio/cache` | Disk cache directory |
 | `precache` | array | `[]` | Files or directories to cache on startup |
+| `precache_blocking` | boolean | `true` | Block startup until precache completes |
+| `max_memory_mb` | integer | `512` | Maximum memory cache size in MB (0 = unlimited) |
 
 #### Precaching
 
@@ -231,6 +233,22 @@ The `precache` array accepts:
 ```
 
 Directory precaching is not recursive — only files directly in the specified folder are cached. Subdirectories must be listed separately if needed.
+
+#### Precache Blocking Mode
+
+The `precache_blocking` option controls startup behavior:
+
+- **`true` (default)**: App waits for all precache files to fully load before accepting MQTT commands. This ensures all sounds are instantly ready, but delays startup.
+- **`false`**: App starts immediately and begins accepting commands while files load in the background. Playback of files still loading may start with a brief delay or silence until data is available.
+
+```json
+"cache": {
+  "precache": ["/sounds/startup.wav"],
+  "precache_blocking": false
+}
+```
+
+**Note:** The MQTT `precache` command always operates in non-blocking mode, regardless of this setting. It queues the file for loading and returns immediately.
 
 ### bass_management
 

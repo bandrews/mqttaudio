@@ -497,22 +497,37 @@ async fn main() {
     // Precache files from config on startup (expands directories to audio files)
     let precache_files = config.expand_precache_entries();
     if !precache_files.is_empty() {
-        tracing::info!("Precaching {} files from config...", precache_files.len());
-        for file_path in &precache_files {
-            let mut cache_mgr = cache_manager.lock().unwrap();
-            match cache_mgr.precache(file_path, output_sample_rate).await {
-                Ok(()) => {
-                    if config.logging.verbose {
-                        cache_mgr.log_stats();
+        if config.cache.precache_blocking {
+            tracing::info!("Precaching {} files (blocking)...", precache_files.len());
+            for file_path in &precache_files {
+                let mut cache_mgr = cache_manager.lock().unwrap();
+                match cache_mgr.precache(file_path, output_sample_rate).await {
+                    Ok(()) => {
+                        if config.logging.verbose {
+                            cache_mgr.log_stats();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to precache {}: {}", file_path, e);
                     }
                 }
-                Err(e) => {
-                    tracing::error!("Failed to precache {}: {}", file_path, e);
-                }
+                drop(cache_mgr);
             }
-            drop(cache_mgr);
+            tracing::info!("Startup precaching complete");
+        } else {
+            tracing::info!("Starting background precache for {} files (non-blocking)...", precache_files.len());
+            for file_path in &precache_files {
+                let mut cache_mgr = cache_manager.lock().unwrap();
+                match cache_mgr.precache_streaming(file_path, output_sample_rate).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::error!("Failed to start precache for {}: {}", file_path, e);
+                    }
+                }
+                drop(cache_mgr);
+            }
+            tracing::info!("Background precache initiated (files loading asynchronously)");
         }
-        tracing::info!("Startup precaching complete");
     }
 
     let mixer_state_clone = mixer_state.clone();
@@ -608,9 +623,9 @@ async fn main() {
 
                     match cmd {
                         mqtt::commands::AudioCommand::Play { file, id, volume, voice, channel_map, fade_in, start_position_ms, loop_mode, crossfade_ms } => {
-                            // Load file (with caching)
+                            // Load file (with streaming support for faster startup)
                             let mut cache_mgr = cache_manager.lock().unwrap();
-                            let buffer_result = cache_mgr.get_or_load(&file, output_sample_rate).await;
+                            let buffer_result = cache_mgr.get_or_load_streaming(&file, output_sample_rate).await;
                             drop(cache_mgr);
 
                             match buffer_result {
@@ -623,16 +638,38 @@ async fn main() {
                                             .as_millis())
                                     });
 
-                                    tracing::info!(
-                                        "Loaded {}: {} channels, {} frames ({:.2}s) [voice: {}{}{}]",
-                                        file,
-                                        buffer.channels,
-                                        buffer.frames,
-                                        buffer.frames as f32 / buffer.sample_rate as f32,
-                                        voice_id,
-                                        if loop_mode { ", looping" } else { "" },
-                                        if crossfade_ms > 0 { format!(", crossfade {}ms", crossfade_ms) } else { String::new() }
-                                    );
+                                    let is_streaming = !buffer.is_complete();
+                                    let frames = buffer.frames();
+                                    let sample_rate = buffer.sample_rate();
+                                    let channels = buffer.channels();
+                                    let duration_secs = if frames > 0 && sample_rate > 0 {
+                                        frames as f32 / sample_rate as f32
+                                    } else {
+                                        0.0
+                                    };
+
+                                    if is_streaming {
+                                        tracing::info!(
+                                            "Playing {} (streaming): {} channels, {} frames loaded so far [voice: {}{}{}]",
+                                            file,
+                                            channels,
+                                            frames,
+                                            voice_id,
+                                            if loop_mode { ", looping" } else { "" },
+                                            if crossfade_ms > 0 { format!(", crossfade {}ms", crossfade_ms) } else { String::new() }
+                                        );
+                                    } else {
+                                        tracing::info!(
+                                            "Playing {}: {} channels, {} frames ({:.2}s) [voice: {}{}{}]",
+                                            file,
+                                            channels,
+                                            frames,
+                                            duration_secs,
+                                            voice_id,
+                                            if loop_mode { ", looping" } else { "" },
+                                            if crossfade_ms > 0 { format!(", crossfade {}ms", crossfade_ms) } else { String::new() }
+                                        );
+                                    }
 
                                     // Get sample ID and voice volume from voice manager
                                     let mut voice_mgr = voice_manager.lock().unwrap();
@@ -691,9 +728,21 @@ async fn main() {
 
                                     // Apply start position if requested
                                     if let Some(start_ms) = start_position_ms {
-                                        let target_frame = ((start_ms * buffer.sample_rate as u64) / 1000) as usize;
-                                        sample.position = target_frame.min(buffer.frames.saturating_sub(1));
-                                        tracing::debug!("Starting at position {}ms (frame {})", start_ms, sample.position);
+                                        let target_frame = ((start_ms * sample_rate as u64) / 1000) as usize;
+                                        // For streaming buffers, use estimate if available, otherwise don't clamp
+                                        // (mixer will return silence for unloaded frames)
+                                        let max_frame = buffer.total_frames_or_estimate()
+                                            .unwrap_or(usize::MAX)
+                                            .saturating_sub(1);
+                                        sample.position = target_frame.min(max_frame);
+                                        if is_streaming && !buffer.is_frame_loaded(sample.position) {
+                                            tracing::debug!(
+                                                "Starting at position {}ms (frame {}), waiting for data to load",
+                                                start_ms, sample.position
+                                            );
+                                        } else {
+                                            tracing::debug!("Starting at position {}ms (frame {})", start_ms, sample.position);
+                                        }
                                     }
 
                                     // Apply fade in if requested
@@ -829,16 +878,16 @@ async fn main() {
                             }
                         }
                         mqtt::commands::AudioCommand::Precache { file } => {
+                            // Non-blocking precache - starts loading and returns immediately
                             let mut cache_mgr = cache_manager.lock().unwrap();
-                            match cache_mgr.precache(&file, output_sample_rate).await {
+                            match cache_mgr.precache_streaming(&file, output_sample_rate).await {
                                 Ok(()) => {
-                                    tracing::info!("Precached: {}", file);
                                     if config.logging.verbose {
                                         cache_mgr.log_stats();
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::error!("Failed to precache {}: {}", file, e);
+                                    tracing::error!("Failed to start precache for {}: {}", file, e);
                                 }
                             }
                         }
