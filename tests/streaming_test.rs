@@ -1,5 +1,5 @@
-// ABOUTME: Integration tests for HTTP streaming audio playback.
-// ABOUTME: Verifies HttpStreamReader works with StreamingDecoder end-to-end.
+// ABOUTME: Integration tests for streaming audio playback (HTTP and local files).
+// ABOUTME: Verifies StreamingBuffer, StreamingDecoder, and CacheManager streaming APIs.
 
 use mqttaudio::audio::streaming_decoder::StreamingDecoder;
 use mqttaudio::cache::http_stream::start_http_stream;
@@ -646,4 +646,172 @@ async fn test_precache_then_seek_beyond_loaded() {
     assert!(buffer.is_frame_loaded(target) || target >= buffer.frames());
 
     let _ = shutdown.send(());
+}
+
+// ============================================================================
+// Local file streaming tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_local_file_streaming_load() {
+    // Test streaming load from local file (not HTTP)
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("local_stream_test.wav");
+    generate_test_wav(&wav_path, 1.0); // 1 second file
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    // Request streaming load of local file
+    let buffer = cache_manager
+        .get_or_load_streaming(wav_path.to_str().unwrap(), 48000)
+        .await
+        .unwrap();
+
+    // Local files may load very quickly - could be either streaming or complete
+    // Wait for completion
+    let mut attempts = 0;
+    while !buffer.is_complete() && attempts < 100 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        attempts += 1;
+    }
+
+    assert!(buffer.is_complete(), "Local file should load completely");
+    assert!(buffer.frames() > 0, "Should have loaded frames");
+    assert_eq!(buffer.channels(), 2);
+}
+
+#[tokio::test]
+async fn test_local_file_cache_hit() {
+    // Test that local files are cached correctly
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("cache_hit_test.wav");
+    generate_test_wav(&wav_path, 0.5);
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    // First load
+    let buffer1 = cache_manager
+        .get_or_load_streaming(wav_path.to_str().unwrap(), 48000)
+        .await
+        .unwrap();
+
+    // Wait for complete
+    while !buffer1.is_complete() {
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+
+    // Cleanup to promote to memory cache
+    cache_manager.cleanup_completed_loads();
+
+    // Second load should be a cache hit
+    let buffer2 = cache_manager
+        .get_or_load_streaming(wav_path.to_str().unwrap(), 48000)
+        .await
+        .unwrap();
+
+    // Should be Complete (not Streaming) since it's cached
+    match &buffer2 {
+        SampleBuffer::Complete(_) => {
+            // Good - cache hit
+        }
+        SampleBuffer::Streaming(_) => {
+            panic!("Expected cache hit to return Complete buffer");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_local_file_with_resampling() {
+    // Test that local file with different sample rate gets resampled
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("resample_test.wav");
+    generate_test_wav(&wav_path, 0.5); // 44100 Hz source
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    // Request at 48000 Hz (different from 44100 source)
+    let buffer = cache_manager
+        .get_or_load_streaming(wav_path.to_str().unwrap(), 48000)
+        .await
+        .unwrap();
+
+    // Wait for complete
+    while !buffer.is_complete() {
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+
+    // Should have been resampled
+    // 0.5 seconds at 48kHz stereo = 24000 frames (approximately, due to resampling)
+    let frames = buffer.frames();
+    assert!(frames > 20000, "Expected ~24000 frames, got {}", frames);
+    assert!(frames < 28000, "Expected ~24000 frames, got {}", frames);
+}
+
+#[tokio::test]
+async fn test_multiple_local_files_concurrent() {
+    // Test loading multiple local files concurrently
+    let temp_dir = TempDir::new().unwrap();
+
+    // Create multiple test files
+    let wav_path1 = temp_dir.path().join("concurrent1.wav");
+    let wav_path2 = temp_dir.path().join("concurrent2.wav");
+    let wav_path3 = temp_dir.path().join("concurrent3.wav");
+    generate_test_wav(&wav_path1, 0.3);
+    generate_test_wav(&wav_path2, 0.4);
+    generate_test_wav(&wav_path3, 0.5);
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    // Load all three concurrently
+    let buffer1 = cache_manager
+        .get_or_load_streaming(wav_path1.to_str().unwrap(), 48000)
+        .await
+        .unwrap();
+    let buffer2 = cache_manager
+        .get_or_load_streaming(wav_path2.to_str().unwrap(), 48000)
+        .await
+        .unwrap();
+    let buffer3 = cache_manager
+        .get_or_load_streaming(wav_path3.to_str().unwrap(), 48000)
+        .await
+        .unwrap();
+
+    // Wait for all to complete
+    let mut all_complete = false;
+    let mut attempts = 0;
+    while !all_complete && attempts < 100 {
+        all_complete = buffer1.is_complete() && buffer2.is_complete() && buffer3.is_complete();
+        if !all_complete {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+        attempts += 1;
+    }
+
+    assert!(buffer1.is_complete(), "Buffer 1 should be complete");
+    assert!(buffer2.is_complete(), "Buffer 2 should be complete");
+    assert!(buffer3.is_complete(), "Buffer 3 should be complete");
+
+    // Each should have different frame counts (different durations)
+    let f1 = buffer1.frames();
+    let f2 = buffer2.frames();
+    let f3 = buffer3.frames();
+    assert!(f1 < f2, "Shorter duration should have fewer frames");
+    assert!(f2 < f3, "Shorter duration should have fewer frames");
+}
+
+#[tokio::test]
+async fn test_nonexistent_file_error() {
+    // Test error handling for missing files
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    let result = cache_manager
+        .get_or_load_streaming("/nonexistent/file/that/does/not/exist.wav", 48000)
+        .await;
+
+    assert!(result.is_err(), "Should return error for nonexistent file");
 }

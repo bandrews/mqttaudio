@@ -498,6 +498,286 @@ async function testCacheClear() {
   }
 }
 
+// ============================================================================
+// Streaming and Performance Tests
+// ============================================================================
+
+async function testColdLoadTiming() {
+  printTest('Cold Load Timing');
+  printExpect('Clear cache, then measure time to first sound');
+
+  // Clear all caches first
+  await post('/cache/clear');
+  await sleep(100);
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_beep_5s.wav');
+  console.log('  Clearing cache and playing cold...');
+
+  const startTime = Date.now();
+  await post('/play', { file: testFile, voice: 'cold_test' });
+
+  // The command returns immediately - measure API response time
+  const apiTime = Date.now() - startTime;
+  console.log(`  API response time: ${apiTime}ms`);
+
+  await sleep(1000);
+  await post('/stopall');
+
+  console.log('  You should have heard the sound start quickly (< 100ms target)');
+  await askConfirmation();
+}
+
+async function testHotLoadTiming() {
+  printTest('Hot Load Timing (Cache Hit)');
+  printExpect('Load file into cache, clear, reload - should be nearly instant');
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_beep_5s.wav');
+
+  // Ensure file is cached
+  await post('/precache', { file: testFile });
+  await sleep(500);
+
+  console.log('  File is now cached. Playing from cache...');
+
+  const startTime = Date.now();
+  await post('/play', { file: testFile, voice: 'hot_test' });
+  const apiTime = Date.now() - startTime;
+  console.log(`  API response time: ${apiTime}ms (should be very fast)`);
+
+  await sleep(1000);
+  await post('/stopall');
+
+  console.log('  Sound should have started essentially instantly');
+  await askConfirmation();
+}
+
+async function testPrecacheThenPlay() {
+  printTest('Precache Then Play');
+  printExpect('Precache file, then play should be instant');
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
+
+  // Clear cache first
+  await post('/cache/clear');
+  await sleep(100);
+
+  // Precache the file
+  console.log('  Precaching file...');
+  const precacheStart = Date.now();
+  await post('/precache', { file: testFile });
+  await sleep(500); // Give it time to load
+
+  const { data: cacheStatus } = await get('/status/cache');
+  console.log(`  Cache status: ${JSON.stringify(cacheStatus.memory)}`);
+
+  // Now play should be instant
+  console.log('  Playing precached file...');
+  const playStart = Date.now();
+  await post('/play', { file: testFile, voice: 'precache_test' });
+  const playTime = Date.now() - playStart;
+  console.log(`  Play response time: ${playTime}ms`);
+
+  await sleep(2500);
+
+  console.log('  Sound should have started immediately (file was precached)');
+  await askConfirmation();
+}
+
+async function testPlayDuringPreload() {
+  printTest('Play During Preload');
+  printExpect('Start precache, then immediately play same file');
+
+  // Clear cache first
+  await post('/cache/clear');
+  await sleep(100);
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_beep_5s.wav');
+
+  // Start precaching
+  console.log('  Starting precache...');
+  post('/precache', { file: testFile }); // Don't await
+
+  // Immediately try to play the same file
+  console.log('  Immediately playing same file...');
+  await post('/play', { file: testFile, voice: 'during_preload' });
+
+  await sleep(2000);
+  await post('/stopall');
+
+  console.log('  Sound should have played (sharing the same loading buffer)');
+  await askConfirmation();
+}
+
+async function testStopDuringPreload() {
+  printTest('Stop During Preload');
+  printExpect('Start playing file, stop it before fully loaded');
+
+  // Clear cache first
+  await post('/cache/clear');
+  await sleep(100);
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_beep_5s.wav');
+
+  console.log('  Playing file (cold load)...');
+  await post('/play', { file: testFile, voice: 'stop_preload_test' });
+
+  // Stop immediately
+  console.log('  Stopping immediately...');
+  await sleep(100); // Give it just a moment
+  await post('/voice/stop', { voice: 'stop_preload_test' });
+
+  await sleep(500);
+
+  console.log('  Sound should have stopped cleanly (no crash, no stuck audio)');
+  await askConfirmation();
+}
+
+async function testMultipleConcurrentLoads() {
+  printTest('Multiple Concurrent Loads');
+  printExpect('Play multiple different files simultaneously (cold load)');
+
+  // Clear cache first
+  await post('/cache/clear');
+  await sleep(100);
+
+  const testFile1 = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
+  const testFile2 = path.join(TEST_AUDIO_DIR, 'test_beep_5s.wav');
+  const testFile3 = path.join(TEST_AUDIO_DIR, 'music_200hz.wav');
+
+  console.log('  Playing 3 files simultaneously (cold load)...');
+  await Promise.all([
+    post('/play', { file: testFile1, voice: 'concurrent1', volume: 0.5 }),
+    post('/play', { file: testFile2, voice: 'concurrent2', volume: 0.5 }),
+    post('/play', { file: testFile3, voice: 'concurrent3', volume: 0.3 }),
+  ]);
+
+  await sleep(3000);
+  await post('/stopall');
+
+  console.log('  All 3 sounds should have played together');
+  await askConfirmation();
+}
+
+async function testCacheMemoryStatus() {
+  printTest('Cache Memory Status');
+  printExpect('Load files and check memory usage reporting');
+
+  // Clear cache first
+  await post('/cache/clear');
+  await sleep(100);
+
+  const { data: before } = await get('/status/cache');
+  console.log(`  Before: ${JSON.stringify(before.memory)}`);
+
+  // Load some files
+  const testFile = path.join(TEST_AUDIO_DIR, 'music_200hz.wav'); // Larger file
+  await post('/precache', { file: testFile });
+  await sleep(1000);
+
+  const { data: after } = await get('/status/cache');
+  console.log(`  After: ${JSON.stringify(after.memory)}`);
+
+  // Field is "entries" not "entry_count"
+  if (after.memory.entries > before.memory.entries) {
+    printPass('Memory cache shows entries');
+  } else {
+    printFail('Memory cache not reporting correctly');
+  }
+}
+
+async function testPrecacheDoesNotPlay() {
+  printTest('Precache Does Not Play Audio');
+  printExpect('Precache a file - should load silently without any audio output');
+
+  // Clear cache first
+  await post('/cache/clear');
+  await sleep(100);
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_440hz_2s.wav');
+
+  console.log('  Precaching file (you should hear NOTHING)...');
+  await post('/precache', { file: testFile });
+
+  // Wait for precache to complete
+  await sleep(1500);
+
+  // Verify it's cached
+  const { data: cacheStatus } = await get('/status/cache');
+  console.log(`  Cache status: ${cacheStatus.memory.entries} entries, ${cacheStatus.memory.size_mb.toFixed(2)} MB`);
+
+  // Verify no samples are playing
+  const { data: samples } = await get('/status/samples');
+  console.log(`  Active samples: ${samples.samples ? samples.samples.length : 0}`);
+
+  if (cacheStatus.memory.entries > 0 && (!samples.samples || samples.samples.length === 0)) {
+    console.log('  File is cached but not playing - correct behavior');
+  } else {
+    console.log('  WARNING: Either not cached or unexpectedly playing');
+  }
+
+  await askConfirmation();
+}
+
+async function testSeekDuringPlayback() {
+  printTest('Seek During Playback');
+  printExpect('Play a 5s file, seek to 4s - sound should stop naturally within ~1s');
+
+  // Make sure nothing is playing
+  await post('/stopall');
+  await sleep(100);
+
+  const testFile = path.join(TEST_AUDIO_DIR, 'test_beep_5s.wav');
+
+  // Play the file (non-looping)
+  console.log('  Starting 5-second file (non-looping)...');
+  const { data: playData } = await post('/play', { file: testFile, voice: 'seek_test', loop: false });
+  console.log(`  Play response: ${JSON.stringify(playData)}`);
+
+  console.log('  Playing for 1 second...');
+  await sleep(1000);
+
+  // Get sample info before seek
+  const { data: samplesBefore } = await get('/status/samples');
+  console.log(`  Active samples before seek: ${samplesBefore.samples ? samplesBefore.samples.length : 0}`);
+
+  if (samplesBefore.samples && samplesBefore.samples.length > 0) {
+    const sample = samplesBefore.samples[0];
+    console.log(`  Sample internal_id: ${sample.internal_id}, id: ${sample.id || 'none'}, position: ${sample.position_ms || 'unknown'}ms`);
+
+    console.log('  Seeking to 4000ms (near end of 5s file)...');
+    // Use internal_id for precise targeting (system-assigned unique ID)
+    const { data: seekData } = await post('/seek', { internal_id: sample.internal_id, position_ms: 4000 });
+    console.log(`  Seek response: ${JSON.stringify(seekData)}`);
+
+    // Check position after seek
+    await sleep(100);
+    const { data: samplesAfter } = await get('/status/samples');
+    if (samplesAfter.samples && samplesAfter.samples.length > 0) {
+      const afterSample = samplesAfter.samples[0];
+      console.log(`  Position after seek: ${afterSample.position_ms || 'unknown'}ms`);
+    }
+
+    console.log('  Waiting 2 seconds - sound should end naturally around 1s after seek...');
+    await sleep(2000);
+
+    // Check if still playing
+    const { data: samplesFinal } = await get('/status/samples');
+    const stillPlaying = samplesFinal.samples && samplesFinal.samples.length > 0;
+    console.log(`  Still playing after 2s wait: ${stillPlaying}`);
+
+    if (stillPlaying) {
+      console.log('  WARNING: Sample still playing - seek may not have worked correctly');
+    } else {
+      console.log('  Sample ended naturally after seek - correct behavior');
+    }
+  } else {
+    console.log('  No samples found to seek');
+  }
+
+  await post('/stopall');
+  await askConfirmation();
+}
+
 // Main
 async function main() {
   printHeader('mqttaudio HTTP Interactive Integration Test');
@@ -540,6 +820,18 @@ async function main() {
     await testPrecache();
     await testStatusSamples();
     await testCacheClear();
+
+    // Streaming and performance tests
+    printHeader('Streaming and Performance Tests');
+    await testColdLoadTiming();
+    await testHotLoadTiming();
+    await testPrecacheThenPlay();
+    await testPrecacheDoesNotPlay();
+    await testPlayDuringPreload();
+    await testStopDuringPreload();
+    await testMultipleConcurrentLoads();
+    await testCacheMemoryStatus();
+    await testSeekDuringPlayback();
 
     // Summary
     printHeader('Test Summary');

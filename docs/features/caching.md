@@ -1,15 +1,16 @@
 # Caching
 
-mqttaudio automatically caches audio files for fast playback. HTTP files are downloaded once and reused. All files are decoded and kept in memory for instant access.
+mqttaudio automatically caches audio files for fast playback. HTTP files are downloaded once and reused. Files are decoded and kept in memory for instant access, with streaming support for large files.
 
 ## Cache Layers
 
 ### Memory Cache
 
 Decoded audio (PCM) is kept in RAM for instant playback:
-- First play: decode file → store in memory
+- First play: decode file → store in memory (streaming for large files)
 - Subsequent plays: instant playback from memory
 - Cleared when mqttaudio exits
+- LRU eviction when memory limit is reached
 
 ### Disk Cache
 
@@ -18,13 +19,22 @@ Downloaded files are stored on disk:
 - Persists across restarts
 - Validated against the server using ETag/Last-Modified headers
 
+## Streaming Playback
+
+For large files or slow HTTP connections, playback begins before the entire file is loaded:
+- Playback starts as soon as enough audio is buffered (~50ms worth)
+- Background task continues loading the rest
+- Unloaded sections return silence (rare in practice)
+- Seeking to unloaded regions waits for data
+
 ## Latency
 
 | Scenario | Typical Latency |
 |----------|-----------------|
-| Cached in memory | < 10 ms |
-| Cached on disk | 20-50 ms |
-| First HTTP download | 100-300 ms |
+| Cached in memory (hot) | ~100 ns |
+| Cold start (local file) | 6-65 ms |
+| Cold start (HTTP) | ~10 ms |
+| First HTTP download (full) | 100-300 ms |
 
 ## Precaching
 
@@ -87,7 +97,8 @@ Force re-download of a specific file:
 {
   "cache": {
     "directory": "~/.mqttaudio/cache",
-    "precache": []
+    "precache": [],
+    "max_memory_mb": 512
   }
 }
 ```
@@ -96,6 +107,21 @@ Force re-download of a specific file:
 |-------|---------|-------------|
 | `directory` | `~/.mqttaudio/cache` | Disk cache location |
 | `precache` | `[]` | Files to cache on startup |
+| `max_memory_mb` | `512` | Memory cache limit in MB (0 = unlimited) |
+
+### CLI Option
+
+You can also set the memory limit via command line:
+```bash
+./mqttaudio --server localhost --topic audio/commands --max-cache-mb 1024
+```
+
+### LRU Eviction
+
+When the memory cache reaches its limit, least-recently-used entries are evicted:
+- Recently accessed files stay in cache
+- Currently playing files are never evicted
+- New files trigger eviction of old entries
 
 ## Disk Cache Location
 
@@ -138,11 +164,16 @@ Decoded audio uses more memory than compressed files:
 
 | Duration | Stereo 48kHz | Mono 48kHz |
 |----------|--------------|------------|
+| 30 seconds | ~11 MB | ~6 MB |
 | 1 minute | ~23 MB | ~11 MB |
 | 5 minutes | ~115 MB | ~57 MB |
-| 30 seconds | ~11 MB | ~6 MB |
+| 10 minutes | ~230 MB | ~115 MB |
 
-Keep this in mind when precaching many files.
+The default 512 MB limit allows for approximately:
+- ~22 minutes of stereo 48kHz audio
+- ~44 minutes of mono 48kHz audio
+
+With LRU eviction, least-recently-used files are automatically removed when the limit is reached. Currently-playing files are protected from eviction.
 
 ## Tips
 

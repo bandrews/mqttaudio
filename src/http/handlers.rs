@@ -157,6 +157,8 @@ pub async fn handle_play(
 #[derive(Deserialize, Default)]
 pub struct StopParams {
     #[serde(default)]
+    internal_id: Option<String>,
+    #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     file: Option<String>,
@@ -172,6 +174,9 @@ pub async fn handle_stop(
 ) -> impl IntoResponse {
 
     let mut message = json!({});
+    if let Some(internal_id) = params.internal_id {
+        message["internal_id"] = json!(internal_id);
+    }
     if let Some(id) = params.id {
         message["id"] = json!(id);
     }
@@ -217,6 +222,8 @@ pub async fn handle_stopall(State(state): State<AppState>) -> impl IntoResponse 
 #[derive(Deserialize, Default)]
 pub struct VolumeParams {
     #[serde(default)]
+    internal_id: Option<String>,
+    #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     file: Option<String>,
@@ -231,6 +238,9 @@ pub async fn handle_volume(
 ) -> impl IntoResponse {
 
     let mut message = json!({ "volume": params.volume });
+    if let Some(internal_id) = params.internal_id {
+        message["internal_id"] = json!(internal_id);
+    }
     if let Some(id) = params.id {
         message["id"] = json!(id);
     }
@@ -258,6 +268,8 @@ pub async fn handle_volume(
 #[derive(Deserialize, Default)]
 pub struct SeekParams {
     #[serde(default)]
+    internal_id: Option<String>,
+    #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     file: Option<String>,
@@ -272,6 +284,9 @@ pub async fn handle_seek(
 ) -> impl IntoResponse {
 
     let mut message = json!({ "position_ms": params.position_ms });
+    if let Some(internal_id) = params.internal_id {
+        message["internal_id"] = json!(internal_id);
+    }
     if let Some(id) = params.id {
         message["id"] = json!(id);
     }
@@ -299,6 +314,8 @@ pub async fn handle_seek(
 #[derive(Deserialize, Default)]
 pub struct SpeedParams {
     #[serde(default)]
+    internal_id: Option<String>,
+    #[serde(default)]
     id: Option<String>,
     #[serde(default)]
     file: Option<String>,
@@ -315,6 +332,9 @@ pub async fn handle_speed(
 ) -> impl IntoResponse {
 
     let mut message = json!({ "speed": params.speed });
+    if let Some(internal_id) = params.internal_id {
+        message["internal_id"] = json!(internal_id);
+    }
     if let Some(id) = params.id {
         message["id"] = json!(id);
     }
@@ -585,9 +605,9 @@ pub async fn handle_samples(State(state): State<AppState>) -> impl IntoResponse 
         .iter()
         .map(|s| {
             json!({
-                "id": s.id,
-                "sample_id": s.sample_id,
-                "voice_id": s.voice_id,
+                "internal_id": s.id.to_string(),
+                "id": s.sample_id,
+                "voice": s.voice_id,
                 "file": s.file_path,
                 "position": s.position,
                 "total_frames": s.buffer.frames(),

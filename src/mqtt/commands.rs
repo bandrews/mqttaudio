@@ -20,9 +20,12 @@ pub struct ChannelMapping {
     pub dest: ChannelRef,
 }
 
-/// Selector for targeting samples by id, file, or voice
+/// Selector for targeting samples by internal_id, id, file, or voice
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 pub struct SampleSelector {
+    /// Target specific sample by system-assigned internal ID (unique, precise)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal_id: Option<String>,
     /// Target specific sample by user-provided ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -36,7 +39,16 @@ pub struct SampleSelector {
 
 impl SampleSelector {
     /// Check if a sample matches this selector
-    pub fn matches(&self, sample_id: Option<&str>, file_path: &str, voice_id: &str) -> bool {
+    pub fn matches(&self, internal_id: u64, sample_id: Option<&str>, file_path: &str, voice_id: &str) -> bool {
+        // Check if selector specifies internal_id and if it matches (highest priority)
+        if let Some(ref iid) = self.internal_id {
+            if let Ok(parsed) = iid.parse::<u64>() {
+                if parsed == internal_id {
+                    return true;
+                }
+            }
+        }
+
         // Check if selector specifies id and if it matches
         if let Some(ref id) = self.id {
             if sample_id == Some(id.as_str()) {
@@ -64,7 +76,7 @@ impl SampleSelector {
 
     /// Check if this selector is empty (no criteria specified)
     pub fn is_empty(&self) -> bool {
-        self.id.is_none() && self.file.is_none() && self.voice.is_none()
+        self.internal_id.is_none() && self.id.is_none() && self.file.is_none() && self.voice.is_none()
     }
 }
 
@@ -144,6 +156,9 @@ pub struct InputMuteMessage {
 /// Seek command parameters
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SeekMessage {
+    /// Target specific sample by system-assigned internal ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal_id: Option<String>,
     /// Target specific sample by user-provided ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -160,6 +175,9 @@ pub struct SeekMessage {
 /// Speed command parameters
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SpeedMessage {
+    /// Target specific sample by system-assigned internal ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal_id: Option<String>,
     /// Target specific sample by user-provided ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -179,6 +197,9 @@ pub struct SpeedMessage {
 /// Stop command parameters (with sample selector)
 #[derive(Debug, Deserialize, Serialize)]
 pub struct StopMessage {
+    /// Target specific sample by system-assigned internal ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal_id: Option<String>,
     /// Target specific sample by user-provided ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -196,6 +217,9 @@ pub struct StopMessage {
 /// Volume command parameters (with sample selector)
 #[derive(Debug, Deserialize, Serialize)]
 pub struct VolumeMessage {
+    /// Target specific sample by system-assigned internal ID
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal_id: Option<String>,
     /// Target specific sample by user-provided ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -388,6 +412,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
 
             Ok(AudioCommand::Seek {
                 selector: SampleSelector {
+                    internal_id: seek_msg.internal_id,
                     id: seek_msg.id,
                     file: seek_msg.file,
                     voice: seek_msg.voice,
@@ -401,6 +426,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
 
             Ok(AudioCommand::Speed {
                 selector: SampleSelector {
+                    internal_id: speed_msg.internal_id,
                     id: speed_msg.id,
                     file: speed_msg.file,
                     voice: speed_msg.voice,
@@ -415,6 +441,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
 
             Ok(AudioCommand::Stop {
                 selector: SampleSelector {
+                    internal_id: stop_msg.internal_id,
                     id: stop_msg.id,
                     file: stop_msg.file,
                     voice: stop_msg.voice,
@@ -428,6 +455,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
 
             Ok(AudioCommand::Volume {
                 selector: SampleSelector {
+                    internal_id: vol_msg.internal_id,
                     id: vol_msg.id,
                     file: vol_msg.file,
                     voice: vol_msg.voice,
@@ -1195,76 +1223,103 @@ mod tests {
     // === SampleSelector Tests ===
 
     #[test]
+    fn test_selector_matches_by_internal_id() {
+        let selector = SampleSelector {
+            internal_id: Some("42".to_string()),
+            id: None,
+            file: None,
+            voice: None,
+        };
+
+        assert!(selector.matches(42, None, "test.wav", "voice1"));
+        assert!(!selector.matches(99, None, "test.wav", "voice1"));
+    }
+
+    #[test]
     fn test_selector_matches_by_id() {
         let selector = SampleSelector {
+            internal_id: None,
             id: Some("my-sound".to_string()),
             file: None,
             voice: None,
         };
 
-        assert!(selector.matches(Some("my-sound"), "test.wav", "voice1"));
-        assert!(!selector.matches(Some("other-sound"), "test.wav", "voice1"));
-        assert!(!selector.matches(None, "test.wav", "voice1"));
+        assert!(selector.matches(1, Some("my-sound"), "test.wav", "voice1"));
+        assert!(!selector.matches(1, Some("other-sound"), "test.wav", "voice1"));
+        assert!(!selector.matches(1, None, "test.wav", "voice1"));
     }
 
     #[test]
     fn test_selector_matches_by_file() {
         let selector = SampleSelector {
+            internal_id: None,
             id: None,
             file: Some("music.mp3".to_string()),
             voice: None,
         };
 
-        assert!(selector.matches(None, "music.mp3", "voice1"));
-        assert!(selector.matches(Some("any-id"), "music.mp3", "voice1"));
-        assert!(!selector.matches(None, "other.mp3", "voice1"));
+        assert!(selector.matches(1, None, "music.mp3", "voice1"));
+        assert!(selector.matches(1, Some("any-id"), "music.mp3", "voice1"));
+        assert!(!selector.matches(1, None, "other.mp3", "voice1"));
     }
 
     #[test]
     fn test_selector_matches_by_voice() {
         let selector = SampleSelector {
+            internal_id: None,
             id: None,
             file: None,
             voice: Some("background".to_string()),
         };
 
-        assert!(selector.matches(None, "any.wav", "background"));
-        assert!(!selector.matches(None, "any.wav", "foreground"));
+        assert!(selector.matches(1, None, "any.wav", "background"));
+        assert!(!selector.matches(1, None, "any.wav", "foreground"));
     }
 
     #[test]
     fn test_selector_matches_any_criterion() {
         // Selector with multiple criteria matches if ANY matches
         let selector = SampleSelector {
+            internal_id: None,
             id: Some("specific-sound".to_string()),
             file: Some("music.mp3".to_string()),
             voice: None,
         };
 
         // Matches by id
-        assert!(selector.matches(Some("specific-sound"), "other.wav", "voice1"));
+        assert!(selector.matches(1, Some("specific-sound"), "other.wav", "voice1"));
         // Matches by file
-        assert!(selector.matches(Some("other-id"), "music.mp3", "voice1"));
+        assert!(selector.matches(1, Some("other-id"), "music.mp3", "voice1"));
         // Matches neither
-        assert!(!selector.matches(Some("other-id"), "other.wav", "voice1"));
+        assert!(!selector.matches(1, Some("other-id"), "other.wav", "voice1"));
     }
 
     #[test]
     fn test_selector_empty() {
         let empty = SampleSelector {
+            internal_id: None,
             id: None,
             file: None,
             voice: None,
         };
         assert!(empty.is_empty());
-        assert!(!empty.matches(Some("any"), "any", "any"));
+        assert!(!empty.matches(1, Some("any"), "any", "any"));
 
         let not_empty = SampleSelector {
+            internal_id: None,
             id: Some("test".to_string()),
             file: None,
             voice: None,
         };
         assert!(!not_empty.is_empty());
+
+        let not_empty_internal = SampleSelector {
+            internal_id: Some("1".to_string()),
+            id: None,
+            file: None,
+            voice: None,
+        };
+        assert!(!not_empty_internal.is_empty());
     }
 
     #[test]

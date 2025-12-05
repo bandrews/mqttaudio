@@ -222,7 +222,7 @@ fn bench_time_to_first_sample(c: &mut Criterion) {
 /// Memory usage tracking
 fn bench_memory_usage(c: &mut Criterion) {
     let mut group = c.benchmark_group("memory_usage");
-    group.sample_size(5);
+    group.sample_size(10);
 
     let temp_dir = TempDir::new().unwrap();
     let cache_dir = temp_dir.path().join("cache");

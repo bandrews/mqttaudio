@@ -1009,6 +1009,7 @@ async fn main() {
 
                                 for sample in state.active_samples.iter_mut() {
                                     if selector.matches(
+                                        sample.id,
                                         sample.sample_id.as_deref(),
                                         &sample.file_path,
                                         &sample.voice_id,
@@ -1041,6 +1042,7 @@ async fn main() {
 
                                 for sample in state.active_samples.iter_mut() {
                                     if selector.matches(
+                                        sample.id,
                                         sample.sample_id.as_deref(),
                                         &sample.file_path,
                                         &sample.voice_id,
@@ -1074,6 +1076,7 @@ async fn main() {
 
                                 for sample in state.active_samples.iter_mut() {
                                     if selector.matches(
+                                        sample.id,
                                         sample.sample_id.as_deref(),
                                         &sample.file_path,
                                         &sample.voice_id,
@@ -1103,6 +1106,7 @@ async fn main() {
 
                                 for sample in state.active_samples.iter_mut() {
                                     if selector.matches(
+                                        sample.id,
                                         sample.sample_id.as_deref(),
                                         &sample.file_path,
                                         &sample.voice_id,
