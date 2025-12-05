@@ -1,6 +1,10 @@
 // ABOUTME: HTTP stream adapter that implements Symphonia's MediaSource trait.
 // ABOUTME: Buffers downloaded bytes to support seeking within the buffered region.
 
+// Allow dead_code until Phase 10 connects streaming to main.rs.
+// This code is tested via integration tests and will be integrated soon.
+#![allow(dead_code)]
+
 use bytes::Bytes;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};

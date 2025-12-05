@@ -1,6 +1,10 @@
 // ABOUTME: Incremental sample rate conversion for streaming audio.
 // ABOUTME: Processes audio in chunks, enabling playback before full file loads.
 
+// Allow dead_code until Phase 10 connects streaming to main.rs.
+// This code is tested via integration tests and will be integrated soon.
+#![allow(dead_code)]
+
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };

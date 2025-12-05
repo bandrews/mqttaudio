@@ -1,6 +1,10 @@
 // ABOUTME: Iterator-based audio decoder for streaming playback.
 // ABOUTME: Yields decoded chunks progressively, enabling playback before full load.
 
+// Allow dead_code until Phase 10 connects streaming to main.rs.
+// This code is tested via integration tests and will be integrated soon.
+#![allow(dead_code)]
+
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{Decoder, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;

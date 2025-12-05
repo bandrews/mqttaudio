@@ -18,6 +18,8 @@ use std::sync::{Arc, RwLock};
 use symphonia::core::probe::Hint;
 
 /// Tracks an active streaming load operation
+// Allow dead_code until Phase 10 connects streaming to main.rs
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct ActiveLoad {
     /// The streaming buffer being filled
@@ -32,6 +34,8 @@ pub struct CacheManager {
     disk_cache: DiskCache,
     resampler_quality: ResamplerQuality,
     /// Currently active streaming loads (path -> ActiveLoad)
+    // Allow dead_code until Phase 10 connects streaming to main.rs
+    #[allow(dead_code)]
     active_loads: HashMap<String, ActiveLoad>,
 }
 
@@ -60,6 +64,8 @@ impl CacheManager {
     /// Returns a SampleBuffer that may be either complete (from cache) or
     /// streaming (still loading). For streaming buffers, playback can begin
     /// as soon as MIN_BUFFER_FRAMES are available.
+    // Allow dead_code until Phase 10 connects streaming to main.rs
+    #[allow(dead_code)]
     pub async fn get_or_load_streaming(
         &mut self,
         file_path: &str,
@@ -115,6 +121,8 @@ impl CacheManager {
     }
 
     /// Start a streaming load for an HTTP URL
+    // Allow dead_code until Phase 10 connects streaming to main.rs
+    #[allow(dead_code)]
     async fn start_streaming_load(
         &mut self,
         url: &str,
@@ -166,6 +174,8 @@ impl CacheManager {
     }
 
     /// Background decode task - runs in spawn_blocking
+    // Allow dead_code until Phase 10 connects streaming to main.rs
+    #[allow(dead_code)]
     fn decode_streaming(
         reader: http_stream::HttpStreamReader,
         hint: Hint,
@@ -238,6 +248,8 @@ impl CacheManager {
     }
 
     /// Check if a file is currently being loaded
+    // Allow dead_code until Phase 10 connects streaming to main.rs
+    #[allow(dead_code)]
     pub fn is_loading(&self, file_path: &str) -> bool {
         if let Some(active) = self.active_loads.get(file_path) {
             if let Ok(guard) = active.buffer.read() {
@@ -248,6 +260,8 @@ impl CacheManager {
     }
 
     /// Get loading progress for a file: (frames_loaded, total_frames_estimate)
+    // Allow dead_code until Phase 10 connects streaming to main.rs
+    #[allow(dead_code)]
     pub fn loading_progress(&self, file_path: &str) -> Option<(usize, Option<usize>)> {
         if let Some(active) = self.active_loads.get(file_path) {
             if let Ok(guard) = active.buffer.read() {
@@ -258,6 +272,8 @@ impl CacheManager {
     }
 
     /// Clean up completed loads and promote to memory cache
+    // Allow dead_code until Phase 10 connects streaming to main.rs
+    #[allow(dead_code)]
     pub fn cleanup_completed_loads(&mut self) {
         let completed: Vec<String> = self.active_loads
             .iter()

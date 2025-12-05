@@ -313,6 +313,8 @@ impl DiskCache {
     /// while the download continues in the background.
     ///
     /// Note: This does NOT cache to disk. Use download_and_cache() for caching.
+    // Allow dead_code until Phase 10 connects streaming to main.rs
+    #[allow(dead_code)]
     pub async fn start_streaming_download(
         url: &str,
     ) -> Result<super::http_stream::HttpStreamReader, CacheError> {

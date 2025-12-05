@@ -1,6 +1,10 @@
 // ABOUTME: Streaming audio buffer types for progressive loading.
 // ABOUTME: Enables playback to begin before full file is loaded.
 
+// Allow dead_code until Phase 10 connects streaming to main.rs.
+// This code is tested via integration tests and will be integrated soon.
+#![allow(dead_code)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::Notify;
