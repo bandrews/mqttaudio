@@ -590,13 +590,13 @@ pub async fn handle_samples(State(state): State<AppState>) -> impl IntoResponse 
                 "voice_id": s.voice_id,
                 "file": s.file_path,
                 "position": s.position,
-                "total_frames": s.buffer.frames,
+                "total_frames": s.buffer.frames(),
                 "volume": s.volume,
                 "voice_volume": s.voice_volume,
                 "speed": s.speed,
                 "loop_mode": s.loop_mode,
-                "progress_percent": if s.buffer.frames > 0 {
-                    (s.position as f64 / s.buffer.frames as f64 * 100.0).round()
+                "progress_percent": if s.buffer.frames() > 0 {
+                    (s.position as f64 / s.buffer.frames() as f64 * 100.0).round()
                 } else {
                     0.0
                 }

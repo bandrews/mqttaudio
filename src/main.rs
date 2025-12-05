@@ -959,9 +959,9 @@ async fn main() {
                                         &sample.voice_id,
                                     ) {
                                         // Convert milliseconds to frames
-                                        let target_frame = ((position_ms as u64 * sample.buffer.sample_rate as u64) / 1000) as usize;
+                                        let target_frame = ((position_ms as u64 * sample.buffer.sample_rate() as u64) / 1000) as usize;
                                         // Clamp to buffer bounds
-                                        sample.position = target_frame.min(sample.buffer.frames.saturating_sub(1));
+                                        sample.position = target_frame.min(sample.buffer.frames().saturating_sub(1));
                                         updated_count += 1;
                                     }
                                 }

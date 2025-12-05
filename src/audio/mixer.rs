@@ -1,12 +1,11 @@
 // ABOUTME: Real-time audio mixer performing sample mixing and channel routing.
 // ABOUTME: Runs in audio callback thread with strict real-time constraints.
 
-use crate::audio::types::DecodedBuffer;
+use crate::audio::streaming::SampleBuffer;
 use crate::audio::ducking::DuckingEngine;
 use crate::audio::bass_management::BassManagement;
 use crate::audio::pitch_correction::PitchCorrector;
 use ringbuf::HeapConsumer;
-use std::sync::Arc;
 
 /// Fade state for audio samples
 #[derive(Debug, Clone, PartialEq)]
@@ -100,8 +99,8 @@ pub struct ActiveSample {
     /// Source file path (for targeting by filename)
     pub file_path: String,
 
-    /// Pre-decoded audio buffer (shared, immutable)
-    pub buffer: Arc<DecodedBuffer>,
+    /// Audio buffer - either complete (cached) or streaming (loading)
+    pub buffer: SampleBuffer,
 
     /// Current playback position (in frames, integer part)
     pub position: usize,
@@ -139,13 +138,14 @@ impl ActiveSample {
     pub fn new(
         id: u64,
         voice_id: String,
-        buffer: Arc<DecodedBuffer>,
+        buffer: impl Into<SampleBuffer>,
         volume: f32,
         voice_volume: f32,
         file_path: String,
     ) -> Self {
+        let buffer = buffer.into();
         // Default channel mapping: 1:1 for available channels
-        let channel_map = (0..buffer.channels)
+        let channel_map = (0..buffer.channels())
             .map(|ch| (ch, ch))
             .collect();
 
@@ -172,7 +172,7 @@ impl ActiveSample {
     pub fn new_with_id(
         id: u64,
         voice_id: String,
-        buffer: Arc<DecodedBuffer>,
+        buffer: impl Into<SampleBuffer>,
         volume: f32,
         voice_volume: f32,
         file_path: String,
@@ -180,8 +180,9 @@ impl ActiveSample {
         loop_mode: bool,
         crossfade_samples: usize,
     ) -> Self {
+        let buffer = buffer.into();
         // Default channel mapping: 1:1 for available channels
-        let channel_map = (0..buffer.channels)
+        let channel_map = (0..buffer.channels())
             .map(|ch| (ch, ch))
             .collect();
 
@@ -208,7 +209,7 @@ impl ActiveSample {
     pub fn new_with_mapping(
         id: u64,
         voice_id: String,
-        buffer: Arc<DecodedBuffer>,
+        buffer: impl Into<SampleBuffer>,
         volume: f32,
         voice_volume: f32,
         channel_map: Vec<(usize, usize)>,
@@ -222,7 +223,7 @@ impl ActiveSample {
             sample_id,
             voice_id,
             file_path,
-            buffer,
+            buffer: buffer.into(),
             position: 0,
             fractional_position: 0.0,
             volume,
@@ -279,8 +280,8 @@ impl ActiveSample {
     pub fn enable_pitch_correction(&mut self) {
         if self.pitch_corrector.is_none() {
             let mut pc = PitchCorrector::new(
-                self.buffer.channels,
-                self.buffer.sample_rate,
+                self.buffer.channels(),
+                self.buffer.sample_rate(),
             );
             pc.set_speed(self.speed);
             self.pitch_corrector = Some(pc);
@@ -337,7 +338,7 @@ impl ActiveSample {
         // For forward playback, finished when position >= frames
         // For reverse playback, finished when position is 0 (or we've gone negative)
         if self.speed >= 0.0 {
-            if self.position >= self.buffer.frames {
+            if self.position >= self.buffer.frames() {
                 return true;
             }
         } else {
@@ -363,7 +364,7 @@ impl ActiveSample {
     fn advance_position(&mut self, output_frames: usize) -> usize {
         let advance = output_frames as f64 * self.speed as f64;
         let new_pos = self.position as f64 + self.fractional_position + advance;
-        let buffer_frames = self.buffer.frames;
+        let buffer_frames = self.buffer.frames();
 
         if self.loop_mode && buffer_frames > 0 {
             // Handle looping
@@ -540,7 +541,8 @@ fn mix_sample_into_output(
     ducking_multiplier: f32,
 ) {
     // Use pitch-corrected path if pitch corrector is enabled
-    if sample.pitch_corrector.is_some() {
+    // Note: pitch correction requires Complete buffers (direct data slice access)
+    if sample.pitch_corrector.is_some() && sample.buffer.is_complete() {
         mix_sample_with_pitch_correction(sample, output, frames, output_channels, ducking_multiplier);
         return;
     }
@@ -548,7 +550,8 @@ fn mix_sample_into_output(
     let base_volume = sample.combined_volume();
     let speed = sample.speed as f64;
     let is_reverse = speed < 0.0;
-    let buffer_frames = sample.buffer.frames;
+    let buffer_frames = sample.buffer.frames();
+    let buffer_channels = sample.buffer.channels();
     let loop_mode = sample.loop_mode;
 
     // Calculate current precise position (integer + fractional parts)
@@ -600,15 +603,14 @@ fn mix_sample_into_output(
         // Apply channel mapping and mix into output
         for &(src_ch, dest_ch) in &sample.channel_map {
             // Bounds check
-            if src_ch >= sample.buffer.channels || dest_ch >= output_channels {
+            if src_ch >= buffer_channels || dest_ch >= output_channels {
                 continue;
             }
 
-            let src_idx = src_frame * sample.buffer.channels + src_ch;
             let dest_idx = frame_idx * output_channels + dest_ch;
 
-            // Get current sample value
-            let sample_val = sample.buffer.data[src_idx];
+            // Get current sample value (returns silence for streaming buffers if unavailable)
+            let sample_val = sample.buffer.get_sample_or_silence(src_frame, src_ch);
 
             // Interpolate with adjacent sample if available
             let interpolated_val = if frac > 0.001 {
@@ -623,8 +625,7 @@ fn mix_sample_into_output(
                         src_frame // No interpolation possible
                     };
                     if prev_frame != src_frame {
-                        let prev_idx = prev_frame * sample.buffer.channels + src_ch;
-                        let prev_val = sample.buffer.data[prev_idx];
+                        let prev_val = sample.buffer.get_sample_or_silence(prev_frame, src_ch);
                         sample_val * (1.0 - frac) + prev_val * frac
                     } else {
                         sample_val
@@ -640,8 +641,7 @@ fn mix_sample_into_output(
                         src_frame // No interpolation possible
                     };
                     if next_frame != src_frame {
-                        let next_idx = next_frame * sample.buffer.channels + src_ch;
-                        let next_val = sample.buffer.data[next_idx];
+                        let next_val = sample.buffer.get_sample_or_silence(next_frame, src_ch);
                         sample_val * (1.0 - frac) + next_val * frac
                     } else {
                         sample_val
@@ -662,8 +662,7 @@ fn mix_sample_into_output(
                         // progress goes from 0.0 (at cf_samples-1) to 1.0 (at frame 0)
                         let progress = 1.0 - (src_frame as f32 / cf_samples as f32);
                         let blend_frame = buffer_frames - cf_samples + src_frame;
-                        let blend_idx = blend_frame * sample.buffer.channels + src_ch;
-                        let blend_val = sample.buffer.data[blend_idx];
+                        let blend_val = sample.buffer.get_sample_or_silence(blend_frame, src_ch);
                         interpolated_val * (1.0 - progress) + blend_val * progress
                     } else {
                         interpolated_val
@@ -677,8 +676,7 @@ fn mix_sample_into_output(
                         let frames_into_crossfade = src_frame - crossfade_start;
                         let progress = frames_into_crossfade as f32 / cf_samples as f32;
                         let blend_frame = frames_into_crossfade;
-                        let blend_idx = blend_frame * sample.buffer.channels + src_ch;
-                        let blend_val = sample.buffer.data[blend_idx];
+                        let blend_val = sample.buffer.get_sample_or_silence(blend_frame, src_ch);
                         interpolated_val * (1.0 - progress) + blend_val * progress
                     } else {
                         interpolated_val
@@ -702,6 +700,7 @@ fn mix_sample_into_output(
 
 /// Mix a sample with pitch correction using time-stretching.
 /// This preserves pitch when speed != 1.0.
+/// Note: This function requires a Complete buffer (not streaming).
 fn mix_sample_with_pitch_correction(
     sample: &mut ActiveSample,
     output: &mut [f32],
@@ -709,15 +708,21 @@ fn mix_sample_with_pitch_correction(
     output_channels: usize,
     ducking_multiplier: f32,
 ) {
+    // Pitch correction requires direct slice access, only available for Complete buffers
+    let decoded_buffer = match sample.buffer.as_complete() {
+        Some(buf) => buf,
+        None => return, // Streaming buffer - skip pitch correction
+    };
+
     let base_volume = sample.combined_volume();
     let speed = sample.speed;
-    let src_channels = sample.buffer.channels;
+    let src_channels = decoded_buffer.channels;
 
     // Calculate how many input frames we need (scaled by speed)
     let input_frames_needed = ((frames as f32 * speed).ceil() as usize).max(1);
 
     // Calculate how many input frames are available
-    let available_frames = sample.buffer.frames.saturating_sub(sample.position);
+    let available_frames = decoded_buffer.frames.saturating_sub(sample.position);
     let input_frames = input_frames_needed.min(available_frames);
 
     if input_frames == 0 {
@@ -727,7 +732,7 @@ fn mix_sample_with_pitch_correction(
     // Extract input samples from the buffer (interleaved)
     let input_start = sample.position * src_channels;
     let input_end = (sample.position + input_frames) * src_channels;
-    let input_slice = &sample.buffer.data[input_start..input_end];
+    let input_slice = &decoded_buffer.data[input_start..input_end];
 
     // Create output buffer for the stretcher (interleaved, same channel count as source)
     let output_samples = frames * src_channels;
@@ -813,6 +818,8 @@ fn mix_live_input_into_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::types::DecodedBuffer;
+    use std::sync::Arc;
 
     fn create_test_buffer(frames: usize, channels: usize, value: f32) -> Arc<DecodedBuffer> {
         let data = vec![value; frames * channels];
@@ -1720,7 +1727,7 @@ mod tests {
 
         // Seek to 500ms (should be frame 24000)
         let position_ms: u64 = 500;
-        let target_frame = ((position_ms * sample.buffer.sample_rate as u64) / 1000) as usize;
+        let target_frame = ((position_ms * sample.buffer.sample_rate() as u64) / 1000) as usize;
         sample.position = target_frame;
 
         assert_eq!(sample.position, 24000);
@@ -1737,7 +1744,7 @@ mod tests {
 
         // Seek to 0ms
         let position_ms: u64 = 0;
-        let target_frame = ((position_ms * sample.buffer.sample_rate as u64) / 1000) as usize;
+        let target_frame = ((position_ms * sample.buffer.sample_rate() as u64) / 1000) as usize;
         sample.position = target_frame;
 
         assert_eq!(sample.position, 0);
@@ -1751,8 +1758,8 @@ mod tests {
 
         // Try to seek to 2 seconds (beyond buffer)
         let position_ms: u64 = 2000;
-        let target_frame = ((position_ms * sample.buffer.sample_rate as u64) / 1000) as usize;
-        sample.position = target_frame.min(sample.buffer.frames.saturating_sub(1));
+        let target_frame = ((position_ms * sample.buffer.sample_rate() as u64) / 1000) as usize;
+        sample.position = target_frame.min(sample.buffer.frames().saturating_sub(1));
 
         // Should be clamped to last valid frame
         assert_eq!(sample.position, 47999); // frames - 1
@@ -1767,8 +1774,8 @@ mod tests {
 
         // Seek to 1000ms (should be frame 44100)
         let position_ms: u64 = 1000;
-        let target_frame = ((position_ms * sample.buffer.sample_rate as u64) / 1000) as usize;
-        sample.position = target_frame.min(sample.buffer.frames.saturating_sub(1));
+        let target_frame = ((position_ms * sample.buffer.sample_rate() as u64) / 1000) as usize;
+        sample.position = target_frame.min(sample.buffer.frames().saturating_sub(1));
 
         // At 44100 Hz, 1000ms = 44100 frames, but clamped to 44099
         assert_eq!(sample.position, 44099);
@@ -1783,7 +1790,7 @@ mod tests {
 
         // Seek to 250ms
         let position_ms: u64 = 250;
-        let target_frame = ((position_ms * sample.buffer.sample_rate as u64) / 1000) as usize;
+        let target_frame = ((position_ms * sample.buffer.sample_rate() as u64) / 1000) as usize;
         sample.position = target_frame;
 
         // Volume and fade state should be preserved

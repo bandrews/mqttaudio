@@ -6,11 +6,11 @@
 |-------|--------|-------|
 | Phase 1: Benchmark Infrastructure | **COMPLETE** | Criterion benchmarks, synthetic audio, HTTP server |
 | Quick Win: Configurable Resampler | **COMPLETE** | 4x speedup with Fast default |
-| Phase 2: StreamingBuffer Foundation | Pending | Next up |
-| Phase 3: Chunked Resampler | Pending | |
+| Phase 2: StreamingBuffer Foundation | **COMPLETE** | SampleBuffer enum, mixer integration |
+| Phase 3: Chunked Resampler | Pending | Next up |
 | Phase 4: Streaming Decoder | Pending | |
 | Phase 5: HTTP Streaming | Pending | |
-| Phase 6: Mixer Integration | Pending | |
+| Phase 6: Mixer Integration | **COMPLETE** | Done as part of Phase 2 |
 | Phase 7: Cache Manager Updates | Pending | |
 | Phase 8: LRU Eviction | Pending | |
 | Phase 9: Seek Support | Pending | |
@@ -84,46 +84,35 @@ This can take seconds for large files. Target: **<100ms cold start latency**.
 
 **Impact:** With Fast quality, a 1-minute 44.1kHz file resampled to 48kHz now takes ~60ms (decode) + ~60ms (resample) = ~120ms total. This is close to the <100ms target for many files.
 
+### Phase 2: StreamingBuffer Foundation
+
+**Files created/modified:**
+- `src/audio/streaming.rs` (new) - SampleBuffer enum, StreamingBuffer struct, LoadingState
+- `src/audio/mixer.rs` - Changed ActiveSample.buffer to SampleBuffer
+- `src/audio/mod.rs` - Added streaming module
+- `src/lib.rs` - Exported streaming module
+- `src/http/handlers.rs` - Updated to use buffer method calls
+- `src/main.rs` - Updated seek handling to use method calls
+
+**Key implementations:**
+- `SampleBuffer` enum with `Complete(Arc<DecodedBuffer>)` and `Streaming(Arc<RwLock<StreamingBuffer>>)` variants
+- `StreamingBuffer` with thread-safe append/read using AtomicUsize for frame counting
+- `get_sample_or_silence()` method for non-blocking audio callback access
+- `impl From<Arc<DecodedBuffer>> for SampleBuffer` for backwards compatibility
+- ActiveSample constructors accept `impl Into<SampleBuffer>` - existing code unchanged
+- Pitch correction automatically falls back to normal mixing for streaming buffers
+- 13 unit tests including concurrent read/write contention test
+
+**Phase 6 (Mixer Integration) completed early:** Done as part of Phase 2 since the type change required updating the mixer anyway.
+
+**Future refactoring opportunity:** The mixer (`src/audio/mixer.rs`) is ~2300 lines and too large. Consider extracting:
+- `FadeState` to `src/audio/fade.rs`
+- `ActiveSample` to `src/audio/active_sample.rs`
+- Tests to separate test files
+
 ---
 
 ## Remaining Implementation Plan
-
-### Phase 2: StreamingBuffer Foundation
-**Files:** `src/audio/streaming.rs` (new), `src/audio/types.rs`
-
-Create the core data structures for streaming playback:
-
-```rust
-pub enum SampleBuffer {
-    Complete(Arc<DecodedBuffer>),           // Cached, immutable
-    Streaming(Arc<RwLock<StreamingBuffer>>), // Loading, growing
-}
-
-pub struct StreamingBuffer {
-    data: Vec<f32>,
-    channels: usize,
-    sample_rate: u32,
-    frames_available: AtomicUsize,  // Updated by loader
-    total_frames: Option<usize>,    // Estimated from Content-Length
-    state: LoadingState,
-    data_available: tokio::sync::Notify,  // For seek waiters
-}
-
-pub enum LoadingState {
-    Loading,
-    Complete,
-    Error(String),
-}
-```
-
-**Tasks:**
-1. Implement `StreamingBuffer` struct with thread-safe append
-2. Implement `SampleBuffer` enum with unified read interface
-3. Add atomic frame counting with Acquire/Release ordering
-4. Add `Notify` for seek waiters
-5. Unit tests for append/read correctness under contention
-
-**Key insight:** Audio callback uses `try_read()` on RwLock - never blocks, falls back to silence on rare contention.
 
 ### Phase 3: Chunked Resampler
 **Files:** `src/audio/streaming_resampler.rs` (new)
@@ -209,34 +198,13 @@ impl Read for HttpStreamReader {
 4. Handle chunked transfer encoding (no Content-Length) gracefully
 5. Handle network errors mid-stream
 
-### Phase 6: Mixer Integration
-**Files:** `src/audio/mixer.rs`
+### Phase 6: Mixer Integration — **COMPLETE** (done with Phase 2)
 
-Update mixer to handle both complete and streaming buffers:
-
-```rust
-pub struct ActiveSample {
-    pub id: u64,
-    pub voice: String,
-    pub buffer: SampleBuffer,  // Changed from Arc<DecodedBuffer>
-    pub position: usize,
-    pub volume: f32,
-    pub voice_volume: f32,
-    // ... rest unchanged
-}
-```
-
-**Tasks:**
-1. Modify `ActiveSample` to accept `SampleBuffer`
-2. Add `try_read()` path in `mix_audio()` for streaming buffers
-3. Handle partial data: mix what's available, output silence for the rest
-4. Track `waiting_for_data` state for logging/debugging
-5. **Critical:** No allocations in audio callback - pre-allocate any needed buffers
-
-**Minimum buffer before playback:**
-- 48kHz, 512-frame callbacks = ~10.7ms per callback
-- Safe minimum: **2560 frames (~53ms)** before starting playback
-- Provides ~5 callback buffers of headroom
+See Phase 2 completion notes above. Key changes:
+- `ActiveSample.buffer` changed from `Arc<DecodedBuffer>` to `SampleBuffer`
+- `mix_sample_into_output()` uses `get_sample_or_silence()` for streaming safety
+- Pitch correction falls back to normal mixing for streaming buffers
+- `MIN_BUFFER_FRAMES = 2560` (~53ms at 48kHz) constant defined
 
 ### Phase 7: Cache Manager Updates
 **Files:** `src/cache/mod.rs`, `src/cache/memory.rs`
@@ -322,16 +290,17 @@ Handle seeking within streaming buffers:
 
 ## Critical Files to Modify
 
-| File | Changes |
-|------|---------|
-| `src/audio/mixer.rs` | SampleBuffer enum, try_read() in mix_audio |
-| `src/audio/types.rs` | StreamingBuffer struct |
-| `src/audio/decoder.rs` | Extract streaming decode iterator |
-| `src/audio/resampler.rs` | Add chunk-based variant |
-| `src/cache/mod.rs` | Streaming load orchestration |
-| `src/cache/memory.rs` | LRU eviction, access tracking |
-| `src/cache/disk.rs` | HTTP streaming download |
-| `src/main.rs` | Accept SampleBuffer in play handler |
+| File | Status | Changes |
+|------|--------|---------|
+| `src/audio/streaming.rs` | **DONE** | SampleBuffer enum, StreamingBuffer struct |
+| `src/audio/mixer.rs` | **DONE** | Uses SampleBuffer, get_sample_or_silence() |
+| `src/audio/decoder.rs` | Pending | Extract streaming decode iterator |
+| `src/audio/resampler.rs` | Pending | Add chunk-based variant |
+| `src/cache/mod.rs` | Pending | Streaming load orchestration |
+| `src/cache/memory.rs` | Pending | LRU eviction, access tracking |
+| `src/cache/disk.rs` | Pending | HTTP streaming download |
+| `src/main.rs` | **DONE** | Uses SampleBuffer methods |
+| `src/http/handlers.rs` | **DONE** | Uses SampleBuffer methods |
 
 ---
 
@@ -362,13 +331,20 @@ Handle seeking within streaming buffers:
 
 ## Notes for Implementers
 
-1. **RwLock try_read() is key** - Audio callback must never block
-2. **Rubato chunk size** - Use 1024 samples, matches existing input.rs
-3. **AtomicUsize for frames_available** - Use Acquire/Release ordering
-4. **Don't break existing tests** - Run `cargo test` frequently
-5. **Memory cache key** - Keep using file path/URL as key
-6. **Precache = full load** - Don't change precache semantics
-7. **ActiveSample.buffer** - Change type from `Arc<DecodedBuffer>` to `SampleBuffer`
+**Already implemented:**
+1. ✅ **RwLock try_read() is key** - Implemented in `get_sample_or_silence()`
+2. ✅ **AtomicUsize for frames_available** - Uses Acquire/Release ordering
+3. ✅ **Don't break existing tests** - All 315 tests pass
+4. ✅ **ActiveSample.buffer** - Changed to `SampleBuffer` with backwards-compatible constructors
+
+**Still needed:**
+5. **Rubato chunk size** - Use 1024 samples when implementing ChunkedResampler
+6. **Memory cache key** - Keep using file path/URL as key
+7. **Precache = full load** - Don't change precache semantics
+
+**Refactoring opportunity (not blocking):**
+- `src/audio/mixer.rs` is ~2300 lines and should be split up
+- Extract `FadeState`, `ActiveSample`, and tests to separate modules
 
 ---
 

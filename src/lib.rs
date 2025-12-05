@@ -11,6 +11,7 @@ pub mod audio {
     pub mod mixer;
     pub mod pitch_correction;
     pub mod resampler;
+    pub mod streaming;
     pub mod types;
 
     #[cfg(target_os = "linux")]
