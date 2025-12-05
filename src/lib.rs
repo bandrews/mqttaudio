@@ -3,6 +3,7 @@
 
 pub mod audio {
     pub mod bass_management;
+    pub mod chunked_resampler;
     pub mod decoder;
     pub mod device;
     pub mod ducking;

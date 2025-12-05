@@ -2,6 +2,7 @@
 // ABOUTME: Manages audio playback, mixing, decoding, and resampling.
 
 pub mod bass_management;
+pub mod chunked_resampler;
 pub mod decoder;
 pub mod device;
 pub mod ducking;

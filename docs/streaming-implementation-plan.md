@@ -7,7 +7,7 @@
 | Phase 1: Benchmark Infrastructure | **COMPLETE** | Criterion benchmarks, synthetic audio, HTTP server |
 | Quick Win: Configurable Resampler | **COMPLETE** | 4x speedup with Fast default |
 | Phase 2: StreamingBuffer Foundation | **COMPLETE** | SampleBuffer enum, mixer integration |
-| Phase 3: Chunked Resampler | Pending | Next up |
+| Phase 3: Chunked Resampler | **COMPLETE** | ChunkedResampler with 14 tests |
 | Phase 4: Streaming Decoder | Pending | |
 | Phase 5: HTTP Streaming | Pending | |
 | Phase 6: Mixer Integration | **COMPLETE** | Done as part of Phase 2 |
@@ -110,37 +110,32 @@ This can take seconds for large files. Target: **<100ms cold start latency**.
 - `ActiveSample` to `src/audio/active_sample.rs`
 - Tests to separate test files
 
----
-
-## Remaining Implementation Plan
-
 ### Phase 3: Chunked Resampler
-**Files:** `src/audio/streaming_resampler.rs` (new)
 
-Wrap Rubato for incremental chunk processing:
+**Files created:**
+- `src/audio/chunked_resampler.rs` (new)
 
+**Key implementations:**
+- `ChunkedResampler` struct wrapping Rubato's `SincFixedIn` for incremental processing
+- Per-channel input accumulator with configurable chunk size (default 1024 frames)
+- `push()` method: accepts interleaved samples, returns output when chunk ready
+- `flush()` method: processes remaining samples at end of stream
+- Handles de-interleaving/re-interleaving internally
+- 14 unit tests including quality comparison with full-file resampler
+
+**API:**
 ```rust
-pub struct ChunkedResampler {
-    resampler: SincFixedIn<f32>,
-    input_buffer: Vec<Vec<f32>>,  // Per-channel accumulator
-    chunk_size: usize,            // e.g., 1024 frames
-    latency_samples: usize,       // ~256 for our settings
-}
-
 impl ChunkedResampler {
-    pub fn push(&mut self, samples: &[f32], channels: usize) -> Option<Vec<f32>>;
-    pub fn flush(&mut self) -> Vec<f32>;  // Get remaining samples at end
+    pub fn new(input_rate: u32, output_rate: u32, channels: usize, quality: ResamplerQuality) -> Result<Self, Error>;
+    pub fn push(&mut self, samples: &[f32]) -> Result<Option<Vec<f32>>, Error>;
+    pub fn flush(&mut self) -> Result<Vec<f32>, Error>;
+    pub fn buffered_frames(&self) -> usize;
 }
 ```
 
-**Tasks:**
-1. Wrap Rubato's `SincFixedIn` for chunk processing
-2. Accumulate input until chunk_size reached
-3. Handle resampler latency (~256 samples for Fast quality)
-4. Handle de-interleave/re-interleave per chunk
-5. Verify output matches full-file resampling (bit-exact not required, but close)
+---
 
-**Note:** Rubato already handles state across calls - proven in existing `input.rs` code.
+## Remaining Implementation Plan
 
 ### Phase 4: Streaming Decoder
 **Files:** `src/audio/decoder.rs` (modify), `src/audio/streaming_decoder.rs` (new)
@@ -293,9 +288,9 @@ Handle seeking within streaming buffers:
 | File | Status | Changes |
 |------|--------|---------|
 | `src/audio/streaming.rs` | **DONE** | SampleBuffer enum, StreamingBuffer struct |
+| `src/audio/chunked_resampler.rs` | **DONE** | Incremental resampling for streaming |
 | `src/audio/mixer.rs` | **DONE** | Uses SampleBuffer, get_sample_or_silence() |
 | `src/audio/decoder.rs` | Pending | Extract streaming decode iterator |
-| `src/audio/resampler.rs` | Pending | Add chunk-based variant |
 | `src/cache/mod.rs` | Pending | Streaming load orchestration |
 | `src/cache/memory.rs` | Pending | LRU eviction, access tracking |
 | `src/cache/disk.rs` | Pending | HTTP streaming download |
