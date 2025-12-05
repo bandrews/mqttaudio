@@ -3,7 +3,8 @@
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
-use mqttaudio::audio::mixer::MixerState;
+use mqttaudio::audio::mixer::{ActiveSample, MixerState};
+use mqttaudio::audio::types::DecodedBuffer;
 use mqttaudio::cache::CacheManager;
 use mqttaudio::http::{create_router, AppState, LogBroadcaster};
 use mqttaudio::voice::VoiceManager;
@@ -542,4 +543,146 @@ async fn test_voice_volume_endpoint() {
     assert_eq!(parsed["message"]["voice"], "ambient");
     let volume = parsed["message"]["volume"].as_f64().unwrap();
     assert!((volume - 0.3).abs() < 0.001);
+}
+
+#[tokio::test]
+async fn test_samples_endpoint_returns_position_ms() {
+    let (state, _rx) = create_test_state();
+
+    // Create a test buffer: 48000 Hz sample rate, 2 channels, 96000 frames (2 seconds)
+    let sample_rate = 48000u32;
+    let frames = 96000usize; // 2 seconds of audio
+    let channels = 2usize;
+    let data = vec![0.5f32; frames * channels];
+    let buffer = Arc::new(DecodedBuffer::new(data, channels, sample_rate));
+
+    // Create an ActiveSample and set position to 1 second (48000 frames)
+    let position_frames = 48000usize; // 1 second at 48000 Hz
+    let expected_position_ms = 1000u64; // 1 second = 1000ms
+
+    let mut sample = ActiveSample::new(
+        1,
+        "test_voice".to_string(),
+        buffer,
+        1.0,
+        1.0,
+        "/test/audio.wav".to_string(),
+    );
+    sample.position = position_frames;
+
+    // Add sample to mixer state
+    {
+        let mut mixer = state.mixer_state.lock().unwrap();
+        mixer.active_samples.push(sample);
+    }
+
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/status/samples")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Verify samples array has one element
+    let samples = json["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 1);
+
+    let sample_json = &samples[0];
+
+    // Verify position_ms is present and correct
+    assert!(
+        sample_json.get("position_ms").is_some(),
+        "position_ms field should be present in response"
+    );
+    let position_ms = sample_json["position_ms"].as_u64().unwrap();
+    assert_eq!(
+        position_ms, expected_position_ms,
+        "position_ms should be {} but was {}",
+        expected_position_ms, position_ms
+    );
+
+    // Also verify other time-related fields are present
+    assert!(
+        sample_json.get("total_ms").is_some(),
+        "total_ms field should be present"
+    );
+    let total_ms = sample_json["total_ms"].as_u64().unwrap();
+    assert_eq!(total_ms, 2000, "total_ms should be 2000 for 2 seconds of audio");
+
+    assert!(
+        sample_json.get("sample_rate").is_some(),
+        "sample_rate field should be present"
+    );
+    let returned_sample_rate = sample_json["sample_rate"].as_u64().unwrap();
+    assert_eq!(returned_sample_rate, 48000, "sample_rate should be 48000");
+
+    // Verify position in frames is also still present
+    assert!(
+        sample_json.get("position").is_some(),
+        "position field (frames) should still be present"
+    );
+    let position = sample_json["position"].as_u64().unwrap();
+    assert_eq!(position, 48000, "position should be 48000 frames");
+}
+
+#[tokio::test]
+async fn test_samples_endpoint_position_ms_handles_zero_sample_rate() {
+    // This test verifies that position_ms handles edge cases gracefully.
+    // When sample_rate is 0 (e.g., still-loading streaming buffer), position_ms should be 0.
+    let (state, _rx) = create_test_state();
+
+    // Create a buffer with sample_rate 0 (simulating an edge case)
+    let sample_rate = 0u32;
+    let frames = 1000usize;
+    let channels = 2usize;
+    let data = vec![0.5f32; frames * channels];
+    let buffer = Arc::new(DecodedBuffer::new(data, channels, sample_rate));
+
+    let sample = ActiveSample::new(
+        1,
+        "test_voice".to_string(),
+        buffer,
+        1.0,
+        1.0,
+        "/test/audio.wav".to_string(),
+    );
+
+    {
+        let mut mixer = state.mixer_state.lock().unwrap();
+        mixer.active_samples.push(sample);
+    }
+
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/status/samples")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let samples = json["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 1);
+
+    // With sample_rate 0, position_ms should be 0 (not cause a divide-by-zero)
+    let position_ms = samples[0]["position_ms"].as_u64().unwrap();
+    assert_eq!(position_ms, 0, "position_ms should be 0 when sample_rate is 0");
 }

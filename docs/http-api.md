@@ -88,6 +88,52 @@ curl -X POST "http://localhost:8080/stopall?token=your-secret-token"
 
 Status endpoints (`/health`, `/status/*`) do not require authentication.
 
+## Status Response Formats
+
+### `/status/samples` Response
+
+Returns active samples with playback position and timing information:
+
+```json
+{
+  "samples": [
+    {
+      "internal_id": "1",
+      "id": "user-provided-id",
+      "voice": "background",
+      "file": "/sounds/music.mp3",
+      "position": 48000,
+      "position_ms": 1000,
+      "total_frames": 480000,
+      "total_ms": 10000,
+      "sample_rate": 48000,
+      "volume": 0.8,
+      "voice_volume": 1.0,
+      "speed": 1.0,
+      "loop_mode": true,
+      "progress_percent": 10
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `internal_id` | string | System-assigned unique ID |
+| `id` | string/null | User-provided sample ID (if any) |
+| `voice` | string | Voice group this sample belongs to |
+| `file` | string | Source file path |
+| `position` | integer | Current position in frames |
+| `position_ms` | integer | Current position in milliseconds |
+| `total_frames` | integer | Total audio length in frames |
+| `total_ms` | integer | Total audio length in milliseconds |
+| `sample_rate` | integer | Sample rate in Hz |
+| `volume` | float | Sample volume (0.0-1.0) |
+| `voice_volume` | float | Voice group volume (0.0-1.0) |
+| `speed` | float | Playback speed multiplier |
+| `loop_mode` | boolean | Whether looping is enabled |
+| `progress_percent` | float | Playback progress (0-100) |
+
 ## WebSocket Log Streaming
 
 Connect to `/ws` for real-time log streaming:

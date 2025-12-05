@@ -604,13 +604,27 @@ pub async fn handle_samples(State(state): State<AppState>) -> impl IntoResponse 
         .active_samples
         .iter()
         .map(|s| {
+            let sample_rate = s.buffer.sample_rate();
+            let position_ms = if sample_rate > 0 {
+                (s.position as u64 * 1000) / sample_rate as u64
+            } else {
+                0
+            };
+            let total_ms = if sample_rate > 0 {
+                (s.buffer.frames() as u64 * 1000) / sample_rate as u64
+            } else {
+                0
+            };
             json!({
                 "internal_id": s.id.to_string(),
                 "id": s.sample_id,
                 "voice": s.voice_id,
                 "file": s.file_path,
                 "position": s.position,
+                "position_ms": position_ms,
                 "total_frames": s.buffer.frames(),
+                "total_ms": total_ms,
+                "sample_rate": sample_rate,
                 "volume": s.volume,
                 "voice_volume": s.voice_volume,
                 "speed": s.speed,
