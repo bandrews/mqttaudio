@@ -46,7 +46,7 @@ sudo pacman -S alsa-lib base-devel clang
 
 ```bash
 # From source (requires Rust 1.70+)
-git clone https://github.com/bandrews/mqttaudio.git
+git clone -b refactor https://github.com/bandrews/mqttaudio.git
 cd mqttaudio
 cargo build --release
 
