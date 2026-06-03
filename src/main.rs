@@ -531,14 +531,35 @@ async fn main() {
     tracing::info!("Cache directory: {}", cache_dir.display());
     tracing::info!("Resampler quality: {:?}", resampler_quality);
 
-    let cache_manager =
-        match cache::CacheManager::with_options(cache_dir, resampler_quality, max_memory_mb) {
-            Ok(cm) => Arc::new(tokio::sync::Mutex::new(cm)),
-            Err(e) => {
-                tracing::error!("Failed to initialize cache: {}", e);
-                std::process::exit(1);
+    if config.security.allowed_directories.is_empty() {
+        tracing::warn!(
+            "No security.allowed_directories configured: any local file path in a Play command \
+             will be opened (open-by-default). Set security.allowed_directories to restrict access."
+        );
+    } else {
+        tracing::info!(
+            "Local file access restricted to {} allowed director{}",
+            config.security.allowed_directories.len(),
+            if config.security.allowed_directories.len() == 1 {
+                "y"
+            } else {
+                "ies"
             }
-        };
+        );
+    }
+
+    let cache_manager = match cache::CacheManager::with_options(
+        cache_dir,
+        resampler_quality,
+        max_memory_mb,
+        config.security.allowed_directories.clone(),
+    ) {
+        Ok(cm) => Arc::new(tokio::sync::Mutex::new(cm)),
+        Err(e) => {
+            tracing::error!("Failed to initialize cache: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     // Precache files from config on startup (expands directories to audio files)
     let precache_files = config.expand_precache_entries();

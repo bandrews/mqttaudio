@@ -494,6 +494,27 @@ impl Config {
             .collect()
     }
 
+    /// Whether `path` is permitted by the allowlist. An **empty** allowlist permits
+    /// any path (the open-by-default behavior); a non-empty allowlist canonicalizes
+    /// both the path and each allowed directory (resolving symlinks and `..`) and
+    /// requires the path to be contained within one of them.
+    pub fn is_path_allowed(path: &Path, allowed: &[String]) -> bool {
+        if allowed.is_empty() {
+            return true;
+        }
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false, // unresolvable path -> reject under an allowlist
+        };
+        allowed.iter().any(|dir| {
+            let expanded = Self::expand_tilde(dir);
+            match Path::new(&expanded).canonicalize() {
+                Ok(allowed_dir) => canonical.starts_with(&allowed_dir),
+                Err(_) => false,
+            }
+        })
+    }
+
     /// Merge CLI arguments into this config (CLI args override config file)
     #[allow(clippy::too_many_arguments)]
     pub fn merge_cli_args(
@@ -1135,6 +1156,32 @@ mod tests {
             .unwrap_err()
             .iter()
             .any(|e| e.contains("target_volume")));
+    }
+
+    #[test]
+    fn is_path_allowed_enforces_only_when_configured() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        // Empty allowlist: everything is allowed (open by default).
+        assert!(Config::is_path_allowed(Path::new("/etc/passwd"), &[]));
+
+        let dir = TempDir::new().unwrap();
+        let allowed = vec![dir.path().to_string_lossy().into_owned()];
+
+        // A file inside the allowed dir is permitted.
+        let good = dir.path().join("a.wav");
+        fs::write(&good, b"x").unwrap();
+        assert!(Config::is_path_allowed(&good, &allowed));
+
+        // A file outside it is rejected (also covers `..` traversal once canonicalized).
+        let outside = dir.path().parent().unwrap().join("escape.wav");
+        fs::write(&outside, b"x").unwrap();
+        assert!(!Config::is_path_allowed(&outside, &allowed));
+        let _ = fs::remove_file(&outside);
+
+        // An unresolvable / out-of-tree path is rejected under an allowlist.
+        assert!(!Config::is_path_allowed(Path::new("/etc/passwd"), &allowed));
     }
 
     #[test]

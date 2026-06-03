@@ -34,6 +34,8 @@ pub struct CacheManager {
     resampler_quality: ResamplerQuality,
     /// Currently active streaming loads (path -> ActiveLoad)
     active_loads: HashMap<String, ActiveLoad>,
+    /// Local-path allowlist; empty = allow-all (open by default).
+    allowed_directories: Vec<String>,
 }
 
 impl CacheManager {
@@ -43,6 +45,7 @@ impl CacheManager {
         cache_dir: PathBuf,
         resampler_quality: ResamplerQuality,
         max_memory_mb: u32,
+        allowed_directories: Vec<String>,
     ) -> Result<Self, CacheError> {
         let disk_cache = DiskCache::new(cache_dir)?;
         let max_bytes = if max_memory_mb == 0 {
@@ -66,6 +69,7 @@ impl CacheManager {
             disk_cache,
             resampler_quality,
             active_loads: HashMap::new(),
+            allowed_directories,
         })
     }
 
@@ -74,7 +78,7 @@ impl CacheManager {
         cache_dir: PathBuf,
         resampler_quality: ResamplerQuality,
     ) -> Result<Self, CacheError> {
-        Self::with_options(cache_dir, resampler_quality, 0)
+        Self::with_options(cache_dir, resampler_quality, 0, Vec::new())
     }
 
     /// Create a new cache manager with default (Fast) resampler quality and no memory limit.
@@ -135,6 +139,16 @@ impl CacheManager {
 
         // Local file - load from disk (could stream later for very large files)
         tracing::debug!("Loading local file: {}", file_path);
+        if !crate::config::Config::is_path_allowed(
+            std::path::Path::new(file_path),
+            &self.allowed_directories,
+        ) {
+            return Err(format!(
+                "file path not permitted by allowed_directories: {}",
+                file_path
+            )
+            .into());
+        }
         let path = file_path.to_string();
         let quality = self.resampler_quality;
         let buffer = tokio::task::spawn_blocking(move || {
@@ -364,6 +378,16 @@ impl CacheManager {
             }
         } else {
             // Local file path
+            if !crate::config::Config::is_path_allowed(
+                std::path::Path::new(file_path),
+                &self.allowed_directories,
+            ) {
+                return Err(format!(
+                    "file path not permitted by allowed_directories: {}",
+                    file_path
+                )
+                .into());
+            }
             PathBuf::from(file_path)
         };
 
@@ -526,5 +550,28 @@ mod tests {
         let cloned = stats.clone();
         assert_eq!(cloned.entry_count, 3);
         assert_eq!(cloned.size_bytes, 12345);
+    }
+
+    #[tokio::test]
+    async fn load_rejects_local_path_outside_allowlist() {
+        let allowed_dir = TempDir::new().unwrap();
+        let cache_dir = TempDir::new().unwrap();
+        let allowed = vec![allowed_dir.path().to_string_lossy().into_owned()];
+        let mut cm = CacheManager::with_options(
+            cache_dir.path().to_path_buf(),
+            ResamplerQuality::default(),
+            0,
+            allowed,
+        )
+        .unwrap();
+
+        // A path outside the configured allowlist must be refused before any open.
+        let result = cm.get_or_load_streaming("/etc/passwd", 48000).await;
+        assert!(result.is_err());
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("allowed_directories"));
     }
 }
