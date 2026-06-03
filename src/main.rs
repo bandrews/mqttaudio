@@ -420,9 +420,13 @@ async fn main() {
 
     // Create bass management from config
     let bass_management = if config.bass_management.enabled {
-        let resolved = config
-            .resolve_bass_management()
-            .expect("Channel alias resolution failed (should have been caught during validation)");
+        let resolved = match config.resolve_bass_management() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Bass management channel resolution failed: {}", e);
+                std::process::exit(1);
+            }
+        };
         let bm_config = audio::bass_management::BassManagementConfig {
             enabled: resolved.enabled,
             lfe_channel: resolved.lfe_channel,
@@ -474,8 +478,14 @@ async fn main() {
                 // Take ownership of the consumer for the mixer
                 if let Some(consumer) = active_input.take_consumer() {
                     // Build channel map from routes config (resolve aliases)
-                    let channel_map: Vec<(usize, usize)> = config.resolve_input_routes(&input_config.routes)
-                        .expect("Channel alias resolution failed (should have been caught during validation)");
+                    let channel_map: Vec<(usize, usize)> =
+                        match config.resolve_input_routes(&input_config.routes) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::error!("Input route channel resolution failed: {}", e);
+                                std::process::exit(1);
+                            }
+                        };
 
                     tracing::info!(
                         "Input {} routed: {:?}",
@@ -619,10 +629,11 @@ async fn main() {
     }
 
     // Spawn MQTT event processor if connected
-    if let Some((_, eventloop)) = mqtt_connection {
+    if let Some((client, eventloop)) = mqtt_connection {
         let mqtt_cmd_tx = cmd_tx.clone();
+        let mqtt_topic = config.mqtt.topic.clone().unwrap_or_default();
         tokio::spawn(async move {
-            mqtt::client::process_mqtt_events(eventloop, mqtt_cmd_tx).await;
+            mqtt::client::process_mqtt_events(client, mqtt_topic, eventloop, mqtt_cmd_tx).await;
         });
         tracing::info!(
             "Ready to receive MQTT commands on topic: {}",

@@ -223,7 +223,7 @@ impl DuckingEngine {
                 let target_volume = applicable_rules
                     .iter()
                     .map(|r| r.target_volume)
-                    .min_by(|a, b| a.partial_cmp(b).unwrap())
+                    .min_by(|a, b| a.total_cmp(b))
                     .unwrap();
 
                 let fade_duration_ms = applicable_rules
@@ -309,6 +309,20 @@ mod tests {
             target_volume: target,
             fade_duration_ms: fade_ms,
         }
+    }
+
+    #[test]
+    fn nan_target_volume_does_not_panic() {
+        // Two active primaries duck the same voice, forcing the min-by comparison
+        // across a NaN target. A NaN-unsafe comparator panics here.
+        let rules = vec![
+            create_test_rule("narration", vec!["music"], f32::NAN, 1000),
+            create_test_rule("dialog", vec!["music"], 0.5, 1000),
+        ];
+        let mut engine = DuckingEngine::new(rules, 48000);
+        engine.notify_voice_active("narration", true);
+        engine.notify_voice_active("dialog", true);
+        let _ = engine.get_multiplier("music", 1);
     }
 
     #[test]

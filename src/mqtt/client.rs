@@ -64,8 +64,15 @@ pub fn publish_payload(publish: &Publish) -> String {
     String::from_utf8_lossy(&publish.payload).to_string()
 }
 
-/// Process MQTT events and forward messages to command channel
-pub async fn process_mqtt_events(mut eventloop: EventLoop, command_tx: mpsc::Sender<String>) {
+/// Process MQTT events and forward messages to command channel.
+/// Re-subscribes to `topic` on every `ConnAck` so a broker restart (with
+/// `clean_session`) does not leave the daemon silently unsubscribed.
+pub async fn process_mqtt_events(
+    client: AsyncClient,
+    topic: String,
+    mut eventloop: EventLoop,
+    command_tx: mpsc::Sender<String>,
+) {
     tracing::info!("Starting MQTT event loop");
 
     loop {
@@ -81,6 +88,11 @@ pub async fn process_mqtt_events(mut eventloop: EventLoop, command_tx: mpsc::Sen
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
                 tracing::info!("MQTT connected");
+                // Re-subscribe on every (re)connect; the broker keeps no
+                // subscription across a clean_session reconnect.
+                if let Err(e) = client.subscribe(&topic, QoS::AtLeastOnce).await {
+                    tracing::error!("Failed to (re)subscribe to '{}': {}", topic, e);
+                }
             }
             Ok(Event::Incoming(Packet::SubAck(_))) => {
                 tracing::debug!("MQTT subscription acknowledged");
@@ -150,9 +162,10 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel(10);
 
-        // Spawn event processor
+        // Spawn event processor with its own client clone for resubscribe.
+        let proc_client = client.clone();
         tokio::spawn(async move {
-            process_mqtt_events(eventloop, tx).await;
+            process_mqtt_events(proc_client, "test/topic".to_string(), eventloop, tx).await;
         });
 
         // Publish a test message

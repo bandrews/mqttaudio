@@ -680,6 +680,17 @@ impl Config {
             }
         }
 
+        // Ducking target volumes must be finite and within [0.0, 1.0]
+        for (i, rule) in self.ducking_rules.iter().enumerate() {
+            let v = rule.target_volume;
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                errors.push(format!(
+                    "ducking_rules[{}].target_volume must be a finite value between 0.0 and 1.0",
+                    i
+                ));
+            }
+        }
+
         // Logging level must be valid
         let valid_levels = ["error", "warn", "info", "debug", "trace"];
         if !valid_levels.contains(&self.logging.level.as_str()) {
@@ -1093,6 +1104,37 @@ mod tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(errors.iter().any(|e| e.contains("buffer_size")));
+    }
+
+    #[test]
+    fn test_validate_rejects_out_of_range_ducking_target() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.ducking_rules.push(DuckingRule {
+            primary_voice: "a".to_string(),
+            ducked_voices: vec!["b".to_string()],
+            target_volume: 1.5,
+            fade_duration_ms: 100,
+        });
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("target_volume")));
+    }
+
+    #[test]
+    fn test_validate_rejects_non_finite_ducking_target() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.ducking_rules.push(DuckingRule {
+            primary_voice: "a".to_string(),
+            ducked_voices: vec!["b".to_string()],
+            target_volume: f32::NAN,
+            fade_duration_ms: 100,
+        });
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("target_volume")));
     }
 
     #[test]
