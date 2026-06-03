@@ -2,7 +2,10 @@
 // ABOUTME: A dedicated test binary with a counting global allocator; arms around mix_audio.
 
 use mqttaudio::audio::ducking::{DuckTargetChange, DuckingApplier};
-use mqttaudio::audio::mixer::{mix_audio, ActiveSample};
+use mqttaudio::audio::input::{
+    convert_input_block, create_ring_buffer, resample_block, ResampleState,
+};
+use mqttaudio::audio::mixer::{mix_audio, ActiveSample, LiveInput};
 use mqttaudio::audio::test_support::{decoded, sine, SceneBuilder};
 use mqttaudio::mqtt::commands::SampleSelector;
 use mqttaudio::rt_engine::{
@@ -108,6 +111,52 @@ fn mix_path_is_allocation_free_after_warmup() {
     assert_eq!(
         deallocs, 0,
         "mix path freed {deallocs} times across 8 blocks"
+    );
+}
+
+#[test]
+fn live_input_underrun_mix_is_allocation_free_after_warmup() {
+    // F3: the graceful-underrun fade in mix_live_input_into_output runs on the RT
+    // thread (inside mix_audio). It holds the last frame and fades it to silence
+    // using only fixed-size stack arrays, never the heap. Mix a live input whose
+    // ring is starved (so every block both reads a few frames and then fades the
+    // rest) and assert zero alloc/free in steady state.
+    const CHANNELS: usize = 2;
+    let (mut producer, consumer) = create_ring_buffer(4096);
+    let input = LiveInput::new(
+        "mic".to_string(),
+        consumer,
+        CHANNELS,
+        1.0,
+        vec![(0, 0), (1, 1)],
+    );
+    let mut state = SceneBuilder::new(2).live_input(input).build();
+    let mut block = vec![0.0f32; BLOCK * 2];
+
+    // Feed fewer frames than a block consumes, so each mix underruns partway and
+    // exercises the hold-and-fade path every block.
+    let feed = sine(440.0, SR, BLOCK / 2, CHANNELS, 0.3);
+
+    // Warm up off the armed region.
+    for _ in 0..4 {
+        producer.push_slice(&feed);
+        mix_audio(&mut block, &mut state);
+    }
+
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..8 {
+            producer.push_slice(&feed);
+            mix_audio(&mut block, &mut state);
+        }
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "live-input underrun mix allocated {allocs} times across 8 blocks"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "live-input underrun mix freed {deallocs} times across 8 blocks"
     );
 }
 
@@ -528,5 +577,126 @@ fn adding_a_sample_into_the_reserved_pool_is_free_free() {
     assert_eq!(
         deallocs, 0,
         "adding a sample into the reserved pool must not free on the RT thread, got {deallocs}"
+    );
+}
+
+/// Drive `resample_block` for many capture blocks at the given rates while armed
+/// and return the (allocs, deallocs) counted during the steady-state region.
+fn count_resample_block_allocs(in_rate: u32, out_rate: u32) -> (usize, usize) {
+    const CHANNELS: usize = 2;
+    // A capture block large enough that several blocks cross the 1024-frame chunk
+    // boundary, so process_into_buffer + the interleave-into-ring run while armed.
+    const BLOCK_FRAMES: usize = 480;
+
+    // Ring sized like production (output rate, 20 ms, 4x headroom).
+    let ring_size = mqttaudio::audio::input::calculate_ring_buffer_size(out_rate, CHANNELS, 20);
+    let (mut producer, mut consumer) = create_ring_buffer(ring_size);
+    let mut state =
+        ResampleState::new(in_rate, out_rate, CHANNELS, producer.capacity()).expect("resampler");
+
+    // Interleaved input block (a quiet sine on both channels).
+    let block = sine(440.0, in_rate, BLOCK_FRAMES, CHANNELS, 0.25);
+
+    // Warm up off the armed region: the first chunks size internal buffers and
+    // prime the resampler. Drain the consumer so the ring never wedges full.
+    let mut sink = vec![0.0f32; ring_size];
+    for _ in 0..16 {
+        resample_block(&mut state, &block, &mut producer);
+        consumer.pop_slice(&mut sink);
+    }
+
+    count_allocs(|| {
+        for _ in 0..64 {
+            resample_block(&mut state, &block, &mut producer);
+            // Drain on the armed thread too; pop_slice is itself allocation-free.
+            consumer.pop_slice(&mut sink);
+        }
+    })
+}
+
+#[test]
+fn resampling_capture_block_is_allocation_free_after_warmup() {
+    // F2: the cpal CAPTURE callback resamples input frames into the ring buffer.
+    // Like mix_audio it runs on an RT thread (cpal's capture thread) and must do no
+    // heap work: pre-sized de-interleave accumulators (no Vec::push growth), a
+    // reusable rubato output buffer via output_buffer_allocate, and
+    // process_into_buffer (never the allocating process()). The drift-control loop
+    // it runs each chunk only reads the producer fill and sets two floats. This
+    // must fail against the old Vec::push / drain(..).collect() / process() code.
+    let (allocs, deallocs) = count_resample_block_allocs(44_100, 48_000);
+    assert_eq!(
+        allocs, 0,
+        "resampling capture block allocated {allocs} times across 64 blocks"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "resampling capture block freed {deallocs} times across 64 blocks"
+    );
+}
+
+#[test]
+fn equal_rate_capture_block_is_allocation_free_after_warmup() {
+    // D33 routes the equal-rate case through async SRC too (for drift control), so
+    // that path is now always-on in production and must also be allocation-free on
+    // the capture thread. Same harness, identical nominal in/out rate.
+    let (allocs, deallocs) = count_resample_block_allocs(48_000, 48_000);
+    assert_eq!(
+        allocs, 0,
+        "equal-rate capture block allocated {allocs} times across 64 blocks"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "equal-rate capture block freed {deallocs} times across 64 blocks"
+    );
+}
+
+#[test]
+fn typed_capture_callback_body_is_allocation_free_after_warmup() {
+    // Mirrors the EXACT production capture-callback body for a non-f32 device:
+    // convert_input_block::<i16> (native -> f32 into a reused scratch) feeding
+    // resample_block. After warmup the scratch is sized and nothing on this path
+    // touches the heap — the same RT rule as mix_audio (D22a).
+    const IN_RATE: u32 = 44_100;
+    const OUT_RATE: u32 = 48_000;
+    const CHANNELS: usize = 2;
+    const BLOCK_FRAMES: usize = 480;
+
+    let ring_size = mqttaudio::audio::input::calculate_ring_buffer_size(OUT_RATE, CHANNELS, 20);
+    let (mut producer, mut consumer) = create_ring_buffer(ring_size);
+    let mut state =
+        ResampleState::new(IN_RATE, OUT_RATE, CHANNELS, producer.capacity()).expect("resampler");
+    let mut scratch: Vec<f32> = Vec::new();
+
+    // An i16 capture block (interleaved), exactly what cpal hands an I16 device.
+    let mut block = vec![0i16; BLOCK_FRAMES * CHANNELS];
+    for (i, s) in block.iter_mut().enumerate() {
+        *s = ((i as f32 * 0.01).sin() * 8000.0) as i16;
+    }
+
+    let mut sink = vec![0.0f32; ring_size];
+    let mut run_one = |producer: &mut _, consumer: &mut ringbuf::HeapConsumer<f32>| {
+        convert_input_block::<i16>(&block, &mut scratch, |f32s| {
+            resample_block(&mut state, f32s, producer);
+        });
+        consumer.pop_slice(&mut sink);
+    };
+
+    for _ in 0..16 {
+        run_one(&mut producer, &mut consumer);
+    }
+
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..64 {
+            run_one(&mut producer, &mut consumer);
+        }
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "typed capture callback body allocated {allocs} times across 64 blocks"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "typed capture callback body freed {deallocs} times across 64 blocks"
     );
 }

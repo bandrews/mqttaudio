@@ -193,6 +193,23 @@ A few mixer behaviors are worth knowing (see `docs/configuration.md` for the ful
   pitch. Note that speeds **above** `1.0` without pitch correction will alias (no anti-aliasing on the
   fast path) — use pitch correction for clean large speed-ups.
 
+### Live input behavior
+
+When `config.inputs` is configured to mix a microphone or line input (see
+[Microphone Input](docs/features/microphone-input.md)):
+
+- **Drift-bounded capture.** Every input runs through async sample-rate conversion whose ratio is steered
+  from the ring-buffer fill, so an input clocked by a different device than the output stays glitch-free over
+  long sessions instead of slowly drifting into periodic dropouts — even when the nominal rates match.
+- **`voice_volume` affects inputs.** A `voice_volume` command targeting an input's `voice_id` now ramps that
+  input's level even when no sample is playing on the voice (previously a no-op).
+- **`input_mute` restores the prior level.** Unmuting returns the input to the volume it had when muted (e.g.
+  a calibrated `0.7`), not a hardcoded `1.0`. Setting an explicit `input_volume` clears the muted state.
+- **Inputs can trigger ducking.** A mic whose `voice_id` is a ducking rule's `primary_voice` ducks that
+  rule's background voices while its stream is open.
+- **Out-of-range routes warn.** A route reading a source channel the device does not have is logged once at
+  startup (the mixer still drops it).
+
 ### Hardening (optional)
 
 mqttaudio runs open by default so it stays easy to use on a trusted LAN. Each of these lockdowns is **opt-in** and leaves existing open deployments unchanged when unset:

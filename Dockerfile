@@ -1,4 +1,4 @@
-FROM rust:1.83-bookworm AS builder
+FROM rust:1.95-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     libasound2-dev libssl-dev pkg-config clang libclang-dev \

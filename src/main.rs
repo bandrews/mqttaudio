@@ -516,6 +516,15 @@ async fn main() {
                             .collect::<Vec<_>>()
                     );
 
+                    // Now that the device's channel count is known, warn about any
+                    // route reading a source channel the device does not have; the
+                    // mixer would otherwise drop it silently (F5).
+                    if let Some(warning) =
+                        out_of_range_input_routes(idx, &channel_map, active_input.channels)
+                    {
+                        tracing::warn!("{}", warning);
+                    }
+
                     // Create LiveInput for the mixer
                     let live_input = audio::mixer::LiveInput::new(
                         input_config.voice_id.clone(),
@@ -815,6 +824,37 @@ fn refresh_snapshot(
     guard.output_channels = output_channels;
     guard.samples = samples;
     guard.inputs = inputs.to_vec();
+}
+
+/// Build the warning for an input whose resolved routes read source channels the
+/// device does not have, or `None` when every source is within range (F5). The
+/// device channel count is only known once the stream opens, so this runs at input
+/// setup rather than during config validation; the mixer silently drops such routes,
+/// so the warning is what makes the misconfiguration visible. Source channels are
+/// 0-based, so a valid index is `< channels`.
+fn out_of_range_input_routes(
+    input_index: usize,
+    channel_map: &[(usize, usize)],
+    channels: usize,
+) -> Option<String> {
+    let mut offending: Vec<usize> = channel_map
+        .iter()
+        .map(|&(src, _)| src)
+        .filter(|&src| src >= channels)
+        .collect();
+    if offending.is_empty() {
+        return None;
+    }
+    offending.sort_unstable();
+    offending.dedup();
+    Some(format!(
+        "Input {} routes read source channel(s) {:?} but the device has only {} channel(s) \
+         (0..{}); those routes will be silently dropped — fix the input's routes config",
+        input_index,
+        offending,
+        channels,
+        channels.saturating_sub(1)
+    ))
 }
 
 /// Notify the control-side ducking engine that a voice's activity changed and
@@ -1214,21 +1254,33 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             let actual_volume = voice_mgr.get_voice_volume(&voice).unwrap_or(1.0);
             drop(voice_mgr);
 
-            if success {
+            // A live input shares this voice id even when no sample-backed voice
+            // exists. The control plane cannot read the audio thread's live_inputs
+            // (D22a), so it checks the configured input voice ids it does own (D35).
+            let input_match = ctx.inputs.iter().any(|i| i.voice_id == voice);
+
+            if success || input_match {
+                // For a sample-backed voice send the VoiceManager's clamped stored
+                // value; for an input-only voice clamp the requested value directly.
+                let target = if success {
+                    actual_volume
+                } else {
+                    new_volume.clamp(0.0, 1.0)
+                };
                 // The audio thread ramps samples and live inputs in this voice
                 // toward the new target (SetVoiceVolume covers both).
                 ctx.send(rt_engine::AudioCommand::SetVoiceVolume {
                     voice: voice.clone(),
-                    volume: actual_volume,
+                    volume: target,
                 });
                 // Keep the status snapshot's per-sample voice volume in step.
                 for status in ctx.playing.values_mut() {
                     if status.voice_id == voice {
-                        status.voice_volume = actual_volume;
+                        status.voice_volume = target;
                     }
                 }
                 ctx.refresh();
-                tracing::info!("Set voice '{}' volume to {:.2}", voice, actual_volume);
+                tracing::info!("Set voice '{}' volume to {:.2}", voice, target);
             } else {
                 tracing::warn!("Voice '{}' not found", voice);
             }
@@ -1298,16 +1350,15 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             });
         }
         mqtt::commands::AudioCommand::InputMute { input, mute } => {
-            // Mute by setting volume to 0, unmute restores to 1.0.
+            // Mute stores the input's current volume and zeroes it; unmute restores
+            // that stored volume (D34) — the audio thread owns the live input, so the
+            // save/restore happens there.
             tracing::info!(
                 "Input '{}' {}",
                 input,
                 if mute { "muted" } else { "unmuted" }
             );
-            ctx.send(rt_engine::AudioCommand::SetInputVolume {
-                input,
-                volume: if mute { 0.0 } else { 1.0 },
-            });
+            ctx.send(rt_engine::AudioCommand::SetInputMute { input, mute });
         }
         mqtt::commands::AudioCommand::Seek {
             selector,
@@ -1722,6 +1773,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn voice_volume_reaches_an_input_only_voice() {
+        // D35: a VoiceVolume targeting a voice that has only a live input (no
+        // sample-backed voice in the VoiceManager) must still ramp that input. The
+        // handler used to gate the SetVoiceVolume send behind a VoiceManager hit and
+        // silently no-op for input-only voices.
+        let mut fixture = Fixture::new(vec![]);
+        push_live_input(&mut fixture, "mic", 1.0);
+
+        fixture
+            .run(AudioCommand::VoiceVolume {
+                voice: "mic".to_string(),
+                volume: 0.4,
+            })
+            .await;
+        fixture.drain();
+
+        let input = &fixture.mixer.live_inputs[0];
+        assert!(
+            (input.target_voice_volume - 0.4).abs() < 1e-6,
+            "an input-only voice's target_voice_volume must update, got {}",
+            input.target_voice_volume
+        );
+        // The ramp is gradual, so the current value has not jumped to the target.
+        assert!((input.voice_volume - 1.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn voice_volume_still_updates_a_sample_backed_voice() {
+        // The input-only path must not regress the normal sample case: a VoiceVolume
+        // on a voice with a playing sample still ramps that sample.
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+
+        fixture
+            .run(AudioCommand::VoiceVolume {
+                voice: "music".to_string(),
+                volume: 0.25,
+            })
+            .await;
+        fixture.drain();
+
+        assert!((fixture.mixer.active_samples[0].target_voice_volume - 0.25).abs() < 1e-6);
+    }
+
+    /// Build a mono live input on `voice` at `volume` with an empty ring and push
+    /// it onto the fixture's mixer, registering a matching control-side
+    /// `InputStatus` so input-targeting commands (which resolve input voice ids on
+    /// the control side, D22a) can see it. The ring content is irrelevant to the
+    /// control-plane tests.
+    fn push_live_input(fixture: &mut Fixture, voice: &str, volume: f32) {
+        use ringbuf::HeapRb;
+        let consumer = HeapRb::<f32>::new(16).split().1;
+        let index = fixture.mixer.live_inputs.len();
+        fixture.mixer.live_inputs.push(audio::mixer::LiveInput::new(
+            voice.to_string(),
+            consumer,
+            1,
+            volume,
+            vec![(0, 0)],
+        ));
+        fixture.inputs.push(http::InputStatus {
+            index,
+            voice_id: voice.to_string(),
+            volume,
+            channels: 1,
+        });
+    }
+
+    #[test]
+    fn out_of_range_input_route_produces_a_warning() {
+        // F5: once the device channel count is known, a route whose SOURCE channel is
+        // >= that count is a misconfiguration (the mixer silently drops it). It must
+        // produce a warning naming the offending channel(s) and the device count.
+        // A 2-channel device with a route reading source channel 3 is out of range.
+        let warning = out_of_range_input_routes(1, &[(0, 0), (3, 1)], 2)
+            .expect("an out-of-range source channel must warn");
+        assert!(
+            warning.contains('3') && warning.contains('2'),
+            "warning must name the out-of-range source channel and the device count: {warning}"
+        );
+    }
+
+    #[test]
+    fn in_range_input_routes_do_not_warn() {
+        // Every source channel within the device count: no warning (pristine output).
+        assert!(
+            out_of_range_input_routes(0, &[(0, 0), (1, 1)], 2).is_none(),
+            "in-range routes must not warn"
+        );
+        // Boundary: channel index == count is out of range (0-based); count-1 is the
+        // last valid index.
+        assert!(out_of_range_input_routes(0, &[(1, 0)], 2).is_none());
+        assert!(out_of_range_input_routes(0, &[(2, 0)], 2).is_some());
+    }
+
+    #[tokio::test]
+    async fn input_mute_unmute_restores_the_calibrated_volume() {
+        // D34: a calibrated input volume must survive a mute/unmute round-trip —
+        // unmute restores the prior level (0.7), not a hardcoded 1.0.
+        let mut fixture = Fixture::new(vec![]);
+        push_live_input(&mut fixture, "mic", 1.0);
+
+        // Calibrate the input to 0.7 via InputVolume.
+        fixture
+            .run(AudioCommand::InputVolume {
+                input: "mic".to_string(),
+                volume: 0.7,
+            })
+            .await;
+        fixture.drain();
+        assert!((fixture.mixer.live_inputs[0].volume - 0.7).abs() < 1e-6);
+
+        // Mute: the input drops to silence.
+        fixture
+            .run(AudioCommand::InputMute {
+                input: "mic".to_string(),
+                mute: true,
+            })
+            .await;
+        fixture.drain();
+        assert_eq!(fixture.mixer.live_inputs[0].volume, 0.0);
+
+        // Unmute: the calibrated 0.7 is restored, NOT 1.0.
+        fixture
+            .run(AudioCommand::InputMute {
+                input: "mic".to_string(),
+                mute: false,
+            })
+            .await;
+        fixture.drain();
+        assert!(
+            (fixture.mixer.live_inputs[0].volume - 0.7).abs() < 1e-6,
+            "unmute must restore the calibrated 0.7, got {}",
+            fixture.mixer.live_inputs[0].volume
+        );
+    }
+
+    #[tokio::test]
     async fn playing_a_ducking_primary_ducks_the_background_voice() {
         let rule = DuckingRule {
             primary_voice: "narration".to_string(),
@@ -1987,6 +2177,7 @@ mod tests {
             rt_engine::AudioCommand::FadeOutMatching { .. } => "FadeOutMatching",
             rt_engine::AudioCommand::SetVoiceVolume { .. } => "SetVoiceVolume",
             rt_engine::AudioCommand::SetInputVolume { .. } => "SetInputVolume",
+            rt_engine::AudioCommand::SetInputMute { .. } => "SetInputMute",
             rt_engine::AudioCommand::SeekMatching { .. } => "SeekMatching",
             rt_engine::AudioCommand::SetSpeedMatching { .. } => "SetSpeedMatching",
             rt_engine::AudioCommand::SetVolumeMatching { .. } => "SetVolumeMatching",

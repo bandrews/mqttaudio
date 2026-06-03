@@ -55,19 +55,64 @@ hanging silently.
 
 ---
 
-## W-2 — Two-device live input soak (clock drift)  _(added by Sprint 8)_
+## W-2 — Two-device live input soak (clock drift) + non-f32 input  _(added by Sprint 8)_
 
-**Why manual:** requires two independent audio clocks (e.g. a USB mic + a different output interface); the
-drift behavior cannot be reproduced with Lane A's synthetic SRC test.
+**Why manual:** the drift correction only has anything to correct when the capture device and the output
+device run on **two independent clocks** (e.g. a USB mic plus a *different* output interface). Lane A's
+synthetic SRC test drives a single simulated clock pair in-process; it proves the steering law is bounded but
+cannot reproduce two real oscillators drifting over tens of minutes. The non-f32 capture path (typed → f32
+convert) likewise needs a real device that presents I16/I32, which Windows USB mics commonly do and Lane B's
+single CoreAudio device may not.
+
+**Setup — two genuinely separate devices.** Use a USB microphone for the input and a *different* interface
+for output (built-in speakers, HDMI, a second USB DAC — anything that is not the same hardware clock as the
+mic). Confirm device names with `target\release\mqttaudio.exe --list-inputs` and `--list-devices`. Write a
+config (`soak.json`) with **debug logging on** so the ring-overflow diagnostic is visible:
+
+```json
+{
+  "mqtt": { "server": "localhost", "topic": "audio/commands" },
+  "audio": { "device": "<output interface>", "channels": 2 },
+  "logging": { "level": "debug" },
+  "inputs": [
+    {
+      "device": "<USB microphone>",
+      "volume": 0.7,
+      "voice_id": "mic",
+      "routes": [
+        { "source_channel": 0, "dest_channel": 0 },
+        { "source_channel": 0, "dest_channel": 1 }
+      ],
+      "latency_ms": 25
+    }
+  ]
+}
+```
 
 **Steps:**
-1. Configure a live input on a separate device from the output (see `docs/features/microphone-input.md`).
-2. Run for ≥30 minutes routing the mic into the mix at a steady level.
+1. Start: `target\release\mqttaudio.exe --config soak.json`. Confirm the startup log shows the input opening,
+   e.g. `Opening input device: <USB microphone> (44100 Hz, 1 channels, I16, 25ms buffer)`. The reported
+   **sample format** records what the device presented — if it is `I16` or `I32` (not `F32`), this run also
+   covers the non-f32 capture path; if your USB mic reports `F32`, repeat once against any I16/I32 input
+   device (most cheap USB mics and interface line-ins are I16/I24→I32) so a non-f32 open is exercised at least
+   once.
+2. Speak into / play steady audio through the mic and confirm it is audible in the output, panned to both
+   channels (the route above) — this is the "opens **and routes**" half of the check.
+3. Leave it running, mic into the mix at a steady level, for **≥30 minutes**. Keep the console visible.
 
-**Expected:** no periodic clicks/dropouts over the session; ring-buffer fill stays bounded (no monotonic
-drift to under/overrun). Also confirm a non-f32-native input device opens and routes audio.
+**Expected:**
+- **No periodic dropouts.** No recurring clicks/gaps every few seconds-to-minutes over the whole session. (A
+  drifting ring with no steering would produce a regular tick as it periodically over/underruns; the steered
+  converter must prevent that.)
+- **Ring fill stays bounded.** The debug log must **not** accumulate `Resampler output overflow: N samples
+  dropped` lines — that message fires only if the ring is being driven to overflow (steering failed to hold
+  it). A bounded ring logs it zero times (or, at most, a one-off near startup before the fill EMA settles,
+  never a steady stream). There is no live ring-fill gauge in `/status`; absence of this line plus no audible
+  dropouts is the bounded-fill evidence.
+- **Non-f32 input.** The I16/I32 device from step 1 opened without a `Stream error` / `Unsupported input
+  sample format` and its audio routed cleanly (no zero-output, no garbled/clipped conversion).
 
-**Result:** _(record PASS/FAIL + notes + date)_
+**Result:** _(record PASS/FAIL + notes + date — note the device names and the logged input sample format)_
 
 ---
 

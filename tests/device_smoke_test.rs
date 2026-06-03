@@ -60,3 +60,40 @@ fn default_output_device_opens_and_runs() {
     std::thread::sleep(std::time::Duration::from_millis(100));
     drop(stream);
 }
+
+/// Open the real default INPUT device and run the capture path briefly. Exercises
+/// the device-open + typed-format dispatch + async-SRC capture callback on a real
+/// platform (Sprint 8). The open + channel count is the hard assertion; the
+/// captured sample count is informational only, because a host may deny microphone
+/// access or be silent, which would legitimately yield zero captured frames.
+#[test]
+#[ignore] // Lane B only (real device): `cargo test -- --ignored` with MQTTAUDIO_DEVICE_TESTS=1
+fn default_input_device_opens_and_captures() {
+    if std::env::var("MQTTAUDIO_DEVICE_TESTS").is_err() {
+        eprintln!("skipping: set MQTTAUDIO_DEVICE_TESTS=1 to run real-device smoke tests");
+        return;
+    }
+
+    use mqttaudio::audio::input::{create_input_stream, InputStreamConfig};
+
+    let mut active = match create_input_stream(InputStreamConfig::default(), 48000) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("skipping: no usable default input device ({e:?})");
+            return;
+        }
+    };
+    assert!(
+        active.channels >= 1,
+        "a default input device should expose at least one channel"
+    );
+    let consumer = active
+        .take_consumer()
+        .expect("the input stream should hand over its ring consumer");
+
+    // Let the real capture callback run and push through the async SRC into the ring.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let captured = consumer.len();
+    eprintln!("input smoke: captured {captured} samples in 300ms (informational)");
+    drop(active);
+}

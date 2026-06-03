@@ -5,6 +5,24 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 
 ## Deferred to a later sprint
 
+- **Deployment `Dockerfile` pins `rust:1.83` but the code uses `usize::is_multiple_of` (stable 1.87) (Sprint 8 — discovered, MEDIUM).**
+  `src/audio/streaming.rs` (pre-existing) and now `src/audio/input.rs` (Sprint 8 F6 de-interleave guard) call
+  `usize::is_multiple_of`, which clippy `-D warnings` actively *requires* (lint `manual_is_multiple_of`) on the
+  validate image (`docker/validate.Dockerfile`, `rust:1.95`). The separate **deployment** image
+  (`/Dockerfile`, `rust:1.83`) predates that API and would fail to compile. The validate gate (1.95) is the one
+  that enforces the lint, so Lane A is self-consistent; the deployment Dockerfile is the stale one. Bump
+  `/Dockerfile` to a Rust ≥ 1.87 builder (or add an MSRV pin + `#[allow(clippy::manual_is_multiple_of)]` and use
+  `% n == 0`). Out of scope for the input-RT work (touching the deployment image is Sprint 9 packaging).
+
+- **Drift control uses a pure-proportional loop, so the ring settles near — not exactly at — half-full (Sprint 8 — LOW, by design).**
+  `steer_ratio` (`src/audio/input.rs`) is a P controller on the smoothed ring fill. Holding a steady clock
+  mismatch requires a steady non-zero ratio deviation, which a P loop produces only with a steady non-zero fill
+  error: the ring therefore parks at an offset from half (e.g. ~±20% of half at a 1% mismatch, less for realistic
+  ppm-scale drift) rather than dead-centre. This satisfies D33's goal (bounded fill, never 0/capacity) and keeps
+  the loop simple and provably stable. If a future need wants the fill pinned to half-full (e.g. to maximize
+  symmetric headroom), add a small integral term (PI) with anti-windup — note it here rather than building it now
+  (YAGNI). Covered by `tests/input_resample_test.rs::steering_converges_to_true_clock_ratio`.
+
 - **No final low-pass on the summed LFE bus (Sprint 7 — LOW, YAGNI per D32).** Bass management low-passes each
   source channel before summing into the LFE, but the LFE *output bus* itself is not low-passed after
   summation. Per D32 a final-LFE low-pass is deliberately **not** added now (YAGNI): each contribution is
@@ -169,6 +187,38 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   running). The ring-buffer level gate that makes ducking follow actual speech/level is Sprint 8 (D36); it
   will drive the *same* notify path, so only the activation trigger changes. The Sprint 6 tests drive the
   notify directly, as the sprint specifies.
+
+- **Sprint 8 control-plane fixes (F3/F5/F7/F8) land on the lock-free command path, not the pre-Sprint-5
+  in-handler mutation the sprint file references.** The Sprint 8 file's `main.rs:1011`/`:1024` line refs for
+  the mute restore (D34) and `main.rs:881`/`:899` for `voice_volume` (D35) predate the Sprint-5 engine, which
+  moved all `MixerState` mutation onto the audio thread behind the command ring (D22a). So:
+  - **F8 (D34) mute restore** lives on the audio side: `LiveInput` gained `muted`/`pre_mute_volume` and
+    `set_muted`/`set_volume` (`src/audio/mixer.rs`); a new `AudioCommand::SetInputMute { input, mute }` is
+    applied by `rt_engine::apply_input_mute`. The control handler (`main.rs` `InputMute`) no longer sends a
+    hardcoded volume — it sends the mute bool. Setting an explicit `input_volume` clears the muted state
+    (`set_volume`) so a later unmute does not revert it.
+  - **F7 (D35) `voice_volume` on input-only voices**: `rt_engine`'s `SetVoiceVolume` already iterated
+    `live_inputs`, but the control handler gated the *send* behind a `VoiceManager` hit, so an input-only
+    voice never reached the audio thread. The control plane cannot read `live_inputs` (D22a), so the handler
+    now also treats a match against the configured input voice ids it owns (`ctx.inputs`) as success and
+    sends the command.
+  - **F3 graceful underrun** is in `mix_live_input_into_output` (`src/audio/mixer.rs`): on a ring shortfall it
+    holds the last frame and fades it to silence over `UNDERRUN_FADE_FRAMES` (64) instead of `break`ing, and
+    keeps calling `advance_voice_volume()` for the silent frames so the ramp stays time-accurate. It uses only
+    fixed stack arrays (RT-safe; `tests/alloc_harness.rs::live_input_underrun_mix_is_allocation_free_after_warmup`).
+  - **F5 route-channel warning** is a pure helper `out_of_range_input_routes` in `main.rs`, called at input
+    setup once `active_input.channels` is known, returning the warning string the caller logs (so the unit
+    test asserts content without a log-capture dependency, keeping test output pristine).
+
+- **Sprint 8 D33 always-on async SRC adds input latency even at equal rates (by design, latency note).**
+  Routing every input through `SincFixedIn` (`src/audio/input.rs`, `sinc_len: 256`, `RESAMPLE_CHUNK_SIZE:
+  1024`) for drift control means the equal-rate (e.g. 48000→48000) path now carries the resampler's
+  fixed group delay plus the 1024-input-frame chunk accumulation before each emit — latency the removed raw
+  passthrough did not have (~tens of ms at 48 kHz, on top of the configured `latency_ms` ring). This is the
+  accepted cost of D33 (bounded ring vs. a passthrough that drifts to a click); it is not a bug. If a
+  latency-critical input ever needs it trimmed, a smaller resampler chunk trades the buffering latency for
+  more frequent `process_into_buffer` calls (still alloc-free) — note it here rather than tuning it now
+  (YAGNI; no decision requires a specific input latency budget).
 
 - **Sprint 6 speed interpolation is cubic; speeds > 1 still alias (F8/D27 — documented, no resampler).** The
   non-pitch speed path now uses 4-point Catmull-Rom cubic interpolation (`cubic_taps`/`cubic_interpolate` in

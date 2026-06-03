@@ -87,6 +87,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (previously input voices were inert as ducking primaries and ducked nothing). Signal-gated activation
   (ducking only while the input is actually loud) is a later change; for now the input counts as active for
   the lifetime of its stream.
+- **`input_mute` now restores the prior volume on unmute instead of forcing `1.0`.** Unmuting an input
+  returns it to the level it had when muted (e.g. a calibrated `0.7`), rather than jumping to full scale.
+  Anyone relying on unmute bumping a calibrated input up to unity will see a difference. (Setting an explicit
+  `input_volume` clears the muted state, so a later unmute does not revert that change.)
+- **`voice_volume` now affects input-only voices.** A `voice_volume` command targeting a voice that has only
+  a live input (no sample playing on that voice) now ramps the input's level. Previously it was a silent
+  no-op unless a sample happened to share the voice id; scripts that sent `voice_volume` to a mic voice
+  expecting nothing will now change the input level.
+- **Live inputs fade to silence on underrun instead of cutting hard.** When an input's ring buffer briefly
+  starves (e.g. clock drift between two devices), the mixer now holds the last frame and fades it to silence
+  over a few samples rather than dropping straight to zero, removing the click an abrupt cut produced. The
+  input's `voice_volume` ramp also keeps advancing through the starved frames, so it stays time-accurate.
+- **Live inputs always run through async sample-rate conversion (drift control), even at equal nominal rates.**
+  A capture device and the output device are clocked by independent oscillators, so even a "48000 → 48000"
+  input slowly drifts against the output and would eventually overflow or starve its ring buffer (a periodic
+  click or dropout on a long-running daemon). Every input now feeds an async resampler whose ratio is gently
+  steered from the measured ring-buffer fill toward half-full, so the ring stays bounded indefinitely. The
+  equal-rate raw passthrough path is gone. This is inaudible in steady state (the steering authority is a
+  fraction of a percent); if any pitch wobble is ever observed on an input, the steering gain is too high.
+- **Out-of-range input routes now log a warning (previously silent).** Once an input device opens and its
+  channel count is known, any route whose source channel is `>=` that count is logged as a warning (the mixer
+  silently drops such routes). No audio change — only a new diagnostic so the misconfiguration is visible.
 - **`/status/samples` no longer reports live per-sample playback position.** HTTP status is now served
   from a control-side snapshot (the audio thread owns playback state lock-free, so the control plane never
   reads it). The endpoint still reports each sample's static metadata — `id`, `voice`, `file`,

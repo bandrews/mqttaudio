@@ -51,6 +51,9 @@ pub enum AudioCommand {
     SetVoiceVolume { voice: String, volume: f32 },
     /// Set a live input's volume, selected by numeric index or by voice id.
     SetInputVolume { input: String, volume: f32 },
+    /// Mute or unmute a live input, selected by numeric index or by voice id.
+    /// Unmuting restores the volume the input had when it was muted (D34).
+    SetInputMute { input: String, mute: bool },
     /// Seek the samples matching `selector` to `position_ms`.
     SeekMatching {
         selector: SampleSelector,
@@ -169,6 +172,9 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
         }
         AudioCommand::SetInputVolume { input, volume } => {
             apply_input_volume(state, input, *volume);
+        }
+        AudioCommand::SetInputMute { input, mute } => {
+            apply_input_mute(state, input, *mute);
         }
         AudioCommand::SeekMatching {
             selector,
@@ -311,22 +317,31 @@ fn sample_matches(selector: &SampleSelector, sample: &ActiveSample) -> bool {
     )
 }
 
-/// Set a live input's volume, selecting by numeric index first, then by voice id.
-/// Mirrors the existing InputVolume/InputMute handler resolution.
-fn apply_input_volume(state: &mut MixerState, input: &str, volume: f32) {
-    let clamped = volume.clamp(0.0, 1.0);
+/// Resolve a live input by numeric index first, then by voice id, and apply `f` to
+/// the first match. Shared by the input volume and mute handlers so both select an
+/// input the same way.
+fn with_live_input(state: &mut MixerState, input: &str, f: impl FnOnce(&mut LiveInput)) {
     if let Ok(idx) = input.parse::<usize>() {
         if let Some(live) = state.live_inputs.get_mut(idx) {
-            live.volume = clamped;
+            f(live);
             return;
         }
     }
-    for live in state.live_inputs.iter_mut() {
-        if live.voice_id == input {
-            live.volume = clamped;
-            return;
-        }
+    if let Some(live) = state.live_inputs.iter_mut().find(|l| l.voice_id == input) {
+        f(live);
     }
+}
+
+/// Set a live input's volume, selecting by numeric index first, then by voice id.
+/// An explicit volume clears any muted state (D34).
+fn apply_input_volume(state: &mut MixerState, input: &str, volume: f32) {
+    with_live_input(state, input, |live| live.set_volume(volume));
+}
+
+/// Mute or unmute a live input, selecting by numeric index first, then by voice id.
+/// Unmuting restores the input's pre-mute volume rather than 1.0 (D34).
+fn apply_input_mute(state: &mut MixerState, input: &str, mute: bool) {
+    with_live_input(state, input, |live| live.set_muted(mute));
 }
 
 #[cfg(test)]
@@ -461,6 +476,88 @@ mod tests {
         );
         assert_eq!(state.active_samples[0].target_voice_volume, 0.25);
         assert_eq!(state.active_samples[1].target_voice_volume, 1.0);
+    }
+
+    fn live_input(voice: &str, volume: f32) -> LiveInput {
+        use ringbuf::HeapRb;
+        let consumer = HeapRb::<f32>::new(16).split().1;
+        LiveInput::new(voice.to_string(), consumer, 1, volume, vec![(0, 0)])
+    }
+
+    #[test]
+    fn input_mute_then_unmute_restores_the_pre_mute_volume() {
+        // D34: muting stores the current (calibrated) volume and zeroes it; unmuting
+        // restores the stored value, NOT a hardcoded 1.0.
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input("mic", 0.7));
+
+        // Mute by voice id: volume drops to 0.0 but the pre-mute 0.7 is remembered.
+        apply_command(
+            &mut state,
+            AudioCommand::SetInputMute {
+                input: "mic".to_string(),
+                mute: true,
+            },
+            48000,
+        );
+        assert_eq!(state.live_inputs[0].volume, 0.0);
+
+        // Unmute restores the stored 0.7, not 1.0.
+        apply_command(
+            &mut state,
+            AudioCommand::SetInputMute {
+                input: "mic".to_string(),
+                mute: false,
+            },
+            48000,
+        );
+        assert_eq!(
+            state.live_inputs[0].volume, 0.7,
+            "unmute must restore the pre-mute volume (0.7), not 1.0"
+        );
+    }
+
+    #[test]
+    fn explicit_input_volume_while_muted_takes_effect_and_unmute_is_a_noop() {
+        // Setting an explicit volume is the operator overriding the level; it clears
+        // the muted state so a later unmute does not revert their change.
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input("mic", 0.7));
+
+        apply_command(
+            &mut state,
+            AudioCommand::SetInputMute {
+                input: "mic".to_string(),
+                mute: true,
+            },
+            48000,
+        );
+        assert_eq!(state.live_inputs[0].volume, 0.0);
+
+        // Explicit volume while muted: it applies immediately.
+        apply_command(
+            &mut state,
+            AudioCommand::SetInputVolume {
+                input: "0".to_string(),
+                volume: 0.4,
+            },
+            48000,
+        );
+        assert_eq!(state.live_inputs[0].volume, 0.4);
+
+        // A later unmute is a no-op: the explicit set already cleared the mute.
+        apply_command(
+            &mut state,
+            AudioCommand::SetInputMute {
+                input: "mic".to_string(),
+                mute: false,
+            },
+            48000,
+        );
+        assert_eq!(
+            state.live_inputs[0].volume, 0.4,
+            "unmute after an explicit volume must not revert to the old pre-mute value"
+        );
     }
 
     #[test]

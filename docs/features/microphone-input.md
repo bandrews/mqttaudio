@@ -94,6 +94,12 @@ Route a microphone to all player earpiece channels:
 ]
 ```
 
+A `source_channel` must exist on the device (channels are 0-based, so a 2-channel device has channels `0` and `1`). The device's channel count is only known once the input stream opens, so a route reading a non-existent source channel is logged as a warning at startup and that route is dropped:
+
+```
+WARN Input 0 routes read source channel(s) [2] but the device has only 2 channel(s) (0..1); those routes will be silently dropped — fix the input's routes config
+```
+
 ## MQTT Commands
 
 ### Adjust Input Volume
@@ -106,7 +112,7 @@ Route a microphone to all player earpiece channels:
 }
 ```
 
-The `input` field can be the `voice_id` or the input index (0, 1, 2...).
+The `input` field can be the `voice_id` or the input index (0, 1, 2...). Setting an explicit volume also takes the input out of any muted state.
 
 ### Mute/Unmute
 
@@ -117,6 +123,22 @@ The `input` field can be the `voice_id` or the input index (0, 1, 2...).
   "mute": true
 }
 ```
+
+Muting stores the input's current volume and silences it; unmuting **restores that stored volume** (for example, a calibrated `0.5`), not a fixed `1.0`. So a mute/unmute round-trip leaves the calibrated level intact.
+
+### Voice Volume
+
+An input's `voice_id` is a first-class voice: a `voice_volume` command targeting it ramps the input's level, even when no sample is playing on that voice.
+
+```json
+{
+  "command": "voice_volume",
+  "voice": "presenter_mic",
+  "volume": 0.4
+}
+```
+
+This is separate from `input_volume` (a per-input gain): `voice_volume` is the shared voice-level gain that also scales any samples playing on the same voice.
 
 ## Ducking Integration
 
@@ -201,15 +223,30 @@ The `latency_ms` setting controls the input buffer size:
 
 For live microphones, use the lowest stable setting (typically 20-30ms).
 
-## Sample Rate Handling
+## Sample Rate and Clock-Drift Handling
 
-If the input device sample rate differs from the output, mqttaudio automatically resamples. You'll see a warning in the logs:
+An input device and the output device are clocked by independent oscillators. Even when their nominal sample
+rates match (e.g. both `48000 Hz`), those clocks tick at very slightly different real-world rates, so over a
+long session the input's ring buffer slowly fills or drains until it overflows (a click) or starves (a
+dropout). To stay glitch-free over the long-running sessions this daemon is built for, **every input runs
+through an asynchronous sample-rate converter**, not just inputs whose rate differs from the output.
+
+The converter's resampling ratio is gently steered from the measured ring-buffer fill toward half-full: if
+the ring is trending full the input is producing slightly faster than the output consumes, so the converter
+emits marginally fewer frames, and vice versa. The correction authority is a small fraction of a percent —
+far more than enough to track real oscillator drift (tens of parts per million) yet small enough to be
+inaudible as pitch. The result is a ring-buffer fill that stays bounded indefinitely instead of drifting to a
+boundary.
+
+If the input device's nominal rate differs from the output you'll also see a warning that the rate conversion
+adds latency:
 
 ```
 WARN Input device 'USB Microphone' sample rate (44100 Hz) differs from output (48000 Hz) - resampling will add latency
 ```
 
-For lowest latency, use an input device that matches your output sample rate.
+For lowest latency, use an input device whose nominal rate matches your output rate; the drift-control
+conversion still runs, but with no nominal rate change it only has to correct the small clock difference.
 
 ## Troubleshooting
 
@@ -227,3 +264,7 @@ For lowest latency, use an input device that matches your output sample rate.
 - Increase `latency_ms`
 - Check CPU usage
 - Reduce number of simultaneous sources
+
+Periodic dropouts caused by clock drift between two independent devices are handled by the always-on
+drift-control converter (see *Sample Rate and Clock-Drift Handling*), so recurring glitches every few minutes
+on a two-device setup should not occur. Glitches that remain are typically CPU- or latency-related.

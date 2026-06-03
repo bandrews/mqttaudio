@@ -656,6 +656,14 @@ pub struct LiveInput {
     /// Per-input volume (0.0 - 1.0)
     pub volume: f32,
 
+    /// Whether this input is currently muted. When muted, `volume` is held at 0.0
+    /// and the operator's pre-mute level is kept in `pre_mute_volume` (D34).
+    muted: bool,
+
+    /// The volume to restore on unmute — the level the input had when it was muted,
+    /// so unmute returns to the calibrated value rather than a hardcoded 1.0 (D34).
+    pre_mute_volume: f32,
+
     /// Voice-level volume (0.0 - 1.0) - current smoothed value
     pub voice_volume: f32,
 
@@ -680,6 +688,8 @@ impl LiveInput {
             consumer,
             input_channels,
             volume,
+            muted: false,
+            pre_mute_volume: volume,
             voice_volume: 1.0,
             target_voice_volume: 1.0,
             channel_map,
@@ -690,6 +700,31 @@ impl LiveInput {
     #[allow(dead_code)]
     pub fn combined_volume(&self) -> f32 {
         self.volume * self.voice_volume
+    }
+
+    /// Set this input's volume directly. An explicit level clears any muted state,
+    /// so the value takes effect immediately and a later unmute does not revert it
+    /// (D34). The value is clamped to a valid gain.
+    pub fn set_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+        self.muted = false;
+    }
+
+    /// Mute or unmute this input. Muting stores the current volume and zeroes it;
+    /// unmuting restores the stored pre-mute volume rather than a hardcoded 1.0
+    /// (D34). Guarded by `muted` so a repeated mute does not overwrite the stored
+    /// level with 0.0, and a repeated unmute is a no-op.
+    pub fn set_muted(&mut self, mute: bool) {
+        if mute {
+            if !self.muted {
+                self.pre_mute_volume = self.volume;
+                self.volume = 0.0;
+                self.muted = true;
+            }
+        } else if self.muted {
+            self.volume = self.pre_mute_volume;
+            self.muted = false;
+        }
     }
 
     /// Set target voice volume for smooth ramping
@@ -1339,7 +1374,19 @@ fn apply_pitch_block(
     }
 }
 
-/// Mix a live input (microphone) into the output buffer
+/// Number of frames over which a live input fades to silence when its ring buffer
+/// underruns, instead of cutting hard to zero. Short (~1.3 ms at 48 kHz) so the
+/// gap is barely audible, but long enough that the step per frame stays well below
+/// a click (F3). The held frame is the last one read this block, faded out.
+const UNDERRUN_FADE_FRAMES: usize = 64;
+
+/// Mix a live input (microphone) into the output buffer.
+///
+/// On a ring-buffer underrun the input does not cut to hard silence (an audible
+/// click): it holds the last frame read this block and fades it to silence over
+/// `UNDERRUN_FADE_FRAMES`, then stays silent (F3). The voice-volume ramp is
+/// advanced for every frame of the block, underrun frames included, so the ramp
+/// stays time-accurate rather than stalling at the underrun.
 fn mix_live_input_into_output(
     input: &mut LiveInput,
     output: &mut [f32],
@@ -1350,34 +1397,46 @@ fn mix_live_input_into_output(
     let input_channels = input.input_channels;
     let base_volume = input.volume;
 
-    // Read available samples from the ring buffer
-    // Process frame by frame to handle underruns gracefully
+    // The last frame successfully read from the ring this block, held and faded out
+    // when the ring underruns so the transition to silence has no hard step.
+    // Supports up to 16 input channels.
+    let mut last_frame = [0.0f32; 16];
+    // Frames elapsed since the underrun began this block; drives the fade-out gain.
+    let mut underrun_frames = 0usize;
+
+    // Read available samples from the ring buffer.
+    // Process frame by frame to handle underruns gracefully.
     for frame_idx in 0..frames {
-        // Advance voice volume toward target (smooth ramping to avoid pops)
+        // Advance voice volume toward target (smooth ramping to avoid pops). Done
+        // every frame — including underrun frames — so the ramp stays time-accurate.
         input.advance_voice_volume();
 
-        // Read one frame worth of samples
+        // Read one frame worth of samples, or — on underrun — hold the last frame
+        // and fade it toward silence so there is no hard cut.
         let samples_needed = input_channels;
-        let samples_available = input.consumer.len();
-
-        if samples_available < samples_needed {
-            // Underrun - not enough samples for a complete frame
-            // Leave remaining output as silence (already zeroed)
-            break;
-        }
-
-        // Read the entire frame from the ring buffer
-        let mut frame_samples = [0.0f32; 16]; // Support up to 16 input channels
-        for slot in frame_samples.iter_mut().take(input_channels.min(16)) {
-            if let Some(sample) = input.consumer.pop() {
-                *slot = sample;
+        let underrun = input.consumer.len() < samples_needed;
+        let fade_gain = if underrun {
+            // Linear fade from the held frame to silence over UNDERRUN_FADE_FRAMES,
+            // then flat silence. Before any frame was read this block last_frame is
+            // zero, so this is silence with no step either way.
+            let g = 1.0 - (underrun_frames as f32 / UNDERRUN_FADE_FRAMES as f32);
+            underrun_frames += 1;
+            g.max(0.0)
+        } else {
+            // Read the entire frame from the ring buffer and remember it as the
+            // frame to hold should the next frame underrun.
+            for slot in last_frame.iter_mut().take(input_channels.min(16)) {
+                if let Some(sample) = input.consumer.pop() {
+                    *slot = sample;
+                }
             }
-        }
+            1.0
+        };
 
         // Calculate volume per-frame to handle smooth ramping (incl. the per-frame
-        // duck gain, D2).
+        // duck gain, D2, and the underrun fade-out gain).
         let ducking_multiplier = duck_frame_gain(duck, frame_idx, frames);
-        let final_volume = base_volume * input.voice_volume * ducking_multiplier;
+        let final_volume = base_volume * input.voice_volume * ducking_multiplier * fade_gain;
 
         // Apply channel mapping
         for &(src_ch, dest_ch) in &input.channel_map {
@@ -1386,7 +1445,7 @@ fn mix_live_input_into_output(
             }
 
             let dest_idx = frame_idx * output_channels + dest_ch;
-            output[dest_idx] += frame_samples[src_ch] * final_volume;
+            output[dest_idx] += last_frame[src_ch] * final_volume;
         }
     }
 }
@@ -2540,15 +2599,120 @@ mod tests {
         let mut output = vec![0.0f32; 20]; // 10 frames requested
         mix_audio(&mut output, &mut state);
 
-        // First 5 frames should have audio
+        // First 5 frames are the real samples at full level.
         for &s in &output[..10] {
             assert_eq!(s, 0.8);
         }
 
-        // Remaining 5 frames should be silence (underrun)
-        for &s in &output[10..] {
-            assert_eq!(s, 0.0);
+        // On underrun the input holds the last frame and fades it toward silence
+        // over UNDERRUN_FADE_FRAMES rather than cutting hard to zero (F3). The
+        // remaining 5 frames are therefore a gentle decay of the held 0.8, each a
+        // small step below the previous one — never a hard 0.8 -> 0.0 cut.
+        let mut prev = 0.8f32;
+        for frame in 5..10 {
+            let expected = 0.8 * (1.0 - (frame - 5) as f32 / UNDERRUN_FADE_FRAMES as f32);
+            for ch in 0..2 {
+                let s = output[frame * 2 + ch];
+                assert!(
+                    (s - expected).abs() < 1e-6,
+                    "underrun frame {frame} ch {ch}: expected faded {expected}, got {s}"
+                );
+                assert!(
+                    s <= prev + 1e-6 && (prev - s) < 0.05,
+                    "underrun must decay smoothly, not cut: {prev} -> {s}"
+                );
+            }
+            prev = expected;
         }
+    }
+
+    #[test]
+    fn underrun_fades_to_silence_without_click_and_keeps_ramp_time_accurate() {
+        // F3: when the ring underruns partway through a block, the input must fade
+        // to silence (no hard cut from the last sample to zero) AND keep advancing
+        // its voice-volume ramp for the silent frames, so the ramp stays
+        // time-accurate (it must not stall at the underrun like the old `break` did).
+        const FRAMES: usize = 256;
+        const REAL_FRAMES: usize = 64; // ring underruns after this many frames
+        const CHANNELS: usize = 2;
+
+        // A constant-amplitude input, so the ONLY discontinuity in the rendered
+        // output is at the underrun boundary (no waveform shape to confound the
+        // click probe).
+        let data = vec![0.8f32; REAL_FRAMES * CHANNELS];
+        let consumer = create_test_ring_buffer_with_data(&data);
+        let mut live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            CHANNELS,
+            1.0,
+            vec![(0, 0), (1, 1)],
+        );
+        // A voice-volume ramp in progress across the whole block.
+        live_input.voice_volume = 0.0;
+        live_input.target_voice_volume = 1.0;
+
+        let mut state = MixerState::new(CHANNELS);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; FRAMES * CHANNELS];
+        mix_audio(&mut output, &mut state);
+
+        // Largest absolute step between consecutive samples of channel 0 — a simple
+        // click probe (computed inline; the shared render-harness helper is only in
+        // the library crate's module tree, not the binary's).
+        let max_inter_sample_delta = |buf: &[f32]| {
+            let mut prev: Option<f32> = None;
+            let mut m = 0.0f32;
+            for &v in buf.iter().step_by(CHANNELS) {
+                if let Some(p) = prev {
+                    m = m.max((v - p).abs());
+                }
+                prev = Some(v);
+            }
+            m
+        };
+
+        // (a) No hard discontinuity anywhere, including at the underrun boundary.
+        // The old hard `break` cut from ~0.8 straight to 0.0 (a ~0.8 step); a fade
+        // keeps every step well under a click threshold.
+        let delta = max_inter_sample_delta(&output);
+        assert!(
+            delta < 0.05,
+            "underrun produced an audible discontinuity: max_inter_sample_delta={delta}"
+        );
+
+        // The tail must actually reach silence (the held frame decays to zero, it
+        // does not hold the last sample forever).
+        for &s in &output[(FRAMES - 2) * CHANNELS..] {
+            assert!(s.abs() < 1e-6, "underrun tail did not reach silence: {s}");
+        }
+
+        // (b) The voice-volume ramp advanced for EVERY frame of the block, silent
+        // frames included — matching a full-block ramp, not one that stalled at the
+        // underrun. Compute the full-block expectation with an independent ramp.
+        let mut reference = LiveInput::new(
+            "ref".to_string(),
+            {
+                use ringbuf::HeapRb;
+                HeapRb::<f32>::new(1).split().1
+            },
+            1,
+            1.0,
+            vec![],
+        );
+        reference.voice_volume = 0.0;
+        reference.target_voice_volume = 1.0;
+        for _ in 0..FRAMES {
+            reference.advance_voice_volume();
+        }
+        let actual = state.live_inputs[0].voice_volume;
+        assert!(
+            (actual - reference.voice_volume).abs() < 1e-6,
+            "ramp desynced from real time across the underrun: got {actual}, \
+             full-block expected {}",
+            reference.voice_volume
+        );
     }
 
     #[test]
