@@ -82,7 +82,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 | 4 | Streaming & cache correctness | Done | 0 | [sprint-04](sprint-04-streaming-and-cache-correctness.md) |
 | 5 | Lock-free real-time engine | Done | 0 | [sprint-05](sprint-05-lockfree-realtime-engine.md) |
 | 6 | Mixer DSP correctness | Done | 5 | [sprint-06](sprint-06-mixer-dsp-correctness.md) |
-| 7 | Bass management & multichannel | Not started | 5 | [sprint-07](sprint-07-bass-management-and-multichannel.md) |
+| 7 | Bass management & multichannel | In progress | 5 | [sprint-07](sprint-07-bass-management-and-multichannel.md) |
 | 8 | Live input robustness | Not started | 5 | [sprint-08](sprint-08-live-input-robustness.md) |
 | 9 | Cleanup, observability, packaging | Not started | 1–8 | [sprint-09](sprint-09-cleanup-observability-packaging.md) |
 
