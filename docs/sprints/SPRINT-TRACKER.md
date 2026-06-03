@@ -84,7 +84,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 | 6 | Mixer DSP correctness | Done | 5 | [sprint-06](sprint-06-mixer-dsp-correctness.md) |
 | 7 | Bass management & multichannel | Done | 5 | [sprint-07](sprint-07-bass-management-and-multichannel.md) |
 | 8 | Live input robustness | Done | 5 | [sprint-08](sprint-08-live-input-robustness.md) |
-| 9 | Cleanup, observability, packaging | Not started | 1–8 | [sprint-09](sprint-09-cleanup-observability-packaging.md) |
+| 9 | Cleanup, observability, packaging | In progress | 1–8 | [sprint-09](sprint-09-cleanup-observability-packaging.md) |
 
 Status values: `Not started` · `In progress` · `Blocked` · `Done`.
 
