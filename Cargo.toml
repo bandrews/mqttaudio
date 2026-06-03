@@ -71,6 +71,9 @@ chrono = "0.4"
 # Directory utilities
 dirs = "5.0"
 
+# Stable content hashing for cache keys
+sha2 = "0.10"
+
 # Linux-specific: ALSA bindings for device probing
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.9"

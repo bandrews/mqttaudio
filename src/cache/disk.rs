@@ -38,10 +38,14 @@ pub struct CacheMetadata {
     pub entries: HashMap<String, CacheEntry>,
 }
 
+/// Current on-disk metadata format version. Bumped when the cache-key hash or
+/// entry layout changes so older entries are discarded rather than misused.
+const CACHE_METADATA_VERSION: u32 = 2;
+
 impl Default for CacheMetadata {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: CACHE_METADATA_VERSION,
             entries: HashMap::new(),
         }
     }
@@ -104,9 +108,17 @@ impl DiskCache {
         let metadata = if metadata_path.exists() {
             match fs::read_to_string(&metadata_path) {
                 Ok(content) => match serde_json::from_str::<CacheMetadata>(&content) {
-                    Ok(meta) => {
+                    Ok(meta) if meta.version == CACHE_METADATA_VERSION => {
                         tracing::info!("Loaded cache metadata with {} entries", meta.entries.len());
                         meta
+                    }
+                    Ok(meta) => {
+                        tracing::info!(
+                            "Cache metadata version {} != {}; discarding stale entries",
+                            meta.version,
+                            CACHE_METADATA_VERSION
+                        );
+                        CacheMetadata::default()
                     }
                     Err(e) => {
                         tracing::warn!("Failed to parse cache metadata: {}, starting fresh", e);
@@ -137,15 +149,18 @@ impl DiskCache {
         Ok(())
     }
 
-    /// Generate a cache filename for a given URL
-    /// Uses first 12 chars of SHA256 hash + extension
+    /// Generate a cache filename for a given URL.
+    /// Uses the first 12 hex chars of the SHA-256 of the URL + extension. SHA-256
+    /// is stable across Rust versions and platforms (unlike `DefaultHasher`).
     pub fn cache_filename_for_url(url: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use sha2::{Digest, Sha256};
 
-        let mut hasher = DefaultHasher::new();
-        url.hash(&mut hasher);
-        let hash = hasher.finish();
+        let digest = Sha256::digest(url.as_bytes());
+        let hash: String = digest
+            .iter()
+            .take(6)
+            .map(|b| format!("{:02x}", b))
+            .collect();
 
         // Extract extension from URL
         let extension = if let Some(last_part) = url.split('/').next_back() {
@@ -162,7 +177,7 @@ impl DiskCache {
             "dat".to_string()
         };
 
-        format!("{:016x}.{}", hash, extension)
+        format!("{}.{}", hash, extension)
     }
 
     /// Get the cache entry for a URL, if it exists
@@ -175,11 +190,16 @@ impl DiskCache {
         self.cache_dir.join("files").join(&entry.local_file)
     }
 
-    /// Check if a file is cached and the file actually exists
+    /// Check if a file is cached, the file exists, and its on-disk length matches
+    /// the recorded `file_size` (so a crash-truncated file is treated as missing
+    /// and re-downloaded).
     pub fn is_cached(&self, url: &str) -> bool {
         if let Some(entry) = self.get_entry(url) {
             let path = self.get_cached_file_path(entry);
-            path.exists()
+            match fs::metadata(&path) {
+                Ok(meta) => meta.len() == entry.file_size,
+                Err(_) => false,
+            }
         } else {
             false
         }
@@ -288,8 +308,14 @@ impl DiskCache {
         let cache_filename = Self::cache_filename_for_url(url);
         let cache_path = self.cache_dir.join("files").join(&cache_filename);
 
-        // Write to disk
-        fs::write(&cache_path, &bytes)?;
+        // Write atomically: a temp file + rename, so a crash mid-write never
+        // leaves a truncated file at the final path.
+        let tmp_path = self
+            .cache_dir
+            .join("files")
+            .join(format!("{}.tmp", cache_filename));
+        fs::write(&tmp_path, &bytes)?;
+        fs::rename(&tmp_path, &cache_path)?;
 
         tracing::info!("Downloaded {} bytes to {}", file_size, cache_filename);
 
@@ -342,6 +368,11 @@ mod tests {
         let name1 = DiskCache::cache_filename_for_url(url1);
         let name2 = DiskCache::cache_filename_for_url(url2);
         let name3 = DiskCache::cache_filename_for_url(url3);
+
+        // Pinned SHA-256 prefixes — stable across Rust versions and platforms.
+        assert_eq!(name1, "5acc8be08cc8.wav");
+        assert_eq!(name2, "4271e79bbe75.mp3");
+        assert_eq!(name3, "4045c088839e.wav");
 
         // Different URLs should have different names
         assert_ne!(name1, name2);
@@ -408,13 +439,13 @@ mod tests {
         // Not cached initially
         assert!(!cache.is_cached(url));
 
-        // Add entry but don't create file
+        // Add entry but don't create file (file_size matches the bytes written below)
         let entry = CacheEntry {
             local_file: "test123.wav".to_string(),
             etag: None,
             last_modified: None,
             last_validated: "2025-10-19T10:00:00Z".to_string(),
-            file_size: 100,
+            file_size: 9, // "test data"
             content_type: None,
         };
         cache.put_entry(url.to_string(), entry.clone());
@@ -428,6 +459,31 @@ mod tests {
 
         // Now it should be cached
         assert!(cache.is_cached(url));
+    }
+
+    #[test]
+    fn test_is_cached_rejects_truncated_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join("cache");
+        let mut cache = DiskCache::new(cache_dir).unwrap();
+
+        let url = "http://example.com/truncated.wav";
+        let entry = CacheEntry {
+            local_file: "trunc.wav".to_string(),
+            etag: None,
+            last_modified: None,
+            last_validated: "2025-10-19T10:00:00Z".to_string(),
+            file_size: 100,
+            content_type: None,
+        };
+        cache.put_entry(url.to_string(), entry.clone());
+
+        // A crash-truncated cache file: shorter than the recorded size.
+        let file_path = cache.get_cached_file_path(&entry);
+        fs::write(file_path, b"short").unwrap(); // 5 bytes, not 100
+
+        // Treated as not cached so the caller re-downloads.
+        assert!(!cache.is_cached(url));
     }
 
     #[test]
