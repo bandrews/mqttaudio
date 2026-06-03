@@ -2,9 +2,9 @@
 # Bundles the Rust toolchain, the audio/TLS build dependencies, and a mosquitto
 # broker. The repo is mounted at /build at run time; CMD runs the validation
 # script (fmt + clippy + build + broker-backed tests).
-# Pinned to match the project's host toolchain (1.87) so Lane A and Lane B
+# Pinned to match the project's host toolchain (1.95) so Lane A and Lane B
 # run the same clippy lint set.
-FROM rust:1.87-bookworm
+FROM rust:1.95-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libasound2-dev libssl-dev pkg-config build-essential \

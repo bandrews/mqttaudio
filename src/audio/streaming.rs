@@ -65,7 +65,7 @@ impl StreamingBuffer {
     /// Called by loader thread with interleaved samples.
     pub fn append(&mut self, samples: &[f32]) {
         debug_assert!(
-            samples.len() % self.channels == 0,
+            samples.len().is_multiple_of(self.channels),
             "Sample count must be divisible by channel count"
         );
         let new_frames = samples.len() / self.channels;

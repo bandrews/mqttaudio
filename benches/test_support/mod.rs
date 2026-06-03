@@ -43,7 +43,7 @@ pub fn generate_test_audio(duration_seconds: f32, sample_rate: u32, channels: us
         let mut sample: f32 = frequencies
             .iter()
             .zip(phases.iter())
-            .map(|(f, p)| ((t * f * std::f32::consts::TAU + p).sin() * 0.08))
+            .map(|(f, p)| (t * f * std::f32::consts::TAU + p).sin() * 0.08)
             .sum();
 
         // Add some pseudo-random noise based on frame position
