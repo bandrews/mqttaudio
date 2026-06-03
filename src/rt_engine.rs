@@ -174,6 +174,37 @@ pub fn drain_commands(
     applied
 }
 
+/// Producer half of the audio->reaper return ring ("graveyard"), held by the audio thread.
+pub type GraveyardProducer = HeapProducer<ActiveSample>;
+/// Consumer half of the graveyard, drained by the off-RT reaper.
+pub type GraveyardConsumer = HeapConsumer<ActiveSample>;
+
+/// Create the audio->reaper return ring. Finished samples are moved here by the
+/// callback and dropped off the real-time thread by the reaper.
+pub fn graveyard_channel(capacity: usize) -> (GraveyardProducer, GraveyardConsumer) {
+    HeapRb::<ActiveSample>::new(capacity).split()
+}
+
+/// Move every finished sample out of `state` into the graveyard for off-RT drop,
+/// returning how many were moved. The callback calls this instead of `retain`, so the
+/// per-sample `channel_map`/`PitchCorrector` frees happen on the reaper thread, never
+/// on the RT thread. If the graveyard is momentarily full the sample is dropped in
+/// place as a fallback (rare; the ring is sized generously).
+pub fn reap_finished(state: &mut MixerState, graveyard: &mut GraveyardProducer) -> usize {
+    let mut moved = 0;
+    let mut i = 0;
+    while i < state.active_samples.len() {
+        if state.active_samples[i].is_finished() {
+            let finished = state.active_samples.swap_remove(i);
+            let _ = graveyard.push(finished);
+            moved += 1;
+        } else {
+            i += 1;
+        }
+    }
+    moved
+}
+
 /// Whether a sample matches a selector (matching is done on the audio side because the
 /// control thread cannot see the live sample list without locking the state).
 fn sample_matches(selector: &SampleSelector, sample: &ActiveSample) -> bool {
@@ -382,6 +413,26 @@ mod tests {
         assert_eq!(applied, 2);
         assert_eq!(state.active_samples.len(), 1);
         assert!(is_fading_out(&state.active_samples[0]));
+    }
+
+    #[test]
+    fn reap_moves_finished_samples_to_graveyard() {
+        let playing = sample(1, "a", None, "a");
+        let mut done = sample(2, "b", None, "b");
+        done.position = 1000; // past the 100-frame buffer -> is_finished()
+        let mut state = state_with(vec![playing, done]);
+
+        let (mut tx, mut rx) = graveyard_channel(8);
+        let moved = reap_finished(&mut state, &mut tx);
+
+        assert_eq!(moved, 1);
+        assert_eq!(state.active_samples.len(), 1);
+        assert_eq!(state.active_samples[0].id, 1, "the playing sample stays");
+        assert_eq!(
+            rx.pop().map(|s| s.id),
+            Some(2),
+            "the finished sample is reaped"
+        );
     }
 
     #[test]
