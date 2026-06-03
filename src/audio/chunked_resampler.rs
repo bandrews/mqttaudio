@@ -80,7 +80,13 @@ impl ChunkedResampler {
         channels: usize,
         quality: ResamplerQuality,
     ) -> Result<Self, ChunkedResampleError> {
-        Self::with_chunk_size(input_rate, output_rate, channels, quality, Self::DEFAULT_CHUNK_SIZE)
+        Self::with_chunk_size(
+            input_rate,
+            output_rate,
+            channels,
+            quality,
+            Self::DEFAULT_CHUNK_SIZE,
+        )
     }
 
     /// Create a new chunked resampler with custom chunk size.
@@ -120,11 +126,8 @@ impl ChunkedResampler {
         };
 
         let resampler = SincFixedIn::<f32>::new(
-            ratio,
-            2.0, // Max relative ratio (allows pitch adjustment)
-            params,
-            chunk_size,
-            channels,
+            ratio, 2.0, // Max relative ratio (allows pitch adjustment)
+            params, chunk_size, channels,
         )?;
 
         let input_buffer = vec![Vec::new(); channels];
@@ -257,7 +260,7 @@ impl ChunkedResampler {
 
     /// Get the number of frames currently buffered
     pub fn buffered_frames(&self) -> usize {
-        self.input_buffer.get(0).map(|b| b.len()).unwrap_or(0)
+        self.input_buffer.first().map(|b| b.len()).unwrap_or(0)
     }
 
     /// Get the chunk size in frames
@@ -292,8 +295,7 @@ mod tests {
 
     #[test]
     fn test_construction_invalid_chunk_size() {
-        let result =
-            ChunkedResampler::with_chunk_size(44100, 48000, 2, ResamplerQuality::Fast, 0);
+        let result = ChunkedResampler::with_chunk_size(44100, 48000, 2, ResamplerQuality::Fast, 0);
         assert!(result.is_err());
     }
 
@@ -459,7 +461,11 @@ mod tests {
             ResamplerQuality::Maximum,
         ] {
             let result = ChunkedResampler::new(44100, 48000, 2, quality);
-            assert!(result.is_ok(), "Failed to create resampler with {:?}", quality);
+            assert!(
+                result.is_ok(),
+                "Failed to create resampler with {:?}",
+                quality
+            );
         }
     }
 
@@ -575,7 +581,7 @@ mod tests {
         let output_frames = output.len() / 2;
 
         assert!(
-            (output_frames as i32 - input_frames as i32).abs() < 50,
+            (output_frames as i32 - input_frames).abs() < 50,
             "Expected ~{} frames, got {}",
             input_frames,
             output_frames

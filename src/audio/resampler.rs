@@ -1,8 +1,11 @@
 // ABOUTME: Sample rate conversion using rubato.
 // ABOUTME: Converts audio to match output device sample rate.
 
-use rubato::{Resampler, ResamplerConstructionError, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 use crate::config::ResamplerQuality;
+use rubato::{
+    Resampler, ResamplerConstructionError, SincFixedIn, SincInterpolationParameters,
+    SincInterpolationType, WindowFunction,
+};
 
 #[derive(Debug)]
 pub enum ResampleError {
@@ -64,7 +67,9 @@ pub fn resample(
     }
 
     if channels == 0 {
-        return Err(ResampleError::InvalidInput("Channel count must be > 0".to_string()));
+        return Err(ResampleError::InvalidInput(
+            "Channel count must be > 0".to_string(),
+        ));
     }
 
     tracing::info!(
@@ -88,11 +93,8 @@ pub fn resample(
     };
 
     let mut resampler = SincFixedIn::<f32>::new(
-        ratio,
-        2.0, // Max relative ratio difference (allows 2x speedup/slowdown)
-        params,
-        frames,
-        channels,
+        ratio, 2.0, // Max relative ratio difference (allows 2x speedup/slowdown)
+        params, frames, channels,
     )?;
 
     // De-interleave input samples
@@ -112,8 +114,8 @@ pub fn resample(
     let mut output = Vec::with_capacity(output_frames * channels);
 
     for frame_idx in 0..output_frames {
-        for ch_idx in 0..channels {
-            output.push(output_channels[ch_idx][frame_idx]);
+        for ch_buf in &output_channels[..channels] {
+            output.push(ch_buf[frame_idx]);
         }
     }
 
@@ -213,8 +215,16 @@ mod tests {
 
         // Mono should work correctly - expected ~1088 frames with some latency
         // Allow wider bounds due to resampler buffering
-        assert!(result.len() > 800, "Got {} frames, expected >800", result.len());
-        assert!(result.len() < 1300, "Got {} frames, expected <1300", result.len());
+        assert!(
+            result.len() > 800,
+            "Got {} frames, expected >800",
+            result.len()
+        );
+        assert!(
+            result.len() < 1300,
+            "Got {} frames, expected <1300",
+            result.len()
+        );
     }
 
     #[test]
@@ -238,7 +248,11 @@ mod tests {
             let result = resample(input.clone(), 44100, 48000, 1, quality);
             assert!(result.is_ok(), "Quality {:?} failed", quality);
             let output = result.unwrap();
-            assert!(output.len() > 800, "Quality {:?} produced too few samples", quality);
+            assert!(
+                output.len() > 800,
+                "Quality {:?} produced too few samples",
+                quality
+            );
         }
     }
 }

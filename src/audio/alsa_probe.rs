@@ -85,8 +85,8 @@ fn alsa_format_to_native(fmt: Format) -> Option<NativeSampleFormat> {
 
 /// Probe native hardware capabilities for an ALSA device
 fn probe_device_capabilities(name: &str) -> Result<NativeCapabilities, String> {
-    let pcm = PCM::new(name, Direction::Playback, false)
-        .map_err(|e| format!("Failed to open: {}", e))?;
+    let pcm =
+        PCM::new(name, Direction::Playback, false).map_err(|e| format!("Failed to open: {}", e))?;
 
     let hwp = HwParams::any(&pcm).map_err(|e| format!("Failed to get hw params: {}", e))?;
 
@@ -112,12 +112,10 @@ fn probe_device_capabilities(name: &str) -> Result<NativeCapabilities, String> {
     // Get channel range (cap at reasonable values for display)
     let min_channels = hwp
         .get_channels_min()
-        .map_err(|e| format!("Failed to get min channels: {}", e))?
-        as u16;
-    let max_channels_raw = hwp
-        .get_channels_max()
-        .map_err(|e| format!("Failed to get max channels: {}", e))?
-        as u16;
+        .map_err(|e| format!("Failed to get min channels: {}", e))? as u16;
+    let max_channels_raw =
+        hwp.get_channels_max()
+            .map_err(|e| format!("Failed to get max channels: {}", e))? as u16;
     // Plugin devices may report absurd values (10000+), cap for sanity
     let max_channels = max_channels_raw.min(128);
 
@@ -390,14 +388,20 @@ mod tests {
             classify_device_name("plughw:CARD=UMC1820,DEV=0"),
             DeviceCategory::PluginHardware
         );
-        assert_eq!(classify_device_name("dmix:CARD=PCH,DEV=0"), DeviceCategory::SoftwareMixer);
+        assert_eq!(
+            classify_device_name("dmix:CARD=PCH,DEV=0"),
+            DeviceCategory::SoftwareMixer
+        );
         assert_eq!(classify_device_name("default"), DeviceCategory::System);
         assert_eq!(classify_device_name("pulse"), DeviceCategory::System);
         assert_eq!(
             classify_device_name("surround71:CARD=PCH,DEV=0"),
             DeviceCategory::ChannelLayout
         );
-        assert_eq!(classify_device_name("hdmi:CARD=PCH,DEV=0"), DeviceCategory::Hdmi);
+        assert_eq!(
+            classify_device_name("hdmi:CARD=PCH,DEV=0"),
+            DeviceCategory::Hdmi
+        );
         assert_eq!(classify_device_name("ch1"), DeviceCategory::Virtual);
         assert_eq!(classify_device_name("room"), DeviceCategory::Virtual);
         assert_eq!(classify_device_name("lavrate"), DeviceCategory::System);

@@ -3,7 +3,7 @@
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Stream, SupportedStreamConfig};
-use ringbuf::{HeapRb, HeapConsumer, HeapProducer};
+use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 
 /// List available audio input devices
 pub fn list_input_devices() {
@@ -35,7 +35,10 @@ pub fn list_input_devices() {
                             max_channels = max_channels.max(config.channels());
                             let min_rate = config.min_sample_rate().0;
                             // Collect unique sample rate ranges
-                            if !sample_rates.iter().any(|(min, max)| *min == min_rate && *max == max_rate) {
+                            if !sample_rates
+                                .iter()
+                                .any(|(min, max)| *min == min_rate && *max == max_rate)
+                            {
                                 sample_rates.push((min_rate, max_rate));
                             }
                         }
@@ -78,7 +81,8 @@ pub fn get_input_device(name: Option<&str>) -> Result<Device, InputError> {
 
     match name {
         Some(device_name) => {
-            let devices = host.input_devices()
+            let devices = host
+                .input_devices()
                 .map_err(|e| InputError::DeviceEnumeration(e.to_string()))?;
 
             for device in devices {
@@ -90,16 +94,16 @@ pub fn get_input_device(name: Option<&str>) -> Result<Device, InputError> {
             }
             Err(InputError::DeviceNotFound(device_name.to_string()))
         }
-        None => {
-            host.default_input_device()
-                .ok_or_else(|| InputError::NoDefaultDevice)
-        }
+        None => host
+            .default_input_device()
+            .ok_or(InputError::NoDefaultDevice),
     }
 }
 
 /// Get the default input configuration for a device
 pub fn get_input_config(device: &Device) -> Result<SupportedStreamConfig, InputError> {
-    device.default_input_config()
+    device
+        .default_input_config()
         .map_err(|e| InputError::ConfigError(e.to_string()))
 }
 
@@ -197,14 +201,12 @@ pub fn create_input_stream(
         )?
     } else {
         // Direct passthrough - no resampling needed
-        create_passthrough_input_stream(
-            &device,
-            supported_config,
-            producer,
-        )?
+        create_passthrough_input_stream(&device, supported_config, producer)?
     };
 
-    stream.play().map_err(|e| InputError::StreamError(e.to_string()))?;
+    stream
+        .play()
+        .map_err(|e| InputError::StreamError(e.to_string()))?;
 
     Ok(ActiveInput {
         stream,
@@ -219,21 +221,26 @@ fn create_passthrough_input_stream(
     config: SupportedStreamConfig,
     mut producer: HeapProducer<f32>,
 ) -> Result<Stream, InputError> {
-    let stream = device.build_input_stream(
-        &config.into(),
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            // Write samples to ring buffer
-            let written = producer.push_slice(data);
-            if written < data.len() {
-                // Ring buffer overflow - samples were dropped
-                tracing::debug!("Input buffer overflow: {} samples dropped", data.len() - written);
-            }
-        },
-        move |err| {
-            tracing::error!("Input stream error: {}", err);
-        },
-        None,
-    ).map_err(|e| InputError::StreamError(e.to_string()))?;
+    let stream = device
+        .build_input_stream(
+            &config.into(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                // Write samples to ring buffer
+                let written = producer.push_slice(data);
+                if written < data.len() {
+                    // Ring buffer overflow - samples were dropped
+                    tracing::debug!(
+                        "Input buffer overflow: {} samples dropped",
+                        data.len() - written
+                    );
+                }
+            },
+            move |err| {
+                tracing::error!("Input stream error: {}", err);
+            },
+            None,
+        )
+        .map_err(|e| InputError::StreamError(e.to_string()))?;
 
     Ok(stream)
 }
@@ -247,7 +254,9 @@ fn create_resampling_input_stream(
     output_rate: u32,
     channels: usize,
 ) -> Result<Stream, InputError> {
-    use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction, Resampler};
+    use rubato::{
+        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    };
 
     // Create resampler
     let params = SincInterpolationParameters {
@@ -269,57 +278,66 @@ fn create_resampling_input_stream(
         params,
         chunk_size,
         channels,
-    ).map_err(|e| InputError::ResamplerError(format!("{:?}", e)))?;
+    )
+    .map_err(|e| InputError::ResamplerError(format!("{:?}", e)))?;
 
     // Buffer for accumulating input samples before resampling
-    let mut input_buffer: Vec<Vec<f32>> = (0..channels).map(|_| Vec::with_capacity(chunk_size * 2)).collect();
+    let mut input_buffer: Vec<Vec<f32>> = (0..channels)
+        .map(|_| Vec::with_capacity(chunk_size * 2))
+        .collect();
 
-    let stream = device.build_input_stream(
-        &config.into(),
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            // De-interleave input data into channel buffers
-            for (i, sample) in data.iter().enumerate() {
-                let channel = i % channels;
-                input_buffer[channel].push(*sample);
-            }
+    let stream = device
+        .build_input_stream(
+            &config.into(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                // De-interleave input data into channel buffers
+                for (i, sample) in data.iter().enumerate() {
+                    let channel = i % channels;
+                    input_buffer[channel].push(*sample);
+                }
 
-            // Process when we have enough samples
-            while input_buffer[0].len() >= chunk_size {
-                // Extract chunk from each channel
-                let input_chunk: Vec<Vec<f32>> = input_buffer.iter_mut()
-                    .map(|ch| ch.drain(..chunk_size).collect())
-                    .collect();
+                // Process when we have enough samples
+                while input_buffer[0].len() >= chunk_size {
+                    // Extract chunk from each channel
+                    let input_chunk: Vec<Vec<f32>> = input_buffer
+                        .iter_mut()
+                        .map(|ch| ch.drain(..chunk_size).collect())
+                        .collect();
 
-                // Resample
-                match resampler.process(&input_chunk, None) {
-                    Ok(output) => {
-                        // Interleave and write to ring buffer
-                        if !output.is_empty() && !output[0].is_empty() {
-                            let num_frames = output[0].len();
-                            let mut dropped = 0usize;
-                            for frame_idx in 0..num_frames {
-                                for ch in 0..channels {
-                                    if producer.push(output[ch][frame_idx]).is_err() {
-                                        dropped += 1;
+                    // Resample
+                    match resampler.process(&input_chunk, None) {
+                        Ok(output) => {
+                            // Interleave and write to ring buffer
+                            if !output.is_empty() && !output[0].is_empty() {
+                                let num_frames = output[0].len();
+                                let mut dropped = 0usize;
+                                for frame_idx in 0..num_frames {
+                                    for ch_buf in &output[..channels] {
+                                        if producer.push(ch_buf[frame_idx]).is_err() {
+                                            dropped += 1;
+                                        }
                                     }
                                 }
-                            }
-                            if dropped > 0 {
-                                tracing::debug!("Resampler output overflow: {} samples dropped", dropped);
+                                if dropped > 0 {
+                                    tracing::debug!(
+                                        "Resampler output overflow: {} samples dropped",
+                                        dropped
+                                    );
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        tracing::error!("Resampling error: {:?}", e);
+                        Err(e) => {
+                            tracing::error!("Resampling error: {:?}", e);
+                        }
                     }
                 }
-            }
-        },
-        move |err| {
-            tracing::error!("Input stream error: {}", err);
-        },
-        None,
-    ).map_err(|e| InputError::StreamError(e.to_string()))?;
+            },
+            move |err| {
+                tracing::error!("Input stream error: {}", err);
+            },
+            None,
+        )
+        .map_err(|e| InputError::StreamError(e.to_string()))?;
 
     Ok(stream)
 }

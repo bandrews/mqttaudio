@@ -23,11 +23,11 @@ pub mod audio {
 pub mod cache;
 
 pub mod mqtt {
-    pub mod commands;
     pub mod client;
+    pub mod commands;
 }
 
 pub mod http;
 
-pub mod voice;
 pub mod config;
+pub mod voice;

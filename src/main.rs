@@ -11,7 +11,6 @@ mod voice;
 use clap::Parser;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use tokio::sync::mpsc;
-use tracing_subscriber;
 
 #[derive(Parser, Debug)]
 #[command(name = "mqttaudio")]
@@ -99,6 +98,10 @@ struct Args {
     max_cache_mb: Option<u32>,
 }
 
+// Sprint 2 (D6): startup precache loops hold the cache guard across `.await`; the
+// proper fix (drop-before-await / internally synchronized cache) lands in Sprint 2.
+// Tracked in docs/bugs.md.
+#[allow(clippy::await_holding_lock)]
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -148,8 +151,9 @@ async fn main() {
         use tracing_subscriber::Layer;
 
         let mqtt_layer = mqtt::logger::MqttLogLayer::new(sender, log_level);
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_filter(tracing_subscriber::filter::LevelFilter::from_level(log_level));
+        let fmt_layer = tracing_subscriber::fmt::layer().with_filter(
+            tracing_subscriber::filter::LevelFilter::from_level(log_level),
+        );
 
         tracing_subscriber::registry()
             .with(fmt_layer)
@@ -158,9 +162,7 @@ async fn main() {
 
         Some(receiver)
     } else {
-        tracing_subscriber::fmt()
-            .with_max_level(log_level)
-            .init();
+        tracing_subscriber::fmt().with_max_level(log_level).init();
         None
     };
 
@@ -195,9 +197,14 @@ async fn main() {
             // Only warn here - we'll fail later if the actual device can't be configured
             tracing::warn!("Could not probe default audio device: {}", e);
             if config.audio.device.is_some() {
-                tracing::info!("Will attempt to use specified device: {:?}", config.audio.device);
+                tracing::info!(
+                    "Will attempt to use specified device: {:?}",
+                    config.audio.device
+                );
             } else {
-                tracing::warn!("No device specified and default device unavailable - audio may fail");
+                tracing::warn!(
+                    "No device specified and default device unavailable - audio may fail"
+                );
             }
         }
     }
@@ -314,7 +321,9 @@ async fn main() {
             topic,
             config.mqtt.username.as_deref(),
             config.mqtt.password.as_deref(),
-        ).await {
+        )
+        .await
+        {
             Ok((c, el)) => Some((c, el)),
             Err(e) => {
                 tracing::error!("Failed to connect to MQTT broker: {}", e);
@@ -368,13 +377,13 @@ async fn main() {
     ) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(
-                "Failed to configure output device '{}': {}",
-                device_name, e
-            );
+            tracing::error!("Failed to configure output device '{}': {}", device_name, e);
             tracing::error!(
                 "Requested: {} channels, {} Hz sample rate",
-                config.audio.channels.map_or("default".to_string(), |c| c.to_string()),
+                config
+                    .audio
+                    .channels
+                    .map_or("default".to_string(), |c| c.to_string()),
                 config.audio.sample_rate
             );
             std::process::exit(1);
@@ -389,22 +398,26 @@ async fn main() {
     tracing::info!("  Channels: {}", output_channels);
 
     // Create mixer state and voice manager
-    use audio::mixer::{ActiveSample, MixerState};
     use audio::ducking::DuckingEngine;
-    use std::sync::{Arc, Mutex};
+    use audio::mixer::MixerState;
     use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
     use voice::VoiceManager;
 
     // Create ducking engine from config rules
     let ducking_engine = if !config.ducking_rules.is_empty() {
-        Some(DuckingEngine::new(config.ducking_rules.clone(), output_sample_rate))
+        Some(DuckingEngine::new(
+            config.ducking_rules.clone(),
+            output_sample_rate,
+        ))
     } else {
         None
     };
 
     // Create bass management from config
     let bass_management = if config.bass_management.enabled {
-        let resolved = config.resolve_bass_management()
+        let resolved = config
+            .resolve_bass_management()
             .expect("Channel alias resolution failed (should have been caught during validation)");
         let bm_config = audio::bass_management::BassManagementConfig {
             enabled: resolved.enabled,
@@ -419,7 +432,11 @@ async fn main() {
             bm_config.crossover_frequency_hz,
             bm_config.source_channels
         );
-        Some(audio::bass_management::BassManagement::new(bm_config, output_sample_rate, output_channels))
+        Some(audio::bass_management::BassManagement::new(
+            bm_config,
+            output_sample_rate,
+            output_channels,
+        ))
     } else {
         None
     };
@@ -459,7 +476,8 @@ async fn main() {
                     tracing::info!(
                         "Input {} routed: {:?}",
                         idx,
-                        channel_map.iter()
+                        channel_map
+                            .iter()
                             .map(|(src, dest)| format!("{}→{}", src, dest))
                             .collect::<Vec<_>>()
                     );
@@ -502,13 +520,14 @@ async fn main() {
     tracing::info!("Cache directory: {}", cache_dir.display());
     tracing::info!("Resampler quality: {:?}", resampler_quality);
 
-    let cache_manager = match cache::CacheManager::with_options(cache_dir, resampler_quality, max_memory_mb) {
-        Ok(cm) => Arc::new(Mutex::new(cm)),
-        Err(e) => {
-            tracing::error!("Failed to initialize cache: {}", e);
-            std::process::exit(1);
-        }
-    };
+    let cache_manager =
+        match cache::CacheManager::with_options(cache_dir, resampler_quality, max_memory_mb) {
+            Ok(cm) => Arc::new(Mutex::new(cm)),
+            Err(e) => {
+                tracing::error!("Failed to initialize cache: {}", e);
+                std::process::exit(1);
+            }
+        };
 
     // Precache files from config on startup (expands directories to audio files)
     let precache_files = config.expand_precache_entries();
@@ -531,10 +550,16 @@ async fn main() {
             }
             tracing::info!("Startup precaching complete");
         } else {
-            tracing::info!("Starting background precache for {} files (non-blocking)...", precache_files.len());
+            tracing::info!(
+                "Starting background precache for {} files (non-blocking)...",
+                precache_files.len()
+            );
             for file_path in &precache_files {
                 let mut cache_mgr = cache_manager.lock().unwrap();
-                match cache_mgr.precache_streaming(file_path, output_sample_rate).await {
+                match cache_mgr
+                    .precache_streaming(file_path, output_sample_rate)
+                    .await
+                {
                     Ok(()) => {}
                     Err(e) => {
                         tracing::error!("Failed to start precache for {}: {}", file_path, e);
@@ -550,14 +575,17 @@ async fn main() {
     let active_voices_clone = active_voices.clone();
 
     // Start audio stream
-    let stream = device.build_output_stream(
-        &stream_config,
+    let stream = device
+        .build_output_stream(
+            &stream_config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let mut state = mixer_state_clone.lock().unwrap();
                 audio::mixer::mix_audio(data, &mut state);
 
                 // Track which voices had samples before cleanup
-                let voices_before: HashSet<String> = state.active_samples.iter()
+                let voices_before: HashSet<String> = state
+                    .active_samples
+                    .iter()
                     .map(|s| s.voice_id.clone())
                     .collect();
 
@@ -565,7 +593,9 @@ async fn main() {
                 state.active_samples.retain(|s| !s.is_finished());
 
                 // Track which voices have samples after cleanup
-                let voices_after: HashSet<String> = state.active_samples.iter()
+                let voices_after: HashSet<String> = state
+                    .active_samples
+                    .iter()
                     .map(|s| s.voice_id.clone())
                     .collect();
 
@@ -584,97 +614,158 @@ async fn main() {
                 tracing::error!("Audio stream error: {}", err);
             },
             None,
-        ).expect("Failed to build audio stream");
+        )
+        .expect("Failed to build audio stream");
 
-        stream.play().expect("Failed to start audio stream");
-        tracing::info!("Audio stream started");
+    stream.play().expect("Failed to start audio stream");
+    tracing::info!("Audio stream started");
 
-        // Create command channel
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(100);
+    // Create command channel
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(100);
 
-        // Start HTTP server if enabled
-        if config.http.enabled {
-            let http_cmd_tx = cmd_tx.clone();
-            match http::start_server(
-                &config.http,
-                http_cmd_tx,
-                mixer_state.clone(),
-                voice_manager.clone(),
-                cache_manager.clone(),
-            ).await {
-                Ok(addr) => {
-                    tracing::info!("HTTP REST API available at http://{}", addr);
-                    if config.http.websocket_enabled {
-                        tracing::info!("WebSocket logs available at ws://{}/ws", addr);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to start HTTP server: {}", e);
-                    // Continue without HTTP server - not fatal
+    // Start HTTP server if enabled
+    if config.http.enabled {
+        let http_cmd_tx = cmd_tx.clone();
+        match http::start_server(
+            &config.http,
+            http_cmd_tx,
+            mixer_state.clone(),
+            voice_manager.clone(),
+            cache_manager.clone(),
+        )
+        .await
+        {
+            Ok(addr) => {
+                tracing::info!("HTTP REST API available at http://{}", addr);
+                if config.http.websocket_enabled {
+                    tracing::info!("WebSocket logs available at ws://{}/ws", addr);
                 }
             }
+            Err(e) => {
+                tracing::error!("Failed to start HTTP server: {}", e);
+                // Continue without HTTP server - not fatal
+            }
         }
+    }
 
-        // Spawn MQTT event processor if connected
-        if let Some((_, eventloop)) = mqtt_connection {
-            let mqtt_cmd_tx = cmd_tx.clone();
-            tokio::spawn(async move {
-                mqtt::client::process_mqtt_events(eventloop, mqtt_cmd_tx).await;
-            });
-            tracing::info!("Ready to receive MQTT commands on topic: {}", config.mqtt.topic.as_ref().unwrap());
+    // Spawn MQTT event processor if connected
+    if let Some((_, eventloop)) = mqtt_connection {
+        let mqtt_cmd_tx = cmd_tx.clone();
+        tokio::spawn(async move {
+            mqtt::client::process_mqtt_events(eventloop, mqtt_cmd_tx).await;
+        });
+        tracing::info!(
+            "Ready to receive MQTT commands on topic: {}",
+            config.mqtt.topic.as_ref().unwrap()
+        );
+    }
+
+    // Keep cmd_tx alive if only HTTP is running (no MQTT)
+    let _cmd_tx_keepalive = cmd_tx;
+
+    // Main command processing loop
+    if mqtt_enabled || http_enabled {
+        tracing::info!("Command processing loop started");
+    }
+
+    let command_ctx = CommandCtx {
+        cache_manager: &cache_manager,
+        voice_manager: &voice_manager,
+        mixer_state: &mixer_state,
+        active_voices: &active_voices,
+        output_sample_rate,
+        config: &config,
+    };
+
+    while let Some(payload) = cmd_rx.recv().await {
+        // Expand macros before parsing
+        let expanded = match mqtt::commands::expand_macros(&payload, &config.macros) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("Macro expansion error: {}", e);
+                continue;
+            }
+        };
+
+        match mqtt::commands::parse_command(&expanded) {
+            Ok(cmd) => handle_command(cmd, &command_ctx).await,
+            Err(e) => {
+                tracing::error!("Failed to parse command: {}", e);
+            }
         }
+    }
 
-        // Keep cmd_tx alive if only HTTP is running (no MQTT)
-        let _cmd_tx_keepalive = cmd_tx;
+    // Keep stream alive
+    drop(stream);
+}
 
-        // Main command processing loop
-        if mqtt_enabled || http_enabled {
-            tracing::info!("Command processing loop started");
-        }
+/// Bundles the shared state a single command operates on.
+struct CommandCtx<'a> {
+    cache_manager: &'a std::sync::Arc<std::sync::Mutex<cache::CacheManager>>,
+    voice_manager: &'a std::sync::Arc<std::sync::Mutex<voice::VoiceManager>>,
+    mixer_state: &'a std::sync::Arc<std::sync::Mutex<audio::mixer::MixerState>>,
+    active_voices: &'a std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    output_sample_rate: u32,
+    config: &'a config::Config,
+}
 
-        while let Some(payload) = cmd_rx.recv().await {
-            // Expand macros before parsing
-            let expanded = match mqtt::commands::expand_macros(&payload, &config.macros) {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::error!("Macro expansion error: {}", e);
-                    continue;
-                }
-            };
+/// Apply a single parsed command to the shared audio state.
+#[allow(clippy::await_holding_lock)] // Sprint 2 (D6): drop cache guard before .await; tracked in docs/bugs.md
+async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>) {
+    let cache_manager = ctx.cache_manager;
+    let voice_manager = ctx.voice_manager;
+    let mixer_state = ctx.mixer_state;
+    let active_voices = ctx.active_voices;
+    let output_sample_rate = ctx.output_sample_rate;
+    let config = ctx.config;
+    use audio::mixer::ActiveSample;
 
-            match mqtt::commands::parse_command(&expanded) {
-                Ok(cmd) => {
-                    tracing::info!("Processing command: {:?}", cmd);
+    tracing::info!("Processing command: {:?}", cmd);
 
-                    match cmd {
-                        mqtt::commands::AudioCommand::Play { file, id, volume, voice, channel_map, fade_in, start_position_ms, loop_mode, crossfade_ms } => {
-                            // Load file (with streaming support for faster startup)
-                            let mut cache_mgr = cache_manager.lock().unwrap();
-                            let buffer_result = cache_mgr.get_or_load_streaming(&file, output_sample_rate).await;
-                            drop(cache_mgr);
+    match cmd {
+        mqtt::commands::AudioCommand::Play {
+            file,
+            id,
+            volume,
+            voice,
+            channel_map,
+            fade_in,
+            start_position_ms,
+            loop_mode,
+            crossfade_ms,
+        } => {
+            // Load file (with streaming support for faster startup)
+            let mut cache_mgr = cache_manager.lock().unwrap();
+            let buffer_result = cache_mgr
+                .get_or_load_streaming(&file, output_sample_rate)
+                .await;
+            drop(cache_mgr);
 
-                            match buffer_result {
-                                Ok(buffer) => {
-                                    // Use provided voice or auto-generate one
-                                    let voice_id = voice.unwrap_or_else(|| {
-                                        format!("_auto_{}", std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_millis())
-                                    });
+            match buffer_result {
+                Ok(buffer) => {
+                    // Use provided voice or auto-generate one
+                    let voice_id = voice.unwrap_or_else(|| {
+                        format!(
+                            "_auto_{}",
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis()
+                        )
+                    });
 
-                                    let is_streaming = !buffer.is_complete();
-                                    let frames = buffer.frames();
-                                    let sample_rate = buffer.sample_rate();
-                                    let channels = buffer.channels();
-                                    let duration_secs = if frames > 0 && sample_rate > 0 {
-                                        frames as f32 / sample_rate as f32
-                                    } else {
-                                        0.0
-                                    };
+                    let is_streaming = !buffer.is_complete();
+                    let frames = buffer.frames();
+                    let sample_rate = buffer.sample_rate();
+                    let channels = buffer.channels();
+                    let duration_secs = if frames > 0 && sample_rate > 0 {
+                        frames as f32 / sample_rate as f32
+                    } else {
+                        0.0
+                    };
 
-                                    if is_streaming {
-                                        tracing::info!(
+                    if is_streaming {
+                        tracing::info!(
                                             "Playing {} (streaming): {} channels, {} frames loaded so far [voice: {}{}{}]",
                                             file,
                                             channels,
@@ -683,494 +774,745 @@ async fn main() {
                                             if loop_mode { ", looping" } else { "" },
                                             if crossfade_ms > 0 { format!(", crossfade {}ms", crossfade_ms) } else { String::new() }
                                         );
-                                    } else {
-                                        tracing::info!(
-                                            "Playing {}: {} channels, {} frames ({:.2}s) [voice: {}{}{}]",
-                                            file,
-                                            channels,
-                                            frames,
-                                            duration_secs,
-                                            voice_id,
-                                            if loop_mode { ", looping" } else { "" },
-                                            if crossfade_ms > 0 { format!(", crossfade {}ms", crossfade_ms) } else { String::new() }
-                                        );
-                                    }
-
-                                    // Get sample ID and voice volume from voice manager
-                                    let mut voice_mgr = voice_manager.lock().unwrap();
-                                    let sample_id = voice_mgr.add_sample_to_voice(&voice_id);
-                                    let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
-                                    drop(voice_mgr);
-
-                                    // Convert crossfade_ms to samples
-                                    let crossfade_samples = (crossfade_ms as usize * output_sample_rate as usize) / 1000;
-
-                                    // Convert channel_map to mixer format (resolve any aliases)
-                                    let mut sample = if let Some(map) = channel_map {
-                                        // Custom channel mapping - resolve aliases
-                                        let mapping_result: Result<Vec<(usize, usize)>, String> = map.iter()
-                                            .map(|m| {
-                                                let src = config.resolve_channel(&m.src)?;
-                                                let dest = config.resolve_channel(&m.dest)?;
-                                                Ok((src, dest))
-                                            })
-                                            .collect();
-
-                                        let mapping = match mapping_result {
-                                            Ok(m) => m,
-                                            Err(e) => {
-                                                tracing::error!("Failed to resolve channel alias: {}", e);
-                                                continue;
-                                            }
-                                        };
-                                        tracing::debug!("Using custom channel mapping: {:?}", mapping);
-                                        ActiveSample::new_with_mapping(
-                                            sample_id,
-                                            voice_id.clone(),
-                                            buffer.clone(),
-                                            volume,
-                                            voice_volume,
-                                            mapping,
-                                            file.clone(),
-                                            id.clone(),
-                                            loop_mode,
-                                            crossfade_samples,
-                                        )
-                                    } else {
-                                        // Default channel mapping (1:1)
-                                        ActiveSample::new_with_id(
-                                            sample_id,
-                                            voice_id.clone(),
-                                            buffer.clone(),
-                                            volume,
-                                            voice_volume,
-                                            file.clone(),
-                                            id.clone(),
-                                            loop_mode,
-                                            crossfade_samples,
-                                        )
-                                    };
-
-                                    // Apply start position if requested
-                                    if let Some(start_ms) = start_position_ms {
-                                        let target_frame = ((start_ms * sample_rate as u64) / 1000) as usize;
-                                        // For streaming buffers, use estimate if available, otherwise don't clamp
-                                        // (mixer will return silence for unloaded frames)
-                                        let max_frame = buffer.total_frames_or_estimate()
-                                            .unwrap_or(usize::MAX)
-                                            .saturating_sub(1);
-                                        sample.position = target_frame.min(max_frame);
-                                        if is_streaming && !buffer.is_frame_loaded(sample.position) {
-                                            tracing::debug!(
-                                                "Starting at position {}ms (frame {}), waiting for data to load",
-                                                start_ms, sample.position
-                                            );
-                                        } else {
-                                            tracing::debug!("Starting at position {}ms (frame {})", start_ms, sample.position);
-                                        }
-                                    }
-
-                                    // Apply fade in if requested
-                                    if let Some(fade_ms) = fade_in {
-                                        sample.set_fade(audio::mixer::FadeState::fade_in(fade_ms, output_sample_rate));
-                                        tracing::debug!("Applied {}ms fade in to voice '{}'", fade_ms, voice_id);
-                                    }
-
-                                    // Notify ducking engine if voice became active
-                                    let mut active_voices_guard = active_voices.lock().unwrap();
-                                    let was_active = active_voices_guard.contains(&voice_id);
-                                    if !was_active {
-                                        active_voices_guard.insert(voice_id.clone());
-                                        drop(active_voices_guard);
-
-                                        // Notify ducking engine that voice became active
-                                        let mut state = mixer_state.lock().unwrap();
-                                        if let Some(ref mut engine) = state.ducking_engine {
-                                            engine.notify_voice_active(&voice_id, true);
-                                        }
-                                        state.active_samples.push(sample);
-                                        tracing::info!("Now playing {} active samples", state.active_samples.len());
-                                    } else {
-                                        drop(active_voices_guard);
-                                        let mut state = mixer_state.lock().unwrap();
-                                        state.active_samples.push(sample);
-                                        tracing::info!("Now playing {} active samples", state.active_samples.len());
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to load {}: {}", file, e);
-                                }
-                            }
-                        }
-                        mqtt::commands::AudioCommand::StopAll => {
-                            // Apply quick 10ms fade-out to prevent clicks/pops
-                            const STOP_FADE_MS: u32 = 10;
-
-                            let mut state = mixer_state.lock().unwrap();
-                            let count = state.active_samples.len();
-
-                            for sample in state.active_samples.iter_mut() {
-                                sample.set_fade(audio::mixer::FadeState::fade_out(STOP_FADE_MS, output_sample_rate));
-                            }
-                            drop(state);
-
-                            // Note: Samples will be automatically removed by the audio callback
-                            // when the fade completes (is_finished() returns true).
-                            // Voice cleanup also happens automatically.
-
-                            tracing::info!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS);
-                        }
-                        mqtt::commands::AudioCommand::VoiceStop { voice } => {
-                            // Apply quick 10ms fade-out to prevent clicks/pops
-                            const STOP_FADE_MS: u32 = 10;
-
-                            // Get sample IDs in the voice
-                            let mut voice_mgr = voice_manager.lock().unwrap();
-                            let sample_ids = voice_mgr.clear_voice(&voice);
-                            drop(voice_mgr);
-
-                            if sample_ids.is_empty() {
-                                tracing::warn!("Voice '{}' not found or already empty", voice);
+                    } else {
+                        tracing::info!(
+                            "Playing {}: {} channels, {} frames ({:.2}s) [voice: {}{}{}]",
+                            file,
+                            channels,
+                            frames,
+                            duration_secs,
+                            voice_id,
+                            if loop_mode { ", looping" } else { "" },
+                            if crossfade_ms > 0 {
+                                format!(", crossfade {}ms", crossfade_ms)
                             } else {
-                                // Apply fade-out to all samples in the voice
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-                                for sample in state.active_samples.iter_mut() {
-                                    if sample_ids.contains(&sample.id) {
-                                        sample.set_fade(audio::mixer::FadeState::fade_out(STOP_FADE_MS, output_sample_rate));
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                tracing::info!(
-                                    "Stopping voice '{}': {} samples ({}ms fade-out)",
-                                    voice, updated_count, STOP_FADE_MS
-                                );
+                                String::new()
                             }
+                        );
+                    }
+
+                    // Get sample ID and voice volume from voice manager
+                    let mut voice_mgr = voice_manager.lock().unwrap();
+                    let sample_id = voice_mgr.add_sample_to_voice(&voice_id);
+                    let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
+                    drop(voice_mgr);
+
+                    // Convert crossfade_ms to samples
+                    let crossfade_samples =
+                        (crossfade_ms as usize * output_sample_rate as usize) / 1000;
+
+                    // Convert channel_map to mixer format (resolve any aliases)
+                    let mut sample = if let Some(map) = channel_map {
+                        // Custom channel mapping - resolve aliases
+                        let mapping_result: Result<Vec<(usize, usize)>, String> = map
+                            .iter()
+                            .map(|m| {
+                                let src = config.resolve_channel(&m.src)?;
+                                let dest = config.resolve_channel(&m.dest)?;
+                                Ok((src, dest))
+                            })
+                            .collect();
+
+                        let mapping = match mapping_result {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::error!("Failed to resolve channel alias: {}", e);
+                                return;
+                            }
+                        };
+                        tracing::debug!("Using custom channel mapping: {:?}", mapping);
+                        ActiveSample::new_with_mapping(
+                            sample_id,
+                            voice_id.clone(),
+                            buffer.clone(),
+                            volume,
+                            voice_volume,
+                            mapping,
+                            file.clone(),
+                            id.clone(),
+                            loop_mode,
+                            crossfade_samples,
+                        )
+                    } else {
+                        // Default channel mapping (1:1)
+                        ActiveSample::new_with_id(
+                            sample_id,
+                            voice_id.clone(),
+                            buffer.clone(),
+                            volume,
+                            voice_volume,
+                            file.clone(),
+                            id.clone(),
+                            loop_mode,
+                            crossfade_samples,
+                        )
+                    };
+
+                    // Apply start position if requested
+                    if let Some(start_ms) = start_position_ms {
+                        let target_frame = ((start_ms * sample_rate as u64) / 1000) as usize;
+                        // For streaming buffers, use estimate if available, otherwise don't clamp
+                        // (mixer will return silence for unloaded frames)
+                        let max_frame = buffer
+                            .total_frames_or_estimate()
+                            .unwrap_or(usize::MAX)
+                            .saturating_sub(1);
+                        sample.position = target_frame.min(max_frame);
+                        if is_streaming && !buffer.is_frame_loaded(sample.position) {
+                            tracing::debug!(
+                                "Starting at position {}ms (frame {}), waiting for data to load",
+                                start_ms,
+                                sample.position
+                            );
+                        } else {
+                            tracing::debug!(
+                                "Starting at position {}ms (frame {})",
+                                start_ms,
+                                sample.position
+                            );
                         }
-                        mqtt::commands::AudioCommand::VoiceFadeOut { voice, time_ms } => {
-                            // Get sample IDs in the voice
-                            let voice_mgr = voice_manager.lock().unwrap();
-                            let sample_ids = voice_mgr.get_voice_sample_ids(&voice);
-                            drop(voice_mgr);
+                    }
 
-                            if sample_ids.is_empty() {
-                                tracing::warn!("Voice '{}' not found or already empty", voice);
-                            } else {
-                                // Apply fade out to all samples in the voice
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-                                for sample in state.active_samples.iter_mut() {
-                                    if sample_ids.contains(&sample.id) {
-                                        sample.set_fade(audio::mixer::FadeState::fade_out(time_ms, output_sample_rate));
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
+                    // Apply fade in if requested
+                    if let Some(fade_ms) = fade_in {
+                        sample.set_fade(audio::mixer::FadeState::fade_in(
+                            fade_ms,
+                            output_sample_rate,
+                        ));
+                        tracing::debug!("Applied {}ms fade in to voice '{}'", fade_ms, voice_id);
+                    }
 
-                                tracing::info!(
-                                    "Applied {}ms fade out to voice '{}' ({} samples)",
-                                    time_ms, voice, updated_count
-                                );
-                            }
+                    // Notify ducking engine if voice became active
+                    let mut active_voices_guard = active_voices.lock().unwrap();
+                    let was_active = active_voices_guard.contains(&voice_id);
+                    if !was_active {
+                        active_voices_guard.insert(voice_id.clone());
+                        drop(active_voices_guard);
+
+                        // Notify ducking engine that voice became active
+                        let mut state = mixer_state.lock().unwrap();
+                        if let Some(ref mut engine) = state.ducking_engine {
+                            engine.notify_voice_active(&voice_id, true);
                         }
-                        mqtt::commands::AudioCommand::VoiceVolume { voice, volume: new_volume } => {
-                            // Set voice volume in voice manager
-                            let mut voice_mgr = voice_manager.lock().unwrap();
-                            let success = voice_mgr.set_voice_volume(&voice, new_volume);
-                            let actual_volume = voice_mgr.get_voice_volume(&voice).unwrap_or(1.0);
-                            drop(voice_mgr);
-
-                            if success {
-                                // Update all active samples and live inputs in this voice with smooth ramping
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut sample_count = 0;
-                                let mut input_count = 0;
-
-                                for sample in state.active_samples.iter_mut() {
-                                    if sample.voice_id == voice {
-                                        // Set target for smooth ramping (avoids pops)
-                                        sample.set_target_voice_volume(actual_volume);
-                                        sample_count += 1;
-                                    }
-                                }
-
-                                for input in state.live_inputs.iter_mut() {
-                                    if input.voice_id == voice {
-                                        // Set target for smooth ramping (avoids pops)
-                                        input.set_target_voice_volume(actual_volume);
-                                        input_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                tracing::info!(
-                                    "Set voice '{}' volume to {:.2} (updated {} samples, {} inputs)",
-                                    voice, actual_volume, sample_count, input_count
-                                );
-                            } else {
-                                tracing::warn!("Voice '{}' not found", voice);
-                            }
-                        }
-                        mqtt::commands::AudioCommand::Precache { file } => {
-                            // Non-blocking precache - starts loading and returns immediately
-                            let mut cache_mgr = cache_manager.lock().unwrap();
-                            match cache_mgr.precache_streaming(&file, output_sample_rate).await {
-                                Ok(()) => {
-                                    if config.logging.verbose {
-                                        cache_mgr.log_stats();
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to start precache for {}: {}", file, e);
-                                }
-                            }
-                        }
-                        mqtt::commands::AudioCommand::CacheClear => {
-                            let mut cache_mgr = cache_manager.lock().unwrap();
-                            if config.logging.verbose {
-                                let mem = cache_mgr.memory_stats();
-                                let disk = cache_mgr.disk_stats();
-                                tracing::debug!(
-                                    "Clearing cache - Memory: {} entries ({:.2} MB), Disk: {} entries ({:.2} MB)",
-                                    mem.entry_count,
-                                    mem.size_bytes as f64 / (1024.0 * 1024.0),
-                                    disk.entry_count,
-                                    disk.size_bytes as f64 / (1024.0 * 1024.0)
-                                );
-                            }
-                            match cache_mgr.clear_all() {
-                                Ok(()) => {
-                                    tracing::info!("Cache cleared successfully");
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to clear cache: {}", e);
-                                }
-                            }
-                        }
-                        mqtt::commands::AudioCommand::CacheInvalidate { file } => {
-                            let mut cache_mgr = cache_manager.lock().unwrap();
-                            match cache_mgr.invalidate(&file) {
-                                Ok(()) => {
-                                    tracing::info!("Invalidated cache for: {}", file);
-                                    if config.logging.verbose {
-                                        cache_mgr.log_stats();
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to invalidate {}: {}", file, e);
-                                }
-                            }
-                        }
-                        mqtt::commands::AudioCommand::InputVolume { input, volume: new_volume } => {
-                            let mut state = mixer_state.lock().unwrap();
-                            let mut found = false;
-
-                            // Try to find by index first
-                            if let Ok(idx) = input.parse::<usize>() {
-                                if idx < state.live_inputs.len() {
-                                    state.live_inputs[idx].volume = new_volume.clamp(0.0, 1.0);
-                                    tracing::info!(
-                                        "Set input {} volume to {:.2}",
-                                        idx, state.live_inputs[idx].volume
-                                    );
-                                    found = true;
-                                }
-                            }
-
-                            // Try to find by voice_id if not found by index
-                            if !found {
-                                for live_input in state.live_inputs.iter_mut() {
-                                    if live_input.voice_id == input {
-                                        live_input.volume = new_volume.clamp(0.0, 1.0);
-                                        tracing::info!(
-                                            "Set input '{}' volume to {:.2}",
-                                            input, live_input.volume
-                                        );
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if !found {
-                                tracing::warn!("Input '{}' not found", input);
-                            }
-                        }
-                        mqtt::commands::AudioCommand::InputMute { input, mute } => {
-                            let mut state = mixer_state.lock().unwrap();
-                            let mut found = false;
-
-                            // Try to find by index first
-                            if let Ok(idx) = input.parse::<usize>() {
-                                if idx < state.live_inputs.len() {
-                                    // Mute by setting volume to 0, unmute restores to 1.0
-                                    // Note: This is a simple mute - a more sophisticated version
-                                    // would store the previous volume
-                                    state.live_inputs[idx].volume = if mute { 0.0 } else { 1.0 };
-                                    tracing::info!(
-                                        "Input {} {}",
-                                        idx, if mute { "muted" } else { "unmuted" }
-                                    );
-                                    found = true;
-                                }
-                            }
-
-                            // Try to find by voice_id if not found by index
-                            if !found {
-                                for live_input in state.live_inputs.iter_mut() {
-                                    if live_input.voice_id == input {
-                                        live_input.volume = if mute { 0.0 } else { 1.0 };
-                                        tracing::info!(
-                                            "Input '{}' {}",
-                                            input, if mute { "muted" } else { "unmuted" }
-                                        );
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if !found {
-                                tracing::warn!("Input '{}' not found", input);
-                            }
-                        }
-                        mqtt::commands::AudioCommand::Seek { selector, position_ms } => {
-                            if selector.is_empty() {
-                                tracing::warn!("Seek command with empty selector - no samples targeted");
-                            } else {
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-
-                                for sample in state.active_samples.iter_mut() {
-                                    if selector.matches(
-                                        sample.id,
-                                        sample.sample_id.as_deref(),
-                                        &sample.file_path,
-                                        &sample.voice_id,
-                                    ) {
-                                        // Convert milliseconds to frames
-                                        let target_frame = ((position_ms as u64 * sample.buffer.sample_rate() as u64) / 1000) as usize;
-                                        // Clamp to buffer bounds
-                                        sample.position = target_frame.min(sample.buffer.frames().saturating_sub(1));
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                if updated_count > 0 {
-                                    tracing::info!(
-                                        "Seeked {} samples to {}ms",
-                                        updated_count, position_ms
-                                    );
-                                } else {
-                                    tracing::warn!("Seek command matched no active samples");
-                                }
-                            }
-                        }
-                        mqtt::commands::AudioCommand::Speed { selector, speed, pitch_correction } => {
-                            if selector.is_empty() {
-                                tracing::warn!("Speed command with empty selector - no samples targeted");
-                            } else {
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-
-                                for sample in state.active_samples.iter_mut() {
-                                    if selector.matches(
-                                        sample.id,
-                                        sample.sample_id.as_deref(),
-                                        &sample.file_path,
-                                        &sample.voice_id,
-                                    ) {
-                                        sample.set_speed_with_mode(speed, pitch_correction);
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                if updated_count > 0 {
-                                    let mode = if pitch_correction { "pitch-corrected" } else { "normal" };
-                                    tracing::info!(
-                                        "Set speed to {}x ({}) for {} samples",
-                                        speed, mode, updated_count
-                                    );
-                                } else {
-                                    tracing::warn!("Speed command matched no active samples");
-                                }
-                            }
-                        }
-                        mqtt::commands::AudioCommand::Stop { selector, fade_out_ms } => {
-                            if selector.is_empty() {
-                                tracing::warn!("Stop command with empty selector - no samples targeted");
-                            } else {
-                                // Default to 10ms fade for smooth stop if not specified
-                                let fade_ms = fade_out_ms.unwrap_or(10);
-
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-
-                                for sample in state.active_samples.iter_mut() {
-                                    if selector.matches(
-                                        sample.id,
-                                        sample.sample_id.as_deref(),
-                                        &sample.file_path,
-                                        &sample.voice_id,
-                                    ) {
-                                        sample.set_fade(audio::mixer::FadeState::fade_out(fade_ms, output_sample_rate));
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                if updated_count > 0 {
-                                    tracing::info!(
-                                        "Stopping {} samples ({}ms fade-out)",
-                                        updated_count, fade_ms
-                                    );
-                                } else {
-                                    tracing::warn!("Stop command matched no active samples");
-                                }
-                            }
-                        }
-                        mqtt::commands::AudioCommand::Volume { selector, volume } => {
-                            if selector.is_empty() {
-                                tracing::warn!("Volume command with empty selector - no samples targeted");
-                            } else {
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-
-                                for sample in state.active_samples.iter_mut() {
-                                    if selector.matches(
-                                        sample.id,
-                                        sample.sample_id.as_deref(),
-                                        &sample.file_path,
-                                        &sample.voice_id,
-                                    ) {
-                                        sample.volume = volume.clamp(0.0, 1.0);
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                if updated_count > 0 {
-                                    tracing::info!(
-                                        "Set volume to {:.2} for {} samples",
-                                        volume, updated_count
-                                    );
-                                } else {
-                                    tracing::warn!("Volume command matched no active samples");
-                                }
-                            }
-                        }
+                        state.active_samples.push(sample);
+                        tracing::info!("Now playing {} active samples", state.active_samples.len());
+                    } else {
+                        drop(active_voices_guard);
+                        let mut state = mixer_state.lock().unwrap();
+                        state.active_samples.push(sample);
+                        tracing::info!("Now playing {} active samples", state.active_samples.len());
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Failed to parse command: {}", e);
+                    tracing::error!("Failed to load {}: {}", file, e);
                 }
             }
         }
+        mqtt::commands::AudioCommand::StopAll => {
+            // Apply quick 10ms fade-out to prevent clicks/pops
+            const STOP_FADE_MS: u32 = 10;
 
-        // Keep stream alive
-        drop(stream);
+            let mut state = mixer_state.lock().unwrap();
+            let count = state.active_samples.len();
+
+            for sample in state.active_samples.iter_mut() {
+                sample.set_fade(audio::mixer::FadeState::fade_out(
+                    STOP_FADE_MS,
+                    output_sample_rate,
+                ));
+            }
+            drop(state);
+
+            // Note: Samples will be automatically removed by the audio callback
+            // when the fade completes (is_finished() returns true).
+            // Voice cleanup also happens automatically.
+
+            tracing::info!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS);
+        }
+        mqtt::commands::AudioCommand::VoiceStop { voice } => {
+            // Apply quick 10ms fade-out to prevent clicks/pops
+            const STOP_FADE_MS: u32 = 10;
+
+            // Get sample IDs in the voice
+            let mut voice_mgr = voice_manager.lock().unwrap();
+            let sample_ids = voice_mgr.clear_voice(&voice);
+            drop(voice_mgr);
+
+            if sample_ids.is_empty() {
+                tracing::warn!("Voice '{}' not found or already empty", voice);
+            } else {
+                // Apply fade-out to all samples in the voice
+                let mut state = mixer_state.lock().unwrap();
+                let mut updated_count = 0;
+                for sample in state.active_samples.iter_mut() {
+                    if sample_ids.contains(&sample.id) {
+                        sample.set_fade(audio::mixer::FadeState::fade_out(
+                            STOP_FADE_MS,
+                            output_sample_rate,
+                        ));
+                        updated_count += 1;
+                    }
+                }
+                drop(state);
+
+                tracing::info!(
+                    "Stopping voice '{}': {} samples ({}ms fade-out)",
+                    voice,
+                    updated_count,
+                    STOP_FADE_MS
+                );
+            }
+        }
+        mqtt::commands::AudioCommand::VoiceFadeOut { voice, time_ms } => {
+            // Get sample IDs in the voice
+            let voice_mgr = voice_manager.lock().unwrap();
+            let sample_ids = voice_mgr.get_voice_sample_ids(&voice);
+            drop(voice_mgr);
+
+            if sample_ids.is_empty() {
+                tracing::warn!("Voice '{}' not found or already empty", voice);
+            } else {
+                // Apply fade out to all samples in the voice
+                let mut state = mixer_state.lock().unwrap();
+                let mut updated_count = 0;
+                for sample in state.active_samples.iter_mut() {
+                    if sample_ids.contains(&sample.id) {
+                        sample.set_fade(audio::mixer::FadeState::fade_out(
+                            time_ms,
+                            output_sample_rate,
+                        ));
+                        updated_count += 1;
+                    }
+                }
+                drop(state);
+
+                tracing::info!(
+                    "Applied {}ms fade out to voice '{}' ({} samples)",
+                    time_ms,
+                    voice,
+                    updated_count
+                );
+            }
+        }
+        mqtt::commands::AudioCommand::VoiceVolume {
+            voice,
+            volume: new_volume,
+        } => {
+            // Set voice volume in voice manager
+            let mut voice_mgr = voice_manager.lock().unwrap();
+            let success = voice_mgr.set_voice_volume(&voice, new_volume);
+            let actual_volume = voice_mgr.get_voice_volume(&voice).unwrap_or(1.0);
+            drop(voice_mgr);
+
+            if success {
+                // Update all active samples and live inputs in this voice with smooth ramping
+                let mut state = mixer_state.lock().unwrap();
+                let mut sample_count = 0;
+                let mut input_count = 0;
+
+                for sample in state.active_samples.iter_mut() {
+                    if sample.voice_id == voice {
+                        // Set target for smooth ramping (avoids pops)
+                        sample.set_target_voice_volume(actual_volume);
+                        sample_count += 1;
+                    }
+                }
+
+                for input in state.live_inputs.iter_mut() {
+                    if input.voice_id == voice {
+                        // Set target for smooth ramping (avoids pops)
+                        input.set_target_voice_volume(actual_volume);
+                        input_count += 1;
+                    }
+                }
+                drop(state);
+
+                tracing::info!(
+                    "Set voice '{}' volume to {:.2} (updated {} samples, {} inputs)",
+                    voice,
+                    actual_volume,
+                    sample_count,
+                    input_count
+                );
+            } else {
+                tracing::warn!("Voice '{}' not found", voice);
+            }
+        }
+        mqtt::commands::AudioCommand::Precache { file } => {
+            // Non-blocking precache - starts loading and returns immediately
+            let mut cache_mgr = cache_manager.lock().unwrap();
+            match cache_mgr
+                .precache_streaming(&file, output_sample_rate)
+                .await
+            {
+                Ok(()) => {
+                    if config.logging.verbose {
+                        cache_mgr.log_stats();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start precache for {}: {}", file, e);
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::CacheClear => {
+            let mut cache_mgr = cache_manager.lock().unwrap();
+            if config.logging.verbose {
+                let mem = cache_mgr.memory_stats();
+                let disk = cache_mgr.disk_stats();
+                tracing::debug!(
+                    "Clearing cache - Memory: {} entries ({:.2} MB), Disk: {} entries ({:.2} MB)",
+                    mem.entry_count,
+                    mem.size_bytes as f64 / (1024.0 * 1024.0),
+                    disk.entry_count,
+                    disk.size_bytes as f64 / (1024.0 * 1024.0)
+                );
+            }
+            match cache_mgr.clear_all() {
+                Ok(()) => {
+                    tracing::info!("Cache cleared successfully");
+                }
+                Err(e) => {
+                    tracing::error!("Failed to clear cache: {}", e);
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::CacheInvalidate { file } => {
+            let mut cache_mgr = cache_manager.lock().unwrap();
+            match cache_mgr.invalidate(&file) {
+                Ok(()) => {
+                    tracing::info!("Invalidated cache for: {}", file);
+                    if config.logging.verbose {
+                        cache_mgr.log_stats();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to invalidate {}: {}", file, e);
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::InputVolume {
+            input,
+            volume: new_volume,
+        } => {
+            let mut state = mixer_state.lock().unwrap();
+            let mut found = false;
+
+            // Try to find by index first
+            if let Ok(idx) = input.parse::<usize>() {
+                if idx < state.live_inputs.len() {
+                    state.live_inputs[idx].volume = new_volume.clamp(0.0, 1.0);
+                    tracing::info!(
+                        "Set input {} volume to {:.2}",
+                        idx,
+                        state.live_inputs[idx].volume
+                    );
+                    found = true;
+                }
+            }
+
+            // Try to find by voice_id if not found by index
+            if !found {
+                for live_input in state.live_inputs.iter_mut() {
+                    if live_input.voice_id == input {
+                        live_input.volume = new_volume.clamp(0.0, 1.0);
+                        tracing::info!("Set input '{}' volume to {:.2}", input, live_input.volume);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            if !found {
+                tracing::warn!("Input '{}' not found", input);
+            }
+        }
+        mqtt::commands::AudioCommand::InputMute { input, mute } => {
+            let mut state = mixer_state.lock().unwrap();
+            let mut found = false;
+
+            // Try to find by index first
+            if let Ok(idx) = input.parse::<usize>() {
+                if idx < state.live_inputs.len() {
+                    // Mute by setting volume to 0, unmute restores to 1.0
+                    // Note: This is a simple mute - a more sophisticated version
+                    // would store the previous volume
+                    state.live_inputs[idx].volume = if mute { 0.0 } else { 1.0 };
+                    tracing::info!("Input {} {}", idx, if mute { "muted" } else { "unmuted" });
+                    found = true;
+                }
+            }
+
+            // Try to find by voice_id if not found by index
+            if !found {
+                for live_input in state.live_inputs.iter_mut() {
+                    if live_input.voice_id == input {
+                        live_input.volume = if mute { 0.0 } else { 1.0 };
+                        tracing::info!(
+                            "Input '{}' {}",
+                            input,
+                            if mute { "muted" } else { "unmuted" }
+                        );
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
+            if !found {
+                tracing::warn!("Input '{}' not found", input);
+            }
+        }
+        mqtt::commands::AudioCommand::Seek {
+            selector,
+            position_ms,
+        } => {
+            if selector.is_empty() {
+                tracing::warn!("Seek command with empty selector - no samples targeted");
+            } else {
+                let mut state = mixer_state.lock().unwrap();
+                let mut updated_count = 0;
+
+                for sample in state.active_samples.iter_mut() {
+                    if selector.matches(
+                        sample.id,
+                        sample.sample_id.as_deref(),
+                        &sample.file_path,
+                        &sample.voice_id,
+                    ) {
+                        // Convert milliseconds to frames
+                        let target_frame =
+                            ((position_ms * sample.buffer.sample_rate() as u64) / 1000) as usize;
+                        // Clamp to buffer bounds
+                        sample.position =
+                            target_frame.min(sample.buffer.frames().saturating_sub(1));
+                        updated_count += 1;
+                    }
+                }
+                drop(state);
+
+                if updated_count > 0 {
+                    tracing::info!("Seeked {} samples to {}ms", updated_count, position_ms);
+                } else {
+                    tracing::warn!("Seek command matched no active samples");
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::Speed {
+            selector,
+            speed,
+            pitch_correction,
+        } => {
+            if selector.is_empty() {
+                tracing::warn!("Speed command with empty selector - no samples targeted");
+            } else {
+                let mut state = mixer_state.lock().unwrap();
+                let mut updated_count = 0;
+
+                for sample in state.active_samples.iter_mut() {
+                    if selector.matches(
+                        sample.id,
+                        sample.sample_id.as_deref(),
+                        &sample.file_path,
+                        &sample.voice_id,
+                    ) {
+                        sample.set_speed_with_mode(speed, pitch_correction);
+                        updated_count += 1;
+                    }
+                }
+                drop(state);
+
+                if updated_count > 0 {
+                    let mode = if pitch_correction {
+                        "pitch-corrected"
+                    } else {
+                        "normal"
+                    };
+                    tracing::info!(
+                        "Set speed to {}x ({}) for {} samples",
+                        speed,
+                        mode,
+                        updated_count
+                    );
+                } else {
+                    tracing::warn!("Speed command matched no active samples");
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::Stop {
+            selector,
+            fade_out_ms,
+        } => {
+            if selector.is_empty() {
+                tracing::warn!("Stop command with empty selector - no samples targeted");
+            } else {
+                // Default to 10ms fade for smooth stop if not specified
+                let fade_ms = fade_out_ms.unwrap_or(10);
+
+                let mut state = mixer_state.lock().unwrap();
+                let mut updated_count = 0;
+
+                for sample in state.active_samples.iter_mut() {
+                    if selector.matches(
+                        sample.id,
+                        sample.sample_id.as_deref(),
+                        &sample.file_path,
+                        &sample.voice_id,
+                    ) {
+                        sample.set_fade(audio::mixer::FadeState::fade_out(
+                            fade_ms,
+                            output_sample_rate,
+                        ));
+                        updated_count += 1;
+                    }
+                }
+                drop(state);
+
+                if updated_count > 0 {
+                    tracing::info!(
+                        "Stopping {} samples ({}ms fade-out)",
+                        updated_count,
+                        fade_ms
+                    );
+                } else {
+                    tracing::warn!("Stop command matched no active samples");
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::Volume { selector, volume } => {
+            if selector.is_empty() {
+                tracing::warn!("Volume command with empty selector - no samples targeted");
+            } else {
+                let mut state = mixer_state.lock().unwrap();
+                let mut updated_count = 0;
+
+                for sample in state.active_samples.iter_mut() {
+                    if selector.matches(
+                        sample.id,
+                        sample.sample_id.as_deref(),
+                        &sample.file_path,
+                        &sample.voice_id,
+                    ) {
+                        sample.volume = volume.clamp(0.0, 1.0);
+                        updated_count += 1;
+                    }
+                }
+                drop(state);
+
+                if updated_count > 0 {
+                    tracing::info!("Set volume to {:.2} for {} samples", volume, updated_count);
+                } else {
+                    tracing::warn!("Volume command matched no active samples");
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use audio::ducking::{DuckingEngine, DuckingRule};
+    use audio::mixer::{FadeState, MixerState};
+    use mqtt::commands::{AudioCommand, SampleSelector};
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use voice::VoiceManager;
+
+    const TEST_WAV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/audio/test_440hz_2s.wav");
+    const SR: u32 = 48000;
+
+    /// Owns the shared state needed to drive `handle_command` in tests.
+    struct Fixture {
+        cache_manager: Arc<Mutex<cache::CacheManager>>,
+        voice_manager: Arc<Mutex<VoiceManager>>,
+        mixer_state: Arc<Mutex<MixerState>>,
+        active_voices: Arc<Mutex<HashSet<String>>>,
+        config: config::Config,
+        _cache_dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new(ducking_engine: Option<DuckingEngine>) -> Self {
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache = cache::CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+            let mixer_state = MixerState {
+                active_samples: Vec::new(),
+                live_inputs: Vec::new(),
+                output_channels: 2,
+                ducking_engine,
+                bass_management: None,
+            };
+            Self {
+                cache_manager: Arc::new(Mutex::new(cache)),
+                voice_manager: Arc::new(Mutex::new(VoiceManager::new())),
+                mixer_state: Arc::new(Mutex::new(mixer_state)),
+                active_voices: Arc::new(Mutex::new(HashSet::new())),
+                config: config::Config::default(),
+                _cache_dir: cache_dir,
+            }
+        }
+
+        fn ctx(&self) -> CommandCtx<'_> {
+            CommandCtx {
+                cache_manager: &self.cache_manager,
+                voice_manager: &self.voice_manager,
+                mixer_state: &self.mixer_state,
+                active_voices: &self.active_voices,
+                output_sample_rate: SR,
+                config: &self.config,
+            }
+        }
+    }
+
+    fn play(voice: Option<&str>, volume: f32) -> AudioCommand {
+        AudioCommand::Play {
+            file: TEST_WAV.to_string(),
+            id: None,
+            volume,
+            voice: voice.map(str::to_string),
+            channel_map: None,
+            fade_in: None,
+            start_position_ms: None,
+            loop_mode: false,
+            crossfade_ms: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn play_adds_active_sample_and_marks_voice_active() {
+        let fixture = Fixture::new(None);
+        handle_command(play(Some("music"), 0.5), &fixture.ctx()).await;
+
+        let state = fixture.mixer_state.lock().unwrap();
+        assert_eq!(state.active_samples.len(), 1);
+        let sample = &state.active_samples[0];
+        assert_eq!(sample.voice_id, "music");
+        assert_eq!(sample.volume, 0.5);
+        assert_eq!(sample.position, 0);
+        assert!(matches!(sample.fade_state, FadeState::None));
+        assert_eq!(sample.crossfade_samples, 0);
+
+        assert!(fixture.active_voices.lock().unwrap().contains("music"));
+    }
+
+    #[tokio::test]
+    async fn play_with_fade_in_sets_fade_state() {
+        let fixture = Fixture::new(None);
+        let mut cmd = play(Some("music"), 1.0);
+        if let AudioCommand::Play { fade_in, .. } = &mut cmd {
+            *fade_in = Some(100);
+        }
+        handle_command(cmd, &fixture.ctx()).await;
+
+        let state = fixture.mixer_state.lock().unwrap();
+        // 100 ms at 48 kHz = 4800 frames
+        assert!(matches!(
+            state.active_samples[0].fade_state,
+            FadeState::In {
+                elapsed: 0,
+                duration: 4800
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_all_applies_fade_out_to_every_sample() {
+        let fixture = Fixture::new(None);
+        handle_command(play(Some("a"), 1.0), &fixture.ctx()).await;
+        handle_command(play(Some("b"), 1.0), &fixture.ctx()).await;
+        assert_eq!(fixture.mixer_state.lock().unwrap().active_samples.len(), 2);
+
+        handle_command(AudioCommand::StopAll, &fixture.ctx()).await;
+
+        let state = fixture.mixer_state.lock().unwrap();
+        assert_eq!(state.active_samples.len(), 2);
+        for sample in &state.active_samples {
+            assert!(matches!(sample.fade_state, FadeState::Out { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_by_voice_selector_fades_only_matching_samples() {
+        let fixture = Fixture::new(None);
+        handle_command(play(Some("music"), 1.0), &fixture.ctx()).await;
+        handle_command(play(Some("sfx"), 1.0), &fixture.ctx()).await;
+
+        let stop = AudioCommand::Stop {
+            selector: SampleSelector {
+                internal_id: None,
+                id: None,
+                file: None,
+                voice: Some("music".to_string()),
+            },
+            fade_out_ms: Some(50),
+        };
+        handle_command(stop, &fixture.ctx()).await;
+
+        let expected_duration = 50 * SR as usize / 1000; // 2400 frames
+        let state = fixture.mixer_state.lock().unwrap();
+        for sample in &state.active_samples {
+            if sample.voice_id == "music" {
+                assert!(matches!(
+                    sample.fade_state,
+                    FadeState::Out { duration, .. } if duration == expected_duration
+                ));
+            } else {
+                assert!(matches!(sample.fade_state, FadeState::None));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_volume_sets_ramp_target_without_jumping() {
+        let fixture = Fixture::new(None);
+        handle_command(play(Some("music"), 1.0), &fixture.ctx()).await;
+
+        handle_command(
+            AudioCommand::VoiceVolume {
+                voice: "music".to_string(),
+                volume: 0.3,
+            },
+            &fixture.ctx(),
+        )
+        .await;
+
+        let state = fixture.mixer_state.lock().unwrap();
+        let sample = &state.active_samples[0];
+        assert!((sample.target_voice_volume - 0.3).abs() < 1e-6);
+        // Current voice volume is ramped over time, so it must not jump immediately.
+        assert!((sample.voice_volume - 1.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn playing_a_ducking_primary_ducks_the_background_voice() {
+        let rule = DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0, // instant, for a deterministic assertion
+        };
+        let fixture = Fixture::new(Some(DuckingEngine::new(vec![rule], SR)));
+
+        // Background music starts first. It is not a ducking primary, so it stays full.
+        handle_command(play(Some("music"), 1.0), &fixture.ctx()).await;
+        {
+            let mut state = fixture.mixer_state.lock().unwrap();
+            let engine = state.ducking_engine.as_mut().unwrap();
+            assert!((engine.get_multiplier("music", 1) - 1.0).abs() < 1e-6);
+        }
+
+        // The primary voice starts: handle_command must notify the ducking engine,
+        // which ducks "music".
+        handle_command(play(Some("narration"), 1.0), &fixture.ctx()).await;
+        {
+            let mut state = fixture.mixer_state.lock().unwrap();
+            let engine = state.ducking_engine.as_mut().unwrap();
+            let multiplier = engine.get_multiplier("music", 1);
+            assert!(
+                multiplier < 0.2,
+                "expected music ducked toward 0.1, got {multiplier}"
+            );
+        }
+    }
 }

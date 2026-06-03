@@ -1,10 +1,10 @@
 // ABOUTME: Real-time audio mixer performing sample mixing and channel routing.
 // ABOUTME: Runs in audio callback thread with strict real-time constraints.
 
-use crate::audio::streaming::SampleBuffer;
-use crate::audio::ducking::DuckingEngine;
 use crate::audio::bass_management::BassManagement;
+use crate::audio::ducking::DuckingEngine;
 use crate::audio::pitch_correction::PitchCorrector;
+use crate::audio::streaming::SampleBuffer;
 use ringbuf::HeapConsumer;
 
 /// Fade state for audio samples
@@ -148,9 +148,7 @@ impl ActiveSample {
     ) -> Self {
         let buffer = buffer.into();
         // Default channel mapping: 1:1 for available channels
-        let channel_map = (0..buffer.channels())
-            .map(|ch| (ch, ch))
-            .collect();
+        let channel_map = (0..buffer.channels()).map(|ch| (ch, ch)).collect();
 
         Self {
             id,
@@ -173,6 +171,7 @@ impl ActiveSample {
     }
 
     /// Create a new active sample with user-provided sample ID
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_id(
         id: u64,
         voice_id: String,
@@ -186,9 +185,7 @@ impl ActiveSample {
     ) -> Self {
         let buffer = buffer.into();
         // Default channel mapping: 1:1 for available channels
-        let channel_map = (0..buffer.channels())
-            .map(|ch| (ch, ch))
-            .collect();
+        let channel_map = (0..buffer.channels()).map(|ch| (ch, ch)).collect();
 
         Self {
             id,
@@ -211,6 +208,7 @@ impl ActiveSample {
     }
 
     /// Create a new active sample with custom channel mapping
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_mapping(
         id: u64,
         voice_id: String,
@@ -285,10 +283,7 @@ impl ActiveSample {
     /// Creates a new PitchCorrector if one doesn't exist.
     pub fn enable_pitch_correction(&mut self) {
         if self.pitch_corrector.is_none() {
-            let mut pc = PitchCorrector::new(
-                self.buffer.channels(),
-                self.buffer.sample_rate(),
-            );
+            let mut pc = PitchCorrector::new(self.buffer.channels(), self.buffer.sample_rate());
             pc.set_speed(self.speed);
             self.pitch_corrector = Some(pc);
         }
@@ -327,13 +322,10 @@ impl ActiveSample {
     /// Looping samples only finish when fade out is complete
     pub fn is_finished(&self) -> bool {
         // Fade out complete - always finishes, even for looping samples
-        match self.fade_state {
-            FadeState::Out { elapsed, duration } => {
-                if elapsed >= duration {
-                    return true;
-                }
+        if let FadeState::Out { elapsed, duration } = self.fade_state {
+            if elapsed >= duration {
+                return true;
             }
-            _ => {}
         }
 
         // Looping samples never finish from buffer position
@@ -555,10 +547,16 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
         let ducking_multiplier = if let Some(ref mut engine) = state.ducking_engine {
             engine.get_multiplier(&sample.voice_id, frames)
         } else {
-            1.0  // No ducking
+            1.0 // No ducking
         };
 
-        mix_sample_into_output(sample, output, frames, state.output_channels, ducking_multiplier);
+        mix_sample_into_output(
+            sample,
+            output,
+            frames,
+            state.output_channels,
+            ducking_multiplier,
+        );
 
         // Advance playback position (accounting for speed)
         sample.advance_position(frames);
@@ -570,10 +568,16 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
         let ducking_multiplier = if let Some(ref mut engine) = state.ducking_engine {
             engine.get_multiplier(&input.voice_id, frames)
         } else {
-            1.0  // No ducking
+            1.0 // No ducking
         };
 
-        mix_live_input_into_output(input, output, frames, state.output_channels, ducking_multiplier);
+        mix_live_input_into_output(
+            input,
+            output,
+            frames,
+            state.output_channels,
+            ducking_multiplier,
+        );
     }
 
     // Apply bass management (LFE extraction and crossover filtering)
@@ -598,7 +602,13 @@ fn mix_sample_into_output(
     // Use pitch-corrected path if pitch corrector is enabled
     // Note: pitch correction requires Complete buffers (direct data slice access)
     if sample.pitch_corrector.is_some() && sample.buffer.is_complete() {
-        mix_sample_with_pitch_correction(sample, output, frames, output_channels, ducking_multiplier);
+        mix_sample_with_pitch_correction(
+            sample,
+            output,
+            frames,
+            output_channels,
+            ducking_multiplier,
+        );
         return;
     }
 
@@ -623,7 +633,7 @@ fn mix_sample_into_output(
                 src_pos = src_pos % buffer_frames as f64 + buffer_frames as f64;
             } else if src_pos >= buffer_frames as f64 {
                 // Wrap from end to start
-                src_pos = src_pos % buffer_frames as f64;
+                src_pos %= buffer_frames as f64;
             }
         } else {
             // Check bounds based on direction (non-looping)
@@ -711,7 +721,10 @@ fn mix_sample_into_output(
             };
 
             // Apply loop crossfade by blending samples from end and beginning
-            let blended_val = if loop_mode && sample.crossfade_samples > 0 && buffer_frames > sample.crossfade_samples * 2 {
+            let blended_val = if loop_mode
+                && sample.crossfade_samples > 0
+                && buffer_frames > sample.crossfade_samples * 2
+            {
                 let cf_samples = sample.crossfade_samples;
 
                 if is_reverse {
@@ -863,9 +876,9 @@ fn mix_live_input_into_output(
 
         // Read the entire frame from the ring buffer
         let mut frame_samples = [0.0f32; 16]; // Support up to 16 input channels
-        for ch in 0..input_channels.min(16) {
+        for slot in frame_samples.iter_mut().take(input_channels.min(16)) {
             if let Some(sample) = input.consumer.pop() {
-                frame_samples[ch] = sample;
+                *slot = sample;
             }
         }
 
@@ -900,7 +913,14 @@ mod tests {
     #[test]
     fn test_single_sample_mixing() {
         let buffer = create_test_buffer(10, 2, 0.5);
-        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -919,8 +939,22 @@ mod tests {
         let buffer1 = create_test_buffer(10, 2, 0.3);
         let buffer2 = create_test_buffer(10, 2, 0.4);
 
-        let sample1 = ActiveSample::new(1, "test".to_string(), buffer1, 1.0, 1.0, TEST_FILE.to_string());
-        let sample2 = ActiveSample::new(2, "test".to_string(), buffer2, 1.0, 1.0, TEST_FILE.to_string());
+        let sample1 = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer1,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
+        let sample2 = ActiveSample::new(
+            2,
+            "test".to_string(),
+            buffer2,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample1);
@@ -938,7 +972,14 @@ mod tests {
     #[test]
     fn test_volume_control() {
         let buffer = create_test_buffer(10, 2, 1.0);
-        let sample = ActiveSample::new(1, "test".to_string(), buffer, 0.5, 1.0, TEST_FILE.to_string()); // 50% sample volume
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            0.5,
+            1.0,
+            TEST_FILE.to_string(),
+        ); // 50% sample volume
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -955,7 +996,14 @@ mod tests {
     #[test]
     fn test_voice_volume() {
         let buffer = create_test_buffer(10, 2, 1.0);
-        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 0.5, TEST_FILE.to_string()); // 50% voice volume
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            0.5,
+            TEST_FILE.to_string(),
+        ); // 50% voice volume
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -972,7 +1020,14 @@ mod tests {
     #[test]
     fn test_combined_volume() {
         let buffer = create_test_buffer(10, 2, 1.0);
-        let sample = ActiveSample::new(1, "test".to_string(), buffer, 0.5, 0.4, TEST_FILE.to_string()); // 50% sample * 40% voice
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            0.5,
+            0.4,
+            TEST_FILE.to_string(),
+        ); // 50% sample * 40% voice
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -991,8 +1046,22 @@ mod tests {
         let buffer1 = create_test_buffer(10, 2, 0.8);
         let buffer2 = create_test_buffer(10, 2, 0.8);
 
-        let sample1 = ActiveSample::new(1, "test".to_string(), buffer1, 1.0, 1.0, TEST_FILE.to_string());
-        let sample2 = ActiveSample::new(2, "test".to_string(), buffer2, 1.0, 1.0, TEST_FILE.to_string());
+        let sample1 = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer1,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
+        let sample2 = ActiveSample::new(
+            2,
+            "test".to_string(),
+            buffer2,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample1);
@@ -1015,7 +1084,18 @@ mod tests {
 
         // Map: L→1, R→3 (4-channel output)
         let channel_map = vec![(0, 1), (1, 3)];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None, false, 0);
+        let sample = ActiveSample::new_with_mapping(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            channel_map,
+            TEST_FILE.to_string(),
+            None,
+            false,
+            0,
+        );
 
         let mut state = MixerState::new(4);
         state.active_samples.push(sample);
@@ -1039,7 +1119,14 @@ mod tests {
     #[test]
     fn test_sample_completion() {
         let buffer = create_test_buffer(5, 2, 0.5);
-        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         assert!(!sample.is_finished());
 
@@ -1056,7 +1143,14 @@ mod tests {
     #[test]
     fn test_partial_sample_playback() {
         let buffer = create_test_buffer(10, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
         sample.position = 8; // Start near the end
 
         let mut state = MixerState::new(2);
@@ -1083,7 +1177,14 @@ mod tests {
     #[test]
     fn test_looping_sample_does_not_finish_at_end() {
         let buffer = create_test_buffer(5, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
         sample.loop_mode = true;
 
         // Position at the end of buffer
@@ -1101,13 +1202,20 @@ mod tests {
     fn test_looping_sample_wraps_forward() {
         // Create buffer with identifiable pattern: first frame = 0.1, last frame = 0.9
         let mut data = vec![0.1, 0.1]; // Frame 0
-        data.extend(vec![0.2, 0.2]);   // Frame 1
-        data.extend(vec![0.3, 0.3]);   // Frame 2
-        data.extend(vec![0.4, 0.4]);   // Frame 3
-        data.extend(vec![0.5, 0.5]);   // Frame 4
+        data.extend(vec![0.2, 0.2]); // Frame 1
+        data.extend(vec![0.3, 0.3]); // Frame 2
+        data.extend(vec![0.4, 0.4]); // Frame 3
+        data.extend(vec![0.5, 0.5]); // Frame 4
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
 
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
         sample.loop_mode = true;
         sample.position = 3; // Start near end
 
@@ -1134,14 +1242,24 @@ mod tests {
     #[test]
     fn test_looping_sample_finishes_on_fade_out() {
         let buffer = create_test_buffer(100, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
         sample.loop_mode = true;
 
         // Not finished yet
         assert!(!sample.is_finished());
 
         // Apply a fade out that will complete immediately
-        sample.fade_state = FadeState::Out { elapsed: 100, duration: 100 };
+        sample.fade_state = FadeState::Out {
+            elapsed: 100,
+            duration: 100,
+        };
 
         // Now should be finished (fade out complete)
         assert!(sample.is_finished());
@@ -1151,13 +1269,20 @@ mod tests {
     fn test_looping_reverse_wraps_to_end() {
         // Create buffer with identifiable pattern
         let mut data = vec![0.1, 0.1]; // Frame 0
-        data.extend(vec![0.2, 0.2]);   // Frame 1
-        data.extend(vec![0.3, 0.3]);   // Frame 2
-        data.extend(vec![0.4, 0.4]);   // Frame 3
-        data.extend(vec![0.5, 0.5]);   // Frame 4
+        data.extend(vec![0.2, 0.2]); // Frame 1
+        data.extend(vec![0.3, 0.3]); // Frame 2
+        data.extend(vec![0.4, 0.4]); // Frame 3
+        data.extend(vec![0.5, 0.5]); // Frame 4
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
 
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
         sample.loop_mode = true;
         sample.speed = -1.0; // Reverse playback
         sample.position = 1; // Start near beginning
@@ -1185,7 +1310,14 @@ mod tests {
     #[test]
     fn test_non_looping_sample_finishes_at_end() {
         let buffer = create_test_buffer(5, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
         sample.loop_mode = false;
 
         sample.position = 5;
@@ -1195,7 +1327,14 @@ mod tests {
     #[test]
     fn test_loop_mode_defaults_to_false() {
         let buffer = create_test_buffer(5, 2, 0.5);
-        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
         assert!(!sample.loop_mode);
     }
 
@@ -1207,7 +1346,18 @@ mod tests {
 
         // Route mono to channels 4 and 5
         let channel_map = vec![(0, 4), (0, 5)];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None, false, 0);
+        let sample = ActiveSample::new_with_mapping(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            channel_map,
+            TEST_FILE.to_string(),
+            None,
+            false,
+            0,
+        );
 
         let mut state = MixerState::new(8);
         state.active_samples.push(sample);
@@ -1234,7 +1384,8 @@ mod tests {
     fn test_quad_to_stereo_downmix() {
         // 4-channel source to stereo output (channels 0 and 1)
         let mut data = Vec::new();
-        for _ in 0..10 {  // 10 frames
+        for _ in 0..10 {
+            // 10 frames
             data.push(0.1); // Front left
             data.push(0.2); // Front right
             data.push(0.3); // Rear left
@@ -1249,7 +1400,18 @@ mod tests {
             (2, 0), // Rear left → Left (mix)
             (3, 1), // Rear right → Right (mix)
         ];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None, false, 0);
+        let sample = ActiveSample::new_with_mapping(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            channel_map,
+            TEST_FILE.to_string(),
+            None,
+            false,
+            0,
+        );
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -1269,7 +1431,18 @@ mod tests {
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
 
         let channel_map = vec![(0, 6), (1, 9)];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None, false, 0);
+        let sample = ActiveSample::new_with_mapping(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            channel_map,
+            TEST_FILE.to_string(),
+            None,
+            false,
+            0,
+        );
 
         let mut state = MixerState::new(12);
         state.active_samples.push(sample);
@@ -1302,7 +1475,18 @@ mod tests {
             (1, 100), // Out of bounds (only 4 output channels)
             (99, 2),  // Invalid source
         ];
-        let sample = ActiveSample::new_with_mapping(1, "test".to_string(), buffer, 1.0, 1.0, channel_map, TEST_FILE.to_string(), None, false, 0);
+        let sample = ActiveSample::new_with_mapping(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            channel_map,
+            TEST_FILE.to_string(),
+            None,
+            false,
+            0,
+        );
 
         let mut state = MixerState::new(4);
         state.active_samples.push(sample);
@@ -1322,85 +1506,158 @@ mod tests {
     #[test]
     fn test_fade_state_creation() {
         let fade_in = FadeState::fade_in(1000, 48000); // 1 second at 48kHz
-        assert_eq!(fade_in, FadeState::In { elapsed: 0, duration: 48000 });
+        assert_eq!(
+            fade_in,
+            FadeState::In {
+                elapsed: 0,
+                duration: 48000
+            }
+        );
 
         let fade_out = FadeState::fade_out(500, 44100); // 0.5 seconds at 44.1kHz
-        assert_eq!(fade_out, FadeState::Out { elapsed: 0, duration: 22050 });
+        assert_eq!(
+            fade_out,
+            FadeState::Out {
+                elapsed: 0,
+                duration: 22050
+            }
+        );
     }
 
     #[test]
     fn test_fade_in_multiplier() {
         // At start: 0/10 = 0.0
-        let fade_start = FadeState::In { elapsed: 0, duration: 10 };
+        let fade_start = FadeState::In {
+            elapsed: 0,
+            duration: 10,
+        };
         assert_eq!(fade_start.multiplier(), 0.0);
 
         // At 30%: 3/10 = 0.3
-        let fade_30 = FadeState::In { elapsed: 3, duration: 10 };
+        let fade_30 = FadeState::In {
+            elapsed: 3,
+            duration: 10,
+        };
         assert!((fade_30.multiplier() - 0.3).abs() < 0.01);
 
         // At 50%: 5/10 = 0.5
-        let fade_50 = FadeState::In { elapsed: 5, duration: 10 };
+        let fade_50 = FadeState::In {
+            elapsed: 5,
+            duration: 10,
+        };
         assert_eq!(fade_50.multiplier(), 0.5);
 
         // At 100%: 10/10 = 1.0
-        let fade_100 = FadeState::In { elapsed: 10, duration: 10 };
+        let fade_100 = FadeState::In {
+            elapsed: 10,
+            duration: 10,
+        };
         assert_eq!(fade_100.multiplier(), 1.0);
 
         // Beyond 100%: clamped to 1.0
-        let fade_over = FadeState::In { elapsed: 15, duration: 10 };
+        let fade_over = FadeState::In {
+            elapsed: 15,
+            duration: 10,
+        };
         assert_eq!(fade_over.multiplier(), 1.0);
     }
 
     #[test]
     fn test_fade_out_multiplier() {
         // At start: 1 - (0/10) = 1.0
-        let fade_start = FadeState::Out { elapsed: 0, duration: 10 };
+        let fade_start = FadeState::Out {
+            elapsed: 0,
+            duration: 10,
+        };
         assert_eq!(fade_start.multiplier(), 1.0);
 
         // At 30%: 1 - (3/10) = 0.7
-        let fade_30 = FadeState::Out { elapsed: 3, duration: 10 };
+        let fade_30 = FadeState::Out {
+            elapsed: 3,
+            duration: 10,
+        };
         assert!((fade_30.multiplier() - 0.7).abs() < 0.01);
 
         // At 50%: 1 - (5/10) = 0.5
-        let fade_50 = FadeState::Out { elapsed: 5, duration: 10 };
+        let fade_50 = FadeState::Out {
+            elapsed: 5,
+            duration: 10,
+        };
         assert_eq!(fade_50.multiplier(), 0.5);
 
         // At 100%: 1 - (10/10) = 0.0
-        let fade_100 = FadeState::Out { elapsed: 10, duration: 10 };
+        let fade_100 = FadeState::Out {
+            elapsed: 10,
+            duration: 10,
+        };
         assert_eq!(fade_100.multiplier(), 0.0);
 
         // Beyond 100%: clamped to 0.0
-        let fade_over = FadeState::Out { elapsed: 15, duration: 10 };
+        let fade_over = FadeState::Out {
+            elapsed: 15,
+            duration: 10,
+        };
         assert_eq!(fade_over.multiplier(), 0.0);
     }
 
     #[test]
     fn test_fade_state_advance() {
-        let mut fade = FadeState::In { elapsed: 0, duration: 5 };
+        let mut fade = FadeState::In {
+            elapsed: 0,
+            duration: 5,
+        };
 
         assert!(!fade.is_complete());
         fade.advance();
-        assert_eq!(fade, FadeState::In { elapsed: 1, duration: 5 });
+        assert_eq!(
+            fade,
+            FadeState::In {
+                elapsed: 1,
+                duration: 5
+            }
+        );
 
         for _ in 0..4 {
             fade.advance();
         }
-        assert_eq!(fade, FadeState::In { elapsed: 5, duration: 5 });
+        assert_eq!(
+            fade,
+            FadeState::In {
+                elapsed: 5,
+                duration: 5
+            }
+        );
         assert!(fade.is_complete());
 
         // Advancing past completion stays at max
         fade.advance();
-        assert_eq!(fade, FadeState::In { elapsed: 5, duration: 5 });
+        assert_eq!(
+            fade,
+            FadeState::In {
+                elapsed: 5,
+                duration: 5
+            }
+        );
     }
 
     #[test]
     fn test_fade_in_mixing() {
         // Create a 10-frame buffer at 48kHz
         let buffer = create_test_buffer(10, 2, 1.0);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Set 10-frame fade in (one frame per iteration)
-        sample.set_fade(FadeState::In { elapsed: 0, duration: 10 });
+        sample.set_fade(FadeState::In {
+            elapsed: 0,
+            duration: 10,
+        });
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -1430,10 +1687,20 @@ mod tests {
     fn test_fade_out_mixing() {
         // Create a 10-frame buffer
         let buffer = create_test_buffer(10, 2, 1.0);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Set 10-frame fade out
-        sample.set_fade(FadeState::Out { elapsed: 0, duration: 10 });
+        sample.set_fade(FadeState::Out {
+            elapsed: 0,
+            duration: 10,
+        });
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -1462,10 +1729,20 @@ mod tests {
     fn test_fade_out_completes_sample() {
         // Create a long buffer
         let buffer = create_test_buffer(100, 2, 1.0);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Set short fade out
-        sample.set_fade(FadeState::Out { elapsed: 0, duration: 5 });
+        sample.set_fade(FadeState::Out {
+            elapsed: 0,
+            duration: 5,
+        });
 
         assert!(!sample.is_finished());
 
@@ -1480,10 +1757,16 @@ mod tests {
 
     #[test]
     fn test_zero_duration_fade() {
-        let fade_in = FadeState::In { elapsed: 0, duration: 0 };
+        let fade_in = FadeState::In {
+            elapsed: 0,
+            duration: 0,
+        };
         assert_eq!(fade_in.multiplier(), 1.0); // Instant full volume
 
-        let fade_out = FadeState::Out { elapsed: 0, duration: 0 };
+        let fade_out = FadeState::Out {
+            elapsed: 0,
+            duration: 0,
+        };
         assert_eq!(fade_out.multiplier(), 0.0); // Instant silence
     }
 
@@ -1500,7 +1783,9 @@ mod tests {
     #[test]
     fn test_live_input_basic_mixing() {
         // Create ring buffer with stereo data (10 frames)
-        let data: Vec<f32> = (0..20).map(|i| if i % 2 == 0 { 0.5 } else { 0.3 }).collect();
+        let data: Vec<f32> = (0..20)
+            .map(|i| if i % 2 == 0 { 0.5 } else { 0.3 })
+            .collect();
         let consumer = create_test_ring_buffer_with_data(&data);
 
         let live_input = LiveInput::new(
@@ -1535,7 +1820,7 @@ mod tests {
         let live_input = LiveInput::new(
             "mic".to_string(),
             consumer,
-            1, // mono input
+            1,   // mono input
             0.5, // 50% volume
             vec![(0, 0)],
         );
@@ -1558,13 +1843,7 @@ mod tests {
         let consumer = create_test_ring_buffer_with_data(&data);
 
         // Route mono input to channels 2 and 3 (4-channel output)
-        let live_input = LiveInput::new(
-            "mic".to_string(),
-            consumer,
-            1,
-            1.0,
-            vec![(0, 2), (0, 3)],
-        );
+        let live_input = LiveInput::new("mic".to_string(), consumer, 1, 1.0, vec![(0, 2), (0, 3)]);
 
         let mut state = MixerState::new(4);
         state.live_inputs.push(live_input);
@@ -1585,13 +1864,7 @@ mod tests {
         let data = vec![0.8f32; 10]; // 5 stereo frames
         let consumer = create_test_ring_buffer_with_data(&data);
 
-        let live_input = LiveInput::new(
-            "mic".to_string(),
-            consumer,
-            2,
-            1.0,
-            vec![(0, 0), (1, 1)],
-        );
+        let live_input = LiveInput::new("mic".to_string(), consumer, 2, 1.0, vec![(0, 0), (1, 1)]);
 
         let mut state = MixerState::new(2);
         state.live_inputs.push(live_input);
@@ -1614,18 +1887,19 @@ mod tests {
     fn test_live_input_mixed_with_samples() {
         // Create a sample and a live input, verify they mix together
         let buffer = create_test_buffer(10, 2, 0.3);
-        let sample = ActiveSample::new(1, "sfx".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let sample = ActiveSample::new(
+            1,
+            "sfx".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         let data = vec![0.4f32; 20]; // 10 stereo frames
         let consumer = create_test_ring_buffer_with_data(&data);
 
-        let live_input = LiveInput::new(
-            "mic".to_string(),
-            consumer,
-            2,
-            1.0,
-            vec![(0, 0), (1, 1)],
-        );
+        let live_input = LiveInput::new("mic".to_string(), consumer, 2, 1.0, vec![(0, 0), (1, 1)]);
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -1791,7 +2065,14 @@ mod tests {
         // Create a buffer at 48000 Hz with 48000 frames (1 second)
         let data = vec![0.5f32; 48000 * 2]; // 1 second stereo
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Initial position is 0
         assert_eq!(sample.position, 0);
@@ -1808,7 +2089,14 @@ mod tests {
     fn test_seek_to_start() {
         let data = vec![0.5f32; 48000 * 2];
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Advance position
         sample.position = 10000;
@@ -1825,7 +2113,14 @@ mod tests {
     fn test_seek_clamps_to_buffer_end() {
         let data = vec![0.5f32; 48000 * 2]; // 1 second stereo at 48kHz
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer.clone(),
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Try to seek to 2 seconds (beyond buffer)
         let position_ms: u64 = 2000;
@@ -1841,7 +2136,14 @@ mod tests {
         // Test seek calculation at 44100 Hz
         let data = vec![0.5f32; 44100 * 2]; // 1 second stereo at 44.1kHz
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 44100));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Seek to 1000ms (should be frame 44100)
         let position_ms: u64 = 1000;
@@ -1856,8 +2158,18 @@ mod tests {
     fn test_seek_preserves_playback_state() {
         let data = vec![0.5f32; 48000 * 2];
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 0.7, 0.8, TEST_FILE.to_string());
-        sample.fade_state = FadeState::In { elapsed: 100, duration: 200 };
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            0.7,
+            0.8,
+            TEST_FILE.to_string(),
+        );
+        sample.fade_state = FadeState::In {
+            elapsed: 100,
+            duration: 200,
+        };
 
         // Seek to 250ms
         let position_ms: u64 = 250;
@@ -1867,7 +2179,13 @@ mod tests {
         // Volume and fade state should be preserved
         assert_eq!(sample.volume, 0.7);
         assert_eq!(sample.voice_volume, 0.8);
-        assert!(matches!(sample.fade_state, FadeState::In { elapsed: 100, duration: 200 }));
+        assert!(matches!(
+            sample.fade_state,
+            FadeState::In {
+                elapsed: 100,
+                duration: 200
+            }
+        ));
         assert_eq!(sample.position, 12000); // 250ms at 48kHz
     }
 
@@ -1875,16 +2193,19 @@ mod tests {
     fn test_seek_then_mix() {
         // Create buffer with distinct values at different positions
         let mut data = vec![0.0f32; 100 * 2]; // 100 stereo frames
-        // First 50 frames: 0.1
-        for i in 0..100 {
-            data[i] = 0.1;
-        }
+                                              // First 50 frames: 0.1
+        data[..100].fill(0.1);
         // Last 50 frames: 0.9
-        for i in 100..200 {
-            data[i] = 0.9;
-        }
+        data[100..200].fill(0.9);
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Seek to frame 50 (the start of the 0.9 section)
         sample.position = 50;
@@ -1906,7 +2227,14 @@ mod tests {
     #[test]
     fn test_speed_default_is_normal() {
         let buffer = create_test_buffer(10, 2, 0.5);
-        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         assert_eq!(sample.speed, 1.0);
     }
@@ -1916,7 +2244,14 @@ mod tests {
         // Create buffer with 100 frames of constant value
         let data = vec![0.5f32; 100 * 2]; // 100 stereo frames
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer.clone(),
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
         sample.speed = 2.0;
 
         let mut state = MixerState::new(2);
@@ -1935,7 +2270,14 @@ mod tests {
     fn test_speed_half_plays_twice_as_slow() {
         let data = vec![0.5f32; 100 * 2];
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer.clone(),
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
         sample.speed = 0.5;
 
         let mut state = MixerState::new(2);
@@ -1957,7 +2299,14 @@ mod tests {
         // Create buffer with linear ramp: 0.0, 0.2, 0.4, 0.6, 0.8, 1.0
         let data = vec![0.0, 0.0, 0.2, 0.2, 0.4, 0.4, 0.6, 0.6, 0.8, 0.8, 1.0, 1.0]; // 6 stereo frames
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
         sample.speed = 0.5;
 
         let mut state = MixerState::new(2);
@@ -1977,7 +2326,14 @@ mod tests {
     #[test]
     fn test_speed_set_via_method() {
         let buffer = create_test_buffer(10, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Without pitch correction: -100 to 100 range
         sample.set_speed(1.5);
@@ -2001,7 +2357,14 @@ mod tests {
     #[test]
     fn test_pitch_correction_enable_disable() {
         let buffer = create_test_buffer(100, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         assert!(!sample.has_pitch_correction());
 
@@ -2015,7 +2378,14 @@ mod tests {
     #[test]
     fn test_pitch_correction_updates_speed() {
         let buffer = create_test_buffer(100, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         sample.set_speed(2.0);
         sample.enable_pitch_correction();
@@ -2038,7 +2408,14 @@ mod tests {
         // Create buffer with 200 frames of constant value
         let data = vec![0.5f32; 200 * 2]; // 200 stereo frames
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer.clone(),
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Enable pitch correction at 2x speed
         sample.set_speed(2.0);
@@ -2061,7 +2438,14 @@ mod tests {
     fn test_pitch_correction_slow_speed() {
         let data = vec![0.5f32; 100 * 2]; // 100 stereo frames
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer.clone(),
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Enable pitch correction at 0.5x speed
         sample.set_speed(0.5);
@@ -2084,7 +2468,14 @@ mod tests {
         // Use a larger buffer because the stretcher has latency
         let data = vec![0.8f32; 48000 * 2]; // 48000 stereo frames (1 second at 48kHz)
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer.clone(),
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         sample.set_speed(1.5);
         sample.enable_pitch_correction();
@@ -2119,7 +2510,14 @@ mod tests {
             data.push(val); // R
         }
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer.clone(),
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Start at end of buffer for reverse playback
         sample.position = 9; // Last frame
@@ -2133,7 +2531,11 @@ mod tests {
         mix_audio(&mut output, &mut state);
 
         // First output should be from position 9 (value ~1.0)
-        assert!((output[0] - 1.0).abs() < 0.1, "First frame should be ~1.0, got {}", output[0]);
+        assert!(
+            (output[0] - 1.0).abs() < 0.1,
+            "First frame should be ~1.0, got {}",
+            output[0]
+        );
         // Position should move backwards
         assert_eq!(state.active_samples[0].position, 4);
     }
@@ -2142,7 +2544,14 @@ mod tests {
     fn test_reverse_playback_finishes_at_start() {
         let data = vec![0.5f32; 20]; // 10 stereo frames
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer.clone(),
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Start at position 5, play backwards
         sample.position = 5;
@@ -2163,7 +2572,14 @@ mod tests {
     fn test_reverse_double_speed() {
         let data = vec![0.5f32; 200]; // 100 stereo frames
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer.clone(),
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Start at position 50, play backwards at 2x
         sample.position = 50;
@@ -2184,7 +2600,14 @@ mod tests {
     fn test_reverse_half_speed() {
         let data = vec![0.5f32; 200]; // 100 stereo frames
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer.clone(),
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Start at position 50, play backwards at 0.5x
         sample.position = 50;
@@ -2205,11 +2628,21 @@ mod tests {
     fn test_reverse_with_volume_and_fade() {
         let data = vec![1.0f32; 20]; // 10 stereo frames
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 0.5, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer.clone(),
+            0.5,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         sample.position = 9;
         sample.set_speed(-1.0);
-        sample.set_fade(FadeState::In { elapsed: 5, duration: 10 }); // 50% fade
+        sample.set_fade(FadeState::In {
+            elapsed: 5,
+            duration: 10,
+        }); // 50% fade
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -2218,19 +2651,33 @@ mod tests {
         mix_audio(&mut output, &mut state);
 
         // First frame: 1.0 * 0.5 (volume) * 0.5 (fade) = 0.25
-        assert!((output[0] - 0.25).abs() < 0.1, "Expected ~0.25, got {}", output[0]);
+        assert!(
+            (output[0] - 0.25).abs() < 0.1,
+            "Expected ~0.25, got {}",
+            output[0]
+        );
     }
 
     #[test]
     fn test_pitch_correction_rejects_negative_speed() {
         let buffer = create_test_buffer(100, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         sample.enable_pitch_correction();
 
         // Try to set negative speed - should be rejected
         let result = sample.set_speed(-1.0);
-        assert!(!result, "set_speed should return false for negative speed with pitch correction");
+        assert!(
+            !result,
+            "set_speed should return false for negative speed with pitch correction"
+        );
 
         // Speed should remain at 1.0 (the default)
         assert_eq!(sample.speed, 1.0);
@@ -2239,7 +2686,14 @@ mod tests {
     #[test]
     fn test_pitch_correction_speed_limits() {
         let buffer = create_test_buffer(100, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         sample.enable_pitch_correction();
 
@@ -2261,7 +2715,14 @@ mod tests {
         // Test switching between forward and reverse playback
         let data = vec![0.5f32; 200]; // 100 stereo frames
         let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer.clone(), 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer.clone(),
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Start at position 50
         sample.position = 50;
@@ -2290,7 +2751,14 @@ mod tests {
         // Regression test: using set_speed_with_mode to switch from
         // pitch-corrected to negative speed in a single call
         let buffer = create_test_buffer(100, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Start with pitch correction enabled at 1.5x
         sample.set_speed_with_mode(1.5, true);
@@ -2303,7 +2771,10 @@ mod tests {
         let result = sample.set_speed_with_mode(-1.5, false);
 
         // Should succeed in a single call
-        assert!(result, "set_speed_with_mode should handle pitch-corrected to reverse");
+        assert!(
+            result,
+            "set_speed_with_mode should handle pitch-corrected to reverse"
+        );
         assert_eq!(sample.speed, -1.5);
         assert!(!sample.has_pitch_correction());
     }
@@ -2312,7 +2783,14 @@ mod tests {
     fn test_set_speed_with_mode_reverse_to_pitch_corrected() {
         // Test switching from reverse playback to pitch-corrected
         let buffer = create_test_buffer(100, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Start in reverse
         sample.set_speed_with_mode(-2.0, false);
@@ -2332,7 +2810,14 @@ mod tests {
         // Attempting negative speed WITH pitch_correction=true should fail
         // (the method enables pitch correction, then rejects negative speed)
         let buffer = create_test_buffer(100, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         sample.set_speed(1.0);
         let result = sample.set_speed_with_mode(-1.5, true);
@@ -2349,7 +2834,14 @@ mod tests {
     fn test_set_speed_with_mode_multiple_transitions() {
         // Test multiple mode transitions
         let buffer = create_test_buffer(100, 2, 0.5);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Forward normal -> Forward pitch-corrected
         sample.set_speed_with_mode(2.0, true);
@@ -2378,7 +2870,14 @@ mod tests {
     fn test_voice_volume_ramping_smooth_transition() {
         // Verify that volume changes happen smoothly frame-by-frame
         let buffer = create_test_buffer(1000, 2, 1.0);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Change target volume from 1.0 to 0.5
         sample.set_target_voice_volume(0.5);
@@ -2394,18 +2893,36 @@ mod tests {
 
             // Verify volume changed by at most RAMP_RATE (0.001)
             let delta = (current - last_volume).abs();
-            assert!(delta <= 0.0011, "Volume changed too quickly: {} -> {} (delta {})", last_volume, current, delta);
+            assert!(
+                delta <= 0.0011,
+                "Volume changed too quickly: {} -> {} (delta {})",
+                last_volume,
+                current,
+                delta
+            );
 
             // Verify monotonic decrease
-            assert!(current < last_volume, "Volume should decrease: {} -> {}", last_volume, current);
+            assert!(
+                current < last_volume,
+                "Volume should decrease: {} -> {}",
+                last_volume,
+                current
+            );
 
             last_volume = current;
             frame_count += 1;
         }
 
         // Should take roughly 500 frames to go from 1.0 to 0.5 (0.5 / 0.001 = 500)
-        assert!(frame_count > 400 && frame_count < 600, "Unexpected frame count: {}", frame_count);
-        assert!((sample.voice_volume - 0.5).abs() < 0.01, "Final volume should be ~0.5");
+        assert!(
+            frame_count > 400 && frame_count < 600,
+            "Unexpected frame count: {}",
+            frame_count
+        );
+        assert!(
+            (sample.voice_volume - 0.5).abs() < 0.01,
+            "Final volume should be ~0.5"
+        );
     }
 
     #[test]
@@ -2413,7 +2930,14 @@ mod tests {
         // Verify that rapid volume changes don't cause issues -
         // the system should smoothly transition to the newest target
         let buffer = create_test_buffer(2000, 2, 1.0);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Change target to 0.5 and start ramping
         sample.set_target_voice_volume(0.5);
@@ -2423,8 +2947,11 @@ mod tests {
         // After 100 frames at 0.001/frame = 0.1 change
         // Volume should be 1.0 - 0.1 = 0.9 (still above 0.5)
         let vol_after_first = sample.voice_volume;
-        assert!(vol_after_first < 1.0 && vol_after_first > 0.5,
-            "Volume {} should be between 0.5 and 1.0", vol_after_first);
+        assert!(
+            vol_after_first < 1.0 && vol_after_first > 0.5,
+            "Volume {} should be between 0.5 and 1.0",
+            vol_after_first
+        );
 
         // Interrupt: change target to 0.2 before reaching 0.5
         sample.set_target_voice_volume(0.2);
@@ -2437,8 +2964,12 @@ mod tests {
         // After 200 more frames at 0.001/frame = 0.2 change
         // Volume should be ~0.9 - 0.2 = 0.7
         let vol_after_second = sample.voice_volume;
-        assert!(vol_after_second < vol_after_first,
-            "Volume should decrease: {} -> {}", vol_after_first, vol_after_second);
+        assert!(
+            vol_after_second < vol_after_first,
+            "Volume should decrease: {} -> {}",
+            vol_after_first,
+            vol_after_second
+        );
 
         // Interrupt again: change target to 0.9 (going back up)
         sample.set_target_voice_volume(0.9);
@@ -2448,8 +2979,12 @@ mod tests {
         for _ in 0..100 {
             sample.advance_voice_volume();
         }
-        assert!(sample.voice_volume > vol_before_third,
-            "Volume should increase toward 0.9: {} -> {}", vol_before_third, sample.voice_volume);
+        assert!(
+            sample.voice_volume > vol_before_third,
+            "Volume should increase toward 0.9: {} -> {}",
+            vol_before_third,
+            sample.voice_volume
+        );
 
         // Key behavior: rapid target changes don't cause discontinuities -
         // the volume always smoothly ramps toward whatever the current target is
@@ -2459,7 +2994,14 @@ mod tests {
     fn test_voice_volume_ramping_in_mix() {
         // Verify that mixing with volume ramping produces smooth output
         let buffer = create_test_buffer(100, 1, 1.0); // Mono, all 1.0 samples
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
 
         // Set target to 0.5 - will ramp during mixing
         sample.set_target_voice_volume(0.5);
@@ -2473,16 +3015,31 @@ mod tests {
 
         // Verify output ramps smoothly - each sample should be slightly less than previous
         for i in 1..50 {
-            let delta = output[i-1] - output[i];
+            let delta = output[i - 1] - output[i];
             // Delta should be roughly 0.001 (the ramp rate)
-            assert!(delta > 0.0, "Output should decrease frame {} to {}: {} -> {}", i-1, i, output[i-1], output[i]);
-            assert!(delta < 0.002, "Output change too large at frame {}: delta = {}", i, delta);
+            assert!(
+                delta > 0.0,
+                "Output should decrease frame {} to {}: {} -> {}",
+                i - 1,
+                i,
+                output[i - 1],
+                output[i]
+            );
+            assert!(
+                delta < 0.002,
+                "Output change too large at frame {}: delta = {}",
+                i,
+                delta
+            );
         }
 
         // First sample should be close to 1.0 (just started ramping)
         assert!(output[0] > 0.99, "First sample should be near 1.0");
         // Last sample should be lower
-        assert!(output[49] < output[0], "Last sample should be lower than first");
+        assert!(
+            output[49] < output[0],
+            "Last sample should be lower than first"
+        );
     }
 
     #[test]
@@ -2499,20 +3056,33 @@ mod tests {
         // Verify ramping works
         let initial = input.voice_volume;
         input.advance_voice_volume();
-        assert!(input.voice_volume < initial, "Voice volume should decrease toward target");
+        assert!(
+            input.voice_volume < initial,
+            "Voice volume should decrease toward target"
+        );
 
         // Continue ramping
         for _ in 0..1000 {
             input.advance_voice_volume();
         }
-        assert!((input.voice_volume - 0.3).abs() < 0.01, "Should reach target of 0.3");
+        assert!(
+            (input.voice_volume - 0.3).abs() < 0.01,
+            "Should reach target of 0.3"
+        );
     }
 
     #[test]
     fn test_volume_ramping_no_change_when_at_target() {
         // Verify no ramping occurs when current == target
         let buffer = create_test_buffer(10, 2, 1.0);
-        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 0.7, TEST_FILE.to_string());
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            0.7,
+            TEST_FILE.to_string(),
+        );
 
         // Current and target are both 0.7
         assert_eq!(sample.voice_volume, 0.7);
@@ -2524,4 +3094,3 @@ mod tests {
         assert_eq!(sample.voice_volume, 0.7);
     }
 }
-

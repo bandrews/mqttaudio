@@ -15,7 +15,6 @@ use crate::voice::VoiceManager;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use tracing;
 
 /// Shared application state passed to all HTTP handlers.
 #[derive(Clone)]

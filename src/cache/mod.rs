@@ -70,7 +70,10 @@ impl CacheManager {
     }
 
     /// Create a new cache manager with specified resampler quality and no memory limit.
-    pub fn with_quality(cache_dir: PathBuf, resampler_quality: ResamplerQuality) -> Result<Self, CacheError> {
+    pub fn with_quality(
+        cache_dir: PathBuf,
+        resampler_quality: ResamplerQuality,
+    ) -> Result<Self, CacheError> {
         Self::with_options(cache_dir, resampler_quality, 0)
     }
 
@@ -117,25 +120,26 @@ impl CacheManager {
                 )?;
 
                 let arc_buffer = Arc::new(buffer);
-                self.memory_cache.put(file_path.to_string(), arc_buffer.clone());
+                self.memory_cache
+                    .put(file_path.to_string(), arc_buffer.clone());
                 return Ok(SampleBuffer::Complete(arc_buffer));
             }
 
             // Start streaming download
             tracing::info!("Starting streaming load for: {}", file_path);
-            return self.start_streaming_load(file_path, target_sample_rate).await;
+            return self
+                .start_streaming_load(file_path, target_sample_rate)
+                .await;
         }
 
         // Local file - load from disk (could stream later for very large files)
         tracing::debug!("Loading local file: {}", file_path);
-        let buffer = decoder::decode_file(
-            file_path,
-            Some(target_sample_rate),
-            self.resampler_quality,
-        )?;
+        let buffer =
+            decoder::decode_file(file_path, Some(target_sample_rate), self.resampler_quality)?;
 
         let arc_buffer = Arc::new(buffer);
-        self.memory_cache.put(file_path.to_string(), arc_buffer.clone());
+        self.memory_cache
+            .put(file_path.to_string(), arc_buffer.clone());
         Ok(SampleBuffer::Complete(arc_buffer))
     }
 
@@ -184,7 +188,14 @@ impl CacheManager {
         let url_clone = url.to_string();
 
         tokio::task::spawn_blocking(move || {
-            Self::decode_streaming(reader, hint, target_sample_rate, quality, buffer_clone, url_clone);
+            Self::decode_streaming(
+                reader,
+                hint,
+                target_sample_rate,
+                quality,
+                buffer_clone,
+                url_clone,
+            );
         });
 
         Ok(SampleBuffer::Streaming(streaming_buffer))
@@ -200,21 +211,17 @@ impl CacheManager {
         url: String,
     ) {
         // Create streaming decoder
-        let decoder = match StreamingDecoder::new(
-            reader,
-            Some(&hint),
-            Some(target_sample_rate),
-            quality,
-        ) {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::error!("Failed to create decoder for {}: {}", url, e);
-                if let Ok(mut guard) = buffer.write() {
-                    guard.mark_error(format!("Decoder init failed: {}", e));
+        let decoder =
+            match StreamingDecoder::new(reader, Some(&hint), Some(target_sample_rate), quality) {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!("Failed to create decoder for {}: {}", url, e);
+                    if let Ok(mut guard) = buffer.write() {
+                        guard.mark_error(format!("Decoder init failed: {}", e));
+                    }
+                    return;
                 }
-                return;
-            }
-        };
+            };
 
         // Update buffer with actual channel count
         let channels = decoder.channels();
@@ -290,7 +297,8 @@ impl CacheManager {
     // Allow dead_code until Phase 10 connects streaming to main.rs
     #[allow(dead_code)]
     pub fn cleanup_completed_loads(&mut self) {
-        let completed: Vec<String> = self.active_loads
+        let completed: Vec<String> = self
+            .active_loads
             .iter()
             .filter_map(|(path, active)| {
                 if let Ok(guard) = active.buffer.read() {
@@ -364,7 +372,8 @@ impl CacheManager {
 
         // Store in memory cache
         let arc_buffer = Arc::new(buffer);
-        self.memory_cache.put(file_path.to_string(), arc_buffer.clone());
+        self.memory_cache
+            .put(file_path.to_string(), arc_buffer.clone());
 
         // Log overall cache stats
         self.log_stats();
@@ -392,7 +401,9 @@ impl CacheManager {
         file_path: &str,
         target_sample_rate: u32,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let buffer = self.get_or_load_streaming(file_path, target_sample_rate).await?;
+        let buffer = self
+            .get_or_load_streaming(file_path, target_sample_rate)
+            .await?;
         if buffer.is_complete() {
             tracing::info!("Precache started (already cached): {}", file_path);
         } else {

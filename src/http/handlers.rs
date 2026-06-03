@@ -2,12 +2,7 @@
 // ABOUTME: Each handler maps HTTP requests to internal commands or status queries.
 
 use super::AppState;
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -116,7 +111,6 @@ pub async fn handle_play(
     State(state): State<AppState>,
     Json(params): Json<PlayParams>,
 ) -> impl IntoResponse {
-
     let mut message = json!({ "file": params.file });
     if let Some(id) = params.id {
         message["id"] = json!(id);
@@ -172,7 +166,6 @@ pub async fn handle_stop(
     State(state): State<AppState>,
     Json(params): Json<StopParams>,
 ) -> impl IntoResponse {
-
     let mut message = json!({});
     if let Some(internal_id) = params.internal_id {
         message["internal_id"] = json!(internal_id);
@@ -236,7 +229,6 @@ pub async fn handle_volume(
     State(state): State<AppState>,
     Json(params): Json<VolumeParams>,
 ) -> impl IntoResponse {
-
     let mut message = json!({ "volume": params.volume });
     if let Some(internal_id) = params.internal_id {
         message["internal_id"] = json!(internal_id);
@@ -282,7 +274,6 @@ pub async fn handle_seek(
     State(state): State<AppState>,
     Json(params): Json<SeekParams>,
 ) -> impl IntoResponse {
-
     let mut message = json!({ "position_ms": params.position_ms });
     if let Some(internal_id) = params.internal_id {
         message["internal_id"] = json!(internal_id);
@@ -330,7 +321,6 @@ pub async fn handle_speed(
     State(state): State<AppState>,
     Json(params): Json<SpeedParams>,
 ) -> impl IntoResponse {
-
     let mut message = json!({ "speed": params.speed });
     if let Some(internal_id) = params.internal_id {
         message["internal_id"] = json!(internal_id);
@@ -371,7 +361,6 @@ pub async fn handle_precache(
     State(state): State<AppState>,
     Json(params): Json<PrecacheParams>,
 ) -> impl IntoResponse {
-
     let command = json!({
         "command": "precache",
         "message": { "file": params.file }
@@ -410,7 +399,6 @@ pub async fn handle_cache_invalidate(
     State(state): State<AppState>,
     Json(params): Json<CacheInvalidateParams>,
 ) -> impl IntoResponse {
-
     let command = json!({
         "command": "cache_invalidate",
         "message": { "file": params.file }
@@ -434,7 +422,6 @@ pub async fn handle_voice_stop(
     State(state): State<AppState>,
     Json(params): Json<VoiceStopParams>,
 ) -> impl IntoResponse {
-
     let command = json!({
         "command": "voice_stop",
         "message": { "voice": params.voice }
@@ -459,7 +446,6 @@ pub async fn handle_voice_fade_out(
     State(state): State<AppState>,
     Json(params): Json<VoiceFadeOutParams>,
 ) -> impl IntoResponse {
-
     let command = json!({
         "command": "voice_fade_out",
         "message": {
@@ -487,7 +473,6 @@ pub async fn handle_voice_volume(
     State(state): State<AppState>,
     Json(params): Json<VoiceVolumeParams>,
 ) -> impl IntoResponse {
-
     let command = json!({
         "command": "voice_volume",
         "message": {
@@ -515,7 +500,6 @@ pub async fn handle_input_volume(
     State(state): State<AppState>,
     Json(params): Json<InputVolumeParams>,
 ) -> impl IntoResponse {
-
     let command = json!({
         "command": "input_volume",
         "message": {
@@ -544,7 +528,6 @@ pub async fn handle_input_mute(
     State(state): State<AppState>,
     Json(params): Json<InputMuteParams>,
 ) -> impl IntoResponse {
-
     let command = json!({
         "command": "input_mute",
         "message": {

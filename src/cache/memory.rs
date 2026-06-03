@@ -117,7 +117,8 @@ impl MemoryCache {
     /// Returns true if an entry was evicted, false if no evictable entries.
     fn evict_one(&mut self) -> bool {
         // Find the LRU entry that is not playing
-        let lru_key = self.entries
+        let lru_key = self
+            .entries
             .iter()
             .filter(|(key, _)| !self.playing.contains(*key))
             .min_by_key(|(_, entry)| entry.last_access)

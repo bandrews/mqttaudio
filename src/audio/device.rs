@@ -47,8 +47,8 @@ impl fmt::Display for DeviceCategory {
 #[allow(dead_code)]
 pub enum NativeSampleFormat {
     S16LE,
-    S24LE,      // 24-bit in 4-byte container
-    S24_3LE,    // 24-bit packed (3 bytes)
+    S24LE,   // 24-bit in 4-byte container
+    S24_3LE, // 24-bit packed (3 bytes)
     S32LE,
     F32LE,
     F64LE,
@@ -82,7 +82,8 @@ pub struct NativeCapabilities {
 impl NativeCapabilities {
     pub fn format_rates(&self) -> String {
         if let Some(ref rates) = self.discrete_rates {
-            rates.iter()
+            rates
+                .iter()
                 .map(|r| r.to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
@@ -102,7 +103,8 @@ impl NativeCapabilities {
     }
 
     pub fn format_formats(&self) -> String {
-        self.formats.iter()
+        self.formats
+            .iter()
             .map(|f| f.to_string())
             .collect::<Vec<_>>()
             .join(", ")
@@ -194,7 +196,8 @@ impl DeviceList {
 
     /// Get devices filtered by category
     pub fn by_category(&self, category: DeviceCategory) -> Vec<&DeviceInfo> {
-        self.devices.iter()
+        self.devices
+            .iter()
             .filter(|d| d.category == category)
             .collect()
     }
@@ -202,7 +205,9 @@ impl DeviceList {
     /// Get all categories that have at least one device
     #[allow(dead_code)]
     pub fn categories(&self) -> Vec<DeviceCategory> {
-        let mut cats: Vec<_> = self.devices.iter()
+        let mut cats: Vec<_> = self
+            .devices
+            .iter()
             .map(|d| d.category.clone())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
@@ -272,9 +277,11 @@ pub fn format_device_list(list: &DeviceList) -> String {
 
             // Show cpal capabilities if no native caps or if they differ
             if device.native_capabilities.is_none() {
-                if let (Some(ch), Some(min_r), Some(max_r)) =
-                    (device.cpal_channels, device.cpal_sample_rate_min, device.cpal_sample_rate_max)
-                {
+                if let (Some(ch), Some(min_r), Some(max_r)) = (
+                    device.cpal_channels,
+                    device.cpal_sample_rate_min,
+                    device.cpal_sample_rate_max,
+                ) {
                     let rate_str = if min_r == max_r {
                         format!("{} Hz", min_r)
                     } else {
@@ -315,9 +322,18 @@ mod tests {
     #[test]
     fn test_device_list_filtering() {
         let mut list = DeviceList::new();
-        list.devices.push(DeviceInfo::new("hw:0".to_string(), DeviceCategory::Hardware));
-        list.devices.push(DeviceInfo::new("plughw:0".to_string(), DeviceCategory::PluginHardware));
-        list.devices.push(DeviceInfo::new("default".to_string(), DeviceCategory::System));
+        list.devices.push(DeviceInfo::new(
+            "hw:0".to_string(),
+            DeviceCategory::Hardware,
+        ));
+        list.devices.push(DeviceInfo::new(
+            "plughw:0".to_string(),
+            DeviceCategory::PluginHardware,
+        ));
+        list.devices.push(DeviceInfo::new(
+            "default".to_string(),
+            DeviceCategory::System,
+        ));
 
         assert_eq!(list.by_category(DeviceCategory::Hardware).len(), 1);
         assert_eq!(list.by_category(DeviceCategory::PluginHardware).len(), 1);

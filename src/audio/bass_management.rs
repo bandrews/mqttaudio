@@ -217,27 +217,10 @@ impl BassManagement {
         }
     }
 
-    /// Reset all filter states
-    #[cfg(test)]
-    pub fn reset(&mut self) {
-        for filter in &mut self.lowpass_filters {
-            filter.reset();
-        }
-        for filter in &mut self.highpass_filters {
-            filter.reset();
-        }
-    }
-
     /// Get the current configuration
     #[allow(dead_code)] // Available for future configuration queries
     pub fn config(&self) -> &BassManagementConfig {
         &self.config
-    }
-
-    /// Get the sample rate
-    #[cfg(test)]
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
     }
 }
 
@@ -316,7 +299,11 @@ mod tests {
 
         // High frequency should be significantly attenuated
         let attenuation_db = 10.0 * (output_power / input_power).log10();
-        assert!(attenuation_db < -20.0, "Expected >20dB attenuation, got {:.1}dB", attenuation_db);
+        assert!(
+            attenuation_db < -20.0,
+            "Expected >20dB attenuation, got {:.1}dB",
+            attenuation_db
+        );
     }
 
     #[test]
@@ -346,7 +333,11 @@ mod tests {
 
         // Low frequency should pass through with minimal attenuation
         let attenuation_db = 10.0 * (output_power / input_power).log10();
-        assert!(attenuation_db > -3.0, "Expected <3dB attenuation, got {:.1}dB", attenuation_db);
+        assert!(
+            attenuation_db > -3.0,
+            "Expected <3dB attenuation, got {:.1}dB",
+            attenuation_db
+        );
     }
 
     #[test]
@@ -375,7 +366,11 @@ mod tests {
 
         // Low frequency should be significantly attenuated
         let attenuation_db = 10.0 * (output_power / input_power).log10();
-        assert!(attenuation_db < -20.0, "Expected >20dB attenuation, got {:.1}dB", attenuation_db);
+        assert!(
+            attenuation_db < -20.0,
+            "Expected >20dB attenuation, got {:.1}dB",
+            attenuation_db
+        );
     }
 
     #[test]
@@ -404,7 +399,11 @@ mod tests {
 
         // High frequency should pass through with minimal attenuation
         let attenuation_db = 10.0 * (output_power / input_power).log10();
-        assert!(attenuation_db > -3.0, "Expected <3dB attenuation, got {:.1}dB", attenuation_db);
+        assert!(
+            attenuation_db > -3.0,
+            "Expected <3dB attenuation, got {:.1}dB",
+            attenuation_db
+        );
     }
 
     #[test]
@@ -478,7 +477,7 @@ mod tests {
         for frame in 0..frames {
             let t = frame as f32 / sample_rate;
             let sample = (2.0 * PI * frequency * t).sin() * 0.5;
-            output[frame * channels + 0] = sample; // Left
+            output[frame * channels] = sample; // Left
             output[frame * channels + 1] = sample; // Right
         }
 
@@ -518,13 +517,13 @@ mod tests {
         for frame in 0..frames {
             let t = frame as f32 / sample_rate;
             let sample = (2.0 * PI * frequency * t).sin() * 0.5;
-            output[frame * channels + 0] = sample;
+            output[frame * channels] = sample;
         }
 
         // Measure original power
         let mut original_power = 0.0_f32;
         for frame in 500..frames {
-            let sample = output[frame * channels + 0];
+            let sample = output[frame * channels];
             original_power += sample * sample;
         }
 
@@ -533,12 +532,16 @@ mod tests {
         // Source channel should have reduced bass
         let mut filtered_power = 0.0_f32;
         for frame in 500..frames {
-            let sample = output[frame * channels + 0];
+            let sample = output[frame * channels];
             filtered_power += sample * sample;
         }
 
         let attenuation_db = 10.0 * (filtered_power / original_power).log10();
-        assert!(attenuation_db < -10.0, "Expected bass reduction, got {:.1}dB", attenuation_db);
+        assert!(
+            attenuation_db < -10.0,
+            "Expected bass reduction, got {:.1}dB",
+            attenuation_db
+        );
     }
 
     #[test]
@@ -564,12 +567,12 @@ mod tests {
         for frame in 0..frames {
             let t = frame as f32 / sample_rate;
             let sample = (2.0 * PI * frequency * t).sin() * 0.5;
-            output[frame * channels + 0] = sample;
+            output[frame * channels] = sample;
         }
 
         let mut original_power = 0.0_f32;
         for frame in 100..frames {
-            let sample = output[frame * channels + 0];
+            let sample = output[frame * channels];
             original_power += sample * sample;
         }
 
@@ -577,13 +580,17 @@ mod tests {
 
         let mut filtered_power = 0.0_f32;
         for frame in 100..frames {
-            let sample = output[frame * channels + 0];
+            let sample = output[frame * channels];
             filtered_power += sample * sample;
         }
 
         // High frequency should be mostly preserved
         let attenuation_db = 10.0 * (filtered_power / original_power).log10();
-        assert!(attenuation_db > -3.0, "High frequency should be preserved, got {:.1}dB attenuation", attenuation_db);
+        assert!(
+            attenuation_db > -3.0,
+            "High frequency should be preserved, got {:.1}dB attenuation",
+            attenuation_db
+        );
     }
 
     #[test]
@@ -634,7 +641,11 @@ mod tests {
         // LFE content should be preserved (not doubled by extracting from itself)
         // Allow for filter transient
         let lfe_sample = output[50 * channels + 3];
-        assert!((lfe_sample - 0.5).abs() < 0.1, "LFE should be preserved, got {}", lfe_sample);
+        assert!(
+            (lfe_sample - 0.5).abs() < 0.1,
+            "LFE should be preserved, got {}",
+            lfe_sample
+        );
     }
 
     #[test]
@@ -660,7 +671,7 @@ mod tests {
         for frame in 0..frames {
             let t = frame as f32 / sample_rate;
             let sample = (2.0 * PI * frequency * t).sin() * 0.3;
-            output[frame * channels + 0] = sample;
+            output[frame * channels] = sample;
             output[frame * channels + 3] = 0.2; // Existing LFE content
         }
 
@@ -676,6 +687,10 @@ mod tests {
         let lfe_rms = (lfe_power / (frames - 500) as f32).sqrt();
 
         // RMS should be > 0.2 (the DC component alone) because we added bass
-        assert!(lfe_rms > 0.2, "LFE should have added bass content, RMS was {}", lfe_rms);
+        assert!(
+            lfe_rms > 0.2,
+            "LFE should have added bass content, RMS was {}",
+            lfe_rms
+        );
     }
 }

@@ -76,8 +76,8 @@ impl DuckState {
     /// Advance fade state by given number of frames and return current multiplier
     fn advance_and_get_multiplier(&mut self, frames: usize) -> f32 {
         // Advance fade state
-        self.fade_elapsed_frames = (self.fade_elapsed_frames + frames)
-            .min(self.fade_duration_frames);
+        self.fade_elapsed_frames =
+            (self.fade_elapsed_frames + frames).min(self.fade_duration_frames);
 
         // Calculate progress (0.0 to 1.0)
         let progress = if self.fade_duration_frames == 0 {
@@ -87,7 +87,8 @@ impl DuckState {
         };
 
         // Linear interpolation from start_multiplier to target_volume
-        self.current_multiplier = self.start_multiplier + (self.target_volume - self.start_multiplier) * progress;
+        self.current_multiplier =
+            self.start_multiplier + (self.target_volume - self.start_multiplier) * progress;
 
         self.current_multiplier
     }
@@ -117,7 +118,11 @@ pub struct DuckingEngine {
 impl DuckingEngine {
     /// Create a new ducking engine with given rules and sample rate
     pub fn new(rules: Vec<DuckingRule>, sample_rate: u32) -> Self {
-        tracing::info!("Initializing ducking engine with {} rules at {} Hz", rules.len(), sample_rate);
+        tracing::info!(
+            "Initializing ducking engine with {} rules at {} Hz",
+            rules.len(),
+            sample_rate
+        );
         for rule in &rules {
             tracing::debug!(
                 "  Rule: '{}' ducks {:?} to {:.1}% over {}ms",
@@ -174,7 +179,8 @@ impl DuckingEngine {
     /// Update all duck states based on current voice activity
     fn update_duck_states(&mut self) {
         // Get all voices that might need ducking (any voice in any rule)
-        let mut all_potential_voices: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut all_potential_voices: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for rule in &self.rules {
             all_potential_voices.insert(rule.primary_voice.clone());
@@ -190,7 +196,8 @@ impl DuckingEngine {
             if applicable_rules.is_empty() {
                 // No ducking needed - restore to full volume
                 // Only start restore if we're not already at full volume
-                let should_restore = self.duck_states
+                let should_restore = self
+                    .duck_states
                     .get(&voice_id)
                     .map(|s| s.target_volume < 1.0 || s.is_ducking)
                     .unwrap_or(false);
@@ -199,37 +206,48 @@ impl DuckingEngine {
                     // Use the longest fade duration from previous rules
                     let fade_duration_ms = 2000; // Default restore time
                     let fade_frames = self.ms_to_frames(fade_duration_ms);
-                    tracing::debug!("Voice '{}' restoring to full volume over {}ms", voice_id, fade_duration_ms);
+                    tracing::debug!(
+                        "Voice '{}' restoring to full volume over {}ms",
+                        voice_id,
+                        fade_duration_ms
+                    );
 
-                    let state = self.duck_states
+                    let state = self
+                        .duck_states
                         .entry(voice_id.clone())
                         .or_insert_with(DuckState::new);
                     state.begin_restore(fade_frames);
                 }
             } else {
                 // Multiple rules: use lowest target volume and fastest fade
-                let target_volume = applicable_rules.iter()
+                let target_volume = applicable_rules
+                    .iter()
                     .map(|r| r.target_volume)
                     .min_by(|a, b| a.partial_cmp(b).unwrap())
                     .unwrap();
 
-                let fade_duration_ms = applicable_rules.iter()
+                let fade_duration_ms = applicable_rules
+                    .iter()
                     .map(|r| r.fade_duration_ms)
                     .min()
                     .unwrap();
 
                 let fade_frames = self.ms_to_frames(fade_duration_ms);
-                let current_multiplier = self.duck_states
+                let current_multiplier = self
+                    .duck_states
                     .get(&voice_id)
                     .map(|s| s.current_multiplier)
                     .unwrap_or(1.0);
 
                 // Check if parameters changed to avoid logging on every update
-                let params_changed = self.duck_states
+                let params_changed = self
+                    .duck_states
                     .get(&voice_id)
-                    .map(|s| (s.target_volume - target_volume).abs() > 0.001
-                           || s.fade_duration_frames != fade_frames
-                           || !s.is_ducking)
+                    .map(|s| {
+                        (s.target_volume - target_volume).abs() > 0.001
+                            || s.fade_duration_frames != fade_frames
+                            || !s.is_ducking
+                    })
                     .unwrap_or(true);
 
                 if params_changed {
@@ -242,7 +260,8 @@ impl DuckingEngine {
                     );
                 }
 
-                let state = self.duck_states
+                let state = self
+                    .duck_states
                     .entry(voice_id.clone())
                     .or_insert_with(DuckState::new);
                 state.begin_duck(target_volume, fade_frames);
@@ -252,13 +271,18 @@ impl DuckingEngine {
 
     /// Find all rules that apply to a given voice (should it be ducked?)
     fn find_applicable_rules(&self, voice_id: &str) -> Vec<&DuckingRule> {
-        self.rules.iter()
+        self.rules
+            .iter()
             .filter(|rule| {
                 // Rule applies if:
                 // 1. This voice is in the ducked_voices list
                 // 2. The primary voice has active samples
-                rule.ducked_voices.iter().any(|v| v == voice_id) &&
-                self.active_voices.get(&rule.primary_voice).copied().unwrap_or(false)
+                rule.ducked_voices.iter().any(|v| v == voice_id)
+                    && self
+                        .active_voices
+                        .get(&rule.primary_voice)
+                        .copied()
+                        .unwrap_or(false)
             })
             .collect()
     }
@@ -273,7 +297,12 @@ impl DuckingEngine {
 mod tests {
     use super::*;
 
-    fn create_test_rule(primary: &str, ducked: Vec<&str>, target: f32, fade_ms: u32) -> DuckingRule {
+    fn create_test_rule(
+        primary: &str,
+        ducked: Vec<&str>,
+        target: f32,
+        fade_ms: u32,
+    ) -> DuckingRule {
         DuckingRule {
             primary_voice: primary.to_string(),
             ducked_voices: ducked.iter().map(|s| s.to_string()).collect(),
@@ -284,9 +313,7 @@ mod tests {
 
     #[test]
     fn test_ducking_engine_creation() {
-        let rules = vec![
-            create_test_rule("narration", vec!["music"], 0.1, 2000),
-        ];
+        let rules = vec![create_test_rule("narration", vec!["music"], 0.1, 2000)];
         let engine = DuckingEngine::new(rules, 48000);
         assert_eq!(engine.rules.len(), 1);
         assert_eq!(engine.sample_rate, 48000);
@@ -294,9 +321,7 @@ mod tests {
 
     #[test]
     fn test_single_rule_ducking() {
-        let rules = vec![
-            create_test_rule("narration", vec!["music"], 0.1, 1000),
-        ];
+        let rules = vec![create_test_rule("narration", vec!["music"], 0.1, 1000)];
         let mut engine = DuckingEngine::new(rules, 48000);
 
         // Initially, no ducking
@@ -314,7 +339,11 @@ mod tests {
 
         // Should be somewhere between 0.1 and 1.0
         let multiplier = engine.peek_multiplier("music");
-        assert!(multiplier > 0.1 && multiplier < 1.0, "Expected multiplier between 0.1 and 1.0, got {}", multiplier);
+        assert!(
+            multiplier > 0.1 && multiplier < 1.0,
+            "Expected multiplier between 0.1 and 1.0, got {}",
+            multiplier
+        );
 
         // Stop narration - music should restore
         engine.notify_voice_active("narration", false);
@@ -324,7 +353,11 @@ mod tests {
 
         // Should be restoring toward 1.0
         let restored = engine.peek_multiplier("music");
-        assert!(restored > multiplier, "Expected restoration, got {}", restored);
+        assert!(
+            restored > multiplier,
+            "Expected restoration, got {}",
+            restored
+        );
     }
 
     #[test]
@@ -359,14 +392,19 @@ mod tests {
 
         // Should use fastest fade (500ms)
         let expected_frames = 24000; // 500ms at 48kHz
-        assert_eq!(engine.duck_states.get("music").unwrap().fade_duration_frames, expected_frames);
+        assert_eq!(
+            engine
+                .duck_states
+                .get("music")
+                .unwrap()
+                .fade_duration_frames,
+            expected_frames
+        );
     }
 
     #[test]
     fn test_no_ducking_when_primary_inactive() {
-        let rules = vec![
-            create_test_rule("narration", vec!["music"], 0.1, 1000),
-        ];
+        let rules = vec![create_test_rule("narration", vec!["music"], 0.1, 1000)];
         let mut engine = DuckingEngine::new(rules, 48000);
 
         // Start music (not narration)
@@ -378,9 +416,12 @@ mod tests {
 
     #[test]
     fn test_ducking_multiple_voices() {
-        let rules = vec![
-            create_test_rule("narration", vec!["music", "ambience", "effects"], 0.1, 1000),
-        ];
+        let rules = vec![create_test_rule(
+            "narration",
+            vec!["music", "ambience", "effects"],
+            0.1,
+            1000,
+        )];
         let mut engine = DuckingEngine::new(rules, 48000);
 
         // Start narration
@@ -394,9 +435,7 @@ mod tests {
 
     #[test]
     fn test_voice_not_in_any_rule() {
-        let rules = vec![
-            create_test_rule("narration", vec!["music"], 0.1, 1000),
-        ];
+        let rules = vec![create_test_rule("narration", vec!["music"], 0.1, 1000)];
         let mut engine = DuckingEngine::new(rules, 48000);
 
         // Start unrelated voice
@@ -443,9 +482,7 @@ mod tests {
 
     #[test]
     fn test_zero_duration_fade() {
-        let rules = vec![
-            create_test_rule("narration", vec!["music"], 0.1, 0),
-        ];
+        let rules = vec![create_test_rule("narration", vec!["music"], 0.1, 0)];
         let mut engine = DuckingEngine::new(rules, 48000);
 
         // Start narration
@@ -453,14 +490,16 @@ mod tests {
 
         // With 0ms fade, should immediately be at target
         let multiplier = engine.get_multiplier("music", 1);
-        assert!((multiplier - 0.1).abs() < 0.01, "Expected ~0.1, got {}", multiplier);
+        assert!(
+            (multiplier - 0.1).abs() < 0.01,
+            "Expected ~0.1, got {}",
+            multiplier
+        );
     }
 
     #[test]
     fn test_fade_progress() {
-        let rules = vec![
-            create_test_rule("narration", vec!["music"], 0.2, 1000),
-        ];
+        let rules = vec![create_test_rule("narration", vec!["music"], 0.2, 1000)];
         let mut engine = DuckingEngine::new(rules, 48000);
 
         // Start ducking
@@ -508,9 +547,7 @@ mod tests {
 
     #[test]
     fn test_primary_voice_not_ducked() {
-        let rules = vec![
-            create_test_rule("narration", vec!["music"], 0.1, 1000),
-        ];
+        let rules = vec![create_test_rule("narration", vec!["music"], 0.1, 1000)];
         let mut engine = DuckingEngine::new(rules, 48000);
 
         // Start narration

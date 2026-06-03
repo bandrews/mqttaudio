@@ -3,11 +3,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
-#[cfg(test)]
-use std::path::Path;
 use std::fs;
 use std::io;
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
 /// Metadata for a single cached file
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,6 +54,7 @@ pub struct DiskCache {
 }
 
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)] // descriptive variant names; renaming deferred to Sprint 9
 pub enum CacheError {
     IoError(io::Error),
     JsonError(serde_json::Error),
@@ -102,18 +103,16 @@ impl DiskCache {
         let metadata_path = cache_dir.join("metadata.json");
         let metadata = if metadata_path.exists() {
             match fs::read_to_string(&metadata_path) {
-                Ok(content) => {
-                    match serde_json::from_str::<CacheMetadata>(&content) {
-                        Ok(meta) => {
-                            tracing::info!("Loaded cache metadata with {} entries", meta.entries.len());
-                            meta
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to parse cache metadata: {}, starting fresh", e);
-                            CacheMetadata::default()
-                        }
+                Ok(content) => match serde_json::from_str::<CacheMetadata>(&content) {
+                    Ok(meta) => {
+                        tracing::info!("Loaded cache metadata with {} entries", meta.entries.len());
+                        meta
                     }
-                }
+                    Err(e) => {
+                        tracing::warn!("Failed to parse cache metadata: {}, starting fresh", e);
+                        CacheMetadata::default()
+                    }
+                },
                 Err(e) => {
                     tracing::warn!("Failed to read cache metadata: {}, starting fresh", e);
                     CacheMetadata::default()
@@ -149,8 +148,8 @@ impl DiskCache {
         let hash = hasher.finish();
 
         // Extract extension from URL
-        let extension = if let Some(last_part) = url.split('/').last() {
-            if let Some(ext) = last_part.split('.').last() {
+        let extension = if let Some(last_part) = url.split('/').next_back() {
+            if let Some(ext) = last_part.split('.').next_back() {
                 // Only use common audio extensions
                 match ext.to_lowercase().as_str() {
                     "wav" | "mp3" | "ogg" | "flac" => ext.to_lowercase(),
@@ -237,9 +236,7 @@ impl DiskCache {
 
     /// Get total size of cached files in bytes
     pub fn total_size_bytes(&self) -> u64 {
-        self.metadata.entries.values()
-            .map(|e| e.file_size)
-            .sum()
+        self.metadata.entries.values().map(|e| e.file_size).sum()
     }
 
     /// Download a file from HTTP/HTTPS URL and store in cache
@@ -248,7 +245,8 @@ impl DiskCache {
         tracing::info!("Downloading {}", url);
 
         // Make HTTP request
-        let response = reqwest::get(url).await
+        let response = reqwest::get(url)
+            .await
             .map_err(|e| CacheError::HttpError(format!("Failed to download: {}", e)))?;
 
         if !response.status().is_success() {
@@ -260,23 +258,28 @@ impl DiskCache {
         }
 
         // Extract cache headers
-        let etag = response.headers()
+        let etag = response
+            .headers()
             .get("etag")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let last_modified = response.headers()
+        let last_modified = response
+            .headers()
             .get("last-modified")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        let content_type = response.headers()
+        let content_type = response
+            .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
         // Download body
-        let bytes = response.bytes().await
+        let bytes = response
+            .bytes()
+            .await
             .map_err(|e| CacheError::HttpError(format!("Failed to read response: {}", e)))?;
 
         let file_size = bytes.len() as u64;

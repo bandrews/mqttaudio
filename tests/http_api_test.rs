@@ -617,7 +617,10 @@ async fn test_samples_endpoint_returns_position_ms() {
         "total_ms field should be present"
     );
     let total_ms = sample_json["total_ms"].as_u64().unwrap();
-    assert_eq!(total_ms, 2000, "total_ms should be 2000 for 2 seconds of audio");
+    assert_eq!(
+        total_ms, 2000,
+        "total_ms should be 2000 for 2 seconds of audio"
+    );
 
     assert!(
         sample_json.get("sample_rate").is_some(),
@@ -684,5 +687,8 @@ async fn test_samples_endpoint_position_ms_handles_zero_sample_rate() {
 
     // With sample_rate 0, position_ms should be 0 (not cause a divide-by-zero)
     let position_ms = samples[0]["position_ms"].as_u64().unwrap();
-    assert_eq!(position_ms, 0, "position_ms should be 0 when sample_rate is 0");
+    assert_eq!(
+        position_ms, 0,
+        "position_ms should be 0 when sample_rate is 0"
+    );
 }

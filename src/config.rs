@@ -1,11 +1,11 @@
 // ABOUTME: Configuration loading and management.
 // ABOUTME: Parses JSON config files and merges with CLI arguments.
 
+use crate::audio::ducking::DuckingRule;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs;
-use crate::audio::ducking::DuckingRule;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -67,11 +67,10 @@ impl ChannelRef {
     pub fn resolve(&self, aliases: &HashMap<String, usize>) -> Result<usize, String> {
         match self {
             ChannelRef::Index(idx) => Ok(*idx),
-            ChannelRef::Alias(name) => {
-                aliases.get(name)
-                    .copied()
-                    .ok_or_else(|| format!("Unknown channel alias: '{}'", name))
-            }
+            ChannelRef::Alias(name) => aliases
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("Unknown channel alias: '{}'", name)),
         }
     }
 }
@@ -187,17 +186,10 @@ impl Default for CacheConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct SecurityConfig {
     #[serde(default)]
     pub allowed_directories: Vec<String>,
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            allowed_directories: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -293,9 +285,11 @@ impl Default for InputConfig {
 /// Resampler quality preset
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ResamplerQuality {
     /// Fastest resampling, acceptable quality for most content.
     /// sinc_len=64, oversample=64. ~60ms for 1 min stereo.
+    #[default]
     Fast,
     /// Balanced quality and speed.
     /// sinc_len=128, oversample=128. ~95ms for 1 min stereo.
@@ -307,12 +301,6 @@ pub enum ResamplerQuality {
     /// sinc_len=256, oversample=256. ~230ms for 1 min stereo.
     /// Only recommended when precaching everything on startup.
     Maximum,
-}
-
-impl Default for ResamplerQuality {
-    fn default() -> Self {
-        ResamplerQuality::Fast
-    }
 }
 
 impl ResamplerQuality {
@@ -410,6 +398,7 @@ impl Default for HttpConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
     pub mqtt: MqttConfig,
     pub audio: AudioConfig,
@@ -433,32 +422,14 @@ pub struct Config {
     pub macros: HashMap<String, serde_json::Value>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            mqtt: MqttConfig::default(),
-            audio: AudioConfig::default(),
-            cache: CacheConfig::default(),
-            security: SecurityConfig::default(),
-            logging: LoggingConfig::default(),
-            http: HttpConfig::default(),
-            ducking_rules: Vec::new(),
-            bass_management: BassManagementConfig::default(),
-            inputs: Vec::new(),
-            advanced: AdvancedConfig::default(),
-            macros: HashMap::new(),
-        }
-    }
-}
-
 impl Config {
     /// Load configuration from a JSON file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let contents = fs::read_to_string(path.as_ref())
-            .map_err(|e| ConfigError::IoError(e.to_string()))?;
+        let contents =
+            fs::read_to_string(path.as_ref()).map_err(|e| ConfigError::IoError(e.to_string()))?;
 
-        let config: Config = serde_json::from_str(&contents)
-            .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        let config: Config =
+            serde_json::from_str(&contents).map_err(|e| ConfigError::ParseError(e.to_string()))?;
 
         Ok(config)
     }
@@ -474,13 +445,7 @@ impl Config {
             PathBuf::from("/etc/mqttaudio/config.json"),
         ];
 
-        for path in search_paths {
-            if path.exists() {
-                return Some(path);
-            }
-        }
-
-        None
+        search_paths.into_iter().find(|path| path.exists())
     }
 
     /// Load config from default search paths or create default config
@@ -522,7 +487,8 @@ impl Config {
     /// Get expanded allowed directories
     #[cfg(test)]
     pub fn allowed_directories(&self) -> Vec<PathBuf> {
-        self.security.allowed_directories
+        self.security
+            .allowed_directories
             .iter()
             .map(|d| PathBuf::from(Self::expand_tilde(d)))
             .collect()
@@ -612,7 +578,9 @@ impl Config {
     /// Resolve bass management channel references to numeric indices
     pub fn resolve_bass_management(&self) -> Result<ResolvedBassManagement, String> {
         let lfe = self.resolve_channel(&self.bass_management.lfe_channel)?;
-        let sources: Result<Vec<usize>, String> = self.bass_management.source_channels
+        let sources: Result<Vec<usize>, String> = self
+            .bass_management
+            .source_channels
             .iter()
             .map(|ch| self.resolve_channel(ch))
             .collect();
@@ -626,8 +594,12 @@ impl Config {
     }
 
     /// Resolve input route channel references to numeric indices
-    pub fn resolve_input_routes(&self, routes: &[InputRouteConfig]) -> Result<Vec<(usize, usize)>, String> {
-        routes.iter()
+    pub fn resolve_input_routes(
+        &self,
+        routes: &[InputRouteConfig],
+    ) -> Result<Vec<(usize, usize)>, String> {
+        routes
+            .iter()
             .map(|r| {
                 let src = self.resolve_channel(&r.source_channel)?;
                 let dest = self.resolve_channel(&r.dest_channel)?;
@@ -701,24 +673,35 @@ impl Config {
         // Channel volumes must be 0.0 to 1.0
         for (ch, vol) in &self.audio.channel_volumes {
             if *vol < 0.0 || *vol > 1.0 {
-                errors.push(format!("audio.channel_volumes.{} must be between 0.0 and 1.0", ch));
+                errors.push(format!(
+                    "audio.channel_volumes.{} must be between 0.0 and 1.0",
+                    ch
+                ));
             }
         }
 
         // Logging level must be valid
-        let valid_levels = vec!["error", "warn", "info", "debug", "trace"];
+        let valid_levels = ["error", "warn", "info", "debug", "trace"];
         if !valid_levels.contains(&self.logging.level.as_str()) {
-            errors.push(format!("logging.level must be one of: {}", valid_levels.join(", ")));
+            errors.push(format!(
+                "logging.level must be one of: {}",
+                valid_levels.join(", ")
+            ));
         }
 
         // Bass management validation
         if self.bass_management.enabled {
             if self.bass_management.crossover_frequency_hz < 10.0
-                || self.bass_management.crossover_frequency_hz > 200.0 {
-                errors.push("bass_management.crossover_frequency_hz must be between 10 and 200".to_string());
+                || self.bass_management.crossover_frequency_hz > 200.0
+            {
+                errors.push(
+                    "bass_management.crossover_frequency_hz must be between 10 and 200".to_string(),
+                );
             }
             if self.bass_management.source_channels.is_empty() {
-                errors.push("bass_management.source_channels must not be empty when enabled".to_string());
+                errors.push(
+                    "bass_management.source_channels must not be empty when enabled".to_string(),
+                );
             }
             // Validate channel aliases resolve
             if let Err(e) = self.resolve_channel(&self.bass_management.lfe_channel) {
@@ -740,7 +723,10 @@ impl Config {
                 errors.push(format!("inputs[{}].routes must not be empty", i));
             }
             if input.latency_ms < 5 || input.latency_ms > 500 {
-                errors.push(format!("inputs[{}].latency_ms must be between 5 and 500", i));
+                errors.push(format!(
+                    "inputs[{}].latency_ms must be between 5 and 500",
+                    i
+                ));
             }
             // Validate channel aliases in routes
             for (j, route) in input.routes.iter().enumerate() {
@@ -762,7 +748,9 @@ impl Config {
             // Auth token should be reasonably long if set
             if let Some(ref token) = self.http.auth_token {
                 if token.len() < 8 {
-                    errors.push("http.auth_token should be at least 8 characters for security".to_string());
+                    errors.push(
+                        "http.auth_token should be at least 8 characters for security".to_string(),
+                    );
                 }
             }
         }
@@ -795,8 +783,8 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_default_config() {
@@ -809,7 +797,7 @@ mod tests {
         assert_eq!(config.mqtt.password, None);
         assert_eq!(config.audio.sample_rate, 48000);
         assert_eq!(config.audio.buffer_size, 512);
-        assert_eq!(config.cache.enabled, true);
+        assert!(config.cache.enabled);
         assert_eq!(config.cache.revalidate_after_seconds, 300);
         assert_eq!(config.logging.level, "info");
     }
@@ -847,7 +835,16 @@ mod tests {
         assert!(config.mqtt.password.is_none());
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
             Some("cli_user".to_string()),
             Some("cli_pass".to_string()),
             None,
@@ -871,7 +868,16 @@ mod tests {
         let mut config: Config = serde_json::from_str(json).unwrap();
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
             Some("cli_user".to_string()),
             Some("cli_pass".to_string()),
             None,
@@ -949,10 +955,13 @@ mod tests {
         assert_eq!(config.audio.device, Some("USB Audio".to_string()));
         assert_eq!(config.audio.sample_rate, 96000);
         assert_eq!(config.audio.buffer_size, 1024);
-        assert_eq!(config.audio.channel_names.get("0"), Some(&"front_left".to_string()));
+        assert_eq!(
+            config.audio.channel_names.get("0"),
+            Some(&"front_left".to_string())
+        );
         assert_eq!(config.audio.channel_volumes.get("front_left"), Some(&0.9));
 
-        assert_eq!(config.cache.enabled, false);
+        assert!(!config.cache.enabled);
         assert_eq!(config.cache.directory, "/tmp/cache");
         assert_eq!(config.cache.revalidate_after_seconds, 60);
 
@@ -960,18 +969,22 @@ mod tests {
         assert_eq!(config.security.allowed_directories[0], "/opt/sounds");
 
         assert_eq!(config.logging.level, "debug");
-        assert_eq!(config.logging.verbose, true);
+        assert!(config.logging.verbose);
     }
 
     #[test]
     fn test_load_from_file() {
         let mut temp_file = NamedTempFile::new().unwrap();
-        write!(temp_file, r#"{{
+        write!(
+            temp_file,
+            r#"{{
             "mqtt": {{
                 "server": "testserver",
                 "topic": "test/topic"
             }}
-        }}"#).unwrap();
+        }}"#
+        )
+        .unwrap();
 
         let config = Config::from_file(temp_file.path()).unwrap();
 
@@ -1016,10 +1029,8 @@ mod tests {
     #[test]
     fn test_allowed_directories_expansion() {
         let mut config = Config::default();
-        config.security.allowed_directories = vec![
-            "~/sounds".to_string(),
-            "/opt/audio".to_string(),
-        ];
+        config.security.allowed_directories =
+            vec!["~/sounds".to_string(), "/opt/audio".to_string()];
 
         let expanded = config.allowed_directories();
         assert_eq!(expanded.len(), 2);
@@ -1034,7 +1045,9 @@ mod tests {
 
         assert!(result.is_err());
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| e.contains("mqtt.topic") || e.contains("http.enabled")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("mqtt.topic") || e.contains("http.enabled")));
     }
 
     #[test]
@@ -1157,8 +1170,8 @@ mod tests {
             Some("audio/logs".to_string()), // log_topic
             Some("testuser".to_string()),   // mqtt_username
             Some("testpass".to_string()),   // mqtt_password
-            None, // http_port
-            None, // max_cache_mb
+            None,                           // http_port
+            None,                           // max_cache_mb
         );
 
         assert_eq!(config.mqtt.server, "newserver");
@@ -1169,7 +1182,7 @@ mod tests {
         assert_eq!(config.audio.device, Some("newdevice".to_string()));
         assert_eq!(config.audio.sample_rate, 96000);
         assert_eq!(config.audio.channels, Some(8));
-        assert_eq!(config.logging.verbose, true);
+        assert!(config.logging.verbose);
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
         assert_eq!(config.bass_management.lfe_channel, ChannelRef::Index(5));
@@ -1184,9 +1197,9 @@ mod tests {
         config.mqtt.topic = Some("original/topic".to_string());
 
         config.merge_cli_args(
-            None,  // Don't override server
-            Some(8883),  // Override port
-            None,  // Don't override topic
+            None,       // Don't override server
+            Some(8883), // Override port
+            None,       // Don't override topic
             None,
             None,
             None, // channels
@@ -1200,20 +1213,22 @@ mod tests {
             None, // max_cache_mb
         );
 
-        assert_eq!(config.mqtt.server, "original");  // Unchanged
-        assert_eq!(config.mqtt.port, 8883);  // Changed
-        assert_eq!(config.mqtt.topic, Some("original/topic".to_string()));  // Unchanged
+        assert_eq!(config.mqtt.server, "original"); // Unchanged
+        assert_eq!(config.mqtt.port, 8883); // Changed
+        assert_eq!(config.mqtt.topic, Some("original/topic".to_string())); // Unchanged
     }
 
     #[test]
     fn test_merge_cli_args_verbose_sets_debug() {
         let mut config = Config::default();
         assert_eq!(config.logging.level, "info");
-        assert_eq!(config.logging.verbose, false);
+        assert!(!config.logging.verbose);
 
-        config.merge_cli_args(None, None, None, None, None, None, true, None, None, None, None, None, None, None);
+        config.merge_cli_args(
+            None, None, None, None, None, None, true, None, None, None, None, None, None, None,
+        );
 
-        assert_eq!(config.logging.verbose, true);
+        assert!(config.logging.verbose);
         assert_eq!(config.logging.level, "debug");
     }
 
@@ -1221,11 +1236,11 @@ mod tests {
     fn test_bass_management_config_default() {
         let config = Config::default();
 
-        assert_eq!(config.bass_management.enabled, false);
+        assert!(!config.bass_management.enabled);
         assert_eq!(config.bass_management.lfe_channel, ChannelRef::Index(3));
         assert_eq!(config.bass_management.crossover_frequency_hz, 80.0);
         assert!(config.bass_management.source_channels.is_empty());
-        assert_eq!(config.bass_management.remove_bass_from_sources, false);
+        assert!(!config.bass_management.remove_bass_from_sources);
     }
 
     #[test]
@@ -1339,7 +1354,10 @@ mod tests {
         config.mqtt.topic = Some("test".to_string());
         config.inputs.push(InputConfig {
             volume: 1.5, // Invalid
-            routes: vec![InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) }],
+            routes: vec![InputRouteConfig {
+                source_channel: ChannelRef::Index(0),
+                dest_channel: ChannelRef::Index(0),
+            }],
             ..Default::default()
         });
 
@@ -1370,7 +1388,10 @@ mod tests {
         config.mqtt.topic = Some("test".to_string());
         config.inputs.push(InputConfig {
             latency_ms: 1000, // Invalid - too high
-            routes: vec![InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) }],
+            routes: vec![InputRouteConfig {
+                source_channel: ChannelRef::Index(0),
+                dest_channel: ChannelRef::Index(0),
+            }],
             ..Default::default()
         });
 
@@ -1389,8 +1410,14 @@ mod tests {
             volume: 0.8,
             voice_id: "mic".to_string(),
             routes: vec![
-                InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) },
-                InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(1) },
+                InputRouteConfig {
+                    source_channel: ChannelRef::Index(0),
+                    dest_channel: ChannelRef::Index(0),
+                },
+                InputRouteConfig {
+                    source_channel: ChannelRef::Index(0),
+                    dest_channel: ChannelRef::Index(1),
+                },
             ],
             latency_ms: 25,
         });
@@ -1516,9 +1543,20 @@ mod tests {
         assert!(config.logging.mqtt_topic.is_none());
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
             Some("audio/logs".to_string()),
-            None, None, None, None,
+            None,
+            None,
+            None,
+            None,
         );
 
         assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
@@ -1607,8 +1645,14 @@ mod tests {
         let json = r#"{"source_channel": "mic_left", "dest_channel": "front_left"}"#;
         let route: InputRouteConfig = serde_json::from_str(json).unwrap();
 
-        assert_eq!(route.source_channel, ChannelRef::Alias("mic_left".to_string()));
-        assert_eq!(route.dest_channel, ChannelRef::Alias("front_left".to_string()));
+        assert_eq!(
+            route.source_channel,
+            ChannelRef::Alias("mic_left".to_string())
+        );
+        assert_eq!(
+            route.dest_channel,
+            ChannelRef::Alias("front_left".to_string())
+        );
     }
 
     #[test]
@@ -1643,7 +1687,10 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
 
         // Check that aliases are stored as ChannelRef::Alias
-        assert_eq!(config.bass_management.lfe_channel, ChannelRef::Alias("lfe".to_string()));
+        assert_eq!(
+            config.bass_management.lfe_channel,
+            ChannelRef::Alias("lfe".to_string())
+        );
 
         // Resolve and check values
         let resolved = config.resolve_bass_management().unwrap();
@@ -1675,7 +1722,9 @@ mod tests {
 
         let config: Config = serde_json::from_str(json).unwrap();
 
-        let routes = config.resolve_input_routes(&config.inputs[0].routes).unwrap();
+        let routes = config
+            .resolve_input_routes(&config.inputs[0].routes)
+            .unwrap();
         assert_eq!(routes, vec![(0, 0), (0, 1)]);
     }
 
@@ -1854,12 +1903,12 @@ mod tests {
     fn test_http_config_default() {
         let config = HttpConfig::default();
 
-        assert_eq!(config.enabled, false);
+        assert!(!config.enabled);
         assert_eq!(config.port, 0);
         assert_eq!(config.bind_address, "127.0.0.1");
         assert!(config.auth_token.is_none());
-        assert_eq!(config.websocket_enabled, true);
-        assert_eq!(config.cors_permissive, false);
+        assert!(config.websocket_enabled);
+        assert!(!config.cors_permissive);
     }
 
     #[test]
@@ -1878,12 +1927,12 @@ mod tests {
 
         let config: Config = serde_json::from_str(json).unwrap();
 
-        assert_eq!(config.http.enabled, true);
+        assert!(config.http.enabled);
         assert_eq!(config.http.port, 8080);
         assert_eq!(config.http.bind_address, "0.0.0.0");
         assert_eq!(config.http.auth_token, Some("secrettoken123".to_string()));
-        assert_eq!(config.http.websocket_enabled, true);
-        assert_eq!(config.http.cors_permissive, true);
+        assert!(config.http.websocket_enabled);
+        assert!(config.http.cors_permissive);
     }
 
     #[test]
@@ -1940,7 +1989,18 @@ mod tests {
         assert_eq!(config.http.port, 0);
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
             Some(9000),
             None,
         );
@@ -1956,7 +2016,18 @@ mod tests {
         assert_eq!(config.cache.max_memory_mb, 512); // default
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             Some(1024),
         );
@@ -1991,9 +2062,16 @@ mod tests {
             ("high", ResamplerQuality::High),
             ("maximum", ResamplerQuality::Maximum),
         ] {
-            let json = format!(r#"{{"mqtt": {{"topic": "test"}}, "advanced": {{"resampler_quality": "{}"}}}}"#, json_value);
+            let json = format!(
+                r#"{{"mqtt": {{"topic": "test"}}, "advanced": {{"resampler_quality": "{}"}}}}"#,
+                json_value
+            );
             let config: Config = serde_json::from_str(&json).unwrap();
-            assert_eq!(config.advanced.resampler_quality, expected, "Failed for {}", json_value);
+            assert_eq!(
+                config.advanced.resampler_quality, expected,
+                "Failed for {}",
+                json_value
+            );
         }
     }
 
@@ -2089,10 +2167,9 @@ mod tests {
     fn test_macros_serialization() {
         let mut config = Config::default();
         config.mqtt.topic = Some("test".to_string());
-        config.macros.insert(
-            "test_macro".to_string(),
-            serde_json::json!({"volume": 0.5}),
-        );
+        config
+            .macros
+            .insert("test_macro".to_string(), serde_json::json!({"volume": 0.5}));
 
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("macros"));

@@ -36,7 +36,7 @@ fn list_devices_linux() {
 /// Fallback device listing using only cpal (for macOS, Windows, etc.)
 #[cfg(not(target_os = "linux"))]
 fn list_devices_cpal_only() {
-    use super::device::{DeviceCategory, DeviceInfo, DeviceList, format_device_list};
+    use super::device::{format_device_list, DeviceCategory, DeviceInfo, DeviceList};
 
     let host = cpal::default_host();
     let mut list = DeviceList::new();
@@ -87,7 +87,8 @@ fn list_devices_cpal_only() {
             }
         }
         Err(e) => {
-            list.discovery_notes.push(format!("Error listing devices: {}", e));
+            list.discovery_notes
+                .push(format!("Error listing devices: {}", e));
         }
     }
 
@@ -97,7 +98,8 @@ fn list_devices_cpal_only() {
 /// Get default device configuration
 pub fn get_default_device_config() -> Result<DeviceConfig, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
-    let device = host.default_output_device()
+    let device = host
+        .default_output_device()
         .ok_or("No default output device available")?;
 
     let config = device.default_output_config()?;
@@ -140,7 +142,11 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
                             // Supports hw:, plughw:, sysdefault:
                             if let Some(matched) = try_match_alsa_device(device_name, &n) {
                                 if matched {
-                                    tracing::info!("Matched ALSA device '{}' to '{}'", device_name, n);
+                                    tracing::info!(
+                                        "Matched ALSA device '{}' to '{}'",
+                                        device_name,
+                                        n
+                                    );
                                     return Ok(device);
                                 }
                             }
@@ -151,10 +157,9 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
 
             Err(format!("Output device not found: {}", device_name).into())
         }
-        None => {
-            host.default_output_device()
-                .ok_or_else(|| "No default output device available".into())
-        }
+        None => host
+            .default_output_device()
+            .ok_or_else(|| "No default output device available".into()),
     }
 }
 
@@ -163,7 +168,14 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
 #[cfg(target_os = "linux")]
 fn try_match_alsa_device(requested: &str, enumerated: &str) -> Option<bool> {
     // Get prefix (hw:, plughw:, sysdefault:, etc.)
-    let prefixes = ["plughw:", "hw:", "sysdefault:", "dmix:", "front:", "surround"];
+    let prefixes = [
+        "plughw:",
+        "hw:",
+        "sysdefault:",
+        "dmix:",
+        "front:",
+        "surround",
+    ];
 
     for prefix in prefixes {
         if requested.starts_with(prefix) && enumerated.starts_with(prefix) {
@@ -186,7 +198,14 @@ fn try_match_alsa_device(requested: &str, enumerated: &str) -> Option<bool> {
 #[cfg(target_os = "linux")]
 fn extract_alsa_card_from_name(name: &str) -> Option<AlsaCardId> {
     // Find prefix end
-    let prefixes = ["plughw:", "hw:", "sysdefault:", "dmix:", "front:", "surround"];
+    let prefixes = [
+        "plughw:",
+        "hw:",
+        "sysdefault:",
+        "dmix:",
+        "front:",
+        "surround",
+    ];
 
     for prefix in prefixes {
         if name.starts_with(prefix) {
@@ -234,8 +253,8 @@ impl PartialEq for AlsaCardId {
             (AlsaCardId::Index(a), AlsaCardId::Index(b)) => a == b,
             (AlsaCardId::Name(a), AlsaCardId::Name(b)) => a == b,
             // Cross-compare by looking up card index from name
-            (AlsaCardId::Index(idx), AlsaCardId::Name(name)) |
-            (AlsaCardId::Name(name), AlsaCardId::Index(idx)) => {
+            (AlsaCardId::Index(idx), AlsaCardId::Name(name))
+            | (AlsaCardId::Name(name), AlsaCardId::Index(idx)) => {
                 // Try to match card name to index by checking /proc/asound/cards
                 if let Ok(cards) = std::fs::read_to_string("/proc/asound/cards") {
                     for line in cards.lines() {
@@ -283,7 +302,8 @@ pub fn find_output_config(
         None => {
             // Find maximum available channels, but cap at 32 for sanity
             // (ALSA plugins may report absurdly high values)
-            supported_configs.iter()
+            supported_configs
+                .iter()
                 .map(|c| c.channels())
                 .filter(|&ch| ch <= 32)
                 .max()
@@ -292,13 +312,15 @@ pub fn find_output_config(
     };
 
     // Find configs that match the requested channel count
-    let matching_configs: Vec<_> = supported_configs.iter()
+    let matching_configs: Vec<_> = supported_configs
+        .iter()
         .filter(|c| c.channels() == target_channels)
         .collect();
 
     if matching_configs.is_empty() {
         // No exact match - list available channel counts (capped for display)
-        let available: Vec<_> = supported_configs.iter()
+        let available: Vec<_> = supported_configs
+            .iter()
             .map(|c| c.channels())
             .filter(|&ch| ch <= 32)
             .collect::<std::collections::HashSet<_>>()
@@ -307,26 +329,26 @@ pub fn find_output_config(
         return Err(format!(
             "No configuration found for {} channels. Available: {:?}",
             target_channels, available
-        ).into());
+        )
+        .into());
     }
 
     // Determine target sample rate
     let target_sample_rate = requested_sample_rate.unwrap_or_else(|| {
         // Use the default config's sample rate if possible, otherwise pick a common rate
-        device.default_output_config()
+        device
+            .default_output_config()
             .map(|c| c.sample_rate().0)
             .unwrap_or(48000)
     });
 
     // Find the best matching config for sample rate
     // Prefer configs with reasonable sample rate ranges, but accept any if needed
-    let best_config = matching_configs.iter()
-        .filter(|c| {
-            let min = c.min_sample_rate().0;
-            let max = c.max_sample_rate().0;
-            target_sample_rate >= min && target_sample_rate <= max
-        })
-        .next();
+    let best_config = matching_configs.iter().find(|c| {
+        let min = c.min_sample_rate().0;
+        let max = c.max_sample_rate().0;
+        target_sample_rate >= min && target_sample_rate <= max
+    });
 
     match best_config {
         Some(config_range) => {
@@ -358,7 +380,8 @@ pub fn find_output_config(
 /// Initialize audio output stream with a test sine wave
 pub fn init_test_sine_wave() -> Result<Stream, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
-    let device = host.default_output_device()
+    let device = host
+        .default_output_device()
         .ok_or("No default output device available")?;
 
     let config = device.default_output_config()?;
@@ -395,7 +418,10 @@ pub fn init_test_sine_wave() -> Result<Stream, Box<dyn std::error::Error>> {
 
                 // Wrap phase to prevent overflow
                 if phase > 2.0 * std::f32::consts::PI {
-                    PHASE.fetch_sub((2.0 * std::f32::consts::PI * 1000.0) as u32, Ordering::Relaxed);
+                    PHASE.fetch_sub(
+                        (2.0 * std::f32::consts::PI * 1000.0) as u32,
+                        Ordering::Relaxed,
+                    );
                 }
             }
         },
@@ -415,7 +441,8 @@ pub fn init_test_sine_wave() -> Result<Stream, Box<dyn std::error::Error>> {
 pub fn play_file(path: &str) -> Result<Stream, Box<dyn std::error::Error>> {
     // Get audio device first to determine target sample rate
     let host = cpal::default_host();
-    let device = host.default_output_device()
+    let device = host
+        .default_output_device()
         .ok_or("No default output device available")?;
 
     let config = device.default_output_config()?;
@@ -505,7 +532,8 @@ pub fn play_file(path: &str) -> Result<Stream, Box<dyn std::error::Error>> {
 pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
     // Get audio device
     let host = cpal::default_host();
-    let device = host.default_output_device()
+    let device = host
+        .default_output_device()
         .ok_or("No default output device available")?;
 
     let config = device.default_output_config()?;
@@ -518,14 +546,18 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
     tracing::info!("  Channels: {}", output_channels);
 
     // Load test files if they exist, otherwise generate test tones
-    let test_files = vec![
+    let test_files = [
         "/Users/bandrews/src/mqttaudio/tests/audio/test_440hz_2s.wav",
         "/Users/bandrews/src/mqttaudio/tests/audio/test_880hz_48khz.wav",
     ];
 
     let mut buffers = Vec::new();
     for (i, file_path) in test_files.iter().enumerate() {
-        match decoder::decode_file(file_path, Some(output_sample_rate), ResamplerQuality::default()) {
+        match decoder::decode_file(
+            file_path,
+            Some(output_sample_rate),
+            ResamplerQuality::default(),
+        ) {
             Ok(buffer) => {
                 tracing::info!(
                     "Loaded sample {}: {} channels, {} frames ({:.2}s)",
@@ -559,7 +591,11 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
             format!("test_file_{}.wav", i + 1),
         );
         active_samples.push(sample);
-        tracing::info!("Added sample {} to mixer at {}% volume", i + 1, (volume * 100.0) as u32);
+        tracing::info!(
+            "Added sample {} to mixer at {}% volume",
+            i + 1,
+            (volume * 100.0) as u32
+        );
     }
 
     // Create mixer state

@@ -92,13 +92,13 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
     let health_route = Router::new().route("/health", get(handlers::handle_health));
 
     // Build the main router
-    let mut app = Router::new()
-        .merge(health_route)
-        .merge(status_routes);
+    let mut app = Router::new().merge(health_route).merge(status_routes);
 
     // Add command routes with auth middleware
-    let authenticated_commands = command_routes
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+    let authenticated_commands = command_routes.layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth_middleware,
+    ));
 
     app = app.merge(authenticated_commands);
 

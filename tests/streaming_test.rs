@@ -264,7 +264,10 @@ async fn test_cache_manager_streaming_load() {
         attempts += 1;
     }
 
-    assert!(buffer.is_complete(), "Buffer should be complete after waiting");
+    assert!(
+        buffer.is_complete(),
+        "Buffer should be complete after waiting"
+    );
     assert!(buffer.frames() > 0, "Should have loaded frames");
     assert_eq!(buffer.channels(), 2);
 
@@ -425,7 +428,10 @@ async fn test_precache_streaming_then_play() {
 
     // Simulate play command coming in while precache is in progress
     // This should return the same streaming buffer
-    let buffer = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
 
     // Should be streaming (same load in progress)
     match &buffer {
@@ -474,7 +480,10 @@ async fn test_play_with_offset_during_streaming() {
     let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
 
     // Start streaming load
-    let buffer = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
 
     // Simulate play with offset - trying to seek to 1 second (48000 frames)
     let target_frame = 48000usize;
@@ -531,7 +540,10 @@ async fn test_reverse_play_with_streaming_buffer() {
     let cache_dir = TempDir::new().unwrap();
     let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
 
-    let buffer = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
 
     // For reverse play, we'd start near the end
     // Since we don't know total frames yet, use estimate or wait
@@ -585,9 +597,18 @@ async fn test_multiple_play_requests_share_buffer() {
     let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
 
     // Simulate multiple play requests at different offsets
-    let buffer1 = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
-    let buffer2 = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
-    let buffer3 = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
+    let buffer1 = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
+    let buffer2 = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
+    let buffer3 = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
 
     // All should share the same underlying streaming buffer
     match (&buffer1, &buffer2, &buffer3) {
@@ -626,7 +647,10 @@ async fn test_precache_then_seek_beyond_loaded() {
     cache_manager.precache_streaming(&url, 48000).await.unwrap();
 
     // Get buffer for play
-    let buffer = cache_manager.get_or_load_streaming(&url, 48000).await.unwrap();
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
 
     // Try to access a frame near the end (might not be loaded yet)
     let target = 90000; // ~1.9 seconds into a 2 second file

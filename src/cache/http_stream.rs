@@ -138,7 +138,7 @@ impl HttpStreamReader {
             // Check if download is complete
             if guard.complete {
                 if let Some(ref err) = guard.error {
-                    return Err(io::Error::new(io::ErrorKind::Other, err.clone()));
+                    return Err(io::Error::other(err.clone()));
                 }
                 // No more data coming
                 return Ok(());
@@ -383,14 +383,14 @@ mod tests {
         assert_eq!(pos, 5);
 
         let mut buf = [0u8; 3];
-        reader.read(&mut buf).unwrap();
+        reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"567");
 
         // Seek backward
         let pos = reader.seek(SeekFrom::Start(2)).unwrap();
         assert_eq!(pos, 2);
 
-        reader.read(&mut buf).unwrap();
+        reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"234");
     }
 
@@ -406,7 +406,7 @@ mod tests {
 
         // Read 3 bytes
         let mut buf = [0u8; 3];
-        reader.read(&mut buf).unwrap();
+        reader.read_exact(&mut buf).unwrap();
         assert_eq!(reader.position, 3);
 
         // Seek forward 2 from current
@@ -417,7 +417,7 @@ mod tests {
         let pos = reader.seek(SeekFrom::Current(-1)).unwrap();
         assert_eq!(pos, 4);
 
-        reader.read(&mut buf).unwrap();
+        reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"456");
     }
 
@@ -436,7 +436,7 @@ mod tests {
         assert_eq!(pos, 7);
 
         let mut buf = [0u8; 3];
-        reader.read(&mut buf).unwrap();
+        reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"789");
     }
 
@@ -624,7 +624,7 @@ mod tests {
         assert_eq!(pos, 10);
 
         let mut buf = [0u8; 5];
-        reader.read(&mut buf).unwrap();
+        reader.read_exact(&mut buf).unwrap();
         assert_eq!(&buf, b"abcde");
 
         producer.join().unwrap();

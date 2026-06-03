@@ -59,10 +59,7 @@ pub async fn connect_mqtt(
 }
 
 /// Process MQTT events and forward messages to command channel
-pub async fn process_mqtt_events(
-    mut eventloop: EventLoop,
-    command_tx: mpsc::Sender<String>,
-) {
+pub async fn process_mqtt_events(mut eventloop: EventLoop, command_tx: mpsc::Sender<String>) {
     tracing::info!("Starting MQTT event loop");
 
     loop {
@@ -108,7 +105,8 @@ mod tests {
     #[tokio::test]
     async fn test_connect_mqtt_with_credentials() {
         // Test that credentials are accepted (actual authentication requires a configured broker)
-        let result = connect_mqtt("localhost", 1883, "test/topic", Some("user"), Some("pass")).await;
+        let result =
+            connect_mqtt("localhost", 1883, "test/topic", Some("user"), Some("pass")).await;
         assert!(result.is_ok());
     }
 

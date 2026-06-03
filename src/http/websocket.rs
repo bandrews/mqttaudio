@@ -12,7 +12,6 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing;
 
 /// Maximum number of log messages to buffer for new subscribers.
 const LOG_BUFFER_SIZE: usize = 1000;
@@ -67,7 +66,7 @@ async fn handle_socket(socket: WebSocket, broadcaster: Arc<LogBroadcaster>) {
     });
 
     if sender
-        .send(Message::Text(welcome.to_string().into()))
+        .send(Message::Text(welcome.to_string()))
         .await
         .is_err()
     {
@@ -85,7 +84,7 @@ async fn handle_socket(socket: WebSocket, broadcaster: Arc<LogBroadcaster>) {
                     });
 
                     if sender
-                        .send(Message::Text(log_message.to_string().into()))
+                        .send(Message::Text(log_message.to_string()))
                         .await
                         .is_err()
                     {
@@ -177,17 +176,13 @@ struct LogVisitor {
 
 impl tracing::field::Visit for LogVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{:?}", value);
-        } else if self.message.is_empty() {
+        if field.name() == "message" || self.message.is_empty() {
             self.message = format!("{:?}", value);
         }
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-        if field.name() == "message" {
-            self.message = value.to_string();
-        } else if self.message.is_empty() {
+        if field.name() == "message" || self.message.is_empty() {
             self.message = value.to_string();
         }
     }
