@@ -71,6 +71,9 @@ dirs = "5.0"
 # Stable content hashing for cache keys
 sha2 = "0.10"
 
+# System memory detection for the auto memory budget (read once at startup)
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+
 # Linux-specific: ALSA bindings for device probing
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.9"

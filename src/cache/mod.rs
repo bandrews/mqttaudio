@@ -4,12 +4,13 @@
 pub mod disk;
 pub mod http_stream;
 pub mod memory;
+pub mod strategy;
 
 use crate::audio::decoder;
 use crate::audio::streaming::{SampleBuffer, StreamingBuffer};
 use crate::audio::streaming_decoder::StreamingDecoder;
 use crate::audio::types::DecodedBuffer;
-use crate::config::ResamplerQuality;
+use crate::config::{MemoryCap, ResamplerQuality};
 use disk::{CacheError, DiskCache};
 use memory::MemoryCache;
 use std::collections::HashMap;
@@ -50,20 +51,40 @@ impl CacheManager {
         allowed_directories: Vec<String>,
         revalidate_after_seconds: u64,
     ) -> Result<Self, CacheError> {
-        let disk_cache = DiskCache::new(cache_dir)?;
-        let max_bytes = if max_memory_mb == 0 {
-            0 // 0 means unlimited in MemoryCache::with_max_size
+        // Legacy/test constructor: 0 keeps the old "unlimited" meaning here. The
+        // production path uses `with_resolved_cap` with a config-resolved cap, where
+        // `max_memory_mb: 0` instead means auto-detect a bounded cap.
+        let cap = if max_memory_mb == 0 {
+            MemoryCap::Unlimited
         } else {
-            (max_memory_mb as usize) * 1024 * 1024
+            MemoryCap::Bytes((max_memory_mb as usize) * 1024 * 1024)
         };
-        let memory_cache = MemoryCache::with_max_size(max_bytes);
+        Self::with_resolved_cap(
+            cache_dir,
+            resampler_quality,
+            cap,
+            allowed_directories,
+            revalidate_after_seconds,
+        )
+    }
+
+    /// Create a cache manager with an already-resolved [`MemoryCap`] (the production
+    /// path; `main` resolves the cap from config + system memory at startup).
+    pub fn with_resolved_cap(
+        cache_dir: PathBuf,
+        resampler_quality: ResamplerQuality,
+        memory_cap: MemoryCap,
+        allowed_directories: Vec<String>,
+        revalidate_after_seconds: u64,
+    ) -> Result<Self, CacheError> {
+        let disk_cache = DiskCache::new(cache_dir)?;
+        let memory_cache = MemoryCache::with_cap(memory_cap);
 
         tracing::info!(
-            "Cache manager initialized (memory limit: {})",
-            if max_memory_mb == 0 {
-                "unlimited".to_string()
-            } else {
-                format!("{} MB", max_memory_mb)
+            "Cache manager initialized (memory cap: {})",
+            match memory_cap {
+                MemoryCap::Unlimited => "unlimited".to_string(),
+                MemoryCap::Bytes(n) => format!("{:.0} MB", n as f64 / (1024.0 * 1024.0)),
             }
         );
 
@@ -75,6 +96,19 @@ impl CacheManager {
             allowed_directories,
             revalidate_after_seconds,
         })
+    }
+
+    /// Bytes of new decoded data the memory cache could accept right now (after
+    /// evicting evictable entries). The load-strategy decision force-windows an asset
+    /// whose estimated decoded size exceeds this.
+    pub fn memory_headroom(&self) -> usize {
+        self.memory_cache.fit_headroom()
+    }
+
+    /// Whether `file_path` is already resident in the memory cache, so a replay can
+    /// skip the probe/strategy decision and serve it directly. Does not touch LRU.
+    pub fn is_resident(&self, file_path: &str) -> bool {
+        self.memory_cache.contains(file_path)
     }
 
     /// Create a new cache manager with specified resampler quality and no memory limit.

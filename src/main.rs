@@ -577,9 +577,24 @@ async fn main() {
     // Create cache manager using config
     let cache_dir = config.cache_directory();
     let resampler_quality = config.advanced.resampler_quality;
-    let max_memory_mb = config.cache.max_memory_mb;
+    // Resolve the memory-cache cap from config + a one-shot read of system memory. The
+    // `auto` budget targets a clamped fraction of available RAM so the daemon never
+    // camps all of it; an explicit cap or `unlimited` overrides.
+    let available_memory = detect_available_memory();
+    let memory_cap = config.cache.resolve_memory_cap(available_memory);
     tracing::info!("Cache directory: {}", cache_dir.display());
     tracing::info!("Resampler quality: {:?}", resampler_quality);
+    match available_memory {
+        Some(avail) => tracing::info!(
+            "Memory budget resolved to {:?} ({:.0} MB available at startup)",
+            memory_cap,
+            avail as f64 / (1024.0 * 1024.0)
+        ),
+        None => tracing::info!(
+            "Memory budget resolved to {:?} (system memory not detectable)",
+            memory_cap
+        ),
+    }
 
     if config.security.allowed_directories.is_empty() {
         tracing::warn!(
@@ -598,10 +613,10 @@ async fn main() {
         );
     }
 
-    let cache_manager = match cache::CacheManager::with_options(
+    let cache_manager = match cache::CacheManager::with_resolved_cap(
         cache_dir,
         resampler_quality,
-        max_memory_mb,
+        memory_cap,
         config.security.allowed_directories.clone(),
         config.cache.revalidate_after_seconds,
     ) {
@@ -915,6 +930,17 @@ fn notify_voice_activity(
             }
         }
     }
+}
+
+/// Read the system's available memory in bytes for the auto memory budget, or `None`
+/// if it cannot be determined (the budget then falls back to its bounded ceiling, never
+/// unlimited). A one-shot read at startup; no background polling.
+fn detect_available_memory() -> Option<u64> {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let available = sys.available_memory();
+    (available > 0).then_some(available)
 }
 
 /// Reconcile control-side bookkeeping for one finished voice-bearing entry (a sample
@@ -1238,6 +1264,61 @@ async fn handle_stream_play(
     );
 }
 
+/// For a local file with mode Auto/Full, decide whether to window it instead of fully
+/// loading it. Skips the decision (returns false) when the asset is already resident
+/// (a cache hit serves it directly, full-feature); otherwise probes the header off the
+/// async thread and applies the load-strategy decision against the live memory-budget
+/// headroom, so an over-budget asset is force-windowed (the never-OOM guarantee).
+async fn should_window_local(file: &str, mode: config::LoadMode, ctx: &CommandCtx<'_>) -> bool {
+    let config = ctx.config;
+    let rate = ctx.output_sample_rate;
+
+    let (resident, headroom) = {
+        let cache_mgr = ctx.cache_manager.lock().await;
+        (cache_mgr.is_resident(file), cache_mgr.memory_headroom())
+    };
+    if resident {
+        return false; // already decoded: serve from cache with full features
+    }
+
+    let quality = config.advanced.resampler_quality;
+    let file_owned = file.to_string();
+    let probe = tokio::task::spawn_blocking(move || {
+        cache::strategy::probe_local_file(&file_owned, rate, quality)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let Some(probe) = probe else {
+        return false; // header unreadable: let the full-load path surface the error
+    };
+
+    let strategy = cache::strategy::decide(
+        mode,
+        config.cache.load_mode,
+        &probe,
+        config.cache.full_load_max_bytes,
+        config.cache.full_load_max_seconds,
+        headroom,
+    );
+
+    if strategy == cache::strategy::Strategy::Windowed {
+        match probe.est_decoded_bytes {
+            Some(bytes) => tracing::info!(
+                "Windowing {} (estimated {:.0} MB decoded; cache headroom {:.0} MB)",
+                file,
+                bytes as f64 / (1024.0 * 1024.0),
+                headroom as f64 / (1024.0 * 1024.0)
+            ),
+            None => tracing::info!("Windowing {} per the configured load_mode", file),
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Whether a selector targets a voice that currently has a windowed/streamed source.
 /// Streamed voices are forward-only, so seek/speed/pitch do not apply. Best-effort:
 /// it matches on the selector's voice (the common case) and is used only to warn — a
@@ -1278,18 +1359,16 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             window_ms,
             prebuffer_ms,
         } => {
-            // An explicit windowed/streamed play takes the bounded-memory producer
-            // path for local files (low time-to-first-sample, O(window) memory). HTTP
-            // windowed streaming is S2; until then an HTTP mode=stream falls through to
-            // the full load with a note.
+            // Windowed streaming applies to local files (HTTP windowed streaming is
+            // deferred to a later sprint). `mode=stream` is explicit; `auto`/`full` are
+            // decided from a cheap header probe and the live memory budget, which
+            // force-windows an over-budget asset so a full load can never blow the cap
+            // (the never-OOM guarantee, O(window) memory, low time-to-first-sample).
             let is_http = file.starts_with("http://") || file.starts_with("https://");
-            if mode == config::LoadMode::Stream {
-                if is_http {
-                    tracing::warn!(
-                        "mode=stream is not yet supported for HTTP ({}); loading fully",
-                        file
-                    );
-                } else {
+            if !is_http {
+                let go_windowed =
+                    mode == config::LoadMode::Stream || should_window_local(&file, mode, ctx).await;
+                if go_windowed {
                     handle_stream_play(
                         file,
                         id,
@@ -1305,9 +1384,14 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     .await;
                     return;
                 }
+            } else if mode == config::LoadMode::Stream {
+                tracing::warn!(
+                    "mode=stream is not yet supported for HTTP ({}); loading fully",
+                    file
+                );
             }
 
-            // Load file (with streaming support for faster startup)
+            // Load file (full in-memory load, with streaming support for faster startup)
             let mut cache_mgr = cache_manager.lock().await;
             let buffer_result = cache_mgr
                 .get_or_load_streaming(&file, output_sample_rate)
@@ -2146,6 +2230,60 @@ mod tests {
             ),
             "seek on a normal voice must still push SeekMatching"
         );
+    }
+
+    #[tokio::test]
+    async fn auto_windows_a_local_asset_over_the_size_threshold() {
+        let mut fixture = Fixture::new(vec![]);
+        // Make the full-load threshold tiny so the 2 s test WAV exceeds it; mode=auto
+        // must then window it (the producer path) rather than fully decode it.
+        fixture.config.cache.full_load_max_bytes = 1000;
+        fixture.run(play(Some("bed"), 1.0)).await; // mode=auto
+        fixture.drain();
+
+        assert_eq!(
+            fixture.mixer.streamed_sources.len(),
+            1,
+            "an over-threshold asset must auto-window"
+        );
+        assert!(fixture.mixer.active_samples.is_empty());
+        assert!(fixture.streamed_voices.contains("bed"));
+    }
+
+    #[tokio::test]
+    async fn auto_full_loads_a_small_local_asset() {
+        let mut fixture = Fixture::new(vec![]);
+        // Default thresholds: the small test WAV is well under them -> full load.
+        fixture.run(play(Some("sfx"), 1.0)).await;
+        fixture.drain();
+
+        assert_eq!(
+            fixture.mixer.active_samples.len(),
+            1,
+            "a small asset must full-load (random-access, all features)"
+        );
+        assert!(fixture.mixer.streamed_sources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_full_keeps_full_load_even_over_the_size_threshold() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.config.cache.full_load_max_bytes = 1000; // tiny threshold
+                                                         // mode=full overrides the auto size threshold (the budget is unlimited in the
+                                                         // fixture, so nothing forces windowing).
+        let mut cmd = play(Some("v"), 1.0);
+        if let AudioCommand::Play { mode, .. } = &mut cmd {
+            *mode = config::LoadMode::Full;
+        }
+        fixture.run(cmd).await;
+        fixture.drain();
+
+        assert_eq!(
+            fixture.mixer.active_samples.len(),
+            1,
+            "mode=full must full-load regardless of the size threshold"
+        );
+        assert!(fixture.mixer.streamed_sources.is_empty());
     }
 
     /// A Play of the test WAV with explicit `loop_mode`/`crossfade_ms`, for the
