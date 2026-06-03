@@ -77,7 +77,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 |---|--------|--------|-----------|------|
 | 0 | Validation harness & Docker pipeline | Done | — | [sprint-00](sprint-00-validation-harness.md) |
 | 1 | Device & format compatibility | Done | 0 | [sprint-01](sprint-01-device-format-compatibility.md) |
-| 2 | Control-plane reliability | Not started | 0 | [sprint-02](sprint-02-control-plane-reliability.md) |
+| 2 | Control-plane reliability | Done | 0 | [sprint-02](sprint-02-control-plane-reliability.md) |
 | 3 | Security & file safety | Not started | 0 | [sprint-03](sprint-03-security-and-file-safety.md) |
 | 4 | Streaming & cache correctness | Not started | 0 | [sprint-04](sprint-04-streaming-and-cache-correctness.md) |
 | 5 | Lock-free real-time engine | Not started | 0 | [sprint-05](sprint-05-lockfree-realtime-engine.md) |
@@ -113,12 +113,12 @@ Tick a box only when genuinely verified. `[A]` = Lane A/Docker, `[B]` = Lane B/n
 - [ ] WASAPI shared (i16/i32) `--list-devices` + play smoke documented and run `[C]` — documented (W-1); pending the final partner Windows pass
 
 ### Sprint 2 — Control-plane reliability
-- [ ] Re-subscribe on `Packet::ConnAck`; integration test proves commands arrive after a broker restart `[A]`
-- [ ] Cache guard dropped before `.await`; `decode_file` runs in `spawn_blocking` `[A]`
-- [ ] RT-shared state no longer poison-bricks audio (non-poisoning or PoisonError-recovering locks); test proves a poisoned non-RT lock doesn't kill the callback path `[A]`
-- [ ] SIGINT/SIGTERM handler fades active samples, drains, flushes cache metadata; test verifies clean shutdown `[A]`
-- [ ] Burst >100 commands does not stall `eventloop.poll()` `[A]`
-- [ ] `total_cmp` replaces `partial_cmp().unwrap()`; `ducking_rules.target_volume` validated finite ∈[0,1]; `resolve_*` exits gracefully instead of `expect` `[A]`
+- [x] Re-subscribe on `Packet::ConnAck`; integration test proves commands arrive after a broker restart `[A]`
+- [x] Cache guard dropped before `.await`; `decode_file` runs in `spawn_blocking` `[A]`
+- [x] RT-shared state no longer poison-bricks audio (non-poisoning or PoisonError-recovering locks); test proves a poisoned non-RT lock doesn't kill the callback path `[A]`
+- [x] SIGINT/SIGTERM handler fades active samples, drains, flushes cache metadata; test verifies clean shutdown `[A]`
+- [x] Burst >100 commands does not stall `eventloop.poll()` `[A]`
+- [x] `total_cmp` replaces `partial_cmp().unwrap()`; `ducking_rules.target_volume` validated finite ∈[0,1]; `resolve_*` exits gracefully instead of `expect` `[A]`
 
 ### Sprint 3 — Security & file safety
 - [ ] `allowed_directories` enforced **when configured** (canonicalize + reject); empty list = allow-all preserved with a startup warning; `/etc/passwd` refused under a configured allowlist; tests cover both `[A]`
