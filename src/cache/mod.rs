@@ -113,11 +113,12 @@ impl CacheManager {
                 let entry = self.disk_cache.get_entry(file_path).unwrap();
                 let local_path = self.disk_cache.get_cached_file_path(entry);
 
-                let buffer = decoder::decode_file(
-                    local_path.to_str().unwrap(),
-                    Some(target_sample_rate),
-                    self.resampler_quality,
-                )?;
+                let path = local_path.to_string_lossy().into_owned();
+                let quality = self.resampler_quality;
+                let buffer = tokio::task::spawn_blocking(move || {
+                    decoder::decode_file(&path, Some(target_sample_rate), quality)
+                })
+                .await??;
 
                 let arc_buffer = Arc::new(buffer);
                 self.memory_cache
@@ -134,8 +135,12 @@ impl CacheManager {
 
         // Local file - load from disk (could stream later for very large files)
         tracing::debug!("Loading local file: {}", file_path);
-        let buffer =
-            decoder::decode_file(file_path, Some(target_sample_rate), self.resampler_quality)?;
+        let path = file_path.to_string();
+        let quality = self.resampler_quality;
+        let buffer = tokio::task::spawn_blocking(move || {
+            decoder::decode_file(&path, Some(target_sample_rate), quality)
+        })
+        .await??;
 
         let arc_buffer = Arc::new(buffer);
         self.memory_cache
@@ -364,11 +369,12 @@ impl CacheManager {
 
         // Decode the file
         tracing::debug!("Decoding: {}", local_path.display());
-        let buffer = decoder::decode_file(
-            local_path.to_str().unwrap(),
-            Some(target_sample_rate),
-            self.resampler_quality,
-        )?;
+        let path = local_path.to_string_lossy().into_owned();
+        let quality = self.resampler_quality;
+        let buffer = tokio::task::spawn_blocking(move || {
+            decoder::decode_file(&path, Some(target_sample_rate), quality)
+        })
+        .await??;
 
         // Store in memory cache
         let arc_buffer = Arc::new(buffer);

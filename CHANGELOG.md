@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **MQTT re-subscription on reconnect.** The daemon now re-subscribes to its command topic on every
+  broker (re)connect, so it recovers command handling after a broker restart instead of going silently
+  deaf.
+- **RT-shared state no longer poison-bricks audio.** The mixer/voice/active-voice mutexes use a
+  non-poisoning lock (`parking_lot`), so a panic in one command/HTTP handler can no longer permanently
+  silence audio via a poisoned lock. Cache access uses an async mutex so a slow decode no longer stalls the
+  command loop or HTTP status endpoints (the decode runs off the async runtime).
+- **MQTT command overflow drops instead of back-pressuring.** Under sustained overflow the MQTT producer
+  now drops commands (logging a running count) rather than blocking the event loop, which previously could
+  stall keepalive and get the broker to drop the session. (HTTP command delivery is unchanged.)
+- **Invalid ducking targets are rejected.** A non-finite or out-of-range `ducking_rules[*].target_volume`
+  now fails configuration validation instead of being accepted.
+
 - **Output device sample-format negotiation.** The output stream is now built to match
   the device's native sample format (I16/U16/I32/F32) using an internal f32 mix bus and
   a per-sample convert shim, instead of assuming f32. Non-f32 Windows WASAPI shared-mode

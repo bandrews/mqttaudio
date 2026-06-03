@@ -8,7 +8,8 @@ use mqttaudio::audio::types::DecodedBuffer;
 use mqttaudio::cache::CacheManager;
 use mqttaudio::http::{create_router, AppState, LogBroadcaster};
 use mqttaudio::voice::VoiceManager;
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tower::util::ServiceExt;
 
@@ -25,7 +26,7 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
     }));
 
     let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));
-    let cache_manager = Arc::new(Mutex::new(
+    let cache_manager = Arc::new(tokio::sync::Mutex::new(
         CacheManager::new(std::env::temp_dir().join("mqttaudio_test_cache")).unwrap(),
     ));
 
@@ -572,7 +573,7 @@ async fn test_samples_endpoint_returns_position_ms() {
 
     // Add sample to mixer state
     {
-        let mut mixer = state.mixer_state.lock().unwrap();
+        let mut mixer = state.mixer_state.lock();
         mixer.active_samples.push(sample);
     }
 
@@ -661,7 +662,7 @@ async fn test_samples_endpoint_position_ms_handles_zero_sample_rate() {
     );
 
     {
-        let mut mixer = state.mixer_state.lock().unwrap();
+        let mut mixer = state.mixer_state.lock();
         mixer.active_samples.push(sample);
     }
 

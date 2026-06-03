@@ -75,15 +75,29 @@ pub async fn process_mqtt_events(
 ) {
     tracing::info!("Starting MQTT event loop");
 
+    let mut dropped_commands: u64 = 0;
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(p))) => {
                 let payload = publish_payload(&p);
                 tracing::debug!("Received MQTT message on topic {}: {}", p.topic, payload);
 
-                // Forward to command handler
-                if let Err(e) = command_tx.send(payload).await {
-                    tracing::error!("Failed to send command to handler: {}", e);
+                // Never block the MQTT event loop on a slow consumer: drop (with a
+                // warning + running count) rather than back-pressuring poll(), which
+                // would stall keepalive and get the broker to drop the session.
+                match command_tx.try_send(payload) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        dropped_commands += 1;
+                        tracing::warn!(
+                            "Command queue full; dropped MQTT command (total dropped: {})",
+                            dropped_commands
+                        );
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::error!("Command channel closed; stopping MQTT event loop");
+                        return;
+                    }
                 }
             }
             Ok(Event::Incoming(Packet::ConnAck(_))) => {

@@ -7,8 +7,9 @@ use crate::audio::types::DeviceConfig;
 use crate::config::ResamplerQuality;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// List available audio output devices
 pub fn list_devices() {
@@ -399,7 +400,7 @@ fn run_mix_callback(
 ) {
     use std::collections::HashSet;
 
-    let mut state = mixer_state.lock().unwrap();
+    let mut state = mixer_state.lock();
     crate::audio::mixer::mix_audio(bus, &mut state);
 
     let voices_before: HashSet<String> = state
@@ -420,7 +421,7 @@ fn run_mix_callback(
         }
     }
 
-    *active_voices.lock().unwrap() = voices_after;
+    *active_voices.lock() = voices_after;
 }
 
 /// Build an output stream of element type `T`, mixing into an f32 scratch bus and
@@ -834,7 +835,7 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
         &config.into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             // Audio callback - mix all active samples
-            let mut state = mixer_state_clone.lock().unwrap();
+            let mut state = mixer_state_clone.lock();
             crate::audio::mixer::mix_audio(data, &mut state);
 
             // Remove finished samples
@@ -848,7 +849,7 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
 
     stream.play()?;
 
-    let num_samples = mixer_state.lock().unwrap().active_samples.len();
+    let num_samples = mixer_state.lock().active_samples.len();
     tracing::info!("Mixer started with {} simultaneous samples", num_samples);
 
     Ok(stream)

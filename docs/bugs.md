@@ -5,13 +5,6 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 
 ## Deferred to a later sprint
 
-- **`await_holding_lock` in the command/precache paths (Sprint 2, D6).** `handle_command`'s `Play` and
-  `Precache` arms, and the two startup precache loops in `main()`, hold the `cache_manager` `Mutex` guard
-  across an `.await` (`src/main.rs`). This is the mutex-across-await reliability finding. It is currently
-  suppressed with targeted `#[allow(clippy::await_holding_lock)]` (on `handle_command` and on `main`) so the
-  Sprint 0 validation gate is green. Sprint 2 must drop the guard before awaiting (decode via
-  `spawn_blocking`, internally-synchronized cache) and remove those allows.
-
 - **`DiskCache` uses `DefaultHasher` for cache keys (Sprint 3).** `src/cache/disk.rs:~147` derives the
   on-disk filename from `std::collections::hash_map::DefaultHasher`, which is not guaranteed stable across
   releases/platforms. Sprint 3 should switch to a stable content hash (truncated SHA-256 / xxhash).

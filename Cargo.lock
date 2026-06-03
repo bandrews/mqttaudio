@@ -1533,6 +1533,7 @@ dependencies = [
  "dirs",
  "futures",
  "futures-util",
+ "parking_lot",
  "rand",
  "reqwest",
  "ringbuf",

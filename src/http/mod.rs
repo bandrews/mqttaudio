@@ -12,8 +12,9 @@ use crate::audio::mixer::MixerState;
 use crate::cache::CacheManager;
 use crate::config::HttpConfig;
 use crate::voice::VoiceManager;
+use parking_lot::Mutex;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Shared application state passed to all HTTP handlers.
@@ -26,7 +27,7 @@ pub struct AppState {
     /// Read-only access to voice manager for status queries
     pub voice_manager: Arc<Mutex<VoiceManager>>,
     /// Read-only access to cache manager for status queries
-    pub cache_manager: Arc<Mutex<CacheManager>>,
+    pub cache_manager: Arc<tokio::sync::Mutex<CacheManager>>,
     /// Optional auth token for Bearer authentication
     pub auth_token: Option<String>,
     /// Log broadcaster for WebSocket clients
@@ -40,7 +41,7 @@ pub async fn start_server(
     cmd_tx: mpsc::Sender<String>,
     mixer_state: Arc<Mutex<MixerState>>,
     voice_manager: Arc<Mutex<VoiceManager>>,
-    cache_manager: Arc<Mutex<CacheManager>>,
+    cache_manager: Arc<tokio::sync::Mutex<CacheManager>>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
 

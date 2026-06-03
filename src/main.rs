@@ -98,10 +98,6 @@ struct Args {
     max_cache_mb: Option<u32>,
 }
 
-// Sprint 2 (D6): startup precache loops hold the cache guard across `.await`; the
-// proper fix (drop-before-await / internally synchronized cache) lands in Sprint 2.
-// Tracked in docs/bugs.md.
-#[allow(clippy::await_holding_lock)]
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -404,8 +400,9 @@ async fn main() {
     // Create mixer state and voice manager
     use audio::ducking::DuckingEngine;
     use audio::mixer::MixerState;
+    use parking_lot::Mutex;
     use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use voice::VoiceManager;
 
     // Create ducking engine from config rules
@@ -506,7 +503,7 @@ async fn main() {
                     );
 
                     // Add to mixer state
-                    mixer_state.lock().unwrap().live_inputs.push(live_input);
+                    mixer_state.lock().live_inputs.push(live_input);
                 }
 
                 // Keep the stream alive by storing it
@@ -536,7 +533,7 @@ async fn main() {
 
     let cache_manager =
         match cache::CacheManager::with_options(cache_dir, resampler_quality, max_memory_mb) {
-            Ok(cm) => Arc::new(Mutex::new(cm)),
+            Ok(cm) => Arc::new(tokio::sync::Mutex::new(cm)),
             Err(e) => {
                 tracing::error!("Failed to initialize cache: {}", e);
                 std::process::exit(1);
@@ -549,7 +546,7 @@ async fn main() {
         if config.cache.precache_blocking {
             tracing::info!("Precaching {} files (blocking)...", precache_files.len());
             for file_path in &precache_files {
-                let mut cache_mgr = cache_manager.lock().unwrap();
+                let mut cache_mgr = cache_manager.lock().await;
                 match cache_mgr.precache(file_path, output_sample_rate).await {
                     Ok(()) => {
                         if config.logging.verbose {
@@ -569,7 +566,7 @@ async fn main() {
                 precache_files.len()
             );
             for file_path in &precache_files {
-                let mut cache_mgr = cache_manager.lock().unwrap();
+                let mut cache_mgr = cache_manager.lock().await;
                 match cache_mgr
                     .precache_streaming(file_path, output_sample_rate)
                     .await
@@ -679,16 +676,15 @@ async fn main() {
 
 /// Bundles the shared state a single command operates on.
 struct CommandCtx<'a> {
-    cache_manager: &'a std::sync::Arc<std::sync::Mutex<cache::CacheManager>>,
-    voice_manager: &'a std::sync::Arc<std::sync::Mutex<voice::VoiceManager>>,
-    mixer_state: &'a std::sync::Arc<std::sync::Mutex<audio::mixer::MixerState>>,
-    active_voices: &'a std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    cache_manager: &'a std::sync::Arc<tokio::sync::Mutex<cache::CacheManager>>,
+    voice_manager: &'a std::sync::Arc<parking_lot::Mutex<voice::VoiceManager>>,
+    mixer_state: &'a std::sync::Arc<parking_lot::Mutex<audio::mixer::MixerState>>,
+    active_voices: &'a std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
     output_sample_rate: u32,
     config: &'a config::Config,
 }
 
 /// Apply a single parsed command to the shared audio state.
-#[allow(clippy::await_holding_lock)] // Sprint 2 (D6): drop cache guard before .await; tracked in docs/bugs.md
 async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>) {
     let cache_manager = ctx.cache_manager;
     let voice_manager = ctx.voice_manager;
@@ -713,7 +709,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             crossfade_ms,
         } => {
             // Load file (with streaming support for faster startup)
-            let mut cache_mgr = cache_manager.lock().unwrap();
+            let mut cache_mgr = cache_manager.lock().await;
             let buffer_result = cache_mgr
                 .get_or_load_streaming(&file, output_sample_rate)
                 .await;
@@ -770,7 +766,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
                     }
 
                     // Get sample ID and voice volume from voice manager
-                    let mut voice_mgr = voice_manager.lock().unwrap();
+                    let mut voice_mgr = voice_manager.lock();
                     let sample_id = voice_mgr.add_sample_to_voice(&voice_id);
                     let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
                     drop(voice_mgr);
@@ -861,14 +857,14 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
                     }
 
                     // Notify ducking engine if voice became active
-                    let mut active_voices_guard = active_voices.lock().unwrap();
+                    let mut active_voices_guard = active_voices.lock();
                     let was_active = active_voices_guard.contains(&voice_id);
                     if !was_active {
                         active_voices_guard.insert(voice_id.clone());
                         drop(active_voices_guard);
 
                         // Notify ducking engine that voice became active
-                        let mut state = mixer_state.lock().unwrap();
+                        let mut state = mixer_state.lock();
                         if let Some(ref mut engine) = state.ducking_engine {
                             engine.notify_voice_active(&voice_id, true);
                         }
@@ -876,7 +872,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
                         tracing::info!("Now playing {} active samples", state.active_samples.len());
                     } else {
                         drop(active_voices_guard);
-                        let mut state = mixer_state.lock().unwrap();
+                        let mut state = mixer_state.lock();
                         state.active_samples.push(sample);
                         tracing::info!("Now playing {} active samples", state.active_samples.len());
                     }
@@ -890,7 +886,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             // Apply quick 10ms fade-out to prevent clicks/pops
             const STOP_FADE_MS: u32 = 10;
 
-            let mut state = mixer_state.lock().unwrap();
+            let mut state = mixer_state.lock();
             let count = state.active_samples.len();
 
             for sample in state.active_samples.iter_mut() {
@@ -912,7 +908,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             const STOP_FADE_MS: u32 = 10;
 
             // Get sample IDs in the voice
-            let mut voice_mgr = voice_manager.lock().unwrap();
+            let mut voice_mgr = voice_manager.lock();
             let sample_ids = voice_mgr.clear_voice(&voice);
             drop(voice_mgr);
 
@@ -920,7 +916,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
                 tracing::warn!("Voice '{}' not found or already empty", voice);
             } else {
                 // Apply fade-out to all samples in the voice
-                let mut state = mixer_state.lock().unwrap();
+                let mut state = mixer_state.lock();
                 let mut updated_count = 0;
                 for sample in state.active_samples.iter_mut() {
                     if sample_ids.contains(&sample.id) {
@@ -943,7 +939,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
         }
         mqtt::commands::AudioCommand::VoiceFadeOut { voice, time_ms } => {
             // Get sample IDs in the voice
-            let voice_mgr = voice_manager.lock().unwrap();
+            let voice_mgr = voice_manager.lock();
             let sample_ids = voice_mgr.get_voice_sample_ids(&voice);
             drop(voice_mgr);
 
@@ -951,7 +947,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
                 tracing::warn!("Voice '{}' not found or already empty", voice);
             } else {
                 // Apply fade out to all samples in the voice
-                let mut state = mixer_state.lock().unwrap();
+                let mut state = mixer_state.lock();
                 let mut updated_count = 0;
                 for sample in state.active_samples.iter_mut() {
                     if sample_ids.contains(&sample.id) {
@@ -977,14 +973,14 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             volume: new_volume,
         } => {
             // Set voice volume in voice manager
-            let mut voice_mgr = voice_manager.lock().unwrap();
+            let mut voice_mgr = voice_manager.lock();
             let success = voice_mgr.set_voice_volume(&voice, new_volume);
             let actual_volume = voice_mgr.get_voice_volume(&voice).unwrap_or(1.0);
             drop(voice_mgr);
 
             if success {
                 // Update all active samples and live inputs in this voice with smooth ramping
-                let mut state = mixer_state.lock().unwrap();
+                let mut state = mixer_state.lock();
                 let mut sample_count = 0;
                 let mut input_count = 0;
 
@@ -1018,7 +1014,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
         }
         mqtt::commands::AudioCommand::Precache { file } => {
             // Non-blocking precache - starts loading and returns immediately
-            let mut cache_mgr = cache_manager.lock().unwrap();
+            let mut cache_mgr = cache_manager.lock().await;
             match cache_mgr
                 .precache_streaming(&file, output_sample_rate)
                 .await
@@ -1034,7 +1030,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             }
         }
         mqtt::commands::AudioCommand::CacheClear => {
-            let mut cache_mgr = cache_manager.lock().unwrap();
+            let mut cache_mgr = cache_manager.lock().await;
             if config.logging.verbose {
                 let mem = cache_mgr.memory_stats();
                 let disk = cache_mgr.disk_stats();
@@ -1056,7 +1052,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             }
         }
         mqtt::commands::AudioCommand::CacheInvalidate { file } => {
-            let mut cache_mgr = cache_manager.lock().unwrap();
+            let mut cache_mgr = cache_manager.lock().await;
             match cache_mgr.invalidate(&file) {
                 Ok(()) => {
                     tracing::info!("Invalidated cache for: {}", file);
@@ -1073,7 +1069,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             input,
             volume: new_volume,
         } => {
-            let mut state = mixer_state.lock().unwrap();
+            let mut state = mixer_state.lock();
             let mut found = false;
 
             // Try to find by index first
@@ -1106,7 +1102,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             }
         }
         mqtt::commands::AudioCommand::InputMute { input, mute } => {
-            let mut state = mixer_state.lock().unwrap();
+            let mut state = mixer_state.lock();
             let mut found = false;
 
             // Try to find by index first
@@ -1148,7 +1144,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             if selector.is_empty() {
                 tracing::warn!("Seek command with empty selector - no samples targeted");
             } else {
-                let mut state = mixer_state.lock().unwrap();
+                let mut state = mixer_state.lock();
                 let mut updated_count = 0;
 
                 for sample in state.active_samples.iter_mut() {
@@ -1184,7 +1180,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             if selector.is_empty() {
                 tracing::warn!("Speed command with empty selector - no samples targeted");
             } else {
-                let mut state = mixer_state.lock().unwrap();
+                let mut state = mixer_state.lock();
                 let mut updated_count = 0;
 
                 for sample in state.active_samples.iter_mut() {
@@ -1227,7 +1223,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
                 // Default to 10ms fade for smooth stop if not specified
                 let fade_ms = fade_out_ms.unwrap_or(10);
 
-                let mut state = mixer_state.lock().unwrap();
+                let mut state = mixer_state.lock();
                 let mut updated_count = 0;
 
                 for sample in state.active_samples.iter_mut() {
@@ -1261,7 +1257,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             if selector.is_empty() {
                 tracing::warn!("Volume command with empty selector - no samples targeted");
             } else {
-                let mut state = mixer_state.lock().unwrap();
+                let mut state = mixer_state.lock();
                 let mut updated_count = 0;
 
                 for sample in state.active_samples.iter_mut() {
@@ -1293,8 +1289,9 @@ mod tests {
     use audio::ducking::{DuckingEngine, DuckingRule};
     use audio::mixer::{FadeState, MixerState};
     use mqtt::commands::{AudioCommand, SampleSelector};
+    use parking_lot::Mutex;
     use std::collections::HashSet;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use voice::VoiceManager;
 
     const TEST_WAV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/audio/test_440hz_2s.wav");
@@ -1302,7 +1299,7 @@ mod tests {
 
     /// Owns the shared state needed to drive `handle_command` in tests.
     struct Fixture {
-        cache_manager: Arc<Mutex<cache::CacheManager>>,
+        cache_manager: Arc<tokio::sync::Mutex<cache::CacheManager>>,
         voice_manager: Arc<Mutex<VoiceManager>>,
         mixer_state: Arc<Mutex<MixerState>>,
         active_voices: Arc<Mutex<HashSet<String>>>,
@@ -1322,7 +1319,7 @@ mod tests {
                 bass_management: None,
             };
             Self {
-                cache_manager: Arc::new(Mutex::new(cache)),
+                cache_manager: Arc::new(tokio::sync::Mutex::new(cache)),
                 voice_manager: Arc::new(Mutex::new(VoiceManager::new())),
                 mixer_state: Arc::new(Mutex::new(mixer_state)),
                 active_voices: Arc::new(Mutex::new(HashSet::new())),
@@ -1362,7 +1359,7 @@ mod tests {
         let fixture = Fixture::new(None);
         handle_command(play(Some("music"), 0.5), &fixture.ctx()).await;
 
-        let state = fixture.mixer_state.lock().unwrap();
+        let state = fixture.mixer_state.lock();
         assert_eq!(state.active_samples.len(), 1);
         let sample = &state.active_samples[0];
         assert_eq!(sample.voice_id, "music");
@@ -1371,7 +1368,7 @@ mod tests {
         assert!(matches!(sample.fade_state, FadeState::None));
         assert_eq!(sample.crossfade_samples, 0);
 
-        assert!(fixture.active_voices.lock().unwrap().contains("music"));
+        assert!(fixture.active_voices.lock().contains("music"));
     }
 
     #[tokio::test]
@@ -1383,7 +1380,7 @@ mod tests {
         }
         handle_command(cmd, &fixture.ctx()).await;
 
-        let state = fixture.mixer_state.lock().unwrap();
+        let state = fixture.mixer_state.lock();
         // 100 ms at 48 kHz = 4800 frames
         assert!(matches!(
             state.active_samples[0].fade_state,
@@ -1399,11 +1396,11 @@ mod tests {
         let fixture = Fixture::new(None);
         handle_command(play(Some("a"), 1.0), &fixture.ctx()).await;
         handle_command(play(Some("b"), 1.0), &fixture.ctx()).await;
-        assert_eq!(fixture.mixer_state.lock().unwrap().active_samples.len(), 2);
+        assert_eq!(fixture.mixer_state.lock().active_samples.len(), 2);
 
         handle_command(AudioCommand::StopAll, &fixture.ctx()).await;
 
-        let state = fixture.mixer_state.lock().unwrap();
+        let state = fixture.mixer_state.lock();
         assert_eq!(state.active_samples.len(), 2);
         for sample in &state.active_samples {
             assert!(matches!(sample.fade_state, FadeState::Out { .. }));
@@ -1428,7 +1425,7 @@ mod tests {
         handle_command(stop, &fixture.ctx()).await;
 
         let expected_duration = 50 * SR as usize / 1000; // 2400 frames
-        let state = fixture.mixer_state.lock().unwrap();
+        let state = fixture.mixer_state.lock();
         for sample in &state.active_samples {
             if sample.voice_id == "music" {
                 assert!(matches!(
@@ -1455,7 +1452,7 @@ mod tests {
         )
         .await;
 
-        let state = fixture.mixer_state.lock().unwrap();
+        let state = fixture.mixer_state.lock();
         let sample = &state.active_samples[0];
         assert!((sample.target_voice_volume - 0.3).abs() < 1e-6);
         // Current voice volume is ramped over time, so it must not jump immediately.
@@ -1475,7 +1472,7 @@ mod tests {
         // Background music starts first. It is not a ducking primary, so it stays full.
         handle_command(play(Some("music"), 1.0), &fixture.ctx()).await;
         {
-            let mut state = fixture.mixer_state.lock().unwrap();
+            let mut state = fixture.mixer_state.lock();
             let engine = state.ducking_engine.as_mut().unwrap();
             assert!((engine.get_multiplier("music", 1) - 1.0).abs() < 1e-6);
         }
@@ -1484,7 +1481,7 @@ mod tests {
         // which ducks "music".
         handle_command(play(Some("narration"), 1.0), &fixture.ctx()).await;
         {
-            let mut state = fixture.mixer_state.lock().unwrap();
+            let mut state = fixture.mixer_state.lock();
             let engine = state.ducking_engine.as_mut().unwrap();
             let multiplier = engine.get_multiplier("music", 1);
             assert!(

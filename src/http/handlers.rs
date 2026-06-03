@@ -550,15 +550,22 @@ pub async fn handle_input_mute(
 // =============================================================================
 
 pub async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
-    let mixer = state.mixer_state.lock().unwrap();
-    let voice_mgr = state.voice_manager.lock().unwrap();
-    let cache_mgr = state.cache_manager.lock().unwrap();
+    // Lock the async cache mutex first (and release it) so the sync parking_lot
+    // guards below are never held across an await.
+    let (mem_stats, disk_stats) = {
+        let cache_mgr = state.cache_manager.lock().await;
+        (cache_mgr.memory_stats(), cache_mgr.disk_stats())
+    };
 
-    let sample_count = mixer.active_samples.len();
-    let input_count = mixer.live_inputs.len();
-    let voice_count = voice_mgr.voice_count();
-    let mem_stats = cache_mgr.memory_stats();
-    let disk_stats = cache_mgr.disk_stats();
+    let (sample_count, input_count, output_channels) = {
+        let mixer = state.mixer_state.lock();
+        (
+            mixer.active_samples.len(),
+            mixer.live_inputs.len(),
+            mixer.output_channels,
+        )
+    };
+    let voice_count = state.voice_manager.lock().voice_count();
 
     Json(json!({
         "status": "running",
@@ -566,7 +573,7 @@ pub async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
         "active_samples": sample_count,
         "active_inputs": input_count,
         "active_voices": voice_count,
-        "output_channels": mixer.output_channels,
+        "output_channels": output_channels,
         "cache": {
             "memory": {
                 "entries": mem_stats.entry_count,
@@ -581,7 +588,7 @@ pub async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn handle_samples(State(state): State<AppState>) -> impl IntoResponse {
-    let mixer = state.mixer_state.lock().unwrap();
+    let mixer = state.mixer_state.lock();
 
     let samples: Vec<Value> = mixer
         .active_samples
@@ -625,14 +632,14 @@ pub async fn handle_samples(State(state): State<AppState>) -> impl IntoResponse 
 }
 
 pub async fn handle_voices(State(state): State<AppState>) -> impl IntoResponse {
-    let voice_mgr = state.voice_manager.lock().unwrap();
+    let voice_mgr = state.voice_manager.lock();
     let voices = voice_mgr.list_voices();
 
     Json(json!({ "voices": voices }))
 }
 
 pub async fn handle_cache_status(State(state): State<AppState>) -> impl IntoResponse {
-    let cache_mgr = state.cache_manager.lock().unwrap();
+    let cache_mgr = state.cache_manager.lock().await;
     let mem_stats = cache_mgr.memory_stats();
     let disk_stats = cache_mgr.disk_stats();
 
@@ -651,7 +658,7 @@ pub async fn handle_cache_status(State(state): State<AppState>) -> impl IntoResp
 }
 
 pub async fn handle_inputs(State(state): State<AppState>) -> impl IntoResponse {
-    let mixer = state.mixer_state.lock().unwrap();
+    let mixer = state.mixer_state.lock();
 
     let inputs: Vec<Value> = mixer
         .live_inputs

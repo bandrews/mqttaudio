@@ -4,9 +4,10 @@
 use cpal::traits::StreamTrait;
 use mqttaudio::audio::engine::{build_output_stream, find_output_config, find_output_device};
 use mqttaudio::audio::mixer::MixerState;
+use parking_lot::Mutex;
 use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Open the real default output device and run a brief stream through the actual
 /// sample-format dispatch with an empty mixer (silence). Exercises the
