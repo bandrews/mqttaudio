@@ -7,8 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Output limiter configuration.** Two new `audio` keys control the final output stage: `output_ceiling_db`
+  (the limiter ceiling in dBFS, default `-1.0`, must be between `-60.0` and `0.0`) and `master_gain` (a
+  linear bus gain applied before limiting, default `1.0`, between `0.0` and `8.0`).
+- **`/status` reports a limiter clip counter.** The `/status` JSON now includes `clip_count`, the number of
+  output samples the limiter held at the ceiling since startup.
+- **Optional per-route downmix gain in `channel_map`.** Each entry of a Play `channel_map` accepts an optional
+  `gain` (default `1.0`), e.g. `{"src": 2, "dest": 0, "gain": 0.5}`. When several source channels are routed
+  to one destination they sum, which can clip; a per-route gain lets you attenuate (or boost) each route. A
+  route with no `gain` is unity, so existing channel maps are unaffected.
+
 ### Changed
 
+- **Output overload is now a soft-knee limiter instead of a brickwall clamp.** The summed bus was previously
+  hard-clamped to ±1.0 (mislabeled "saturation"), which flat-tops the waveform and adds harmonic distortion
+  past full scale. It now passes through a soft-knee limiter at a configurable ceiling (default `-1.0` dBFS,
+  see `audio.output_ceiling_db`) with an optional `audio.master_gain`: signal below the knee is unchanged,
+  and louder material is smoothly limited so the peak never exceeds the ceiling. Full-scale material is
+  therefore reproduced ~1 dB quieter (and less harsh) than before. The number of limited samples is exposed
+  as `clip_count` on `/status`.
+- **Per-channel calibration (`audio.channel_volumes`) is now applied.** These per-output-channel gains were
+  parsed and validated but never affected output; they are now applied as the final per-channel gain stage
+  (resolved once at startup, supporting numeric or alias channel keys). Anyone who set `channel_volumes`
+  expecting attenuation will now hear it.
+- **Play `volume` is clamped to `[0, 1]`.** A Play command with `volume > 1.0` (or negative) is now clamped
+  at construction, matching the runtime `volume` command. Previously a Play could amplify above unity (e.g.
+  `volume: 5.0` gave a 5× contribution into the mix); such configs will now play at unity instead.
+- **Reverse playback no longer adds comb/low-pass distortion.** At any fractional reverse speed (e.g.
+  `-0.5`, `-0.75`, `-1.5`) the sub-sample interpolation was blending the wrong neighbor (frame `n-1`
+  instead of frame `n+1`), distorting all reverse playback. Interpolation now uses the same direction-
+  independent rule in both directions, so reverse playback is clean.
+- **Speed changes use cubic (Catmull-Rom) interpolation.** The non-pitch playback-speed path previously read
+  the source with two-point linear interpolation, a poor reconstruction filter that adds audible grit when
+  playing at a fractional speed (e.g. `0.6×`). It now uses 4-point cubic interpolation, which is far cleaner
+  (markedly less spurious energy) and is exact for linear material. The `±100` speed range is unchanged.
+  Note: cubic is a reconstruction filter, not an anti-aliasing one — speeds **above** `1.0` on the non-pitch
+  path still alias (there is no low-pass before the speed-up). For clean large speed-ups, enable pitch
+  correction (`pitch_correction: true`), whose time-stretcher is band-limited.
+- **Loop crossfades are equal-power and seamless.** Looped playback with `crossfade_ms` set now uses an
+  equal-power (cos/sin) crossfade, removing the ~3 dB level dip a linear blend produced at the crossfade
+  midpoint, and the next loop pass resumes past the overlapped head so the crossfaded head region is no
+  longer replayed at full level (which previously double-triggered transients near the loop start and could
+  click at the seam). Looped ambience/beds will sound subtly fuller and smoother. (Fade-in/out ramps remain
+  linear, which is adequate for their typically short durations.)
+- **Enabling pitch correction mid-playback no longer drops a silent gap or clicks.** Switching a playing
+  sample to pitch-corrected speed (`speed` with `pitch_correction: true`) used to build a fresh
+  time-stretcher whose ~120 ms warm-up latency produced several callbacks of silence before audio resumed.
+  The stretcher is now pre-rolled with the audio just before the playback position so signal is present from
+  the first block, and the brief switch from direct to stretched playback is equal-power crossfaded over a
+  few milliseconds so it does not click.
+- **Pitch-corrected playback stays phase-continuous at non-integer speeds.** The pitch path advanced the read
+  position by the fractional `frames × speed` while feeding the stretcher a rounded-up whole number of input
+  frames, so at speeds whose product with the buffer size is not an integer (e.g. `0.7`) each callback re-fed
+  a fraction of a frame, smearing the tone. The read position is now advanced by exactly the integer input
+  frames fed (carrying the fractional remainder), so successive input slices abut and the output stays clean.
+- **Pitch-corrected playback no longer truncates the tail at end-of-file.** The last ~120 ms held inside the
+  time-stretcher were previously dropped when the source ended; the stretcher is now drained at EOF and its
+  buffered tail is played out, so pitch-corrected sounds end completely instead of cutting off early.
+- **Ducking restore now uses the triggering rule's `fade_duration_ms` instead of a fixed 2000 ms.** When a
+  ducking primary goes idle, the ducked voices now return to full volume over the same fade the rule ducked
+  them with (the longest fade, if several rules ducked the voice), rather than always taking 2 s. A rule with
+  `fade_duration_ms: 200` therefore recovers in ~200 ms; configs that relied on the slow 2 s release will
+  restore faster.
+- **Ducking gain is now smooth and advances at the correct rate.** A voice's duck fade is advanced exactly
+  once per audio buffer (previously once per playing sample on the voice, so two overlapping sounds on a
+  ducked voice faded ~2× too fast and saw inconsistent gain within a buffer), and the gain is interpolated per
+  frame across the buffer instead of stepping once per buffer (removing zipper/stair noise on the fade).
+- **Live-input voices can now trigger ducking.** A microphone/line input whose configured `voice_id` is a
+  ducking rule's `primary_voice` now ducks the rule's background voices while its input stream is open
+  (previously input voices were inert as ducking primaries and ducked nothing). Signal-gated activation
+  (ducking only while the input is actually loud) is a later change; for now the input counts as active for
+  the lifetime of its stream.
 - **`/status/samples` no longer reports live per-sample playback position.** HTTP status is now served
   from a control-side snapshot (the audio thread owns playback state lock-free, so the control plane never
   reads it). The endpoint still reports each sample's static metadata — `id`, `voice`, `file`,

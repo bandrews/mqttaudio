@@ -795,13 +795,9 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
     }
 
     // Create mixer state
-    let mixer_state = Arc::new(Mutex::new(MixerState {
-        active_samples,
-        live_inputs: Vec::new(),
-        output_channels,
-        ducking_applier: None,
-        bass_management: None,
-    }));
+    let mut mixer = MixerState::new(output_channels);
+    mixer.active_samples = active_samples;
+    let mixer_state = Arc::new(Mutex::new(mixer));
 
     let mixer_state_clone = mixer_state.clone();
 

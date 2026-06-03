@@ -7,13 +7,7 @@ use std::sync::Arc;
 
 #[test]
 fn panic_while_holding_mixer_lock_does_not_brick_the_callback() {
-    let mixer_state = Arc::new(Mutex::new(MixerState {
-        active_samples: Vec::new(),
-        live_inputs: Vec::new(),
-        output_channels: 2,
-        ducking_applier: None,
-        bass_management: None,
-    }));
+    let mixer_state = Arc::new(Mutex::new(MixerState::new(2)));
 
     // A thread panics while holding the mixer guard. With std::sync::Mutex this
     // would poison the lock and the next `.lock().unwrap()` (including the audio

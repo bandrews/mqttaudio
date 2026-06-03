@@ -28,13 +28,7 @@ fn default_output_device_opens_and_runs() {
     let channels = output_config.stream_config.channels as usize;
     let output_sample_rate = output_config.stream_config.sample_rate.0;
 
-    let mixer = MixerState {
-        active_samples: Vec::new(),
-        live_inputs: Vec::new(),
-        output_channels: channels,
-        ducking_applier: None,
-        bass_management: None,
-    };
+    let mixer = MixerState::new(channels);
 
     // The callback owns the bundled mixer + command consumer + command-return
     // producer + graveyard producer behind one uncontended mutex; an empty mixer

@@ -7,6 +7,7 @@ use mqttaudio::cache::CacheManager;
 use mqttaudio::http::{create_router, AppState, LogBroadcaster, SampleStatus, StatusSnapshot};
 use mqttaudio::voice::VoiceManager;
 use parking_lot::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tower::util::ServiceExt;
@@ -51,6 +52,7 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         status,
         voice_manager,
         cache_manager,
+        clip_count: Arc::new(AtomicU64::new(0)),
         auth_token: None,
         require_auth: false,
         log_broadcaster: Arc::new(LogBroadcaster::new()),
@@ -121,6 +123,8 @@ async fn test_status_endpoint() {
     assert_eq!(json["status"], "running");
     assert_eq!(json["active_samples"], 0);
     assert_eq!(json["output_channels"], 2);
+    // The limiter clip/over counter is surfaced (F2); fresh state reports 0.
+    assert_eq!(json["clip_count"], 0);
 }
 
 #[tokio::test]

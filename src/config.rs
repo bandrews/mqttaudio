@@ -51,6 +51,21 @@ impl Default for MqttConfig {
     }
 }
 
+/// Default limiter ceiling in dBFS. The summed bus is limited so its peak never
+/// exceeds this level, leaving headroom below digital full scale.
+pub const DEFAULT_OUTPUT_CEILING_DB: f32 = -1.0;
+
+/// Default master gain applied to the summed bus before limiting (unity).
+pub const DEFAULT_MASTER_GAIN: f32 = 1.0;
+
+fn default_output_ceiling_db() -> f32 {
+    DEFAULT_OUTPUT_CEILING_DB
+}
+
+fn default_master_gain() -> f32 {
+    DEFAULT_MASTER_GAIN
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AudioConfig {
@@ -65,6 +80,13 @@ pub struct AudioConfig {
     /// Maps alias names to channel numbers (e.g., "front_left" -> 0)
     #[serde(default)]
     pub channel_aliases: HashMap<String, usize>,
+    /// Limiter ceiling in dBFS. The summed output bus is soft-limited so its peak
+    /// stays at or below this level (default -1.0 dBFS). Must be <= 0 dBFS.
+    #[serde(default = "default_output_ceiling_db")]
+    pub output_ceiling_db: f32,
+    /// Linear gain applied to the whole bus before limiting (default 1.0 = unity).
+    #[serde(default = "default_master_gain")]
+    pub master_gain: f32,
 }
 
 /// A channel reference that can be either a numeric index or a string alias.
@@ -76,6 +98,15 @@ pub enum ChannelRef {
 }
 
 impl ChannelRef {
+    /// Build a `ChannelRef` from a map key string: a value parseable as an index is
+    /// an `Index`, otherwise it is an `Alias` (mirrors string deserialization).
+    pub fn from_key(key: &str) -> Self {
+        match key.parse::<usize>() {
+            Ok(idx) => ChannelRef::Index(idx),
+            Err(_) => ChannelRef::Alias(key.to_string()),
+        }
+    }
+
     /// Resolve this channel reference to a numeric index using the alias map.
     /// Returns an error if the alias is not found.
     pub fn resolve(&self, aliases: &HashMap<String, usize>) -> Result<usize, String> {
@@ -162,6 +193,8 @@ impl Default for AudioConfig {
             channel_names: HashMap::new(),
             channel_volumes: HashMap::new(),
             channel_aliases: HashMap::new(),
+            output_ceiling_db: DEFAULT_OUTPUT_CEILING_DB,
+            master_gain: DEFAULT_MASTER_GAIN,
         }
     }
 }
@@ -615,6 +648,28 @@ impl Config {
         channel.resolve(&self.audio.channel_aliases)
     }
 
+    /// Resolve `audio.channel_volumes` into a per-output-channel gain vector of
+    /// length `output_channels`, defaulting to unity. Keys may be numeric channel
+    /// indices or aliases; entries that resolve outside the channel range (or to an
+    /// unknown alias) are skipped with a warning so a misconfiguration never aborts
+    /// startup or panics the audio thread.
+    pub fn resolve_channel_gains(&self, output_channels: usize) -> Vec<f32> {
+        let mut gains = vec![1.0; output_channels];
+        for (key, &volume) in &self.audio.channel_volumes {
+            let channel = ChannelRef::from_key(key);
+            match self.resolve_channel(&channel) {
+                Ok(index) if index < output_channels => gains[index] = volume,
+                Ok(index) => tracing::warn!(
+                    "audio.channel_volumes: channel {} is beyond the {} output channels; ignoring",
+                    index,
+                    output_channels
+                ),
+                Err(e) => tracing::warn!("audio.channel_volumes: {}; ignoring '{}'", e, key),
+            }
+        }
+        gains
+    }
+
     /// Resolve bass management channel references to numeric indices
     pub fn resolve_bass_management(&self) -> Result<ResolvedBassManagement, String> {
         let lfe = self.resolve_channel(&self.bass_management.lfe_channel)?;
@@ -718,6 +773,21 @@ impl Config {
                     ch
                 ));
             }
+        }
+
+        // Limiter ceiling must be a finite level at or below full scale, and not
+        // absurdly low (a floor keeps a misconfigured value from muting everything).
+        let ceiling = self.audio.output_ceiling_db;
+        if !ceiling.is_finite() || !(-60.0..=0.0).contains(&ceiling) {
+            errors.push(
+                "audio.output_ceiling_db must be a finite value between -60.0 and 0.0".to_string(),
+            );
+        }
+
+        // Master gain must be a finite, non-negative trim with a sane upper bound.
+        let master_gain = self.audio.master_gain;
+        if !master_gain.is_finite() || !(0.0..=8.0).contains(&master_gain) {
+            errors.push("audio.master_gain must be a finite value between 0.0 and 8.0".to_string());
         }
 
         // Ducking target volumes must be finite and within [0.0, 1.0]
@@ -1213,6 +1283,100 @@ mod tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(errors.iter().any(|e| e.contains("channel_volumes")));
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_defaults_to_unity() {
+        let config = Config::default();
+        let gains = config.resolve_channel_gains(4);
+        assert_eq!(gains, vec![1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_by_numeric_key() {
+        let mut config = Config::default();
+        config.audio.channel_volumes.insert("0".to_string(), 0.5);
+        config.audio.channel_volumes.insert("2".to_string(), 0.25);
+        let gains = config.resolve_channel_gains(4);
+        assert_eq!(gains, vec![0.5, 1.0, 0.25, 1.0]);
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_by_alias() {
+        let mut config = Config::default();
+        config
+            .audio
+            .channel_aliases
+            .insert("front_left".to_string(), 0);
+        config
+            .audio
+            .channel_aliases
+            .insert("front_right".to_string(), 1);
+        config
+            .audio
+            .channel_volumes
+            .insert("front_left".to_string(), 0.5);
+        let gains = config.resolve_channel_gains(2);
+        assert_eq!(gains, vec![0.5, 1.0]);
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_ignores_out_of_range_and_unknown() {
+        let mut config = Config::default();
+        // Index beyond the output channel count is ignored (not applied, no panic).
+        config.audio.channel_volumes.insert("5".to_string(), 0.5);
+        // An unknown alias is ignored rather than aborting resolution.
+        config
+            .audio
+            .channel_volumes
+            .insert("nonexistent".to_string(), 0.3);
+        let gains = config.resolve_channel_gains(2);
+        assert_eq!(gains, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_output_stage_defaults() {
+        let config = Config::default();
+        assert_eq!(config.audio.output_ceiling_db, DEFAULT_OUTPUT_CEILING_DB);
+        assert_eq!(config.audio.output_ceiling_db, -1.0);
+        assert_eq!(config.audio.master_gain, DEFAULT_MASTER_GAIN);
+        assert_eq!(config.audio.master_gain, 1.0);
+    }
+
+    #[test]
+    fn test_validate_invalid_output_ceiling() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        // A ceiling above full scale is meaningless for a limiter.
+        config.audio.output_ceiling_db = 3.0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("output_ceiling_db")));
+
+        // Non-finite is rejected too.
+        config.audio.output_ceiling_db = f32::NAN;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("output_ceiling_db")));
+    }
+
+    #[test]
+    fn test_validate_invalid_master_gain() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.audio.master_gain = -1.0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("master_gain")));
+
+        config.audio.master_gain = 100.0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("master_gain")));
+    }
+
+    #[test]
+    fn test_validate_accepts_default_output_stage() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        // Defaults (-1.0 dBFS ceiling, unity master gain) must validate.
+        assert!(config.validate().is_ok());
     }
 
     #[test]

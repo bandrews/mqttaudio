@@ -26,13 +26,7 @@ fn create_test_buffer(channels: usize, frames: usize) -> Arc<DecodedBuffer> {
 
 /// Create a mixer state with N active samples
 fn create_mixer_state(num_samples: usize, output_channels: usize) -> MixerState {
-    let mut state = MixerState {
-        active_samples: Vec::new(),
-        live_inputs: Vec::new(),
-        output_channels,
-        ducking_applier: None,
-        bass_management: None,
-    };
+    let mut state = MixerState::new(output_channels);
 
     let buffer = create_test_buffer(2, 48000); // 1 second of stereo audio
 
@@ -58,13 +52,7 @@ fn create_mixer_state_with_routing(
     dest_channels: usize,
     channel_map: Vec<(usize, usize)>,
 ) -> MixerState {
-    let mut state = MixerState {
-        active_samples: Vec::new(),
-        live_inputs: Vec::new(),
-        output_channels: dest_channels,
-        ducking_applier: None,
-        bass_management: None,
-    };
+    let mut state = MixerState::new(dest_channels);
 
     let buffer = create_test_buffer(src_channels, 48000);
 

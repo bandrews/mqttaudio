@@ -566,6 +566,7 @@ pub async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
         )
     };
     let voice_count = state.voice_manager.lock().voice_count();
+    let clip_count = state.clip_count.load(std::sync::atomic::Ordering::Relaxed);
 
     Json(json!({
         "status": "running",
@@ -574,6 +575,7 @@ pub async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
         "active_inputs": input_count,
         "active_voices": voice_count,
         "output_channels": output_channels,
+        "clip_count": clip_count,
         "cache": {
             "memory": {
                 "entries": mem_stats.entry_count,

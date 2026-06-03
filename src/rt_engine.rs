@@ -24,6 +24,12 @@ use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 /// straight into the mixer, freeing nothing on the real-time thread. This makes the
 /// enum larger, but the command ring is pre-allocated, so it is a one-time memory
 /// cost, not a per-callback allocation.
+///
+/// `large_enum_variant` is therefore allowed deliberately: boxing `AddSample` (as the
+/// lint suggests) would put the sample on the heap and free it on the audio thread
+/// when drained, re-introducing exactly the RT allocation Sprint 5 removed (and that
+/// the allocation harness guards).
+#[allow(clippy::large_enum_variant)]
 pub enum AudioCommand {
     /// Start playing a fully-built sample. Ducking for the sample's voice is
     /// driven separately via [`AudioCommand::SetDuckTarget`].
@@ -346,13 +352,9 @@ mod tests {
     }
 
     fn state_with(samples: Vec<ActiveSample>) -> MixerState {
-        MixerState {
-            active_samples: samples,
-            live_inputs: Vec::new(),
-            output_channels: 2,
-            ducking_applier: None,
-            bass_management: None,
-        }
+        let mut state = MixerState::new(2);
+        state.active_samples = samples;
+        state
     }
 
     fn selector_voice(voice: &str) -> SampleSelector {

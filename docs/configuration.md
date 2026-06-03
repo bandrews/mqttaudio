@@ -185,6 +185,30 @@ Audio output settings.
 | `buffer_size` | integer | `512` | Buffer size in frames (lower = less latency, more CPU) |
 | `channels` | integer | auto-detect | Number of output channels |
 | `channel_aliases` | object | `{}` | Named aliases for channel numbers |
+| `channel_volumes` | object | `{}` | Per-output-channel calibration gain, `0.0`–`1.0`, keyed by channel number or alias |
+| `output_ceiling_db` | number | `-1.0` | Limiter ceiling in dBFS (`-60.0`–`0.0`); the output peak is held at or below this level |
+| `master_gain` | number | `1.0` | Linear gain applied to the whole bus before limiting (`0.0`–`8.0`) |
+
+#### Channel Volumes (per-channel calibration)
+
+`channel_volumes` applies a fixed gain to each output channel after mixing, useful for level-matching
+speakers. Keys are channel numbers or `channel_aliases`; values are `0.0`–`1.0`. Channels not listed
+play at unity. Entries that reference a channel beyond the output count, or an unknown alias, are ignored
+with a warning.
+
+```json
+"audio": {
+  "channel_aliases": { "front_left": 0, "front_right": 1 },
+  "channel_volumes": { "front_left": 0.8, "1": 1.0 }
+}
+```
+
+#### Output Limiter
+
+The summed output bus passes through a soft-knee limiter so peaks never exceed `output_ceiling_db`
+(default `-1.0` dBFS). Signal below the knee is unchanged; louder material is smoothly compressed toward
+the ceiling rather than hard-clipped. `master_gain` is applied to the bus before limiting. The number of
+samples the limiter held at the ceiling is reported as `clip_count` on `/status`.
 
 #### Channel Aliases
 

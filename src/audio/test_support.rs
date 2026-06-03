@@ -31,6 +31,67 @@ pub fn sine(
     data
 }
 
+/// Interleaved PCM whose every channel of frame `n` holds `n as f32 * step`, a
+/// linear ramp. Because consecutive frames differ by exactly `step`, the
+/// mixer's two-point interpolation at any source position `p` resolves to
+/// `p * step` regardless of playback direction, so a test can assert the
+/// interpolated output analytically. `step` keeps the values well under the
+/// limiter knee.
+pub fn ramp(frames: usize, channels: usize, step: f32) -> Vec<f32> {
+    let mut data = Vec::with_capacity(frames * channels);
+    for n in 0..frames {
+        let v = n as f32 * step;
+        for _ in 0..channels {
+            data.push(v);
+        }
+    }
+    data
+}
+
+/// Interleaved PCM that is silent except for a single full-amplitude impulse at
+/// `impulse_frame` (on every channel). Looped with a crossfade, the impulse
+/// must appear exactly once per loop period; the F6 overlap-on-wrap bug replays
+/// the crossfaded head `[0..cf_samples]`, so an impulse inside that head would
+/// be heard twice per loop.
+pub fn transient_loop(
+    frames: usize,
+    channels: usize,
+    impulse_frame: usize,
+    amplitude: f32,
+) -> Vec<f32> {
+    let mut data = vec![0.0f32; frames * channels];
+    for ch in 0..channels {
+        let idx = impulse_frame * channels + ch;
+        if idx < data.len() {
+            data[idx] = amplitude;
+        }
+    }
+    data
+}
+
+/// Interleaved PCM of `frames` length carrying a steady amplitude, with
+/// non-finite values injected at `bad_frames`: each listed frame's samples are
+/// set to NaN, +Inf, and -Inf in rotation across channels. Used to prove the
+/// final-loop finite-guard sanitizes poison samples to silence.
+pub fn nan_poisoned(
+    frames: usize,
+    channels: usize,
+    amplitude: f32,
+    bad_frames: &[usize],
+) -> Vec<f32> {
+    let mut data = vec![amplitude; frames * channels];
+    let poison = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY];
+    for &frame in bad_frames {
+        for ch in 0..channels {
+            let idx = frame * channels + ch;
+            if idx < data.len() {
+                data[idx] = poison[ch % poison.len()];
+            }
+        }
+    }
+    data
+}
+
 /// Builder for a `MixerState` scene with samples, live inputs, ducking, and
 /// bass management wired up. Lets a test describe a mix and then render it.
 pub struct SceneBuilder {
@@ -39,6 +100,7 @@ pub struct SceneBuilder {
     live_inputs: Vec<LiveInput>,
     ducking_applier: Option<DuckingApplier>,
     bass_management: Option<BassManagement>,
+    channel_gains: Option<Vec<f32>>,
 }
 
 impl SceneBuilder {
@@ -49,6 +111,7 @@ impl SceneBuilder {
             live_inputs: Vec::new(),
             ducking_applier: None,
             bass_management: None,
+            channel_gains: None,
         }
     }
 
@@ -72,14 +135,22 @@ impl SceneBuilder {
         self
     }
 
+    /// Set the per-output-channel calibration gains (length `output_channels`).
+    pub fn channel_gains(mut self, gains: Vec<f32>) -> Self {
+        self.channel_gains = Some(gains);
+        self
+    }
+
     pub fn build(self) -> MixerState {
-        MixerState {
-            active_samples: self.samples,
-            live_inputs: self.live_inputs,
-            output_channels: self.output_channels,
-            ducking_applier: self.ducking_applier,
-            bass_management: self.bass_management,
+        let mut state = MixerState::new(self.output_channels);
+        state.active_samples = self.samples;
+        state.live_inputs = self.live_inputs;
+        state.ducking_applier = self.ducking_applier;
+        state.bass_management = self.bass_management;
+        if let Some(gains) = self.channel_gains {
+            state.channel_gains = gains;
         }
+        state
     }
 }
 

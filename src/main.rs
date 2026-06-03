@@ -447,12 +447,20 @@ async fn main() {
         None
     };
 
+    // Shared clip/over counter: the audio thread increments it (lock-free) when the
+    // limiter acts; HTTP `/status` reads it. Created once and cloned into both sides.
+    let clip_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     let mixer = MixerState {
         active_samples: Vec::with_capacity(audio::mixer::MAX_VOICES),
         live_inputs: Vec::with_capacity(audio::mixer::MAX_LIVE_INPUTS),
         output_channels,
         ducking_applier,
         bass_management,
+        channel_gains: config.resolve_channel_gains(output_channels),
+        output_ceiling: audio::mixer::db_to_linear(config.audio.output_ceiling_db),
+        master_gain: config.audio.master_gain,
+        clip_count: clip_count.clone(),
     };
 
     // Control->audio command ring, audio->reaper graveyard ring, and audio->reaper
@@ -531,6 +539,17 @@ async fn main() {
                     {
                         tracing::error!("Command ring full while adding live input {}", idx);
                     }
+
+                    // Mark the configured input voice active so it can trigger ducking
+                    // as a primary (D4), through the same off-RT notify path as sample
+                    // voices. The stream is open for the process lifetime, so the voice
+                    // is active for it; signal-gated activation is Sprint 8 (D36).
+                    notify_voice_activity(
+                        &input_config.voice_id,
+                        true,
+                        ducking_engine.as_mut(),
+                        &mut cmd_tx,
+                    );
                 }
 
                 // Keep the stream alive by storing it
@@ -677,6 +696,7 @@ async fn main() {
             status_snapshot.clone(),
             voice_manager.clone(),
             cache_manager.clone(),
+            clip_count.clone(),
         )
         .await
         {
@@ -796,6 +816,29 @@ fn refresh_snapshot(
     guard.inputs = inputs.to_vec();
 }
 
+/// Notify the control-side ducking engine that a voice's activity changed and
+/// forward any resulting target changes to the audio thread. Used by both the
+/// sample-playback path and the configured-input path (D4), so live-input voices
+/// can trigger ducking through the same off-RT `compute_changes` path. A no-op when
+/// ducking is not configured.
+fn notify_voice_activity(
+    voice_id: &str,
+    is_active: bool,
+    ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
+    cmd_tx: &mut rt_engine::CommandProducer,
+) {
+    if let Some(engine) = ducking_engine {
+        for change in engine.compute_changes(voice_id, is_active) {
+            if cmd_tx
+                .push(rt_engine::AudioCommand::SetDuckTarget(change))
+                .is_err()
+            {
+                tracing::error!("Audio command ring full; duck target dropped");
+            }
+        }
+    }
+}
+
 /// Drain the graveyard and the command-return ring, dropping both finished samples
 /// and spent mutation commands off the audio thread, and reconcile control-side
 /// voice activity. When a voice's last sample finishes, the ducking engine computes
@@ -833,11 +876,8 @@ fn reap_finished_samples(
             *count -= 1;
             if *count == 0 {
                 active_counts.remove(&voice);
-                if let Some(engine) = ducking_engine.as_mut() {
-                    for change in engine.compute_changes(&voice, false) {
-                        let _ = cmd_tx.push(rt_engine::AudioCommand::SetDuckTarget(change));
-                    }
-                }
+                // Voice's last sample finished: restore through the shared notify path.
+                notify_voice_activity(&voice, false, ducking_engine.as_deref_mut(), cmd_tx);
             }
         }
     }
@@ -993,7 +1033,19 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             }
                         };
                         tracing::debug!("Using custom channel mapping: {:?}", mapping);
-                        ActiveSample::new_with_mapping(
+                        // Per-route downmix gains parallel to the resolved map (D29);
+                        // a route with no gain defaults to unity, leaving plain 1:1
+                        // mappings unchanged. Clamp to a sane finite, non-negative
+                        // range (matching audio.master_gain) so a bad value can never
+                        // push NaN/Inf or a wild level onto the bus.
+                        let route_gains: Vec<f32> = map
+                            .iter()
+                            .map(|m| match m.gain {
+                                Some(g) if g.is_finite() => g.clamp(0.0, 8.0),
+                                _ => 1.0,
+                            })
+                            .collect();
+                        let mut sample = ActiveSample::new_with_mapping(
                             sample_id,
                             voice_id.clone(),
                             buffer.clone(),
@@ -1004,7 +1056,11 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             id.clone(),
                             loop_mode,
                             crossfade_samples,
-                        )
+                        );
+                        if route_gains.iter().any(|&g| g != 1.0) {
+                            sample.set_channel_route_gains(route_gains);
+                        }
+                        sample
                     } else {
                         // Default channel mapping (1:1)
                         ActiveSample::new_with_id(
@@ -1069,14 +1125,16 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                         loop_mode: sample.loop_mode,
                     };
 
-                    // Voice became active: compute and forward ducking targets.
+                    // Voice became active: compute and forward ducking targets
+                    // through the shared off-RT notify path (also used by inputs, D4).
                     let became_active = !ctx.active_counts.contains_key(&voice_id);
                     if became_active {
-                        if let Some(engine) = ctx.ducking_engine.as_mut() {
-                            for change in engine.compute_changes(&voice_id, true) {
-                                ctx.send(rt_engine::AudioCommand::SetDuckTarget(change));
-                            }
-                        }
+                        notify_voice_activity(
+                            &voice_id,
+                            true,
+                            ctx.ducking_engine.as_mut(),
+                            ctx.cmd_tx,
+                        );
                     }
                     *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
                     ctx.playing.insert(status.internal_id, status);
@@ -1453,11 +1511,8 @@ mod tests {
                 )
             };
             let mixer = MixerState {
-                active_samples: Vec::with_capacity(audio::mixer::MAX_VOICES),
-                live_inputs: Vec::with_capacity(audio::mixer::MAX_LIVE_INPUTS),
-                output_channels: 2,
                 ducking_applier,
-                bass_management: None,
+                ..MixerState::new(2)
             };
             let (cmd_tx, cmd_rx) = rt_engine::command_channel(1024);
             let (cmd_return_tx, cmd_return_rx) = rt_engine::command_return_channel(1024);
@@ -1532,6 +1587,18 @@ mod tests {
                 &self.snapshot,
                 &self.inputs,
                 2,
+            );
+        }
+
+        /// Drive the off-RT voice-activity notify path directly, as the input setup
+        /// (D4) and a future input-activity gate (Sprint 8) will, forwarding any
+        /// resulting duck targets onto the command ring.
+        fn notify_voice(&mut self, voice: &str, is_active: bool) {
+            notify_voice_activity(
+                voice,
+                is_active,
+                self.ducking_engine.as_mut(),
+                &mut self.cmd_tx,
             );
         }
     }
@@ -1687,6 +1754,54 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn an_active_input_voice_ducks_the_background_voice() {
+        // D4: a configured live-input voice used as a ducking primary must duck the
+        // background, driven through the same off-RT notify/compute_changes path as
+        // sample voices. Activity detection is Sprint 8; here the notify is driven
+        // directly (as input setup will, "active while the stream is open").
+        let rule = DuckingRule {
+            primary_voice: "mic".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0, // instant, for a deterministic assertion
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        // Background music plays and is not ducked while the mic is idle.
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            assert!((applier.get_multiplier("music", 1) - 1.0).abs() < 1e-6);
+        }
+
+        // The mic input voice becomes active: the notify path must emit a duck for
+        // "music" that the applier applies.
+        fixture.notify_voice("mic", true);
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            let multiplier = applier.get_multiplier("music", 1);
+            assert!(
+                multiplier < 0.2,
+                "an active input primary must duck music toward 0.1, got {multiplier}"
+            );
+        }
+
+        // The mic goes idle again: music restores toward full volume.
+        fixture.notify_voice("mic", false);
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            let multiplier = applier.get_multiplier("music", 1);
+            assert!(
+                (multiplier - 1.0).abs() < 1e-6,
+                "music must restore once the input primary is idle, got {multiplier}"
+            );
+        }
+    }
+
     /// Move the (single) active sample for `voice` out of the mixer into the
     /// graveyard, mirroring the RT thread reaping a finished sample, so the
     /// control-side reaper can then reconcile it.
@@ -1815,6 +1930,48 @@ mod tests {
             "no restore should be emitted while the voice still has samples"
         );
         assert_eq!(fixture.playing.len(), 2, "one narration + music remain");
+    }
+
+    #[tokio::test]
+    async fn reaper_restore_uses_the_rules_fade_duration_not_a_fixed_default() {
+        // D25/D3: a 200ms rule must restore over ~200ms end-to-end through the
+        // control-side reaper path, not the old hardcoded 2000ms.
+        let rule = DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 200,
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.run(play(Some("narration"), 1.0)).await;
+        fixture.drain();
+        // Drain the duck commands so the ring only holds what the reaper emits next.
+        while fixture.cmd_rx.pop().is_some() {}
+
+        // The narration sample finishes; the reaper emits the restore for "music".
+        finish_voice_sample(&mut fixture, "narration");
+        fixture.reap();
+
+        let restore = fixture.cmd_rx.pop().expect("a restore command on the ring");
+        match restore {
+            rt_engine::AudioCommand::SetDuckTarget(change) => {
+                assert_eq!(change.voice, "music");
+                assert!((change.target_volume - 1.0).abs() < 1e-6);
+                // 200ms at 48kHz == 9600 frames, not the old 2000ms (96000 frames).
+                assert_eq!(
+                    change.fade_frames,
+                    (SR / 5) as usize,
+                    "restore must use the rule's 200ms fade, got {} frames",
+                    change.fade_frames
+                );
+            }
+            other => panic!(
+                "expected a SetDuckTarget restore, got {:?}",
+                other_variant(&other)
+            ),
+        }
     }
 
     /// Describe a command variant for panic messages without requiring `Debug` on

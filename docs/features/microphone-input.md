@@ -142,7 +142,7 @@ Microphone inputs work with audio ducking. Set a `voice_id` and use it in duckin
 }
 ```
 
-Now when the gamemaster speaks, ambient audio and music automatically duck.
+Ambient audio and music duck while the gamemaster microphone's input stream is open. Activation is not yet gated on the microphone's signal level, so the duck holds while the input is running rather than only while the gamemaster is actually speaking; signal-level gating is planned.
 
 ## Example: Escape Room
 
@@ -185,7 +185,7 @@ Complete configuration for an escape room with gamemaster microphone:
 This:
 - Captures from the gamemaster's headset microphone
 - Routes to player earpiece channels (4-7)
-- Automatically ducks ambient audio when gamemaster speaks
+- Ducks ambient audio while the gamemaster microphone is active (its input stream is open)
 - Uses low latency (25ms) for natural conversation feel
 
 ## Latency

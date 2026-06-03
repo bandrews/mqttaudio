@@ -44,6 +44,10 @@ impl MqttCommand {
 pub struct ChannelMapping {
     pub src: ChannelRef,
     pub dest: ChannelRef,
+    /// Optional per-route gain (default 1.0). Lets a downmix that sums several
+    /// source channels into one destination be attenuated to avoid clipping (D29).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gain: Option<f32>,
 }
 
 /// Selector for targeting samples by internal_id, id, file, or voice
@@ -876,14 +880,16 @@ mod tests {
                     map[0],
                     ChannelMapping {
                         src: ChannelRef::Index(0),
-                        dest: ChannelRef::Index(6)
+                        dest: ChannelRef::Index(6),
+                        gain: None,
                     }
                 );
                 assert_eq!(
                     map[1],
                     ChannelMapping {
                         src: ChannelRef::Index(1),
-                        dest: ChannelRef::Index(7)
+                        dest: ChannelRef::Index(7),
+                        gain: None,
                     }
                 );
             }
@@ -916,30 +922,57 @@ mod tests {
                     map[0],
                     ChannelMapping {
                         src: ChannelRef::Index(0),
-                        dest: ChannelRef::Index(0)
+                        dest: ChannelRef::Index(0),
+                        gain: None,
                     }
                 );
                 assert_eq!(
                     map[1],
                     ChannelMapping {
                         src: ChannelRef::Index(1),
-                        dest: ChannelRef::Index(1)
+                        dest: ChannelRef::Index(1),
+                        gain: None,
                     }
                 );
                 assert_eq!(
                     map[2],
                     ChannelMapping {
                         src: ChannelRef::Index(2),
-                        dest: ChannelRef::Index(2)
+                        dest: ChannelRef::Index(2),
+                        gain: None,
                     }
                 );
                 assert_eq!(
                     map[3],
                     ChannelMapping {
                         src: ChannelRef::Index(3),
-                        dest: ChannelRef::Index(3)
+                        dest: ChannelRef::Index(3),
+                        gain: None,
                     }
                 );
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_channel_map_with_per_route_gain() {
+        // D29: an optional per-route `gain` parses into ChannelMapping.gain; routes
+        // that omit it stay None (resolved to unity downstream).
+        let json = r#"{"command": "play", "message": {
+            "file": "quad.wav",
+            "channel_map": [
+                {"src": 2, "dest": 0, "gain": 0.5},
+                {"src": 3, "dest": 1}
+            ]
+        }}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { channel_map, .. } => {
+                let map = channel_map.unwrap();
+                assert_eq!(map[0].gain, Some(0.5), "explicit gain must parse");
+                assert_eq!(map[1].gain, None, "omitted gain stays None");
             }
             _ => panic!("Expected Play command"),
         }
@@ -978,28 +1011,32 @@ mod tests {
                     map[0],
                     ChannelMapping {
                         src: ChannelRef::Index(0),
-                        dest: ChannelRef::Index(8)
+                        dest: ChannelRef::Index(8),
+                        gain: None,
                     }
                 );
                 assert_eq!(
                     map[1],
                     ChannelMapping {
                         src: ChannelRef::Index(1),
-                        dest: ChannelRef::Index(9)
+                        dest: ChannelRef::Index(9),
+                        gain: None,
                     }
                 );
                 assert_eq!(
                     map[2],
                     ChannelMapping {
                         src: ChannelRef::Index(2),
-                        dest: ChannelRef::Index(10)
+                        dest: ChannelRef::Index(10),
+                        gain: None,
                     }
                 );
                 assert_eq!(
                     map[3],
                     ChannelMapping {
                         src: ChannelRef::Index(3),
-                        dest: ChannelRef::Index(11)
+                        dest: ChannelRef::Index(11),
+                        gain: None,
                     }
                 );
             }
@@ -1027,14 +1064,16 @@ mod tests {
                     map[0],
                     ChannelMapping {
                         src: ChannelRef::Index(0),
-                        dest: ChannelRef::Index(0)
+                        dest: ChannelRef::Index(0),
+                        gain: None,
                     }
                 );
                 assert_eq!(
                     map[1],
                     ChannelMapping {
                         src: ChannelRef::Index(0),
-                        dest: ChannelRef::Index(1)
+                        dest: ChannelRef::Index(1),
+                        gain: None,
                     }
                 );
             }
@@ -1076,14 +1115,16 @@ mod tests {
                     map[0],
                     ChannelMapping {
                         src: ChannelRef::Index(0),
-                        dest: ChannelRef::Alias("front_left".to_string())
+                        dest: ChannelRef::Alias("front_left".to_string()),
+                        gain: None,
                     }
                 );
                 assert_eq!(
                     map[1],
                     ChannelMapping {
                         src: ChannelRef::Index(1),
-                        dest: ChannelRef::Alias("front_right".to_string())
+                        dest: ChannelRef::Alias("front_right".to_string()),
+                        gain: None,
                     }
                 );
             }
@@ -1111,14 +1152,16 @@ mod tests {
                     map[0],
                     ChannelMapping {
                         src: ChannelRef::Alias("left".to_string()),
-                        dest: ChannelRef::Alias("speaker_1".to_string())
+                        dest: ChannelRef::Alias("speaker_1".to_string()),
+                        gain: None,
                     }
                 );
                 assert_eq!(
                     map[1],
                     ChannelMapping {
                         src: ChannelRef::Alias("right".to_string()),
-                        dest: ChannelRef::Alias("speaker_2".to_string())
+                        dest: ChannelRef::Alias("speaker_2".to_string()),
+                        gain: None,
                     }
                 );
             }
@@ -2143,14 +2186,16 @@ mod tests {
                     map[0],
                     ChannelMapping {
                         src: ChannelRef::Index(0),
-                        dest: ChannelRef::Index(2)
+                        dest: ChannelRef::Index(2),
+                        gain: None,
                     }
                 );
                 assert_eq!(
                     map[1],
                     ChannelMapping {
                         src: ChannelRef::Index(1),
-                        dest: ChannelRef::Index(3)
+                        dest: ChannelRef::Index(3),
+                        gain: None,
                     }
                 );
             }

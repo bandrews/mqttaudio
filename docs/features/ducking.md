@@ -139,6 +139,10 @@ When multiple rules apply simultaneously:
 
 For example, if both narration (15%, 2000ms) and dialog (10%, 1500ms) are playing, music ducks to 10% with a 1500ms fade.
 
+## Restore Timing
+
+When the primary voice stops, ducked voices fade back to full volume over the same `fade_duration_ms` that ducked them — the **longest** fade, if several rules ducked the voice. (In the example above, where music was ducked with a 2000ms narration rule and a 1500ms dialog rule, it restores over 2000ms.) Ducking and restoring a voice are therefore symmetric by default.
+
 ## Microphone Input Ducking
 
 Ducking works with microphone inputs too. Configure the microphone with a `voice_id`:
@@ -163,7 +167,7 @@ Ducking works with microphone inputs too. Configure the microphone with a `voice
 }
 ```
 
-Now whenever the presenter speaks, music automatically ducks.
+Music ducks while the microphone's input stream is open. Activation is not yet gated on the microphone's signal level, so the duck holds for as long as the input is configured and running; signal-level gating (ducking only while the mic is actually loud) is planned. To toggle this ducking on and off today, start and stop the input.
 
 ## Tips
 

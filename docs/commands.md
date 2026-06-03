@@ -91,6 +91,23 @@ You can route one source to multiple destinations:
 }
 ```
 
+Each route accepts an optional `gain` (default `1.0`). When several source channels are routed to the same
+destination they sum, which can clip; a per-route `gain` lets you attenuate (or boost) each route. A route
+without `gain` is unity, so existing maps are unaffected:
+
+```json
+{
+  "command": "play",
+  "file": "/quad.wav",
+  "channel_map": [
+    {"src": 0, "dest": 0, "gain": 0.5},
+    {"src": 2, "dest": 0, "gain": 0.5},
+    {"src": 1, "dest": 1, "gain": 0.5},
+    {"src": 3, "dest": 1, "gain": 0.5}
+  ]
+}
+```
+
 ### stopall
 
 Stop all playing audio immediately.

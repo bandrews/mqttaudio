@@ -129,6 +129,19 @@ mosquitto_pub -t audio/commands -m '{
     {"src": 1, "dest": 5}
   ]
 }'
+
+# Downmix 4 channels to stereo with a per-route gain so the summed
+# channels don't clip (gain is optional, default 1.0)
+mosquitto_pub -t audio/commands -m '{
+  "command": "play",
+  "file": "/sounds/quad.wav",
+  "channel_map": [
+    {"src": 0, "dest": 0, "gain": 0.5},
+    {"src": 2, "dest": 0, "gain": 0.5},
+    {"src": 1, "dest": 1, "gain": 0.5},
+    {"src": 3, "dest": 1, "gain": 0.5}
+  ]
+}'
 ```
 
 ## Configuration
@@ -157,6 +170,28 @@ Then run with:
 ```bash
 ./mqttaudio --config config.json
 ```
+
+### Audio output behavior
+
+A few mixer behaviors are worth knowing (see `docs/configuration.md` for the full reference):
+
+- **Output limiter.** The summed output is held below a configurable ceiling by a soft-knee limiter instead
+  of a brickwall clamp, so loud mixes stay clean rather than distorting. Configure it under `audio`:
+  `output_ceiling_db` (limiter ceiling in dBFS, default `-1.0`, range `-60.0`..`0.0`) and `master_gain` (a
+  linear bus gain applied before limiting, default `1.0`, range `0.0`..`8.0`). The `/status` endpoint reports
+  `clip_count`, how many output samples the limiter has had to hold at the ceiling.
+- **Play `volume` is clamped to `[0, 1]`.** A `play` with `volume` above `1.0` (or negative) is clamped,
+  matching the `voice_volume` command. (Previously a Play could amplify above unity.)
+- **Per-channel calibration applies.** `audio.channel_volumes` (per-output-channel gains, by index or alias)
+  is applied as a final gain stage.
+- **Looped crossfades are seamless.** `loop: true` with `crossfade_ms` uses an equal-power crossfade with
+  correct overlap on wrap (no midpoint dip, no double-triggered head).
+- **Ducking restore honors the rule's fade.** When a ducking primary goes idle, ducked voices recover over
+  the triggering rule's `fade_duration_ms` (not a fixed 2 s).
+- **Playback speed.** `speed` supports `-100`..`100` (negative = reverse) and uses cubic interpolation for
+  clean fractional speeds. There is no pitch correction by default; set `pitch_correction: true` to preserve
+  pitch. Note that speeds **above** `1.0` without pitch correction will alias (no anti-aliasing on the
+  fast path) — use pitch correction for clean large speed-ups.
 
 ### Hardening (optional)
 

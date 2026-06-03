@@ -43,8 +43,15 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static GLOBAL: CountingAlloc = CountingAlloc;
 
+/// Serializes the armed counting regions. The `ARMED` flag is thread-local but the
+/// `ALLOCS`/`DEALLOCS` counters are global, so two tests counting concurrently (the
+/// default multi-threaded test runner) would contaminate each other's totals. This
+/// lock makes the count regions mutually exclusive.
+static COUNT_LOCK: Mutex<()> = Mutex::new(());
+
 /// Count allocations and frees made on this thread while `f` runs.
 fn count_allocs<F: FnOnce()>(f: F) -> (usize, usize) {
+    let _guard = COUNT_LOCK.lock();
     ALLOCS.store(0, Ordering::Relaxed);
     DEALLOCS.store(0, Ordering::Relaxed);
     ARMED.with(|a| a.set(true));
@@ -105,6 +112,52 @@ fn mix_path_is_allocation_free_after_warmup() {
 }
 
 #[test]
+fn fractional_speed_and_route_gain_mix_is_allocation_free() {
+    // Exercises the cubic interpolation path (a non-integer speed makes frac != 0 on
+    // every frame, so cubic_taps/cubic_interpolate run, D27) AND the per-route
+    // downmix gain path (a custom channel map with route gains, D29). Both must add
+    // no heap work on the audio thread: cubic is pure arithmetic over the borrowed
+    // buffer, and the route gain is a Vec lookup set off-RT at construction.
+    let mut fractional = ActiveSample::new_with_mapping(
+        1,
+        "a".to_string(),
+        decoded(sine(440.0, SR, SR as usize, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        vec![(0, 0), (1, 1), (0, 1)], // a downmix route (src 0 -> dest 1) to gain
+        "a".to_string(),
+        None,
+        false,
+        0,
+    );
+    // Non-integer speed: frac sweeps, so the cubic branch runs each frame.
+    assert!(fractional.set_speed(0.618));
+    // Per-route gains (the Vec is allocated here, off the armed region below).
+    fractional.set_channel_route_gains(vec![0.5, 0.5, 0.5]);
+
+    let mut state = SceneBuilder::new(2).sample(fractional).build();
+    let mut block = vec![0.0f32; BLOCK * 2];
+
+    // Warm up off the armed region (first block may touch lazily-sized buffers).
+    mix_audio(&mut block, &mut state);
+
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..8 {
+            mix_audio(&mut block, &mut state);
+        }
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "cubic/route-gain mix path allocated {allocs} times across 8 blocks"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "cubic/route-gain mix path freed {deallocs} times across 8 blocks"
+    );
+}
+
+#[test]
 fn pitch_mix_path_is_allocation_free_after_warmup() {
     // The pitch-correction path used to heap-allocate a stretcher output buffer
     // every block (F5-4). With the pre-allocated scratch it must not allocate in
@@ -144,6 +197,54 @@ fn pitch_mix_path_is_allocation_free_after_warmup() {
 }
 
 #[test]
+fn pitch_eof_flush_and_drain_is_free_free() {
+    // F12: at EOF the pitch path drains the stretcher's tail in a single `flush` into
+    // a pre-sized tail buffer, then plays it out block by block. Both the flush and
+    // the per-block drain copy must do no heap work on the audio thread. The sample
+    // is built and pitch-enabled off the armed region (where the stretcher and the
+    // tail buffer are allocated), then EOF and the whole tail drain run armed.
+    let mut pitched = ActiveSample::new(
+        1,
+        "p".to_string(),
+        // Short source so EOF and the full tail drain fall inside the armed render.
+        decoded(sine(220.0, SR, 6000, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "p".to_string(),
+    );
+    pitched.enable_pitch_correction();
+    pitched.set_speed(1.0);
+    let mut state = SceneBuilder::new(2).sample(pitched).build();
+    let mut block = vec![0.0f32; BLOCK * 2];
+
+    // Warm up off the armed region (prime the stretcher; sizes the scratch).
+    for _ in 0..2 {
+        mix_audio(&mut block, &mut state);
+    }
+
+    // Drive past EOF and through the entire tail drain while armed. 6000 input frames
+    // at unity ≈ 12 blocks to EOF, then ~6 blocks of tail; 30 blocks covers the EOF
+    // flush, every drain copy, and the post-drain no-op blocks. The finished sample
+    // is NOT retained-out here: in production its drop happens off the RT thread (the
+    // Sprint 5 graveyard), so dropping it here would mismeasure the mix path. What is
+    // under test is that the flush and the per-block drain copy allocate nothing.
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..30 {
+            mix_audio(&mut block, &mut state);
+        }
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "pitch EOF flush/drain allocated {allocs} times on the audio thread"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "pitch EOF flush/drain freed {deallocs} times on the audio thread"
+    );
+}
+
+#[test]
 fn callback_step_is_allocation_free_after_warmup() {
     // The full cpal callback step the engine runs each block — lock the bundled
     // state, drain pending commands, mix, then reap finished samples into the
@@ -152,10 +253,20 @@ fn callback_step_is_allocation_free_after_warmup() {
     //
     // Representative scene: a plain sample, a looping sample, and a pitch-corrected
     // sample, with a ducking applier carrying a target already applied to one voice.
+    // TWO samples share the ducked voice "a" so the D1 once-per-buffer advance and
+    // the per-sample non-advancing reads are exercised under the allocation counter.
     let plain = ActiveSample::new(
         1,
         "a".to_string(),
         decoded(sine(440.0, SR, SR as usize, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "a".to_string(),
+    );
+    let plain_same_voice = ActiveSample::new(
+        4,
+        "a".to_string(),
+        decoded(sine(550.0, SR, SR as usize, 2, 0.3), 2, SR),
         1.0,
         1.0,
         "a".to_string(),
@@ -193,6 +304,7 @@ fn callback_step_is_allocation_free_after_warmup() {
 
     let mixer = SceneBuilder::new(2)
         .sample(plain)
+        .sample(plain_same_voice)
         .sample(looping)
         .sample(pitched)
         .ducking(applier)

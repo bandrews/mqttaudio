@@ -13,6 +13,7 @@ use crate::config::HttpConfig;
 use crate::voice::VoiceManager;
 use parking_lot::Mutex;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 
@@ -63,6 +64,8 @@ pub struct AppState {
     pub voice_manager: Arc<Mutex<VoiceManager>>,
     /// Read-only access to cache manager for status queries
     pub cache_manager: Arc<tokio::sync::Mutex<CacheManager>>,
+    /// Count of output samples the limiter held at the ceiling, for `/status`.
+    pub clip_count: Arc<AtomicU64>,
     /// Optional auth token for Bearer authentication
     pub auth_token: Option<String>,
     /// Opt-in: require a valid token on ALL routes (status + ws included).
@@ -91,12 +94,14 @@ pub fn exposure_warning(
 
 /// Start the HTTP server.
 /// Returns the actual bound address (useful when port 0 is used for auto-selection).
+#[allow(clippy::too_many_arguments)]
 pub async fn start_server(
     config: &HttpConfig,
     cmd_tx: mpsc::Sender<String>,
     status: Arc<RwLock<StatusSnapshot>>,
     voice_manager: Arc<Mutex<VoiceManager>>,
     cache_manager: Arc<tokio::sync::Mutex<CacheManager>>,
+    clip_count: Arc<AtomicU64>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
 
@@ -105,6 +110,7 @@ pub async fn start_server(
         status,
         voice_manager,
         cache_manager,
+        clip_count,
         auth_token: config.auth_token.clone(),
         require_auth: config.require_auth,
         log_broadcaster: log_broadcaster.clone(),

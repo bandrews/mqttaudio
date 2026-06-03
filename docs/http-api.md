@@ -90,6 +90,34 @@ Status endpoints (`/health`, `/status/*`) do not require authentication.
 
 ## Status Response Formats
 
+### `/status` Response
+
+Returns a summary of playback and cache state:
+
+```json
+{
+  "status": "running",
+  "version": "2.0.0",
+  "active_samples": 2,
+  "active_inputs": 0,
+  "active_voices": 1,
+  "output_channels": 2,
+  "clip_count": 0,
+  "cache": {
+    "memory": { "entries": 3, "size_bytes": 1048576 },
+    "disk": { "entries": 10, "size_bytes": 5242880 }
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `active_samples` | integer | Number of samples currently playing |
+| `active_inputs` | integer | Number of active live inputs |
+| `active_voices` | integer | Number of active voice groups |
+| `output_channels` | integer | Output channel count |
+| `clip_count` | integer | Output samples the limiter held at the ceiling since startup |
+
 ### `/status/samples` Response
 
 Returns active samples with playback position and timing information:
