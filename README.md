@@ -29,14 +29,14 @@ mqttaudio listens for JSON commands over MQTT or a REST endpoint, and plays audi
 
 
 
-**Linux:**  Install ALSA development libraries, C++ build tools, and clang:
+**Linux:**  Install ALSA and OpenSSL development libraries, C++ build tools, clang, and pkg-config:
 
 ```bash
 # Debian/Ubuntu
-sudo apt-get install libasound2-dev build-essential clang libclang-dev
+sudo apt-get install libasound2-dev libssl-dev pkg-config build-essential clang libclang-dev
 
 # Fedora/RHEL
-sudo dnf install alsa-lib-devel gcc-c++ clang clang-devel
+sudo dnf install alsa-lib-devel openssl-devel pkgconf-pkg-config gcc-c++ clang clang-devel
 
 # Arch
 sudo pacman -S alsa-lib base-devel clang
@@ -215,7 +215,7 @@ Files are automatically resampled to match your output device.
 ## Platform Support
 
 - **macOS** — CoreAudio (no dependencies)
-- **Linux** — ALSA (requires `libasound2-dev`, `clang`, and `libclang-dev`)
+- **Linux** — ALSA (requires `libasound2-dev`, `libssl-dev`, `pkg-config`, `clang`, and `libclang-dev`)
 - **Windows** — WASAPI (requires C++ build tools)
 
 ## Performance

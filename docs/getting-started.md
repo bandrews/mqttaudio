@@ -12,7 +12,7 @@ This guide walks you through installing mqttaudio, running your first commands, 
 
 **Linux (Debian/Ubuntu):**
 ```bash
-sudo apt-get install libasound2-dev
+sudo apt-get install libasound2-dev libssl-dev pkg-config build-essential clang libclang-dev
 ```
 
 **macOS and Windows:** No additional dependencies.

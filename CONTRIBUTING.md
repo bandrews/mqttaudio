@@ -15,10 +15,10 @@ This document explains how to set up your development environment and run tests.
 **Linux only:**
 ```bash
 # Debian/Ubuntu
-sudo apt-get install libasound2-dev build-essential clang libclang-dev
+sudo apt-get install libasound2-dev libssl-dev pkg-config build-essential clang libclang-dev
 
 # Fedora/RHEL
-sudo dnf install alsa-lib-devel gcc-c++ clang clang-devel
+sudo dnf install alsa-lib-devel openssl-devel pkgconf-pkg-config gcc-c++ clang clang-devel
 ```
 
 ### Building
