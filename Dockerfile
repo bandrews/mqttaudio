@@ -1,7 +1,7 @@
 FROM rust:1.83-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
-    libasound2-dev pkg-config clang libclang-dev \
+    libasound2-dev libssl-dev pkg-config clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
