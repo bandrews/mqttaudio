@@ -76,7 +76,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 | # | Sprint | Status | Depends on | File |
 |---|--------|--------|-----------|------|
 | 0 | Validation harness & Docker pipeline | Done | — | [sprint-00](sprint-00-validation-harness.md) |
-| 1 | Device & format compatibility | Not started | 0 | [sprint-01](sprint-01-device-format-compatibility.md) |
+| 1 | Device & format compatibility | Done | 0 | [sprint-01](sprint-01-device-format-compatibility.md) |
 | 2 | Control-plane reliability | Not started | 0 | [sprint-02](sprint-02-control-plane-reliability.md) |
 | 3 | Security & file safety | Not started | 0 | [sprint-03](sprint-03-security-and-file-safety.md) |
 | 4 | Streaming & cache correctness | Not started | 0 | [sprint-04](sprint-04-streaming-and-cache-correctness.md) |
@@ -104,13 +104,13 @@ Tick a box only when genuinely verified. `[A]` = Lane A/Docker, `[B]` = Lane B/n
 - [x] Device-opening tests gated behind `--ignored`/env flag: run in Lane B, skipped in Lane A `[A][B]`
 
 ### Sprint 1 — Device & format compatibility
-- [ ] Pure-helper unit tests for sample-format / rate / channel selection pass; a forced-i16 path proves no panic `[A]`
-- [ ] Output builds a typed stream matching the device's native format (I16/U16/I32/F32) with an f32 mix bus + convert shim; `.expect` replaced with graceful error/fallback `[A]`
-- [ ] `find_output_config` filters by `sample_format` and returns it; nearest-supported discrete rate chosen; channel-count fallback (next-larger + zero-fill) `[A]`
-- [ ] `audio.buffer_size` honored via `BufferSize::Fixed` within device range `[A]`
-- [ ] Device-error callback rebuilds the stream with backoff `[A]`
-- [ ] `--list-devices` + play smoke runs on the real CoreAudio device via the format dispatch `[B]`
-- [ ] WASAPI shared (i16/i32) `--list-devices` + play smoke documented and run `[C]`
+- [x] Pure-helper unit tests for sample-format / rate / channel selection pass; a forced-i16 path proves no panic `[A]`
+- [x] Output builds a typed stream matching the device's native format (I16/U16/I32/F32) with an f32 mix bus + convert shim; `.expect` replaced with graceful error/fallback `[A]`
+- [x] `find_output_config` filters by `sample_format` and returns it; nearest-supported discrete rate chosen; channel-count fallback (next-larger + zero-fill) `[A]`
+- [x] `audio.buffer_size` honored via `BufferSize::Fixed` within device range `[A]`
+- [x] Device-error callback rebuilds the stream with backoff `[A]`
+- [x] `--list-devices` + play smoke runs on the real CoreAudio device via the format dispatch `[B]`
+- [ ] WASAPI shared (i16/i32) `--list-devices` + play smoke documented and run `[C]` — documented (W-1); pending the final partner Windows pass
 
 ### Sprint 2 — Control-plane reliability
 - [ ] Re-subscribe on `Packet::ConnAck`; integration test proves commands arrive after a broker restart `[A]`
