@@ -80,7 +80,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 | 2 | Control-plane reliability | Done | 0 | [sprint-02](sprint-02-control-plane-reliability.md) |
 | 3 | Security & file safety | Done | 0 | [sprint-03](sprint-03-security-and-file-safety.md) |
 | 4 | Streaming & cache correctness | Done | 0 | [sprint-04](sprint-04-streaming-and-cache-correctness.md) |
-| 5 | Lock-free real-time engine | Not started | 0 | [sprint-05](sprint-05-lockfree-realtime-engine.md) |
+| 5 | Lock-free real-time engine | In progress | 0 | [sprint-05](sprint-05-lockfree-realtime-engine.md) |
 | 6 | Mixer DSP correctness | Not started | 5 | [sprint-06](sprint-06-mixer-dsp-correctness.md) |
 | 7 | Bass management & multichannel | Not started | 5 | [sprint-07](sprint-07-bass-management-and-multichannel.md) |
 | 8 | Live input robustness | Not started | 5 | [sprint-08](sprint-08-live-input-robustness.md) |
@@ -134,11 +134,24 @@ Tick a box only when genuinely verified. `[A]` = Lane A/Docker, `[B]` = Lane B/n
 - [x] `MIN_BUFFER_FRAMES` prebuffer enforced or removed (no misleading dead code) `[A]`
 
 ### Sprint 5 — Lock-free real-time engine
-- [ ] No locks, allocations, or frees in the callback path — verified by code audit **and** an allocation-counting harness around `mix_audio`/the callback shim `[A]`
+- [ ] No locks, allocations, or frees in the callback path — verified by code audit **and** an allocation-counting harness around `mix_audio`/the callback shim `[A]` — *partial: alloc harness landed and `mix_audio` (incl. the pitch path) proven alloc-free; the callback still locks/builds `HashSet`s until the ownership move (5b) lands*
 - [ ] Control→audio handoff via SPSC command ring; audio thread owns `MixerState`; pre-allocated voice pool; graveyard reaper drops finished payloads off-RT; status via snapshot for HTTP `[A]`
-- [ ] Ducking notify + voice bookkeeping moved off the RT thread; pitch scratch pre-allocated `[A]`
+- [ ] Ducking notify + voice bookkeeping moved off the RT thread; pitch scratch pre-allocated `[A]` — *partial: pitch scratch pre-allocated (F5-4) + proven by the alloc harness; ducking-off-RT still pending the ownership move*
 - [ ] Render harness shows within-tolerance output vs pre-redesign for a fixed scene; soak test (many plays/stops) shows no xrun-counter increments `[A]`
 - [ ] Real-device soak smoke runs clean on this Mac `[B]`
+
+> **Sprint 5 progress (In progress).** Two isolated, low-risk pieces are landed and green on Lane A:
+> **F5-4** (pre-allocated pitch-correction scratch — no per-callback `vec!`; commit `2be7547`) and **Task 0**
+> (the allocation-counting harness `tests/alloc_harness.rs`, which proves `mix_audio` + the pitch path are
+> allocation-free in steady state; commit `4850ba3`). **Remaining (the core redesign, 5a + 5b):** the SPSC
+> command ring, moving `MixerState` ownership onto the audio thread, the fixed voice pool + over-cap policy
+> (D17/D18), the graveyard reaper, moving ducking `notify`/`update_duck_states` off the RT thread, the
+> control-side `RwLock<StatusSnapshot>` + HTTP-handler migration, and the xrun counter + soak. This is a
+> large, cross-cutting change (the callback in `engine.rs`/`main.rs`, ~20 command-handler lock sites, the HTTP
+> status handlers, **and** the ~15 binary unit tests that currently assert via `mixer_state.lock()` and must be
+> re-pointed at the ring/snapshot). The design is fully locked (DECISIONS D15–D22) — no human input is needed,
+> only a dedicated, phased implementation pass (the sprint's subagent fan-out: ring / pool / graveyard /
+> status / integration). It is the gating item for Sprints 6–8, which depend on the safe engine.
 
 ### Sprint 6 — Mixer DSP correctness
 - [ ] NaN/non-finite input → silence, not NaN, at the output; clip/over counter exposed `[A]`
