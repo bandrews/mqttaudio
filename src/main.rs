@@ -740,6 +740,10 @@ async fn main() {
     // Periodic reaper: drains finished samples returned by the audio thread,
     // decrements voice activity, and lets the ducking engine restore voices.
     let mut reaper_tick = tokio::time::interval(std::time::Duration::from_millis(20));
+    // Periodic HTTP freshness tick (stale-while-revalidate): refreshes stale remote
+    // cache entries out-of-band so a play never blocks on the network. Idle when
+    // freshness is pinned.
+    let mut freshness_tick = tokio::time::interval(std::time::Duration::from_secs(30));
 
     loop {
         tokio::select! {
@@ -797,6 +801,25 @@ async fn main() {
                     &input_statuses,
                     output_channels,
                 );
+            }
+            _ = freshness_tick.tick() => {
+                if config.cache.freshness != config::FreshnessMode::Pinned {
+                    // Dev re-checks every tick (zero window); trusting honours the
+                    // configured revalidation window.
+                    let window = if config.cache.freshness == config::FreshnessMode::Dev {
+                        std::time::Duration::ZERO
+                    } else {
+                        std::time::Duration::from_secs(config.cache.revalidate_after_seconds)
+                    };
+                    let n = cache_manager.lock().await.revalidate_stale_http(window).await;
+                    if n > 0 {
+                        tracing::info!(
+                            "Freshness tick refreshed {} stale HTTP cache entr{}",
+                            n,
+                            if n == 1 { "y" } else { "ies" }
+                        );
+                    }
+                }
             }
             _ = shutdown_signal() => {
                 tracing::info!("Shutdown signal received");

@@ -578,6 +578,36 @@ impl CacheManager {
         Ok(())
     }
 
+    /// Revalidate every disk-cached HTTP entry that is also resident in memory and past
+    /// the freshness `window`, dropping the decoded copy of any that changed so the next
+    /// play re-decodes from the now-fresh disk file (no network on the play). Run
+    /// out-of-band by the freshness tick, so a play never blocks on the network — the
+    /// stale-while-revalidate fix for the warm-memory-hit short-circuit. Returns how
+    /// many entries were refreshed.
+    pub async fn revalidate_stale_http(&mut self, window: std::time::Duration) -> usize {
+        let urls: Vec<String> = self
+            .disk_cache
+            .cached_urls()
+            .into_iter()
+            .filter(|u| self.memory_cache.contains(u))
+            .collect();
+        let mut refreshed = 0;
+        for url in urls {
+            match self.disk_cache.revalidate_if_due(&url, window).await {
+                Ok(true) => {
+                    // Content changed: drop the stale decoded buffer (the playing
+                    // sample keeps its own Arc; the next play re-decodes fresh).
+                    self.memory_cache.remove(&url);
+                    refreshed += 1;
+                    tracing::info!("Refreshed stale HTTP cache entry: {}", url);
+                }
+                Ok(false) => {}
+                Err(e) => tracing::warn!("Revalidation error for {}: {}", url, e),
+            }
+        }
+        refreshed
+    }
+
     /// Flush the disk-cache metadata to disk (called on graceful shutdown).
     pub fn flush_metadata(&self) -> Result<(), CacheError> {
         self.disk_cache.save_metadata()

@@ -17,6 +17,14 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   MP3/OGG that is also very large could then full-load. Mitigate by tagging such assets `mode=stream`, or set
   a non-`auto` `cache.load_mode`. (Auto-windowing for local files with a known size — the never-OOM guarantee
   for a 2-hour 5.1 cue under the default `mode=auto` — is fully implemented in S2.)
+- **Incremental HTTP-to-disk persistence of streamed plays is deferred (redesign S3 — LOW).** An ad-hoc HTTP
+  `play` of an uncached URL streams to the *memory* cache only (`cache/mod.rs` `start_streaming_load`), so a
+  restart re-downloads it. The blocking precache path (`precache_blocking`, `download_and_cache`) already
+  persists HTTP assets to disk, and `cache_reload` re-warms an entry, so this only affects URLs that are
+  played ad-hoc and never precached. The S3 freshness work added stale-while-revalidate for HTTP entries that
+  *are* disk-cached (the freshness tick + `revalidate_stale_http`); teeing raw bytes from the streaming
+  download to disk (so an ad-hoc streamed play also persists) is the remaining piece, deferred as low value
+  for the disk-focused first client.
 - **The seek/speed gate for streamed voices is voice-keyed and best-effort (redesign S1 — LOW).**
   `selector_targets_streamed_voice` (`src/main.rs`) warns when a Seek/Speed selector names a voice that has a
   streamed source. A selector that targets a streamed source by `file`/`id` only, or a voice that mixes

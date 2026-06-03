@@ -337,19 +337,27 @@ impl DiskCache {
         Ok(cache_path)
     }
 
+    /// All URLs currently in the disk cache metadata.
+    pub fn cached_urls(&self) -> Vec<String> {
+        self.metadata.entries.keys().cloned().collect()
+    }
+
     /// If the cached entry is older than `revalidate_after`, issue a conditional
     /// GET (`If-None-Match` / `If-Modified-Since`). A `304 Not Modified` just
     /// refreshes `last_validated`; a `200` re-downloads via the atomic-write path;
     /// any error keeps the existing cached copy. A zero duration always
     /// revalidates. No-op for URLs that are not cached.
+    ///
+    /// Returns whether the content was re-downloaded (changed), so the caller can drop
+    /// a now-stale decoded copy from the memory cache.
     pub async fn revalidate_if_due(
         &mut self,
         url: &str,
         revalidate_after: std::time::Duration,
-    ) -> Result<(), CacheError> {
+    ) -> Result<bool, CacheError> {
         let entry = match self.get_entry(url) {
             Some(e) => e.clone(),
-            None => return Ok(()),
+            None => return Ok(false),
         };
 
         // Skip while still inside the freshness window.
@@ -357,7 +365,7 @@ impl DiskCache {
             let age = chrono::Utc::now().signed_duration_since(last.with_timezone(&chrono::Utc));
             if let Ok(age) = age.to_std() {
                 if age < revalidate_after {
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
@@ -371,17 +379,19 @@ impl DiskCache {
             req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
         }
 
-        match req.send().await {
+        let changed = match req.send().await {
             Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
                 if let Some(e) = self.metadata.entries.get_mut(url) {
                     e.last_validated = chrono::Utc::now().to_rfc3339();
                 }
                 self.save_metadata()?;
                 tracing::debug!("Cache revalidated (304 Not Modified): {}", url);
+                false
             }
             Ok(resp) if resp.status().is_success() => {
                 self.download_and_cache(url).await?;
                 tracing::info!("Cache refreshed (content changed): {}", url);
+                true
             }
             Ok(resp) => {
                 tracing::warn!(
@@ -389,6 +399,7 @@ impl DiskCache {
                     resp.status(),
                     url
                 );
+                false
             }
             Err(e) => {
                 tracing::warn!(
@@ -396,9 +407,10 @@ impl DiskCache {
                     url,
                     e
                 );
+                false
             }
-        }
-        Ok(())
+        };
+        Ok(changed)
     }
 
     /// Start a streaming download from HTTP/HTTPS URL.
