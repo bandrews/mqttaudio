@@ -140,18 +140,24 @@ Tick a box only when genuinely verified. `[A]` = Lane A/Docker, `[B]` = Lane B/n
 - [ ] Render harness shows within-tolerance output vs pre-redesign for a fixed scene; soak test (many plays/stops) shows no xrun-counter increments `[A]`
 - [ ] Real-device soak smoke runs clean on this Mac `[B]`
 
-> **Sprint 5 progress (In progress).** Two isolated, low-risk pieces are landed and green on Lane A:
-> **F5-4** (pre-allocated pitch-correction scratch — no per-callback `vec!`; commit `2be7547`) and **Task 0**
-> (the allocation-counting harness `tests/alloc_harness.rs`, which proves `mix_audio` + the pitch path are
-> allocation-free in steady state; commit `4850ba3`). **Remaining (the core redesign, 5a + 5b):** the SPSC
-> command ring, moving `MixerState` ownership onto the audio thread, the fixed voice pool + over-cap policy
-> (D17/D18), the graveyard reaper, moving ducking `notify`/`update_duck_states` off the RT thread, the
-> control-side `RwLock<StatusSnapshot>` + HTTP-handler migration, and the xrun counter + soak. This is a
-> large, cross-cutting change (the callback in `engine.rs`/`main.rs`, ~20 command-handler lock sites, the HTTP
-> status handlers, **and** the ~15 binary unit tests that currently assert via `mixer_state.lock()` and must be
-> re-pointed at the ring/snapshot). The design is fully locked (DECISIONS D15–D22) — no human input is needed,
-> only a dedicated, phased implementation pass (the sprint's subagent fan-out: ring / pool / graveyard /
-> status / integration). It is the gating item for Sprints 6–8, which depend on the safe engine.
+> **Sprint 5 progress (In progress).** Three tested, Lane-A-green pieces are landed:
+> **F5-4** (pre-allocated pitch-correction scratch — no per-callback `vec!`; commit `2be7547`); **Task 0**
+> (the allocation-counting harness `tests/alloc_harness.rs`, proving `mix_audio` + the pitch path are
+> allocation-free in steady state; commit `4850ba3`); and the **control→audio command-ring bridge**
+> (`src/rt_engine.rs`: `AudioCommand` + `apply_command` + a bounded SPSC ring via the existing `ringbuf`;
+> 10 unit tests; commit `d6d9e05`). The bridge is additive/lib-only — the live callback is untouched, so the
+> runtime is unchanged.
+>
+> **Remaining — the atomic ownership move (5b core):** wire the bridge into the live system. This is
+> deliberately **not** an incremental step: `MixerState` ownership is exclusive, so the supervisor callback,
+> the ~13 `mixer_state.lock()` handler sites, the active-voice/ducking reconciliation (needs a graveyard
+> return-signal so the callback stops building `HashSet`s — D19/D20/F5-3), the fixed voice pool + over-cap
+> policy (D17/D18), the control-side `RwLock<StatusSnapshot>` + HTTP-handler migration, the xrun counter, and
+> the ~15 binary `Fixture` unit tests (which assert via `mixer_state.lock()`) must all convert in **one**
+> green change, then be validated by render-harness parity + a many-plays/stops soak (Lane A) + a real-device
+> soak with human listening (Lane B). The design is fully locked (DECISIONS D15–D22) — no human decision is
+> needed; this is a large, focused implementation pass (the sprint's ring/pool/graveyard/status/integration
+> fan-out). It gates Sprints 6–8.
 
 ### Sprint 6 — Mixer DSP correctness
 - [ ] NaN/non-finite input → silence, not NaN, at the output; clip/over counter exposed `[A]`
