@@ -30,5 +30,8 @@
 *.exe
 *.out
 *.app
-mqttaudio
-mofang_player
+
+
+# Added by cargo
+
+/target

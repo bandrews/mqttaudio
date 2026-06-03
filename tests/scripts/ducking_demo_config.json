@@ -1,0 +1,16 @@
+{
+  "ducking_rules": [
+    {
+      "primary_voice": "narration",
+      "ducked_voices": ["music", "effects"],
+      "target_volume": 0.15,
+      "fade_duration_ms": 2000
+    },
+    {
+      "primary_voice": "dialog",
+      "ducked_voices": ["music", "effects", "narration"],
+      "target_volume": 0.05,
+      "fade_duration_ms": 1000
+    }
+  ]
+}

@@ -1,0 +1,90 @@
+[package]
+name = "mqttaudio"
+version = "2.0.0"
+edition = "2021"
+authors = ["Mo Fang Heavy Industries LLC"]
+description = "MQTT-controlled multichannel audio player for interactive entertainment"
+license = "MIT"
+
+[dependencies]
+# Audio I/O
+cpal = "0.15"
+
+# Audio decoding
+symphonia = { version = "0.5", features = ["all"] }
+
+# Sample rate conversion
+rubato = "0.14"
+
+# MQTT
+rumqttc = "0.24"
+
+# HTTP client
+reqwest = { version = "0.11", features = ["stream"] }
+
+# JSON parsing
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# DSP utilities
+dasp = "0.11"
+
+# Time-stretching for pitch correction
+signalsmith-stretch = "0.1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Lock-free structures
+ringbuf = "0.3"
+
+# Signal handling
+ctrlc = "3.4"
+
+# HTTP server
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+
+# Async utilities
+futures = "0.3"
+futures-util = "0.3"
+
+# Byte buffer types
+bytes = "1.0"
+
+# Random number generation
+rand = "0.8"
+
+# Date/time handling
+chrono = "0.4"
+
+# Directory utilities
+dirs = "5.0"
+
+# Linux-specific: ALSA bindings for device probing
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa = "0.9"
+
+[dev-dependencies]
+criterion = "0.5"
+tempfile = "3.8"
+tower = "0.5"
+
+[[bench]]
+name = "mixer_benchmark"
+harness = false
+
+[[bench]]
+name = "loading_benchmark"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
