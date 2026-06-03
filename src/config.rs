@@ -66,6 +66,13 @@ fn default_master_gain() -> f32 {
     DEFAULT_MASTER_GAIN
 }
 
+/// Default LFE trim gain for bass management (unity).
+pub const DEFAULT_LFE_GAIN: f32 = 1.0;
+
+fn default_lfe_gain() -> f32 {
+    DEFAULT_LFE_GAIN
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct AudioConfig {
@@ -268,6 +275,9 @@ pub struct BassManagementConfig {
     #[serde(default)]
     pub source_channels: Vec<ChannelRef>,
     pub remove_bass_from_sources: bool,
+    /// Linear trim applied to the count-normalized summed LFE (D32).
+    #[serde(default = "default_lfe_gain")]
+    pub lfe_gain: f32,
 }
 
 impl Default for BassManagementConfig {
@@ -277,7 +287,11 @@ impl Default for BassManagementConfig {
             lfe_channel: ChannelRef::Index(3), // Standard 5.1 LFE position
             crossover_frequency_hz: 80.0,
             source_channels: Vec::new(),
-            remove_bass_from_sources: false,
+            // Proper bass management high-passes the mains so they no longer carry
+            // the bass routed to the sub (D30). The additive "LFE+Main" mode is
+            // still available by setting this false.
+            remove_bass_from_sources: true,
+            lfe_gain: DEFAULT_LFE_GAIN,
         }
     }
 }
@@ -290,6 +304,7 @@ pub struct ResolvedBassManagement {
     pub crossover_frequency_hz: f32,
     pub source_channels: Vec<usize>,
     pub remove_bass_from_sources: bool,
+    pub lfe_gain: f32,
 }
 
 /// Configuration for a single input-to-output route
@@ -685,6 +700,7 @@ impl Config {
             crossover_frequency_hz: self.bass_management.crossover_frequency_hz,
             source_channels: sources?,
             remove_bass_from_sources: self.bass_management.remove_bass_from_sources,
+            lfe_gain: self.bass_management.lfe_gain,
         })
     }
 
@@ -1512,7 +1528,10 @@ mod tests {
         assert_eq!(config.bass_management.lfe_channel, ChannelRef::Index(3));
         assert_eq!(config.bass_management.crossover_frequency_hz, 80.0);
         assert!(config.bass_management.source_channels.is_empty());
-        assert!(!config.bass_management.remove_bass_from_sources);
+        // D30: the default high-passes the mains when bass management is enabled
+        // (was false; the additive LFE+Main mode is now opt-in via false).
+        assert!(config.bass_management.remove_bass_from_sources);
+        assert_eq!(config.bass_management.lfe_gain, 1.0);
     }
 
     #[test]

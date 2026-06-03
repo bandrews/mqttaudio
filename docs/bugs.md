@@ -5,6 +5,15 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 
 ## Deferred to a later sprint
 
+- **No final low-pass on the summed LFE bus (Sprint 7 — LOW, YAGNI per D32).** Bass management low-passes each
+  source channel before summing into the LFE, but the LFE *output bus* itself is not low-passed after
+  summation. Per D32 a final-LFE low-pass is deliberately **not** added now (YAGNI): each contribution is
+  already band-limited by its per-channel low-pass, so the sum is band-limited too. The one case it would
+  catch is full-range content routed *directly* to the LFE output index by another voice (documented as the
+  additive-LFE collision in `docs/features/bass-management.md`) — that directly-routed content bypasses the
+  crossover and is not low-passed. If that becomes a real problem, add a single low-pass on the LFE bus after
+  summation in `BassManagement::process`.
+
 - **Alloc harness cannot see the pitch stretcher's C++ allocations (Sprint 6 — LOW, harness limitation).**
   `tests/alloc_harness.rs` hooks Rust's `#[global_allocator]`, so it proves the Rust-side mix/command/ducking
   paths are alloc/free-free. The `signalsmith-stretch` pitch path is C++ FFI (`process`/`seek`/`flush`) and

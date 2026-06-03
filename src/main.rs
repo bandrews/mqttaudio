@@ -431,6 +431,7 @@ async fn main() {
             crossover_frequency_hz: resolved.crossover_frequency_hz,
             source_channels: resolved.source_channels.clone(),
             remove_bass_from_sources: resolved.remove_bass_from_sources,
+            lfe_gain: resolved.lfe_gain,
         };
         tracing::info!(
             "Bass management enabled: LFE channel {}, crossover {} Hz, sources {:?}",

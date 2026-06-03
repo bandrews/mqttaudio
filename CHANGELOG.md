@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gain` (default `1.0`), e.g. `{"src": 2, "dest": 0, "gain": 0.5}`. When several source channels are routed
   to one destination they sum, which can clip; a per-route gain lets you attenuate (or boost) each route. A
   route with no `gain` is unity, so existing channel maps are unaffected.
+- **`bass_management.lfe_gain` trim.** A new optional `bass_management` key (default `1.0`) applies a linear
+  trim to the (now count-normalized) summed LFE, so you can match the sub level to the room without touching
+  the amplifier. Omitting it leaves the sub at its normalized level.
+- **Startup warning when the LFE channel does not exist.** When bass management is enabled but
+  `lfe_channel` is greater than or equal to the device's output channel count, a one-time warning is logged
+  at startup explaining that bass management will be a no-op (the bass cannot be redirected). Previously this
+  was a silent no-op.
 
 ### Changed
 
@@ -123,6 +130,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`audio.buffer_size` is now honored** via `BufferSize::Fixed` when the device supports
   it (previously the validated value was ignored). Latency/period size may change for
   existing configs.
+- **Bass management high-passes the mains by default.** `bass_management.remove_bass_from_sources` now
+  defaults to `true` (was `false`): when bass management is enabled, the bass routed to the sub is removed
+  from the source channels, which is standard bass management. Anyone who relied on the previous additive
+  "LFE+Main" behavior (full-range mains *and* the same bass in the sub) must now set
+  `remove_bass_from_sources: false` explicitly. This only affects configs with `bass_management.enabled: true`.
+- **Bass-management crossover is now 4th-order Linkwitz-Riley.** The crossover used a single 2nd-order
+  Butterworth low-pass/high-pass pair, whose outputs are 180° out of phase at the crossover frequency and so
+  notch (partially cancel) where the mains and sub overlap. It is now a 4th-order Linkwitz-Riley crossover
+  (two cascaded Butterworth sections per filter): the low- and high-pass outputs are in phase and recombine
+  flat through the crossover, and the slopes are steeper (24 dB/oct). This changes the acoustic response for
+  anyone with bass management enabled (a fuller, flatter blend at the crossover).
+- **LFE level is independent of the number of source channels.** The summed LFE was the *sum* of the bass
+  extracted from every source channel, so feeding correlated bass from two channels made the sub ~6 dB louder
+  than from one. The summed LFE is now normalized by the active source count, so the sub level no longer
+  scales with how many channels feed it. A 2-source setup is therefore ~6 dB quieter in the sub than before;
+  use the new `bass_management.lfe_gain` to trim if needed. Affects only configs with bass management enabled.
 
 ### Fixed
 
@@ -131,6 +154,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Output auto-recovery.** A fatal output-device error now rebuilds the stream with
   exponential backoff (re-resolving the device) instead of going permanently silent; if it
   cannot recover, the process exits so a service manager can restart it.
+- **Bass-management filter no longer processes denormals after audio goes quiet.** The crossover's IIR
+  decay tail could settle into the floating-point subnormal range and be processed every sample on the audio
+  thread, where subnormal arithmetic is dramatically slower (a periodic CPU-spike / dropout risk during quiet
+  passages). The filter state is now flushed to zero once it falls below an inaudible threshold. No effect on
+  correct-level audio.
 
 ### Security
 

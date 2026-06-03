@@ -14,7 +14,7 @@ mqttaudio listens for JSON commands over MQTT or a REST endpoint, and plays audi
 - **Live mixing** — Play 20+ sounds simultaneously without glitches
 - **HTTP caching** — Stream audio from URLs with automatic caching
 - **Variable speed** — Speed up, slow down, or reverse playback with optional pitch correction
-- **Software LFE** — Extract low frequencies with configurable crossover and route them to a designated channel, allowing fine grained control over subwoofer output
+- **Software LFE** — Extract low frequencies with a 4th-order Linkwitz-Riley crossover and route them to a designated subwoofer channel, with level kept independent of the number of source channels
 - **REST API** — Optional HTTP server with REST endpoints mirroring MQTT commands, plus WebSocket for log streaming
 
 ## Quick Start

@@ -5,9 +5,9 @@ Bass management extracts low frequencies from main channels and routes them to a
 ## How It Works
 
 1. Audio plays through the mixer as normal
-2. A low-pass filter extracts frequencies below the crossover point
-3. Extracted bass is summed and sent to the LFE channel
-4. Optionally, bass is removed from the source channels (high-pass filtered)
+2. A 4th-order Linkwitz-Riley low-pass extracts frequencies below the crossover point
+3. The extracted bass from every source channel is summed, normalized by the source count, and sent to the LFE channel
+4. By default, bass is removed from the source channels (a matching 4th-order Linkwitz-Riley high-pass); set `remove_bass_from_sources: false` to leave the mains full-range
 
 ## Configuration
 
@@ -31,7 +31,13 @@ Add bass management to your config file:
 | `lfe_channel` | Output channel for the subwoofer (0-indexed) |
 | `crossover_frequency_hz` | Frequency cutoff (typically 80-120 Hz) |
 | `source_channels` | Channels to extract bass from |
-| `remove_bass_from_sources` | Remove bass from source channels after extraction |
+| `remove_bass_from_sources` | Remove bass from the source channels after extraction. **Default `true`** (standard bass management); set `false` for the additive "LFE+Main" mode |
+| `lfe_gain` | Linear trim applied to the summed LFE (default `1.0`). The LFE is normalized by the source count first, so this just matches sub level to the room |
+
+> **Default change:** `remove_bass_from_sources` now defaults to `true`. The bass routed to the sub is
+> removed from the main channels, as in standard bass management. For the older additive behavior —
+> full-range mains *and* the same bass duplicated in the sub — set `remove_bass_from_sources: false`
+> ("LFE+Main", see the Bass Copy example).
 
 ## CLI Options
 
@@ -112,11 +118,30 @@ The crossover frequency determines what counts as "bass":
 | 100 Hz | Smaller speakers, more subwoofer contribution |
 | 120 Hz | Small satellite speakers, maximum bass redirection |
 
+## LFE Routing Behavior
+
+A few things to know about how content reaches the LFE channel:
+
+- **Count-normalized level.** The bass extracted from each source channel is summed and then divided by the
+  number of active source channels, so the sub level does not scale with how many channels feed it. Feeding
+  correlated bass from two channels gives the same sub level as one (it is **not** +6 dB louder). Use
+  `lfe_gain` to trim the result.
+- **The LFE index is added to, not replaced.** Extracted bass is *summed onto* whatever is already on the
+  `lfe_channel`. If another voice routes full-range material directly to that output index (e.g. via a Play
+  `channel_map`), the LFE carries that directly-routed content **plus** the extracted bass — the directly
+  routed content is not crossed over. This is the additive-LFE behavior; route content to the LFE index
+  deliberately.
+- **Out-of-range LFE is a no-op (with a warning).** If `lfe_channel` is greater than or equal to the device's
+  output channel count, bass management cannot redirect anything and does nothing; a one-time warning is
+  logged at startup. The mains are left full-range (no bass is lost, but none is redirected either).
+
 ## Technical Details
 
-- Uses 2nd-order Butterworth filters for smooth response
-- Low-pass filter for LFE extraction
-- High-pass filter for source channel bass removal (when enabled)
+- 4th-order Linkwitz-Riley crossover (two cascaded Butterworth biquads per filter), so the low- and
+  high-pass outputs are in phase and recombine flat through the crossover (24 dB/oct slopes)
+- Low-pass filter for LFE extraction; matching high-pass for source-channel bass removal (when enabled)
+- The filter state is flushed to zero once it decays below an inaudible threshold, keeping the IIR tail out
+  of the (CPU-expensive) floating-point denormal range on the audio thread
 - Processing happens in real-time with minimal latency
 
 ## Tips
