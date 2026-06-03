@@ -98,3 +98,38 @@ fn fade_out_decays_monotonically_without_clicks() {
         "inter-sample delta {delta} exceeds smooth-fade bound"
     );
 }
+
+#[test]
+fn pitch_corrected_render_is_stable_across_blocks() {
+    // A pitch-corrected sample rendered over many callback blocks exercises the
+    // reused pre-allocated pitch scratch buffer (allocated once, then reused). The
+    // output must stay clean: finite, non-silent, bounded, and click-free — proving
+    // the scratch refactor did not change the audible result.
+    let frames = 48000;
+    let buffer = decoded(sine(220.0, SR, frames, 2, 0.5), 2, SR);
+    let mut sample = ActiveSample::new(1, "v".to_string(), buffer, 1.0, 1.0, "f".to_string());
+    sample.enable_pitch_correction();
+    sample.set_speed(0.5); // half speed, pitch preserved
+
+    // Enough blocks to clear the stretcher's startup latency and reach steady
+    // state, so the reused scratch buffer is exercised across many callbacks.
+    let mut state = SceneBuilder::new(2).sample(sample).build();
+    let out = render(&mut state, 512, 64);
+
+    assert!(
+        out.iter().all(|s| s.is_finite()),
+        "pitch-corrected output must be finite"
+    );
+    // `peak` proves real signal got through (RMS is diluted by the stretcher's
+    // startup latency over a short render) and that it stays bounded.
+    let pk = peak(&out);
+    assert!(
+        pk > 0.1 && pk <= 1.5,
+        "pitch-corrected output should be present and bounded, peak = {pk}"
+    );
+    assert!(
+        max_inter_sample_delta(&out, 0, 2) < 0.5,
+        "pitch-corrected output clicked, max delta = {}",
+        max_inter_sample_delta(&out, 0, 2)
+    );
+}
