@@ -337,6 +337,70 @@ impl DiskCache {
         Ok(cache_path)
     }
 
+    /// If the cached entry is older than `revalidate_after`, issue a conditional
+    /// GET (`If-None-Match` / `If-Modified-Since`). A `304 Not Modified` just
+    /// refreshes `last_validated`; a `200` re-downloads via the atomic-write path;
+    /// any error keeps the existing cached copy. A zero duration always
+    /// revalidates. No-op for URLs that are not cached.
+    pub async fn revalidate_if_due(
+        &mut self,
+        url: &str,
+        revalidate_after: std::time::Duration,
+    ) -> Result<(), CacheError> {
+        let entry = match self.get_entry(url) {
+            Some(e) => e.clone(),
+            None => return Ok(()),
+        };
+
+        // Skip while still inside the freshness window.
+        if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&entry.last_validated) {
+            let age = chrono::Utc::now().signed_duration_since(last.with_timezone(&chrono::Utc));
+            if let Ok(age) = age.to_std() {
+                if age < revalidate_after {
+                    return Ok(());
+                }
+            }
+        }
+
+        let client = reqwest::Client::new();
+        let mut req = client.get(url);
+        if let Some(etag) = &entry.etag {
+            req = req.header(reqwest::header::IF_NONE_MATCH, etag);
+        }
+        if let Some(lm) = &entry.last_modified {
+            req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
+        }
+
+        match req.send().await {
+            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
+                if let Some(e) = self.metadata.entries.get_mut(url) {
+                    e.last_validated = chrono::Utc::now().to_rfc3339();
+                }
+                self.save_metadata()?;
+                tracing::debug!("Cache revalidated (304 Not Modified): {}", url);
+            }
+            Ok(resp) if resp.status().is_success() => {
+                self.download_and_cache(url).await?;
+                tracing::info!("Cache refreshed (content changed): {}", url);
+            }
+            Ok(resp) => {
+                tracing::warn!(
+                    "Revalidation got HTTP {} for {}; keeping cached copy",
+                    resp.status(),
+                    url
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Revalidation failed for {}: {}; keeping cached copy",
+                    url,
+                    e
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Start a streaming download from HTTP/HTTPS URL.
     /// Returns an HttpStreamReader that can be used immediately for decoding
     /// while the download continues in the background.

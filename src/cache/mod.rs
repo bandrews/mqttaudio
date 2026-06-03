@@ -36,6 +36,8 @@ pub struct CacheManager {
     active_loads: HashMap<String, ActiveLoad>,
     /// Local-path allowlist; empty = allow-all (open by default).
     allowed_directories: Vec<String>,
+    /// Revalidate a disk-cached HTTP entry once it is older than this many seconds.
+    revalidate_after_seconds: u64,
 }
 
 impl CacheManager {
@@ -46,6 +48,7 @@ impl CacheManager {
         resampler_quality: ResamplerQuality,
         max_memory_mb: u32,
         allowed_directories: Vec<String>,
+        revalidate_after_seconds: u64,
     ) -> Result<Self, CacheError> {
         let disk_cache = DiskCache::new(cache_dir)?;
         let max_bytes = if max_memory_mb == 0 {
@@ -70,6 +73,7 @@ impl CacheManager {
             resampler_quality,
             active_loads: HashMap::new(),
             allowed_directories,
+            revalidate_after_seconds,
         })
     }
 
@@ -78,7 +82,7 @@ impl CacheManager {
         cache_dir: PathBuf,
         resampler_quality: ResamplerQuality,
     ) -> Result<Self, CacheError> {
-        Self::with_options(cache_dir, resampler_quality, 0, Vec::new())
+        Self::with_options(cache_dir, resampler_quality, 0, Vec::new(), 300)
     }
 
     /// Create a new cache manager with default (Fast) resampler quality and no memory limit.
@@ -114,6 +118,13 @@ impl CacheManager {
             // Check disk cache first - if cached, load from disk (fast)
             if self.disk_cache.is_cached(file_path) {
                 tracing::debug!("Disk cache hit for: {}", file_path);
+                let _ = self
+                    .disk_cache
+                    .revalidate_if_due(
+                        file_path,
+                        std::time::Duration::from_secs(self.revalidate_after_seconds),
+                    )
+                    .await;
                 let entry = self.disk_cache.get_entry(file_path).unwrap();
                 let local_path = self.disk_cache.get_cached_file_path(entry);
 
@@ -366,6 +377,13 @@ impl CacheManager {
             // HTTP URL - check disk cache
             if self.disk_cache.is_cached(file_path) {
                 tracing::debug!("Disk cache hit for: {}", file_path);
+                let _ = self
+                    .disk_cache
+                    .revalidate_if_due(
+                        file_path,
+                        std::time::Duration::from_secs(self.revalidate_after_seconds),
+                    )
+                    .await;
                 let entry = self.disk_cache.get_entry(file_path).unwrap();
                 self.disk_cache.get_cached_file_path(entry)
             } else {
@@ -562,6 +580,7 @@ mod tests {
             ResamplerQuality::default(),
             0,
             allowed,
+            300,
         )
         .unwrap();
 

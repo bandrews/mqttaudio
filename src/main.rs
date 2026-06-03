@@ -553,6 +553,7 @@ async fn main() {
         resampler_quality,
         max_memory_mb,
         config.security.allowed_directories.clone(),
+        config.cache.revalidate_after_seconds,
     ) {
         Ok(cm) => Arc::new(tokio::sync::Mutex::new(cm)),
         Err(e) => {
