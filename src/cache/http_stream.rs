@@ -1,10 +1,6 @@
 // ABOUTME: HTTP stream adapter that implements Symphonia's MediaSource trait.
 // ABOUTME: Buffers downloaded bytes to support seeking within the buffered region.
 
-// Allow dead_code until Phase 10 connects streaming to main.rs.
-// This code is tested via integration tests and will be integrated soon.
-#![allow(dead_code)]
-
 use bytes::Bytes;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -16,8 +12,6 @@ use symphonia::core::io::MediaSource;
 pub enum HttpStreamError {
     /// HTTP request failed
     Request(String),
-    /// Download was cancelled
-    Cancelled,
     /// I/O error during streaming
     Io(io::Error),
 }
@@ -26,7 +20,6 @@ impl std::fmt::Display for HttpStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HttpStreamError::Request(msg) => write!(f, "HTTP request error: {}", msg),
-            HttpStreamError::Cancelled => write!(f, "Download cancelled"),
             HttpStreamError::Io(e) => write!(f, "I/O error: {}", e),
         }
     }
@@ -95,12 +88,14 @@ impl HttpStreamReader {
         }
     }
 
-    /// Cancel the download
+    /// Cancel the download. Exercised by the http_stream tests.
+    #[allow(dead_code)]
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
 
-    /// Check if the download is complete
+    /// Check if the download is complete. Exercised by the http_stream tests.
+    #[allow(dead_code)]
     pub fn is_complete(&self) -> bool {
         let guard = self.buffer.lock().unwrap();
         guard.complete
@@ -117,12 +112,6 @@ impl HttpStreamReader {
             self.bytes_downloaded(),
             self.content_length.map(|l| l as usize),
         )
-    }
-
-    /// Get the number of bytes available to read from current position
-    fn bytes_available(&self) -> usize {
-        let guard = self.buffer.lock().unwrap();
-        guard.data.len().saturating_sub(self.position)
     }
 
     /// Wait for data to become available at current position

@@ -56,6 +56,67 @@ pub async fn handle_health() -> impl IntoResponse {
 }
 
 // =============================================================================
+// Version & Metrics
+// =============================================================================
+
+/// Build/version identity. `git_sha` is included only when the build injected
+/// `MQTTAUDIO_GIT_SHA` (e.g. a CI/release build); it is omitted otherwise rather
+/// than reported as a placeholder.
+pub async fn handle_version() -> impl IntoResponse {
+    let mut body = json!({
+        "name": env!("CARGO_PKG_NAME"),
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    if let Some(sha) = option_env!("MQTTAUDIO_GIT_SHA") {
+        body["git_sha"] = json!(sha);
+    }
+    Json(body)
+}
+
+/// Operational telemetry for monitoring. Every field is real: `uptime_seconds`
+/// from the daemon's start instant, `clips` from the Sprint-6 limiter counter,
+/// `xruns` from the Sprint-5 cpal stream-error counter, the activity counts from
+/// the VoiceManager and the control-side status snapshot, and `ducking` the
+/// control-side per-voice resolved target multiplier (a voice below 1.0 is being
+/// ducked). No value is fabricated.
+pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+
+    let uptime_seconds = state.start_time.elapsed().as_secs_f64();
+    let clips = state.clip_count.load(Ordering::Relaxed);
+    let xruns = state.xruns.load(Ordering::Relaxed);
+    let voice_count = state.voice_manager.lock().voice_count();
+
+    let (active_samples, active_inputs, output_channels) = {
+        let snapshot = state.status.read().unwrap();
+        (
+            snapshot.active_samples,
+            snapshot.inputs.len(),
+            snapshot.output_channels,
+        )
+    };
+
+    let ducking: serde_json::Map<String, Value> = state
+        .ducking
+        .read()
+        .unwrap()
+        .iter()
+        .map(|(voice, multiplier)| (voice.clone(), json!(multiplier)))
+        .collect();
+
+    Json(json!({
+        "uptime_seconds": uptime_seconds,
+        "clips": clips,
+        "xruns": xruns,
+        "active_voices": voice_count,
+        "active_samples": active_samples,
+        "active_inputs": active_inputs,
+        "output_channels": output_channels,
+        "ducking": ducking,
+    }))
+}
+
+// =============================================================================
 // Generic Command Endpoint
 // =============================================================================
 
@@ -567,6 +628,7 @@ pub async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
     };
     let voice_count = state.voice_manager.lock().voice_count();
     let clip_count = state.clip_count.load(std::sync::atomic::Ordering::Relaxed);
+    let xruns = state.xruns.load(std::sync::atomic::Ordering::Relaxed);
 
     Json(json!({
         "status": "running",
@@ -576,6 +638,7 @@ pub async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
         "active_voices": voice_count,
         "output_channels": output_channels,
         "clip_count": clip_count,
+        "xruns": xruns,
         "cache": {
             "memory": {
                 "entries": mem_stats.entry_count,
@@ -626,8 +689,25 @@ pub async fn handle_samples(State(state): State<AppState>) -> impl IntoResponse 
 }
 
 pub async fn handle_voices(State(state): State<AppState>) -> impl IntoResponse {
-    let voice_mgr = state.voice_manager.lock();
-    let voices = voice_mgr.list_voices();
+    let voices = state.voice_manager.lock().list_voices();
+    let ducking = state.ducking.read().unwrap();
+
+    // Enrich each voice with its resolved ducking multiplier (D40). A voice the
+    // control thread has not ducked is at the resting full-volume multiplier 1.0.
+    let voices: Vec<Value> = voices
+        .into_iter()
+        .map(|mut voice| {
+            let multiplier = voice
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| ducking.get(id).copied())
+                .unwrap_or(1.0);
+            if let Some(obj) = voice.as_object_mut() {
+                obj.insert("ducking_multiplier".to_string(), json!(multiplier));
+            }
+            voice
+        })
+        .collect();
 
     Json(json!({ "voices": voices }))
 }

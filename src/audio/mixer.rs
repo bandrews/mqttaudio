@@ -190,7 +190,14 @@ pub struct ActiveSample {
 }
 
 impl ActiveSample {
-    /// Create a new active sample with default stereo mapping
+    /// Create a new active sample with default stereo mapping and no sample id,
+    /// loop, or crossfade. The convenience constructor for tests and the offline
+    /// render/alloc harnesses (`audio::test_support`, the integration suites); the
+    /// running daemon builds samples via `new_with_id`/`new_with_mapping`, which
+    /// carry the command's id, loop, and crossfade. Used by the library crate's
+    /// harness but only by `#[cfg(test)]` code in the binary, so the binary build
+    /// would otherwise flag it dead.
+    #[allow(dead_code)]
     pub fn new(
         id: u64,
         voice_id: String,
@@ -888,7 +895,13 @@ pub struct MixerState {
 impl MixerState {
     /// Create a `MixerState` with the output stage at its defaults: unity
     /// per-channel gains, the default limiter ceiling and master gain, and a fresh
-    /// clip counter.
+    /// clip counter. The convenience constructor for tests and the offline
+    /// render/alloc harnesses (`audio::test_support`, the integration suites); the
+    /// running daemon builds its `MixerState` inline in `main.rs` with the resolved
+    /// gains, ducking applier, and bass management. Used by the library crate's
+    /// harness but only by `#[cfg(test)]` code in the binary, so the binary build
+    /// would otherwise flag it dead.
+    #[allow(dead_code)]
     pub fn new(output_channels: usize) -> Self {
         Self {
             active_samples: Vec::with_capacity(MAX_VOICES),

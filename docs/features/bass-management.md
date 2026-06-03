@@ -128,9 +128,11 @@ A few things to know about how content reaches the LFE channel:
   `lfe_gain` to trim the result.
 - **The LFE index is added to, not replaced.** Extracted bass is *summed onto* whatever is already on the
   `lfe_channel`. If another voice routes full-range material directly to that output index (e.g. via a Play
-  `channel_map`), the LFE carries that directly-routed content **plus** the extracted bass — the directly
-  routed content is not crossed over. This is the additive-LFE behavior; route content to the LFE index
-  deliberately.
+  `channel_map`, or a configured input route), the LFE carries that directly-routed content **plus** the
+  extracted bass — the directly routed content is **not** crossed over (it bypasses the high-pass). This is the
+  additive-LFE behavior; route content to the LFE index deliberately. A configured **input route** whose
+  destination is the LFE channel is flagged with a one-time startup warning so the bypass is not a silent
+  surprise; a Play `channel_map` to the LFE channel is a per-command runtime decision and is not warned.
 - **Out-of-range LFE is a no-op (with a warning).** If `lfe_channel` is greater than or equal to the device's
   output channel count, bass management cannot redirect anything and does nothing; a one-time warning is
   logged at startup. The mains are left full-range (no bass is lost, but none is redirected either).

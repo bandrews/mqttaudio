@@ -94,13 +94,17 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         .route("/input/volume", post(handlers::handle_input_volume))
         .route("/input/mute", post(handlers::handle_input_mute));
 
-    // Build status routes (read-only, no auth required for basic status)
+    // Build status routes (read-only, no auth required for basic status). These
+    // include /version and /metrics, which are gated alongside the status routes
+    // when require_auth is set and open otherwise.
     let status_routes = Router::new()
         .route("/status", get(handlers::handle_status))
         .route("/status/samples", get(handlers::handle_samples))
         .route("/status/voices", get(handlers::handle_voices))
         .route("/status/cache", get(handlers::handle_cache_status))
-        .route("/status/inputs", get(handlers::handle_inputs));
+        .route("/status/inputs", get(handlers::handle_inputs))
+        .route("/version", get(handlers::handle_version))
+        .route("/metrics", get(handlers::handle_metrics));
 
     // Health check (no auth)
     let health_route = Router::new().route("/health", get(handlers::handle_health));

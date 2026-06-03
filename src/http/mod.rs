@@ -12,9 +12,11 @@ use crate::cache::CacheManager;
 use crate::config::HttpConfig;
 use crate::voice::VoiceManager;
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
+use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// Per-sample status the control thread knows when a sample is started. Live
@@ -64,8 +66,20 @@ pub struct AppState {
     pub voice_manager: Arc<Mutex<VoiceManager>>,
     /// Read-only access to cache manager for status queries
     pub cache_manager: Arc<tokio::sync::Mutex<CacheManager>>,
-    /// Count of output samples the limiter held at the ceiling, for `/status`.
+    /// Count of output samples the limiter held at the ceiling, for `/status`
+    /// and `/metrics`. Produced by the Sprint-6 limiter on the audio thread.
     pub clip_count: Arc<AtomicU64>,
+    /// Count of cpal stream-error callbacks (dropouts/underruns that triggered a
+    /// stream rebuild), produced by the Sprint-5 audio engine. Surfaced in
+    /// `/metrics` and `/status`.
+    pub xruns: Arc<AtomicU64>,
+    /// When the daemon started, for the `/metrics` uptime field.
+    pub start_time: Instant,
+    /// Control-side per-voice ducking multiplier (resolved target, where < 1.0
+    /// means the voice is ducked). The control thread owns ducking (D20) and
+    /// updates this whenever a target changes; the HTTP handlers read it for
+    /// `/metrics` and `/status/voices`. A voice at full volume is absent.
+    pub ducking: Arc<RwLock<HashMap<String, f32>>>,
     /// Optional auth token for Bearer authentication
     pub auth_token: Option<String>,
     /// Opt-in: require a valid token on ALL routes (status + ws included).
@@ -102,6 +116,9 @@ pub async fn start_server(
     voice_manager: Arc<Mutex<VoiceManager>>,
     cache_manager: Arc<tokio::sync::Mutex<CacheManager>>,
     clip_count: Arc<AtomicU64>,
+    xruns: Arc<AtomicU64>,
+    start_time: Instant,
+    ducking: Arc<RwLock<HashMap<String, f32>>>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
 
@@ -111,6 +128,9 @@ pub async fn start_server(
         voice_manager,
         cache_manager,
         clip_count,
+        xruns,
+        start_time,
+        ducking,
         auth_token: config.auth_token.clone(),
         require_auth: config.require_auth,
         log_broadcaster: log_broadcaster.clone(),

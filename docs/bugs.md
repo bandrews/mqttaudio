@@ -5,6 +5,19 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 
 ## Deferred to a later sprint
 
+- **`handle_command`'s own "Invalid JSON" 400 branch is unreachable (Sprint 9 F10 — discovered, LOW).**
+  `src/http/handlers.rs` `handle_command` extracts `Json(body): Json<Value>` then maps a
+  `serde_json::to_string(&body)` failure to `400 + CommandResponse::error("Invalid JSON: ...")`. But by the
+  time the handler runs, axum's `Json` extractor has *already* parsed the body into a `Value`; re-serializing
+  a `Value` cannot fail, so that branch is dead. A genuinely non-JSON body is rejected earlier by the
+  extractor with axum's own `400` whose body is **plaintext** (`"Failed to parse the request body as JSON:
+  ..."`), not a `CommandResponse`. So the Sprint-9 spec's "400 + `CommandResponse` error shape" for
+  `/command` cannot both hold against the current handler: the status is 400 but the body shape is axum's.
+  `tests/http_api_test.rs::test_command_non_json_body_returns_400` locks the *actual* behavior (400 +
+  plaintext). Making the body a `CommandResponse` would mean adding a custom `JsonRejection` handler (or a
+  `WithRejection` wrapper) — a production change owned by the HTTP-handlers work, out of scope for the
+  additive test-gap group. Left as-is and surfaced here.
+
 - **Deployment `Dockerfile` pins `rust:1.83` but the code uses `usize::is_multiple_of` (stable 1.87) (Sprint 8 — discovered, MEDIUM).**
   `src/audio/streaming.rs` (pre-existing) and now `src/audio/input.rs` (Sprint 8 F6 de-interleave guard) call
   `usize::is_multiple_of`, which clippy `-D warnings` actively *requires* (lint `manual_is_multiple_of`) on the
@@ -80,12 +93,17 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   and to return the displaced corrector via a graveyard for off-RT drop (mirroring the sample graveyard) —
   a separate, larger change. Pairs with the Sprint-6 pitch-correction work.
 
-- **`xruns` counter is incremented but not surfaced on `/status` (Sprint 5).** The lock-free RT engine
-  creates an `xruns: AtomicU64` (`src/main.rs:553`), passes it to the output supervisor, and increments it
-  in the cpal error callback (`src/audio/engine.rs`), but it is not yet plumbed into the control-side
-  `StatusSnapshot` or the `/status` JSON. Sprint 5's acceptance ("expose it on the status snapshot for the
-  soak test") and Sprint 9's `/metrics` work still need to wire it through. The counter is live and usable
-  by a soak test that holds the `Arc<AtomicU64>` directly; only the HTTP exposure is missing.
+- **`xruns` counter surfaced on `/status` and `/metrics` (Sprint 5 residual, CLOSED in Sprint 9).** The
+  lock-free RT engine creates an `xruns: Arc<AtomicU64>` in `main.rs`, passes it to the output supervisor,
+  and increments it in the cpal error callback (`src/audio/engine.rs:437`). Sprint 9 threads that same `Arc`
+  into `AppState` and reads it in `handle_status` (`/status` → `xruns`) and `handle_metrics`
+  (`/metrics` → `xruns`), closing the Sprint-5 exposure gap. **Semantic note (surface what exists, do not
+  overstate):** the counter counts **cpal stream-error callback invocations**, not per-buffer underruns. On
+  most platforms a dropout/underrun surfaces as a stream error (which also triggers the Sprint-1 device
+  rebuild), so this is the available dropout signal — but a backend that silently glitches without raising a
+  stream error would not bump it. There is no lower-level per-block underrun counter in cpal to surface; if a
+  finer dropout metric is ever needed it must come from a backend that reports it. The value is real and
+  live, never a placeholder.
 
 - **`/status/samples` live position is gone by design (Sprint 5 / D20 / D22a).** Because the control plane
   never reads `MixerState` (D22a), the status snapshot is control-side and cannot see audio-thread-owned
@@ -102,12 +120,38 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   `enum_variant_names` fires on the shared `Error` suffix. Renaming ripples through many match arms, so it
   is suppressed with a targeted `#[allow(clippy::enum_variant_names)]` for now (`src/cache/disk.rs`).
 
-- **Stale `#![allow(dead_code)]` "Phase 10" banner (Sprint 9, D39).** `src/audio/streaming_decoder.rs`
-  still carries a crate-style `#![allow(dead_code)]`. Sprint 9 removes dev scaffolding and must make the
-  build warning-free without this blanket allow.
+- **Two file-level `#![allow(dead_code)]` "Phase 10" banners remain in the streaming decode path (Sprint 9 F2 — deferred, LOW).**
+  Sprint 9 F2 removed the stale banner in `src/audio/chunked_resampler.rs` (the three now-genuinely-dead
+  test-only accessors `buffered_frames`/`chunk_size`/`ratio` were narrowed to `#[cfg(test)]`). The same
+  "Allow dead_code until Phase 10 …" banner still sits at `src/audio/streaming_decoder.rs:4-6` and
+  `src/cache/http_stream.rs:4-6`. Removing the `chunked_resampler` banner did **not** surface warnings there
+  (each file's own blanket still masks whatever is dead inside it), so per the Sprint 9 spec they were left in
+  place — the gate is green without touching them. De-masking each would require auditing and narrowing every
+  dead item in those two files individually (a larger change than F2's scope). Pick them up the same way
+  (remove the blanket, then `#[cfg(test)]`/narrow-`#[allow]`/delete per item) when that path is next touched.
 
-- **Hardcoded `/Users/bandrews/...` paths (Sprint 9, D39).** `audio::engine::test_mixer` embeds absolute
-  developer paths for its test files. Sprint 9 removes `test_mixer`/`--test-mixer` and the dev scaffolding.
+  Audited under Sprint 9's final gate (banners temporarily removed, `RUSTFLAGS=-D warnings` build) — the exact
+  set a future de-mask must resolve, and the right disposition for each (the binary does not call into the
+  streaming decode path; these items are exercised only by the lib's integration tests and the files' own
+  `#[cfg(test)]` modules, which is why they are dead in the `bin` target but live in the `lib`/test targets):
+  - `src/cache/http_stream.rs`: `HttpStreamReader::bytes_available` is **genuinely dead** (zero callers in
+    `src/` or `tests/`; its logic is inlined in `read()`/`wait_for_data()`) — **delete** it. `HttpStreamError::Cancelled`
+    is never constructed today (the download task reports cancellation via `fail("Download cancelled")`, not the
+    variant) — either wire it or **delete** it. `cancel`/`is_complete` are public API used by the file's own
+    `#[cfg(test)]` tests — narrow to `#[cfg(test)]` or keep as documented public API.
+  - `src/audio/streaming_decoder.rs`: the `sample_rate`/`target_sample_rate`/`estimated_frames` **fields** and
+    the `source_sample_rate`/`sample_rate`/`estimated_frames`/`is_finished` **accessors** are public API consumed
+    only by that file's `#[cfg(test)]` tests; keep as documented public API (or `#[cfg(test)]` the accessors) —
+    do not delete the fields, they back the public accessors.
+
+- **Unused `ctrlc` dependency after dev-scaffolding removal (Sprint 9 F1 — RESOLVED in Sprint 9 finalization).** The
+  `ctrlc = "3.4"` dependency (`Cargo.toml`) was used **only** by the removed `--test-tone`/`--file`/`--test-mixer`
+  handlers; the daemon's real shutdown path uses `tokio::signal::ctrl_c()`/SIGTERM in `shutdown_signal()`, not the
+  `ctrlc` crate. F1 removed the handlers, leaving `ctrlc` unused (zero references anywhere in `src/`; `cargo tree -i
+  ctrlc` showed `mqttaudio` as its only dependent, so nothing transitive needed it). It produced no compiler
+  warning, so the gate was unaffected, but shipping a dead dependency in the final release is exactly the
+  tree-cleanliness this sprint exists to close. The Sprint-9 finalization pass removed it from `Cargo.toml` and
+  `Cargo.lock` (dropping `ctrlc v3.5.0` + its `cfg_aliases v0.2.1`); the full gate stays green.
 
 - **ALSA name matcher hardening deferred (Sprint 1 F6 — LOW, Linux-only).** `try_match_alsa_device` /
   `extract_alsa_card_from_name` in `src/audio/engine.rs` compare only the card identifier (ignoring the
@@ -141,6 +185,17 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   exercised in earnest.
 
 ## Implementation notes
+
+- **Auto voice-id format: `_auto_<millis>_<n>` shipped, reconciling DECISIONS.md D24 vs D41/Sprint-9 F5.**
+  DECISIONS.md D24 (Sprint 6) specified `_auto_<n>` (a bare monotonic counter, no millis). Sprint 9's F5
+  finding, decision D41, and the Sprint-9 orchestration brief all specify `_auto_<millis>_<n>` (the original
+  `_auto_<millis>` with a process-global `AtomicU64` counter appended). The later, more specific Sprint-9
+  decision was implemented and is what ships (`next_auto_voice_id()` in `src/main.rs`, tested by
+  `auto_voice_ids_are_unique_within_a_millisecond` and `two_no_voice_plays_get_distinct_voice_ids`). Both forms
+  satisfy D24's actual requirement — uniqueness, so same-millisecond no-voice Plays no longer collide into one
+  voice — and the shipped form is strictly more informative (it carries the start timestamp). The CHANGELOG
+  documents `_auto_<millis>_<n>` as the user-visible contract. Noted here only so the D24↔D41 wording mismatch
+  is on the record; no further action needed.
 
 - **Sprint 6 pitch pre-roll (F10) covers the mid-playback enable, not first-enable-at-start.** Enabling pitch
   correction while a sample is already playing pre-rolls the stretcher with the audio just before the

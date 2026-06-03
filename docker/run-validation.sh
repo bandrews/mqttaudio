@@ -13,6 +13,12 @@ cargo clippy --all-targets -- -D warnings
 echo "==> cargo build --release (RUSTFLAGS=-D warnings)"
 RUSTFLAGS="-D warnings" cargo build --release
 
+# Property/fuzz suite for the untrusted JSON surfaces (no broker or device needed).
+# Run explicitly so a panic-on-malformed-input regression is surfaced on its own,
+# independent of the broad broker-backed run below.
+echo "==> cargo test --test fuzz_command_config (proptest)"
+cargo test --test fuzz_command_config
+
 echo "==> generating throwaway TLS certificates"
 /usr/local/bin/gen-test-certs.sh /etc/mosquitto/tls
 

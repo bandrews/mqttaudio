@@ -58,18 +58,6 @@ struct Args {
     #[arg(long)]
     list_inputs: bool,
 
-    /// Play a 440Hz test tone (for testing audio output)
-    #[arg(long)]
-    test_tone: bool,
-
-    /// Play an audio file (for testing decoder)
-    #[arg(long)]
-    file: Option<String>,
-
-    /// Test mixer with multiple simultaneous files (Phase 4)
-    #[arg(long)]
-    test_mixer: bool,
-
     /// LFE (subwoofer) channel number for bass management
     #[arg(long)]
     lfe_channel: Option<usize>,
@@ -97,6 +85,36 @@ struct Args {
     /// Maximum memory cache size in MB (0 = unlimited)
     #[arg(long)]
     max_cache_mb: Option<u32>,
+}
+
+/// Build the formatting log layer for the chosen `logging.format`, filtered to
+/// `level` and writing through `make_writer` (F13/D40). `"json"` produces
+/// line-delimited JSON records for log aggregation; anything else (the validated
+/// default `"text"`) produces the human-readable rendering. Boxed so both formats
+/// share one type and compose with the optional MQTT layer in the registry.
+fn build_fmt_layer<S, W>(
+    format: &str,
+    level: tracing::Level,
+    make_writer: W,
+) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::Layer;
+    let filter = tracing_subscriber::filter::LevelFilter::from_level(level);
+    if format == "json" {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(make_writer)
+            .with_filter(filter)
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer()
+            .with_writer(make_writer)
+            .with_filter(filter)
+            .boxed()
+    }
 }
 
 #[tokio::main]
@@ -140,27 +158,28 @@ async fn main() {
         _ => tracing::Level::INFO,
     };
 
-    // Create log channel for MQTT publishing (if configured)
-    let mqtt_log_receiver = if config.logging.mqtt_topic.is_some() {
-        let (sender, receiver) = mqtt::logger::create_log_channel(100);
+    // Initialize logging: a console fmt layer (text or JSON per logging.format)
+    // plus, when an MQTT log topic is configured, a composable MQTT publish layer.
+    // Both sinks live in one registry so the format choice applies regardless of
+    // whether MQTT logging is on (F13/D40).
+    let mqtt_log_receiver = {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
-        use tracing_subscriber::Layer;
 
-        let mqtt_layer = mqtt::logger::MqttLogLayer::new(sender, log_level);
-        let fmt_layer = tracing_subscriber::fmt::layer().with_filter(
-            tracing_subscriber::filter::LevelFilter::from_level(log_level),
-        );
+        let fmt_layer = build_fmt_layer(&config.logging.format, log_level, std::io::stdout);
 
-        tracing_subscriber::registry()
-            .with(fmt_layer)
-            .with(mqtt_layer)
-            .init();
-
-        Some(receiver)
-    } else {
-        tracing_subscriber::fmt().with_max_level(log_level).init();
-        None
+        if config.logging.mqtt_topic.is_some() {
+            let (sender, receiver) = mqtt::logger::create_log_channel(100);
+            let mqtt_layer = mqtt::logger::MqttLogLayer::new(sender, log_level);
+            tracing_subscriber::registry()
+                .with(fmt_layer)
+                .with(mqtt_layer)
+                .init();
+            Some(receiver)
+        } else {
+            tracing_subscriber::registry().with(fmt_layer).init();
+            None
+        }
     };
 
     tracing::info!("mqttaudio {} starting", env!("CARGO_PKG_VERSION"));
@@ -206,84 +225,10 @@ async fn main() {
         }
     }
 
-    // Handle --test-tone (Phase 1)
-    if args.test_tone {
-        tracing::info!("Starting test tone mode (440Hz sine wave)...");
-        match audio::engine::init_test_sine_wave() {
-            Ok(_stream) => {
-                tracing::info!("Test tone playing. Press Ctrl+C to exit.");
-
-                // Keep stream alive until Ctrl+C
-                let (tx, rx) = std::sync::mpsc::channel();
-                ctrlc::set_handler(move || {
-                    tx.send(()).expect("Could not send signal on channel");
-                })
-                .expect("Error setting Ctrl-C handler");
-
-                rx.recv().expect("Could not receive from channel");
-                tracing::info!("Stopping test tone...");
-
-                // Stream will be dropped here, stopping playback
-            }
-            Err(e) => {
-                tracing::error!("Failed to initialize audio stream: {}", e);
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
-    // Handle --file (Phase 2)
-    if let Some(file_path) = args.file {
-        match audio::engine::play_file(&file_path) {
-            Ok(_stream) => {
-                tracing::info!("File playing. Press Ctrl+C to exit.");
-
-                // Keep stream alive until Ctrl+C
-                let (tx, rx) = std::sync::mpsc::channel();
-                ctrlc::set_handler(move || {
-                    tx.send(()).expect("Could not send signal on channel");
-                })
-                .expect("Error setting Ctrl-C handler");
-
-                rx.recv().expect("Could not receive from channel");
-                tracing::info!("Stopping playback...");
-
-                // Stream will be dropped here, stopping playback
-            }
-            Err(e) => {
-                tracing::error!("Failed to play file: {}", e);
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
-    // Handle --test-mixer (Phase 4)
-    if args.test_mixer {
-        tracing::info!("Starting mixer test (multiple simultaneous samples)...");
-        match audio::engine::test_mixer() {
-            Ok(_stream) => {
-                tracing::info!("Mixer test running. Press Ctrl+C to exit.");
-
-                // Keep stream alive until Ctrl+C
-                let (tx, rx) = std::sync::mpsc::channel();
-                ctrlc::set_handler(move || {
-                    tx.send(()).expect("Could not send signal on channel");
-                })
-                .expect("Error setting Ctrl-C handler");
-
-                rx.recv().expect("Could not receive from channel");
-                tracing::info!("Stopping mixer test...");
-
-                // Stream will be dropped here, stopping playback
-            }
-            Err(e) => {
-                tracing::error!("Failed to start mixer test: {}", e);
-                std::process::exit(1);
-            }
-        }
-        return;
+    // Warn (do not fail) if the config declares a schema version newer than this
+    // build understands — newer fields may be silently ignored (F4/D38).
+    if let Some(warning) = config.schema_version_warning() {
+        tracing::warn!("{}", warning);
     }
 
     // Validate config
@@ -416,7 +361,16 @@ async fn main() {
         None
     };
 
-    // Create bass management from config
+    // Control-side per-voice ducking multiplier snapshot the HTTP handlers read
+    // (D40). The control thread updates it through `notify_voice_activity` as
+    // ducking targets resolve; the audio thread never touches it (D20). Created
+    // before the input loop so configured-input voices that trigger ducking can
+    // record their target.
+    let ducking_snapshot: Arc<RwLock<HashMap<String, f32>>> = Arc::new(RwLock::new(HashMap::new()));
+
+    // Create bass management from config. Also keep the resolved LFE channel (when
+    // enabled) so the input-setup loop can warn about routes that collide with it.
+    let mut bass_lfe_channel: Option<usize> = None;
     let bass_management = if config.bass_management.enabled {
         let resolved = match config.resolve_bass_management() {
             Ok(r) => r,
@@ -425,6 +379,7 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+        bass_lfe_channel = Some(resolved.lfe_channel);
         let bm_config = audio::bass_management::BassManagementConfig {
             enabled: resolved.enabled,
             lfe_channel: resolved.lfe_channel,
@@ -525,6 +480,16 @@ async fn main() {
                         tracing::warn!("{}", warning);
                     }
 
+                    // With bass management enabled, warn once if any route lands
+                    // content directly on the LFE channel: that content bypasses the
+                    // crossover and the extracted bass is summed on top (F7).
+                    if let Some(lfe) = bass_lfe_channel {
+                        if let Some(warning) = input_routes_collide_with_lfe(idx, &channel_map, lfe)
+                        {
+                            tracing::warn!("{}", warning);
+                        }
+                    }
+
                     // Create LiveInput for the mixer
                     let live_input = audio::mixer::LiveInput::new(
                         input_config.voice_id.clone(),
@@ -559,6 +524,7 @@ async fn main() {
                         true,
                         ducking_engine.as_mut(),
                         &mut cmd_tx,
+                        &ducking_snapshot,
                     );
                 }
 
@@ -598,6 +564,9 @@ async fn main() {
         samples: Vec::new(),
         inputs: input_statuses.clone(),
     }));
+
+    // When the daemon started, for the `/metrics` uptime field (D40).
+    let start_time = std::time::Instant::now();
 
     // Create cache manager using config
     let cache_dir = config.cache_directory();
@@ -707,6 +676,9 @@ async fn main() {
             voice_manager.clone(),
             cache_manager.clone(),
             clip_count.clone(),
+            xruns.clone(),
+            start_time,
+            ducking_snapshot.clone(),
         )
         .await
         {
@@ -775,6 +747,7 @@ async fn main() {
                             active_counts: &mut active_counts,
                             playing: &mut playing,
                             snapshot: &status_snapshot,
+                            ducking_snapshot: &ducking_snapshot,
                             inputs: &input_statuses,
                             output_channels,
                             output_sample_rate,
@@ -796,6 +769,7 @@ async fn main() {
                     &mut active_counts,
                     &mut playing,
                     &status_snapshot,
+                    &ducking_snapshot,
                     &input_statuses,
                     output_channels,
                 );
@@ -857,19 +831,73 @@ fn out_of_range_input_routes(
     ))
 }
 
+/// Build the warning for an input whose resolved routes land content directly on
+/// the bass-management LFE channel, or `None` when no route targets it (F7/D41).
+/// Content routed straight to the LFE output index is *not* high-passed by the
+/// crossover, and bass management then sums the extracted bass on top of it (the
+/// additive-LFE behavior) — so the sub carries that full-range content unfiltered.
+/// This is a documented footgun, not a hard error: routing to the LFE deliberately
+/// is valid, so this warns rather than rejecting. Only meaningful when bass
+/// management is enabled; the caller gates on that.
+fn input_routes_collide_with_lfe(
+    input_index: usize,
+    channel_map: &[(usize, usize)],
+    lfe_channel: usize,
+) -> Option<String> {
+    if !channel_map.iter().any(|&(_, dest)| dest == lfe_channel) {
+        return None;
+    }
+    Some(format!(
+        "Input {} routes content to the bass-management LFE channel {}; that content is sent to the \
+         sub full-range (the crossover is bypassed) and the extracted bass is added on top — route \
+         to the LFE deliberately or change the destination",
+        input_index, lfe_channel
+    ))
+}
+
+/// Generate a unique voice id for a Play that did not specify one. The wall-clock
+/// millisecond keeps the id human-readable/orderable, and a process-global monotonic
+/// counter makes two Plays in the same millisecond distinct (F5/D41) so a later
+/// voice_stop/voice_volume/ducking on one does not affect the other.
+fn next_auto_voice_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static AUTO_VOICE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = AUTO_VOICE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("_auto_{}_{}", millis, n)
+}
+
 /// Notify the control-side ducking engine that a voice's activity changed and
 /// forward any resulting target changes to the audio thread. Used by both the
 /// sample-playback path and the configured-input path (D4), so live-input voices
 /// can trigger ducking through the same off-RT `compute_changes` path. A no-op when
 /// ducking is not configured.
+///
+/// Each forwarded change also updates the control-side per-voice ducking snapshot
+/// the HTTP `/metrics` and `/status/voices` handlers read (D40): a target below
+/// full volume records the voice's multiplier, a restore (>= 1.0) clears it. The
+/// snapshot tracks resolved targets, not the in-flight fade, matching what the
+/// control thread authoritatively knows (D20).
 fn notify_voice_activity(
     voice_id: &str,
     is_active: bool,
     ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
     cmd_tx: &mut rt_engine::CommandProducer,
+    ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
 ) {
     if let Some(engine) = ducking_engine {
         for change in engine.compute_changes(voice_id, is_active) {
+            {
+                let mut guard = ducking_snapshot.write().unwrap();
+                if change.target_volume >= 1.0 {
+                    guard.remove(&change.voice);
+                } else {
+                    guard.insert(change.voice.clone(), change.target_volume);
+                }
+            }
             if cmd_tx
                 .push(rt_engine::AudioCommand::SetDuckTarget(change))
                 .is_err()
@@ -894,6 +922,7 @@ fn reap_finished_samples(
     active_counts: &mut std::collections::HashMap<String, usize>,
     playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
     snapshot: &std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
+    ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
     inputs: &[http::InputStatus],
     output_channels: usize,
 ) {
@@ -918,7 +947,13 @@ fn reap_finished_samples(
             if *count == 0 {
                 active_counts.remove(&voice);
                 // Voice's last sample finished: restore through the shared notify path.
-                notify_voice_activity(&voice, false, ducking_engine.as_deref_mut(), cmd_tx);
+                notify_voice_activity(
+                    &voice,
+                    false,
+                    ducking_engine.as_deref_mut(),
+                    cmd_tx,
+                    ducking_snapshot,
+                );
             }
         }
     }
@@ -940,6 +975,7 @@ struct CommandCtx<'a> {
     active_counts: &'a mut std::collections::HashMap<String, usize>,
     playing: &'a mut std::collections::HashMap<u64, http::SampleStatus>,
     snapshot: &'a std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
+    ducking_snapshot: &'a std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
     inputs: &'a [http::InputStatus],
     output_channels: usize,
     output_sample_rate: u32,
@@ -996,16 +1032,8 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
 
             match buffer_result {
                 Ok(buffer) => {
-                    // Use provided voice or auto-generate one
-                    let voice_id = voice.unwrap_or_else(|| {
-                        format!(
-                            "_auto_{}",
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis()
-                        )
-                    });
+                    // Use provided voice or auto-generate a unique one.
+                    let voice_id = voice.unwrap_or_else(next_auto_voice_id);
 
                     let is_streaming = !buffer.is_complete();
                     let frames = buffer.frames();
@@ -1053,6 +1081,40 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     // Convert crossfade_ms to samples
                     let crossfade_samples =
                         (crossfade_ms as usize * output_sample_rate as usize) / 1000;
+
+                    // The loop crossfade only engages on a loop boundary of a buffer
+                    // long enough to hold a crossfade at both ends
+                    // (`buffer_frames > crossfade_samples * 2`, see
+                    // `mixer::crossfade_active`). Warn when a requested crossfade can
+                    // therefore never run, so the silent drop is visible (F8/D41). This
+                    // is feedback only — the blend math is unchanged.
+                    if crossfade_ms > 0 {
+                        if !loop_mode {
+                            tracing::warn!(
+                                "Play of {} requested crossfade {}ms without loop:true; \
+                                 the crossfade only applies at loop boundaries and will be \
+                                 ignored",
+                                file,
+                                crossfade_ms
+                            );
+                        } else if let Some(total) = buffer.total_frames_or_estimate() {
+                            // Judge the length only when the total is known. A streaming
+                            // buffer with an unknown total cannot be judged yet (the
+                            // mixer defers looping until the buffer is complete, D11), so
+                            // skip rather than warn on the small loaded-so-far count.
+                            if crossfade_samples * 2 >= total {
+                                tracing::warn!(
+                                    "Play of {} requested crossfade {}ms ({} frames) but the clip \
+                                     is only {} frames; a crossfade needs more than twice its \
+                                     length and will be ignored",
+                                    file,
+                                    crossfade_ms,
+                                    crossfade_samples,
+                                    total
+                                );
+                            }
+                        }
+                    }
 
                     // Convert channel_map to mixer format (resolve any aliases)
                     let mut sample = if let Some(map) = channel_map {
@@ -1175,6 +1237,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             true,
                             ctx.ducking_engine.as_mut(),
                             ctx.cmd_tx,
+                            ctx.ducking_snapshot,
                         );
                     }
                     *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
@@ -1542,6 +1605,7 @@ mod tests {
         active_counts: HashMap<String, usize>,
         playing: HashMap<u64, http::SampleStatus>,
         snapshot: Arc<RwLock<http::StatusSnapshot>>,
+        ducking_snapshot: Arc<RwLock<HashMap<String, f32>>>,
         inputs: Vec<http::InputStatus>,
         config: config::Config,
         _cache_dir: tempfile::TempDir,
@@ -1588,6 +1652,7 @@ mod tests {
                     samples: Vec::new(),
                     inputs: Vec::new(),
                 })),
+                ducking_snapshot: Arc::new(RwLock::new(HashMap::new())),
                 inputs: Vec::new(),
                 config: config::Config::default(),
                 _cache_dir: cache_dir,
@@ -1605,6 +1670,7 @@ mod tests {
                 active_counts: &mut self.active_counts,
                 playing: &mut self.playing,
                 snapshot: &self.snapshot,
+                ducking_snapshot: &self.ducking_snapshot,
                 inputs: &self.inputs,
                 output_channels: 2,
                 output_sample_rate: SR,
@@ -1637,6 +1703,7 @@ mod tests {
                 &mut self.active_counts,
                 &mut self.playing,
                 &self.snapshot,
+                &self.ducking_snapshot,
                 &self.inputs,
                 2,
             );
@@ -1651,6 +1718,7 @@ mod tests {
                 is_active,
                 self.ducking_engine.as_mut(),
                 &mut self.cmd_tx,
+                &self.ducking_snapshot,
             );
         }
     }
@@ -1667,6 +1735,163 @@ mod tests {
             loop_mode: false,
             crossfade_ms: 0,
         }
+    }
+
+    #[test]
+    fn auto_voice_ids_are_unique_within_a_millisecond() {
+        // F5/D41: two Plays with no explicit voice must get distinct ids even when
+        // generated in the same millisecond. `next_auto_voice_id` is called back to
+        // back here (no sleep), so the millisecond component is identical; only the
+        // appended monotonic counter makes them differ. The old `_auto_<millis>`
+        // form would collide and merge the two sounds under one voice.
+        let a = next_auto_voice_id();
+        let b = next_auto_voice_id();
+        assert_ne!(
+            a, b,
+            "same-millisecond auto voice ids must differ: {a} vs {b}"
+        );
+        assert!(
+            a.starts_with("_auto_"),
+            "auto voice id must keep the _auto_ prefix, got {a}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_no_voice_plays_get_distinct_voice_ids() {
+        // End-to-end through handle_command: two Plays without a `voice` must land in
+        // two distinct voices so a later voice_stop/voice_volume/ducking on one does
+        // not affect the other.
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(None, 1.0)).await;
+        fixture.run(play(None, 1.0)).await;
+        fixture.drain();
+
+        assert_eq!(fixture.mixer.active_samples.len(), 2);
+        let v0 = &fixture.mixer.active_samples[0].voice_id;
+        let v1 = &fixture.mixer.active_samples[1].voice_id;
+        assert_ne!(v0, v1, "two no-voice Plays must get distinct voice ids");
+    }
+
+    /// A Play of the test WAV with explicit `loop_mode`/`crossfade_ms`, for the
+    /// crossfade-without-loop warning (F8).
+    fn play_crossfade(loop_mode: bool, crossfade_ms: u32) -> AudioCommand {
+        AudioCommand::Play {
+            file: TEST_WAV.to_string(),
+            id: None,
+            volume: 1.0,
+            voice: Some("v".to_string()),
+            channel_map: None,
+            fade_in: None,
+            start_position_ms: None,
+            loop_mode,
+            crossfade_ms,
+        }
+    }
+
+    /// Captures the `message` field of a tracing event into a shared buffer.
+    struct CaptureVisitor<'a> {
+        message: &'a mut String,
+    }
+
+    impl tracing::field::Visit for CaptureVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.message = format!("{value:?}");
+            }
+        }
+    }
+
+    /// Records WARN-and-above event messages so a test can assert on emitted log
+    /// output without it leaking to the console (keeps test output pristine).
+    struct CaptureLayer {
+        warnings: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() > tracing::Level::WARN {
+                return;
+            }
+            let mut message = String::new();
+            event.record(&mut CaptureVisitor {
+                message: &mut message,
+            });
+            self.warnings.lock().unwrap().push(message);
+        }
+    }
+
+    /// Serializes the WARN-capturing tests: `set_default` installs a thread-local
+    /// subscriber, and tokio may schedule async tests on shared worker threads, so
+    /// without this lock one capturing test could observe another's events.
+    static MAIN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Run `cmd` through `handle_command` under a WARN-capturing subscriber and
+    /// return every captured warning message.
+    async fn run_capturing_warnings(fixture: &mut Fixture, cmd: AudioCommand) -> Vec<String> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer {
+            warnings: warnings.clone(),
+        });
+        // `with_default` needs a sync scope, but `handle_command` is async; use a
+        // dispatcher guard that stays in scope across the await.
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        fixture.run(cmd).await;
+        let captured = warnings.lock().unwrap().clone();
+        captured
+    }
+
+    #[tokio::test]
+    async fn crossfade_without_loop_warns() {
+        // F8: a Play with crossfade_ms but no loop:true silently drops the crossfade
+        // (the blend only runs on loop boundaries). Dispatch must warn so the user
+        // gets feedback. Use a Mutex to serialize the thread-local subscriber.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let warnings = run_capturing_warnings(&mut fixture, play_crossfade(false, 100)).await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("crossfade") && w.contains("loop")),
+            "a crossfade without loop must warn about the loop requirement, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn crossfade_with_loop_within_buffer_does_not_warn() {
+        // The happy path: loop:true with a crossfade well under half the buffer
+        // (the 2s test WAV is ~96000 frames; 100ms crossfade is ~4800 frames) must
+        // NOT warn (pristine output).
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let warnings = run_capturing_warnings(&mut fixture, play_crossfade(true, 100)).await;
+        assert!(
+            warnings.is_empty(),
+            "a valid looped crossfade must not warn, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn crossfade_longer_than_half_buffer_warns_even_with_loop() {
+        // Even with loop:true, a crossfade whose 2x exceeds the buffer length never
+        // engages in the mixer (it needs buffer_frames > crossfade_samples * 2). The
+        // 2s test WAV is ~2000ms; a 5000ms crossfade is far past half, so it is
+        // silently dropped and must warn.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let warnings = run_capturing_warnings(&mut fixture, play_crossfade(true, 5000)).await;
+        assert!(
+            warnings.iter().any(|w| w.contains("crossfade")),
+            "a crossfade longer than half the buffer must warn, got {warnings:?}"
+        );
     }
 
     #[tokio::test]
@@ -1869,6 +2094,31 @@ mod tests {
         assert!(out_of_range_input_routes(0, &[(2, 0)], 2).is_some());
     }
 
+    #[test]
+    fn input_route_to_lfe_channel_produces_a_warning() {
+        // F7/D41: with bass management enabled, an input route whose DESTINATION is
+        // the LFE channel lands full-range content on the sub unfiltered; bass
+        // management then *adds* extracted bass on top (the crossover is bypassed for
+        // that directly-routed content). It must warn, naming the offending channel.
+        // LFE is channel 3; a route 0->3 collides.
+        let warning = input_routes_collide_with_lfe(2, &[(0, 0), (0, 3)], 3)
+            .expect("a route destined for the LFE channel must warn");
+        assert!(
+            warning.contains('3'),
+            "warning must name the LFE channel, got {warning}"
+        );
+    }
+
+    #[test]
+    fn input_routes_clear_of_lfe_do_not_warn() {
+        // No route destined for the LFE channel: pristine output. LFE is 3; routes go
+        // to 0 and 1.
+        assert!(
+            input_routes_collide_with_lfe(0, &[(0, 0), (1, 1)], 3).is_none(),
+            "routes that avoid the LFE channel must not warn"
+        );
+    }
+
     #[tokio::test]
     async fn input_mute_unmute_restores_the_calibrated_volume() {
         // D34: a calibrated input volume must survive a mute/unmute round-trip —
@@ -1943,6 +2193,61 @@ mod tests {
                 "expected music ducked toward 0.1, got {multiplier}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn control_thread_records_ducking_into_the_status_snapshot() {
+        // F3/D40: the control-side ducking snapshot the HTTP `/metrics` and
+        // `/status/voices` handlers read must be populated by the control thread as
+        // targets resolve, and cleared when a voice restores — proving the value
+        // surfaced over HTTP is the real resolved target, not a placeholder.
+        let rule = DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0,
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        // Music alone is not ducked: the snapshot stays empty.
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+        assert!(
+            fixture.ducking_snapshot.read().unwrap().is_empty(),
+            "no voice is ducked yet"
+        );
+
+        // The primary plays: the snapshot records music's resolved target (0.1).
+        fixture.run(play(Some("narration"), 1.0)).await;
+        fixture.drain();
+        {
+            let snap = fixture.ducking_snapshot.read().unwrap();
+            let music = snap
+                .get("music")
+                .copied()
+                .expect("music must be recorded as ducked");
+            assert!(
+                (music - 0.1).abs() < 1e-6,
+                "the snapshot must hold the resolved target 0.1, got {music}"
+            );
+            assert!(
+                !snap.contains_key("narration"),
+                "the primary voice is not itself ducked"
+            );
+        }
+
+        // The narration sample finishes and is reaped: music restores, and the
+        // snapshot drops it (a restored voice is at full volume, so absent).
+        finish_voice_sample(&mut fixture, "narration");
+        fixture.reap();
+        assert!(
+            !fixture
+                .ducking_snapshot
+                .read()
+                .unwrap()
+                .contains_key("music"),
+            "a restored voice must be cleared from the ducking snapshot"
+        );
     }
 
     #[tokio::test]
@@ -2203,6 +2508,100 @@ mod tests {
         assert!(
             metadata.exists(),
             "metadata.json should be flushed on shutdown"
+        );
+    }
+
+    /// A `MakeWriter` that appends every formatted log record to a shared byte
+    /// buffer, so a test can inspect exactly what a tracing layer wrote.
+    #[derive(Clone)]
+    struct BufferWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferWriter {
+        type Writer = BufferWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn json_logging_format_emits_line_delimited_json() {
+        // F13: with logging.format = "json", each record the fmt layer writes must
+        // be a standalone JSON object on its own line (line-delimited JSON), so a
+        // log aggregator can parse it. Capture the layer's output and assert every
+        // non-empty line parses as JSON carrying the fields we emitted.
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = build_fmt_layer("json", tracing::Level::INFO, BufferWriter(buffer.clone()));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(voice = "music", "first event");
+            tracing::warn!("second event");
+        });
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "two events => two JSON lines, got: {output:?}"
+        );
+
+        for line in &lines {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("each line must be valid JSON ({e}): {line:?}"));
+            assert!(
+                value.get("level").is_some(),
+                "a JSON log record carries a level field: {line}"
+            );
+            assert!(
+                value.get("fields").and_then(|f| f.get("message")).is_some(),
+                "a JSON log record carries the message under fields: {line}"
+            );
+        }
+
+        // The structured field we attached to the first event is present in JSON.
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            first["fields"]["voice"], "music",
+            "structured fields are serialized in JSON mode: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn text_logging_format_is_not_json() {
+        // The default text format is human-readable, not JSON: a captured line must
+        // NOT parse as a JSON object (it is the plain fmt rendering).
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = build_fmt_layer("text", tracing::Level::INFO, BufferWriter(buffer.clone()));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("a human line");
+        });
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("a human line"),
+            "text output carries the message"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(output.trim()).is_err(),
+            "text format must not be JSON, got: {output:?}"
         );
     }
 }

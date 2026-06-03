@@ -50,9 +50,12 @@ Config file example:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check (returns service status) |
+| `/version` | GET | Build identity (`name`, `version`, optional `git_sha`) |
+| `/metrics` | GET | Operational telemetry (uptime, clips, xruns, active counts, per-voice ducking) |
 | `/status` | GET | Current playback status (samples, voices, cache) |
 | `/status/samples` | GET | List of active samples |
-| `/status/voices` | GET | List of active voices |
+| `/status/voices` | GET | List of active voices (with per-voice ducking multiplier) |
+| `/status/inputs` | GET | List of configured live inputs |
 | `/status/cache` | GET | Cache statistics |
 
 ### Command Endpoints (Authentication Required if configured)
@@ -103,6 +106,7 @@ Returns a summary of playback and cache state:
   "active_voices": 1,
   "output_channels": 2,
   "clip_count": 0,
+  "xruns": 0,
   "cache": {
     "memory": { "entries": 3, "size_bytes": 1048576 },
     "disk": { "entries": 10, "size_bytes": 5242880 }
@@ -117,6 +121,60 @@ Returns a summary of playback and cache state:
 | `active_voices` | integer | Number of active voice groups |
 | `output_channels` | integer | Output channel count |
 | `clip_count` | integer | Output samples the limiter held at the ceiling since startup |
+| `xruns` | integer | Audio stream-error callbacks (dropouts/underruns that triggered a stream rebuild) since startup |
+
+### `/version` Response
+
+Build identity. `git_sha` is present only when the build injected `MQTTAUDIO_GIT_SHA`.
+
+```json
+{
+  "name": "mqttaudio",
+  "version": "2.0.0",
+  "git_sha": "a1b2c3d"
+}
+```
+
+### `/metrics` Response
+
+Operational telemetry for monitoring. Every field is real — no placeholders.
+
+```json
+{
+  "uptime_seconds": 3600.5,
+  "clips": 0,
+  "xruns": 0,
+  "active_voices": 1,
+  "active_samples": 2,
+  "active_inputs": 0,
+  "output_channels": 2,
+  "ducking": { "music": 0.1 }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `uptime_seconds` | float | Seconds since the daemon started |
+| `clips` | integer | Output samples the limiter held at the ceiling since startup |
+| `xruns` | integer | Audio stream-error callbacks (dropouts/underruns) since startup |
+| `active_voices` | integer | Number of active voice groups |
+| `active_samples` | integer | Number of samples currently playing |
+| `active_inputs` | integer | Number of active live inputs |
+| `output_channels` | integer | Output channel count |
+| `ducking` | object | Map of voice id to its resolved ducking multiplier (`< 1.0` = ducked); voices at full volume are omitted |
+
+### `/status/voices` Response
+
+Each voice carries its resolved ducking multiplier (`1.0` when not ducked):
+
+```json
+{
+  "voices": [
+    { "id": "music", "sample_count": 1, "volume": 1.0, "ducking_multiplier": 0.1 },
+    { "id": "narration", "sample_count": 1, "volume": 1.0, "ducking_multiplier": 1.0 }
+  ]
+}
+```
 
 ### `/status/samples` Response
 

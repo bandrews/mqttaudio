@@ -185,7 +185,9 @@ A few mixer behaviors are worth knowing (see `docs/configuration.md` for the ful
 - **Per-channel calibration applies.** `audio.channel_volumes` (per-output-channel gains, by index or alias)
   is applied as a final gain stage.
 - **Looped crossfades are seamless.** `loop: true` with `crossfade_ms` uses an equal-power crossfade with
-  correct overlap on wrap (no midpoint dip, no double-triggered head).
+  correct overlap on wrap (no midpoint dip, no double-triggered head). The crossfade applies **only at loop
+  boundaries**, and only when the clip is longer than twice the crossfade. A `crossfade_ms` on a one-shot
+  (no `loop: true`), or longer than half the clip, never engages and is logged as a warning at dispatch.
 - **Ducking restore honors the rule's fade.** When a ducking primary goes idle, ducked voices recover over
   the triggering rule's `fade_duration_ms` (not a fixed 2 s).
 - **Playback speed.** `speed` supports `-100`..`100` (negative = reverse) and uses cubic interpolation for
@@ -209,6 +211,11 @@ When `config.inputs` is configured to mix a microphone or line input (see
   rule's background voices while its stream is open.
 - **Out-of-range routes warn.** A route reading a source channel the device does not have is logged once at
   startup (the mixer still drops it).
+- **Routing to the LFE channel bypasses the crossover.** With bass management enabled, an input route (or a
+  Play `channel_map`) whose destination is the configured `lfe_channel` sends that content to the sub
+  full-range — the crossover does not high-pass it — and bass management then sums the extracted bass on top.
+  A configured input route that does this is logged once at startup. Route to the LFE deliberately. See
+  [Bass Management](docs/features/bass-management.md).
 
 ### Hardening (optional)
 
@@ -235,6 +242,59 @@ curl -X POST http://localhost:8080/play \
   -H "Content-Type: application/json" \
   -d '{"file": "/sounds/effect.wav"}'
 ```
+
+The server also exposes observability endpoints (no auth in open mode):
+
+- `GET /version` — build identity (`name`, `version`, and `git_sha` when the build injected `MQTTAUDIO_GIT_SHA`).
+- `GET /metrics` — operational telemetry: `uptime_seconds`, `clips` (limiter holds), `xruns` (audio
+  stream-error/dropout count), active voice/sample/input counts, and a per-voice `ducking` map of resolved
+  multipliers. Every value is real, suitable for scraping into a monitor.
+- `GET /status` and `/status/voices` also carry the limiter `clip_count`, the `xruns` counter, and (on
+  `/status/voices`) each voice's current `ducking_multiplier`.
+
+## Production Deployment
+
+### Run under systemd
+
+A hardened service unit is provided at [`packaging/mqttaudio.service`](packaging/mqttaudio.service). It runs
+the release binary as a dedicated unprivileged user, restarts on failure, and locks the process down (read-only
+filesystem except a writable cache state directory, no new privileges, ALSA device access only).
+
+```bash
+# Build, then install the binary, a service user, your config, and the unit:
+cargo build --release
+sudo install -Dm755 target/release/mqttaudio /usr/local/bin/mqttaudio
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin mqttaudio
+sudo install -Dm644 your-config.json /etc/mqttaudio/config.json
+sudo install -Dm644 packaging/mqttaudio.service /etc/systemd/system/mqttaudio.service
+
+# Point the on-disk cache at the writable state directory the unit grants:
+#   "cache": { "directory": "/var/lib/mqttaudio/cache" }
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now mqttaudio
+sudo journalctl -u mqttaudio -f
+```
+
+The daemon exits non-zero when it cannot recover the audio device, so systemd's `Restart=on-failure` brings it
+back. See the comments at the top of the unit for the full install/hardening notes.
+
+### Structured (JSON) logging
+
+For log aggregation, set the log format to JSON. Each record is then emitted as one JSON object per line
+(line-delimited JSON), which `journalctl`, Loki, or the ELK stack can parse directly:
+
+```json
+{
+  "logging": {
+    "level": "info",
+    "format": "json"
+  }
+}
+```
+
+`format` defaults to `"text"` (the human-readable console rendering). The MQTT log topic (if configured)
+keeps publishing alongside whichever console format is selected.
 
 ## Documentation
 

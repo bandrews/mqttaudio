@@ -115,6 +115,21 @@ Specify with `--config`, or mqttaudio searches these locations:
 
 ## Configuration Sections
 
+### schema_version
+
+Optional top-level integer naming the config schema version this file targets.
+
+```json
+"schema_version": 1
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `schema_version` | integer | absent (= current) | Config schema version. If it is **newer** than the running build understands, a one-time startup warning is logged that newer fields may be ignored; the config still loads and runs. |
+
+Leave it out unless you are pinning a config to a specific schema; an absent value is treated as the current
+version and never warns.
+
 ### mqtt
 
 MQTT broker connection settings.
@@ -318,6 +333,12 @@ LFE/subwoofer routing.
 
 Channel aliases from `audio.channel_aliases` can be used for `lfe_channel` and `source_channels`.
 
+`source_channels` must not contain a duplicate channel, nor the `lfe_channel` itself (a number and an alias
+that resolve to the same channel count as a duplicate); either is a configuration error naming the offending
+channel. Routing other content (an input route or a Play `channel_map`) **to** the `lfe_channel` is allowed
+but bypasses the crossover — that content reaches the sub full-range and the extracted bass is added on top
+(a one-time startup warning flags a configured input route that does this).
+
 See [Bass Management](features/bass-management.md) for details.
 
 ### inputs
@@ -404,6 +425,7 @@ Log output settings.
 ```json
 "logging": {
   "level": "info",
+  "format": "text",
   "mqtt_topic": "audio/logs"
 }
 ```
@@ -411,7 +433,12 @@ Log output settings.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `level` | string | `"info"` | Log level: `error`, `warn`, `info`, `debug`, `trace` |
+| `format` | string | `"text"` | Console log format: `text` (human-readable) or `json` (line-delimited JSON for log aggregation) |
 | `mqtt_topic` | string | — | Publish logs to this MQTT topic |
+
+Setting `format` to `json` emits one JSON object per line on the console, which `journalctl`, Loki, or the ELK
+stack can parse directly. The `mqtt_topic` sink (when set) publishes alongside whichever console format is
+chosen.
 
 When `mqtt_topic` is set, log entries are published as JSON:
 

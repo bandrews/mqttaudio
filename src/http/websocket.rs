@@ -191,6 +191,8 @@ impl tracing::field::Visit for LogVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use tracing_subscriber::layer::SubscriberExt;
 
     #[test]
     fn test_log_broadcaster_creation() {
@@ -211,5 +213,122 @@ mod tests {
             Ok(msg) => assert_eq!(msg, "test message"),
             Err(_) => panic!("Should have received message"),
         }
+    }
+
+    /// A layer that runs `LogVisitor` against each event and records the extracted
+    /// message, so the (private) visitor can be exercised through real tracing
+    /// events without hand-constructing an `Event`.
+    struct VisitorProbe {
+        messages: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for VisitorProbe
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = LogVisitor::default();
+            event.record(&mut visitor);
+            self.messages.lock().unwrap().push(visitor.message);
+        }
+    }
+
+    #[test]
+    fn test_log_visitor_extracts_message_field() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(VisitorProbe {
+            messages: messages.clone(),
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            // A plain log message is recorded as the `message` field.
+            tracing::info!("hello world");
+        });
+
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0], "hello world");
+    }
+
+    #[test]
+    fn test_log_visitor_message_field_wins_over_other_fields() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(VisitorProbe {
+            messages: messages.clone(),
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            // The `message` field must win even when a structured field is recorded
+            // first (LogVisitor overwrites whatever the first field set once it sees
+            // a field literally named "message").
+            tracing::info!(count = 7, "the real message");
+        });
+
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0], "the real message");
+    }
+
+    #[test]
+    fn test_log_visitor_captures_non_message_first_field() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(VisitorProbe {
+            messages: messages.clone(),
+        });
+
+        tracing::subscriber::with_default(subscriber, || {
+            // No message string: the first (and only) field is not named "message",
+            // so LogVisitor falls back to capturing it because `message` is empty.
+            tracing::info!(detail = "first-field-value");
+        });
+
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0], "first-field-value",
+            "with no message field, the first field's value is captured"
+        );
+    }
+
+    #[test]
+    fn test_websocket_log_layer_on_event_format_and_broadcast() {
+        let broadcaster = Arc::new(LogBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+
+        let layer = WebSocketLogLayer::new(broadcaster.clone());
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!("disk almost full");
+        });
+
+        let line = rx.try_recv().expect("on_event should broadcast a line");
+        // Format is "<timestamp> [<LEVEL>] <target>: <message>".
+        assert!(
+            line.contains("[WARN]"),
+            "line should carry the level, got: {line}"
+        );
+        assert!(
+            line.contains("disk almost full"),
+            "line should carry the message, got: {line}"
+        );
+        // The target is the module path of the emitting code; the formatted line
+        // ends with ": <message>" after the target.
+        assert!(
+            line.contains(": disk almost full"),
+            "line should separate target and message with ': ', got: {line}"
+        );
+        // A second event broadcasts a second distinct line.
+        let subscriber2 =
+            tracing_subscriber::registry().with(WebSocketLogLayer::new(broadcaster.clone()));
+        tracing::subscriber::with_default(subscriber2, || {
+            tracing::info!("back to normal");
+        });
+        let line2 = rx.try_recv().expect("second event should broadcast");
+        assert!(line2.contains("[INFO]") && line2.contains("back to normal"));
     }
 }

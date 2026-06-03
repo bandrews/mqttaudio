@@ -251,6 +251,9 @@ pub struct SecurityConfig {
 pub struct LoggingConfig {
     pub level: String,
     pub verbose: bool,
+    /// Log record format: `"text"` (human-readable, default) or `"json"`
+    /// (line-delimited JSON) for production log aggregation.
+    pub format: String,
     /// MQTT topic to publish log messages to (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mqtt_topic: Option<String>,
@@ -261,6 +264,7 @@ impl Default for LoggingConfig {
         Self {
             level: "info".to_string(),
             verbose: false,
+            format: "text".to_string(),
             mqtt_topic: None,
         }
     }
@@ -463,10 +467,20 @@ impl Default for HttpConfig {
     }
 }
 
+/// Config schema version this build understands. An absent `schema_version`
+/// means "current"; a value greater than this is from a newer mqttaudio and may
+/// use fields this build ignores, so it warns (F4/D38). Bump this when the config
+/// schema changes in a way operators should be told about.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 #[derive(Default)]
 pub struct Config {
+    /// Optional config schema version. Absent = current. A newer value warns at
+    /// startup (this build may ignore fields it does not know).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     pub mqtt: MqttConfig,
     pub audio: AudioConfig,
     pub cache: CacheConfig,
@@ -762,6 +776,21 @@ impl Config {
         result
     }
 
+    /// Warning string when the configured `schema_version` is newer than this build
+    /// understands, else `None`. An absent or current/older version produces no
+    /// warning. Kept separate from `validate()` so an unknown version is a heads-up,
+    /// not a hard failure — the config still loads and runs (F4/D38).
+    pub fn schema_version_warning(&self) -> Option<String> {
+        match self.schema_version {
+            Some(v) if v > CURRENT_SCHEMA_VERSION => Some(format!(
+                "config schema_version {} is newer than this build supports ({}); \
+                 newer fields may be ignored — update mqttaudio or the config",
+                v, CURRENT_SCHEMA_VERSION
+            )),
+            _ => None,
+        }
+    }
+
     /// Validate configuration
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
@@ -826,6 +855,16 @@ impl Config {
             ));
         }
 
+        // Logging format must be a recognized renderer.
+        let valid_formats = ["text", "json"];
+        if !valid_formats.contains(&self.logging.format.as_str()) {
+            errors.push(format!(
+                "logging.format must be one of: {} (got '{}')",
+                valid_formats.join(", "),
+                self.logging.format
+            ));
+        }
+
         // Bass management validation
         if self.bass_management.enabled {
             if self.bass_management.crossover_frequency_hz < 10.0
@@ -841,12 +880,38 @@ impl Config {
                 );
             }
             // Validate channel aliases resolve
-            if let Err(e) = self.resolve_channel(&self.bass_management.lfe_channel) {
+            let resolved_lfe = self.resolve_channel(&self.bass_management.lfe_channel);
+            if let Err(ref e) = resolved_lfe {
                 errors.push(format!("bass_management.lfe_channel: {}", e));
             }
+            // Resolve each source so duplicate/LFE-collision checks compare numeric
+            // indices (aliases and indices that name the same channel collide too).
+            let mut resolved_sources: Vec<usize> = Vec::new();
             for (i, ch) in self.bass_management.source_channels.iter().enumerate() {
-                if let Err(e) = self.resolve_channel(ch) {
-                    errors.push(format!("bass_management.source_channels[{}]: {}", i, e));
+                match self.resolve_channel(ch) {
+                    Ok(idx) => resolved_sources.push(idx),
+                    Err(e) => errors.push(format!("bass_management.source_channels[{}]: {}", i, e)),
+                }
+            }
+            // A duplicate source channel would extract and sum the same channel's bass
+            // twice and skew the count-normalization — reject it, naming the channel.
+            let mut seen = std::collections::HashSet::new();
+            for &idx in &resolved_sources {
+                if !seen.insert(idx) {
+                    errors.push(format!(
+                        "bass_management.source_channels contains duplicate channel {}",
+                        idx
+                    ));
+                }
+            }
+            // A source channel equal to the resolved LFE channel would feed the LFE
+            // output back into its own crossover — reject it, naming the channel.
+            if let Ok(lfe) = resolved_lfe {
+                if resolved_sources.contains(&lfe) {
+                    errors.push(format!(
+                        "bass_management.source_channels must not include the LFE channel {}",
+                        lfe
+                    ));
                 }
             }
         }
@@ -1408,6 +1473,39 @@ mod tests {
     }
 
     #[test]
+    fn test_logging_format_defaults_to_text() {
+        // F13: an absent logging.format means the human-readable text renderer.
+        let config = Config::default();
+        assert_eq!(config.logging.format, "text");
+    }
+
+    #[test]
+    fn test_logging_format_json_parses_and_validates() {
+        // logging.format = "json" parses and is a valid format.
+        let json = r#"{"mqtt": {"topic": "t"}, "logging": {"format": "json"}}"#;
+        let config: Config = serde_json::from_str(json).expect("json format must parse");
+        assert_eq!(config.logging.format, "json");
+        assert!(config.validate().is_ok(), "json is a valid logging.format");
+    }
+
+    #[test]
+    fn test_validate_invalid_logging_format_names_the_value() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.logging.format = "yaml".to_string();
+
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("logging.format") && e.contains("yaml")),
+            "the error must name logging.format and the offending value, got {errors:?}"
+        );
+    }
+
+    #[test]
     fn test_validate_valid_config() {
         let mut config = Config::default();
         config.mqtt.topic = Some("test".to_string());
@@ -1571,6 +1669,92 @@ mod tests {
 
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_bass_management_rejects_duplicate_source_channels() {
+        // F4: a duplicate source channel is a misconfiguration (the same channel's
+        // bass would be summed twice and inflate the count-normalization). It must be
+        // rejected with a message naming the offending channel.
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.bass_management.enabled = true;
+        config.bass_management.crossover_frequency_hz = 80.0;
+        config.bass_management.source_channels = vec![
+            ChannelRef::Index(0),
+            ChannelRef::Index(1),
+            ChannelRef::Index(0),
+        ];
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("source_channels")
+                && e.contains("duplicate")
+                && e.contains('0')),
+            "duplicate source channel must be rejected naming the channel, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_bass_management_rejects_source_channel_equal_to_lfe() {
+        // F4: a source channel equal to the resolved LFE channel would feed the LFE's
+        // own output back into the crossover. Reject it with a clear message naming
+        // the offending channel. LFE is 3; making 3 a source collides.
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.bass_management.enabled = true;
+        config.bass_management.crossover_frequency_hz = 80.0;
+        config.bass_management.lfe_channel = ChannelRef::Index(3);
+        config.bass_management.source_channels = vec![ChannelRef::Index(0), ChannelRef::Index(3)];
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("source_channels") && e.contains("LFE") && e.contains('3')),
+            "a source channel equal to the LFE channel must be rejected naming it, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_schema_version_absent_is_current_no_warning() {
+        // An absent schema_version means "current" — no warning.
+        let config = Config::default();
+        assert!(
+            config.schema_version_warning().is_none(),
+            "a config without schema_version must not warn"
+        );
+    }
+
+    #[test]
+    fn test_schema_version_current_no_warning() {
+        let json = format!(
+            r#"{{"schema_version": {}, "mqtt": {{"topic": "t"}}}}"#,
+            CURRENT_SCHEMA_VERSION
+        );
+        let config: Config = serde_json::from_str(&json).unwrap();
+        assert!(config.schema_version_warning().is_none());
+    }
+
+    #[test]
+    fn test_schema_version_newer_warns_naming_the_value() {
+        // A newer schema_version than this build understands must warn, naming both
+        // the configured value and the supported version, so an operator running an
+        // old binary against a new config gets a heads-up.
+        let newer = CURRENT_SCHEMA_VERSION + 1;
+        let json = format!(
+            r#"{{"schema_version": {}, "mqtt": {{"topic": "t"}}}}"#,
+            newer
+        );
+        let config: Config = serde_json::from_str(&json).unwrap();
+        let warning = config
+            .schema_version_warning()
+            .expect("a newer schema_version must warn");
+        assert!(
+            warning.contains(&newer.to_string())
+                && warning.contains(&CURRENT_SCHEMA_VERSION.to_string()),
+            "warning must name the configured and supported versions, got {warning}"
+        );
     }
 
     #[test]
@@ -1858,16 +2042,19 @@ mod tests {
         let config = LoggingConfig {
             level: "debug".to_string(),
             verbose: true,
+            format: "json".to_string(),
             mqtt_topic: Some("test/logs".to_string()),
         };
 
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"mqtt_topic\":\"test/logs\""));
+        assert!(json.contains("\"format\":\"json\""));
 
         // With no mqtt_topic, it should be omitted
         let config_no_topic = LoggingConfig {
             level: "info".to_string(),
             verbose: false,
+            format: "text".to_string(),
             mqtt_topic: None,
         };
         let json_no_topic = serde_json::to_string(&config_no_topic).unwrap();

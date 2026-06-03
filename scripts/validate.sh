@@ -19,6 +19,8 @@ run_native() {
     cargo fmt --check
     cargo clippy --all-targets -- -D warnings
     RUSTFLAGS="-D warnings" cargo build --release
+    # Property/fuzz suite for the untrusted JSON surfaces, surfaced on its own.
+    cargo test --test fuzz_command_config
     # --include-ignored also runs the gated real-device smoke test.
     MQTTAUDIO_DEVICE_TESTS=1 cargo test -- --include-ignored
     echo "== Lane B OK =="

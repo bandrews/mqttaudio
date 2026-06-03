@@ -184,7 +184,16 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
                 if sample_matches(selector, sample) {
                     let target =
                         ((position_ms * sample.buffer.sample_rate() as u64) / 1000) as usize;
-                    sample.position = target.min(sample.buffer.frames().saturating_sub(1));
+                    // Clamp against the total (or streaming estimate), matching
+                    // `start_position_ms` (F6/D41): a forward seek into a still-loading
+                    // region lands at the requested frame (the mixer returns silence
+                    // until it loads) instead of snapping back to the loaded edge.
+                    let max_frame = sample
+                        .buffer
+                        .total_frames_or_estimate()
+                        .unwrap_or(usize::MAX)
+                        .saturating_sub(1);
+                    sample.position = target.min(max_frame);
                 }
             }
         }
@@ -587,6 +596,68 @@ mod tests {
             48000,
         );
         assert_eq!(state.active_samples[0].position, 99);
+    }
+
+    /// Build an ActiveSample over a streaming buffer that has only `loaded` frames
+    /// decoded but an `estimate`d total, mirroring a still-downloading stream. The
+    /// loaded edge and the estimate intentionally differ so a seek past the edge can
+    /// be distinguished from a clamp to the loaded frames.
+    fn streaming_sample(loaded: usize, estimate: usize) -> ActiveSample {
+        use crate::audio::streaming::{SampleBuffer, StreamingBuffer};
+        use std::sync::RwLock;
+        let mut streaming = StreamingBuffer::new(2, 48000, Some(estimate));
+        streaming.append(&vec![0.1f32; loaded * 2]); // `loaded` stereo frames
+        let buf = SampleBuffer::Streaming(Arc::new(RwLock::new(streaming)));
+        ActiveSample::new_with_id(
+            1,
+            "music".to_string(),
+            buf,
+            1.0,
+            1.0,
+            "s".to_string(),
+            None,
+            false,
+            0,
+        )
+    }
+
+    #[test]
+    fn seek_on_streaming_buffer_clamps_to_estimate_not_loaded_edge() {
+        // F6/D41: a forward seek into the not-yet-loaded region of a streaming buffer
+        // must land at the requested frame (clamped only to the total estimate), the
+        // same rule `start_position_ms` uses — not at the loaded edge. Here 100 frames
+        // are loaded but the estimate is 100_000; a seek to 1000 ms (frame 48000) is
+        // past the loaded edge yet within the estimate, so it must land at 48000, not
+        // be clamped back to frame 99.
+        let mut state = state_with(vec![streaming_sample(100, 100_000)]);
+        apply_command(
+            &mut state,
+            AudioCommand::SeekMatching {
+                selector: selector_voice("music"),
+                position_ms: 1000,
+            },
+            48000,
+        );
+        assert_eq!(
+            state.active_samples[0].position, 48000,
+            "forward seek past the loaded edge must land at the requested frame (clamped to the estimate)"
+        );
+    }
+
+    #[test]
+    fn seek_past_estimate_clamps_to_estimate_edge() {
+        // Beyond the estimated total, seek still clamps to the last estimated frame so
+        // it can never run off the end. 100_000-frame estimate -> last frame 99_999.
+        let mut state = state_with(vec![streaming_sample(100, 100_000)]);
+        apply_command(
+            &mut state,
+            AudioCommand::SeekMatching {
+                selector: selector_voice("music"),
+                position_ms: 10_000, // frame 480_000, past the 100_000 estimate
+            },
+            48000,
+        );
+        assert_eq!(state.active_samples[0].position, 99_999);
     }
 
     #[test]

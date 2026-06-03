@@ -1,10 +1,6 @@
 // ABOUTME: Incremental sample rate conversion for streaming audio.
 // ABOUTME: Processes audio in chunks, enabling playback before full file loads.
 
-// Allow dead_code until Phase 10 connects streaming to main.rs.
-// This code is tested via integration tests and will be integrated soon.
-#![allow(dead_code)]
-
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
@@ -258,17 +254,24 @@ impl ChunkedResampler {
         Ok(output)
     }
 
-    /// Get the number of frames currently buffered
+    /// Get the number of frames currently buffered. Test-only accessor exercising
+    /// the internal accumulator; production code drives the resampler through
+    /// `push`/`flush` and never inspects the buffer depth.
+    #[cfg(test)]
     pub fn buffered_frames(&self) -> usize {
         self.input_buffer.first().map(|b| b.len()).unwrap_or(0)
     }
 
-    /// Get the chunk size in frames
+    /// Get the chunk size in frames. Test-only accessor (the chunk size is fixed at
+    /// construction; production code does not read it back).
+    #[cfg(test)]
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
     }
 
-    /// Get the resampling ratio (output/input)
+    /// Get the resampling ratio (output/input). Test-only accessor used to assert the
+    /// computed ratio; production code does not read it back.
+    #[cfg(test)]
     pub fn ratio(&self) -> f64 {
         self.ratio
     }

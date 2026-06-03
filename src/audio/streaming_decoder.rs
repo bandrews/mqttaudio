@@ -1,10 +1,6 @@
 // ABOUTME: Iterator-based audio decoder for streaming playback.
 // ABOUTME: Yields decoded chunks progressively, enabling playback before full load.
 
-// Allow dead_code until Phase 10 connects streaming to main.rs.
-// This code is tested via integration tests and will be integrated soon.
-#![allow(dead_code)]
-
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::{Decoder, DecoderOptions};
 use symphonia::core::errors::Error as SymphoniaError;
@@ -187,21 +183,24 @@ impl StreamingDecoder {
         self.channels
     }
 
-    /// Get the source sample rate (before resampling)
+    /// Get the source sample rate (before resampling). Exercised by the streaming tests.
+    #[allow(dead_code)]
     pub fn source_sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
-    /// Get the target sample rate (after resampling)
+    /// Get the target sample rate (after resampling). Exercised by the streaming tests.
     // The `sample_rate` field holds the source rate (see `source_sample_rate`);
     // this getter intentionally returns the post-resample target rate.
-    #[allow(clippy::misnamed_getters)]
+    #[allow(clippy::misnamed_getters, dead_code)]
     pub fn sample_rate(&self) -> u32 {
         self.target_sample_rate
     }
 
-    /// Get the estimated total frames (if known from metadata)
+    /// Get the estimated total frames (if known from metadata).
     /// This is an estimate based on file metadata and may not be exact.
+    /// Exercised by the streaming tests.
+    #[allow(dead_code)]
     pub fn estimated_frames(&self) -> Option<u64> {
         if let Some(frames) = self.estimated_frames {
             if self.resampler.is_some() {
@@ -216,7 +215,9 @@ impl StreamingDecoder {
         }
     }
 
-    /// Check if the decoder has finished (no more data to yield)
+    /// Check if the decoder has finished (no more data to yield).
+    /// Exercised by the streaming tests.
+    #[allow(dead_code)]
     pub fn is_finished(&self) -> bool {
         self.finished
     }

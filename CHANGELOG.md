@@ -25,6 +25,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `lfe_channel` is greater than or equal to the device's output channel count, a one-time warning is logged
   at startup explaining that bass management will be a no-op (the bass cannot be redirected). Previously this
   was a silent no-op.
+- **Optional `schema_version` config field.** The config may now carry a top-level `schema_version` integer
+  (absent means "current"). If it is *newer* than the running build understands, a one-time startup warning is
+  logged that newer fields may be ignored; the config still loads. This lets an operator running an old binary
+  against a newer config get a heads-up instead of silent surprises.
+- **Bass source-channel sanity checks.** Config validation now rejects a `bass_management.source_channels`
+  list that contains a duplicate channel, or a source channel equal to the resolved `lfe_channel`, with an
+  error message naming the offending channel (previously both were silently accepted).
+- **`/version` and `/metrics` HTTP endpoints.** `GET /version` returns the build identity
+  (`name`, `version`, and `git_sha` when the build injected `MQTTAUDIO_GIT_SHA`). `GET /metrics` returns real
+  operational telemetry — `uptime_seconds`, `clips` (limiter holds), `xruns` (audio stream-error/dropout
+  count), the active voice/sample/input counts, `output_channels`, and a per-voice `ducking` map of resolved
+  multipliers. Both are open in open mode and gated alongside the status routes under `http.require_auth`.
+- **`/status` and `/status/voices` enriched.** `/status` now also reports `xruns` (the audio stream-error
+  count, alongside the existing `clip_count`), and each entry of `/status/voices` carries its current
+  `ducking_multiplier` (`1.0` when the voice is not ducked).
+- **Structured (JSON) logging.** A new `logging.format` option (`"text"` default, or `"json"`) emits each log
+  record as one JSON object per line for log aggregation (journalctl/Loki/ELK). The MQTT log topic, when
+  configured, publishes alongside whichever console format is selected.
+- **systemd service unit.** `packaging/mqttaudio.service` ships a hardened `Type=simple` unit
+  (dedicated unprivileged user, `Restart=on-failure`, read-only filesystem with a writable cache state
+  directory, ALSA-only device access) plus install/enable instructions in the README.
 
 ### Changed
 
@@ -168,6 +189,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than from one. The summed LFE is now normalized by the active source count, so the sub level no longer
   scales with how many channels feed it. A 2-source setup is therefore ~6 dB quieter in the sub than before;
   use the new `bass_management.lfe_gain` to trim if needed. Affects only configs with bass management enabled.
+- **Auto-generated voice ids are now unique.** A Play with no explicit `voice` is assigned an auto id of the
+  form `_auto_<millis>_<n>` (a monotonic counter is appended), where it was previously just `_auto_<millis>`.
+  Two Plays without a voice in the same millisecond used to receive the *same* id and so merged into one voice
+  for `voice_stop`/`voice_fade_out`/`voice_volume`/ducking purposes; they now get distinct voices. Anyone
+  relying on the exact `_auto_<millis>` string, or on same-millisecond no-voice Plays sharing a voice, is
+  affected.
+- **`seek` on a still-loading stream now lands at the requested time.** A forward `seek` into a region of a
+  streaming buffer that has not yet downloaded previously snapped back to the last loaded frame; it now clamps
+  against the total (or the streaming estimate) — the same rule `start_position_ms` already used — so the seek
+  lands at the requested frame and plays silence until that region loads. Seeks within a fully loaded or
+  complete buffer are unchanged. (Affects streaming/HTTP sources only.)
+- **`crossfade_ms` without `loop: true` now logs a warning.** The loop crossfade only runs at a loop boundary
+  of a buffer long enough to hold the crossfade at both ends. A Play that sets `crossfade_ms` without
+  `loop: true`, or whose crossfade is longer than half the clip, silently did nothing; dispatch now logs a
+  warning so the ignored crossfade is visible. No change to the blend math.
+- **Routing input content to the bass-management LFE channel now logs a warning.** When bass management is
+  enabled and a configured input route's destination is the LFE channel, that content reaches the sub
+  full-range (the crossover is bypassed) and the extracted bass is summed on top. A one-time startup warning
+  now flags this so it is not a silent surprise; routing to the LFE deliberately is still allowed.
 
 ### Fixed
 

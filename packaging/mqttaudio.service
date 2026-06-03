@@ -1,0 +1,66 @@
+# systemd service unit for the mqttaudio daemon.
+#
+# Install:
+#   sudo install -Dm644 packaging/mqttaudio.service /etc/systemd/system/mqttaudio.service
+#   sudo install -Dm755 target/release/mqttaudio /usr/local/bin/mqttaudio
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin mqttaudio
+#   sudo install -Dm644 your-config.json /etc/mqttaudio/config.json
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mqttaudio
+#
+# Set cache.directory in /etc/mqttaudio/config.json to /var/lib/mqttaudio/cache so
+# it lands in the writable StateDirectory granted below (the default is the
+# service user's home, which the hardening stanza makes read-only).
+#
+# The daemon exits non-zero when the audio device cannot be recovered (D4); with
+# Restart=on-failure systemd then restarts it.
+
+[Unit]
+Description=mqttaudio MQTT-controlled multichannel audio player
+Documentation=https://github.com/bandrews/mqttaudio
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mqttaudio --config /etc/mqttaudio/config.json
+Restart=on-failure
+RestartSec=2
+
+# Run as an unprivileged dedicated user. SupplementaryGroups=audio grants access
+# to the ALSA sound devices (/dev/snd) the audio output stream needs.
+User=mqttaudio
+Group=mqttaudio
+SupplementaryGroups=audio
+
+# Writable state directory (/var/lib/mqttaudio) for the on-disk cache. Point
+# cache.directory at /var/lib/mqttaudio/cache in the config.
+StateDirectory=mqttaudio
+StateDirectoryMode=0750
+
+# Hardening. The daemon needs only its config (read-only), the sound devices, and
+# its StateDirectory (writable); everything else is locked down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+DeviceAllow=char-alsa rw
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+RestrictRealtime=false
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
