@@ -75,7 +75,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 
 | # | Sprint | Status | Depends on | File |
 |---|--------|--------|-----------|------|
-| 0 | Validation harness & Docker pipeline | Not started | — | [sprint-00](sprint-00-validation-harness.md) |
+| 0 | Validation harness & Docker pipeline | Done | — | [sprint-00](sprint-00-validation-harness.md) |
 | 1 | Device & format compatibility | Not started | 0 | [sprint-01](sprint-01-device-format-compatibility.md) |
 | 2 | Control-plane reliability | Not started | 0 | [sprint-02](sprint-02-control-plane-reliability.md) |
 | 3 | Security & file safety | Not started | 0 | [sprint-03](sprint-03-security-and-file-safety.md) |
@@ -96,12 +96,12 @@ Tick a box only when genuinely verified. `[A]` = Lane A/Docker, `[B]` = Lane B/n
 `[C]` = Lane C/manual Windows.
 
 ### Sprint 0 — Validation harness & Docker pipeline
-- [ ] `docker/validate.Dockerfile` + `scripts/validate.sh` exist; Lane A runs build `-D warnings`, clippy, `fmt --check`, tests, render-harness, broker tests, and exits non-zero on any failure `[A]`
-- [ ] `scripts/validate.sh --native` runs the host suite incl. the real-device smoke test and is green on this Mac `[B]`
-- [ ] Offline render harness exists (pumps buffers through `mix_audio`, concatenates output) with RMS/peak/FFT-band/inter-sample-delta assert helpers, used by ≥2 new cross-feature tests `[A]`
-- [ ] Command dispatch extracted to a testable `async fn handle_command(...)`; tests assert Play/Stop/VoiceVolume effects on `mixer_state`/voice/ducking state `[A]`
-- [ ] Live-broker MQTT tests run in Docker (with mosquitto) and are skipped in a bare `cargo test`; event-translation refactored into a pure tested fn `[A]`
-- [ ] Device-opening tests gated behind `--ignored`/env flag: run in Lane B, skipped in Lane A `[A][B]`
+- [x] `docker/validate.Dockerfile` + `scripts/validate.sh` exist; Lane A runs build `-D warnings`, clippy, `fmt --check`, tests, render-harness, broker tests, and exits non-zero on any failure `[A]`
+- [x] `scripts/validate.sh --native` runs the host suite incl. the real-device smoke test and is green on this Mac `[B]`
+- [x] Offline render harness exists (pumps buffers through `mix_audio`, concatenates output) with RMS/peak/FFT-band/inter-sample-delta assert helpers, used by ≥2 new cross-feature tests `[A]`
+- [x] Command dispatch extracted to a testable `async fn handle_command(...)`; tests assert Play/Stop/VoiceVolume effects on `mixer_state`/voice/ducking state `[A]`
+- [x] Live-broker MQTT tests run in Docker (with mosquitto) and are skipped in a bare `cargo test`; event-translation refactored into a pure tested fn `[A]`
+- [x] Device-opening tests gated behind `--ignored`/env flag: run in Lane B, skipped in Lane A `[A][B]`
 
 ### Sprint 1 — Device & format compatibility
 - [ ] Pure-helper unit tests for sample-format / rate / channel selection pass; a forced-i16 path proves no panic `[A]`

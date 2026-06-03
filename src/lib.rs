@@ -16,6 +16,9 @@ pub mod audio {
     pub mod streaming_decoder;
     pub mod types;
 
+    /// Offline render harness and signal-analysis helpers, available to tests/benches.
+    pub mod test_support;
+
     #[cfg(target_os = "linux")]
     pub mod alsa_probe;
 }

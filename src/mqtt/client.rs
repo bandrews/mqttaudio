@@ -1,7 +1,7 @@
 // ABOUTME: MQTT connection management using rumqttc.
 // ABOUTME: Handles connection, reconnection, and message receiving.
 
-use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, QoS};
+use rumqttc::{AsyncClient, Event, EventLoop, MqttOptions, Packet, Publish, QoS};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -58,6 +58,12 @@ pub async fn connect_mqtt(
     Ok((client, eventloop))
 }
 
+/// Extract the command payload from a Publish packet as lossy UTF-8.
+/// Pure and broker-independent so it can be unit-tested directly.
+pub fn publish_payload(publish: &Publish) -> String {
+    String::from_utf8_lossy(&publish.payload).to_string()
+}
+
 /// Process MQTT events and forward messages to command channel
 pub async fn process_mqtt_events(mut eventloop: EventLoop, command_tx: mpsc::Sender<String>) {
     tracing::info!("Starting MQTT event loop");
@@ -65,7 +71,7 @@ pub async fn process_mqtt_events(mut eventloop: EventLoop, command_tx: mpsc::Sen
     loop {
         match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(p))) => {
-                let payload = String::from_utf8_lossy(&p.payload).to_string();
+                let payload = publish_payload(&p);
                 tracing::debug!("Received MQTT message on topic {}: {}", p.topic, payload);
 
                 // Forward to command handler
@@ -96,14 +102,37 @@ pub async fn process_mqtt_events(mut eventloop: EventLoop, command_tx: mpsc::Sen
 mod tests {
     use super::*;
 
+    /// Live-broker tests run only when `MQTTAUDIO_BROKER_TESTS` is set (Lane A
+    /// sets it with a containerized mosquitto). A bare `cargo test` skips them
+    /// so it never depends on a running broker.
+    fn broker_tests_enabled() -> bool {
+        std::env::var("MQTTAUDIO_BROKER_TESTS").is_ok()
+    }
+
+    #[test]
+    fn publish_payload_decodes_lossy_utf8() {
+        let valid = Publish::new("topic", QoS::AtLeastOnce, b"hello".to_vec());
+        assert_eq!(publish_payload(&valid), "hello");
+
+        // Invalid UTF-8 must not panic; it decodes to the replacement character.
+        let invalid = Publish::new("topic", QoS::AtLeastOnce, vec![0xff, 0xfe]);
+        assert!(publish_payload(&invalid).contains('\u{FFFD}'));
+    }
+
     #[tokio::test]
     async fn test_connect_mqtt() {
+        if !broker_tests_enabled() {
+            return;
+        }
         let result = connect_mqtt("localhost", 1883, "test/topic", None, None).await;
         assert!(result.is_ok());
     }
 
     #[tokio::test]
     async fn test_connect_mqtt_with_credentials() {
+        if !broker_tests_enabled() {
+            return;
+        }
         // Test that credentials are accepted (actual authentication requires a configured broker)
         let result =
             connect_mqtt("localhost", 1883, "test/topic", Some("user"), Some("pass")).await;
@@ -112,6 +141,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_mqtt_event_processing() {
+        if !broker_tests_enabled() {
+            return;
+        }
         let (client, eventloop) = connect_mqtt("localhost", 1883, "test/topic", None, None)
             .await
             .unwrap();
