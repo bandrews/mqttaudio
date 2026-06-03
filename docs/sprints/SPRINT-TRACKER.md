@@ -79,7 +79,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 | 1 | Device & format compatibility | Done | 0 | [sprint-01](sprint-01-device-format-compatibility.md) |
 | 2 | Control-plane reliability | Done | 0 | [sprint-02](sprint-02-control-plane-reliability.md) |
 | 3 | Security & file safety | Done | 0 | [sprint-03](sprint-03-security-and-file-safety.md) |
-| 4 | Streaming & cache correctness | In progress | 0 | [sprint-04](sprint-04-streaming-and-cache-correctness.md) |
+| 4 | Streaming & cache correctness | Done | 0 | [sprint-04](sprint-04-streaming-and-cache-correctness.md) |
 | 5 | Lock-free real-time engine | Not started | 0 | [sprint-05](sprint-05-lockfree-realtime-engine.md) |
 | 6 | Mixer DSP correctness | Not started | 5 | [sprint-06](sprint-06-mixer-dsp-correctness.md) |
 | 7 | Bass management & multichannel | Not started | 5 | [sprint-07](sprint-07-bass-management-and-multichannel.md) |
@@ -128,10 +128,10 @@ Tick a box only when genuinely verified. `[A]` = Lane A/Docker, `[B]` = Lane B/n
 - [x] HTTP revalidation implemented (If-None-Match/If-Modified-Since) **or** dead `revalidate_after_seconds` knob removed `[A]`
 
 ### Sprint 4 — Streaming & cache correctness
-- [ ] Looping a still-streaming buffer no longer wraps the growing loaded length (loop deferred until complete / wraps on total estimate); render-harness asserts no tight-loop buzz on a fake incrementally-filled buffer `[A]`
-- [ ] Completed streams promoted to memory cache; replaying a finished URL hits the cache, not a stale streaming buffer; `active_loads` bounded `[A]`
-- [ ] `mark_playing` eviction protection wired; size accounting fixed; bounded cache stays under `max_memory_mb` with a playing buffer `[A]`
-- [ ] `MIN_BUFFER_FRAMES` prebuffer enforced or removed (no misleading dead code) `[A]`
+- [x] Looping a still-streaming buffer no longer wraps the growing loaded length (loop deferred until complete / wraps on total estimate); render-harness asserts no tight-loop buzz on a fake incrementally-filled buffer `[A]`
+- [x] Completed streams promoted to memory cache; replaying a finished URL hits the cache, not a stale streaming buffer; `active_loads` bounded `[A]`
+- [x] Eviction protection active (Arc keep-alive per D12, not the deleted `mark_playing` set); size accounting fixed; bounded cache stays under `max_memory_mb` with a playing buffer `[A]`
+- [x] `MIN_BUFFER_FRAMES` prebuffer enforced or removed (no misleading dead code) `[A]`
 
 ### Sprint 5 — Lock-free real-time engine
 - [ ] No locks, allocations, or frees in the callback path — verified by code audit **and** an allocation-counting harness around `mix_audio`/the callback shim `[A]`
