@@ -83,7 +83,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 | 5 | Lock-free real-time engine | Done | 0 | [sprint-05](sprint-05-lockfree-realtime-engine.md) |
 | 6 | Mixer DSP correctness | Done | 5 | [sprint-06](sprint-06-mixer-dsp-correctness.md) |
 | 7 | Bass management & multichannel | Done | 5 | [sprint-07](sprint-07-bass-management-and-multichannel.md) |
-| 8 | Live input robustness | In progress | 5 | [sprint-08](sprint-08-live-input-robustness.md) |
+| 8 | Live input robustness | Done | 5 | [sprint-08](sprint-08-live-input-robustness.md) |
 | 9 | Cleanup, observability, packaging | Not started | 1–8 | [sprint-09](sprint-09-cleanup-observability-packaging.md) |
 
 Status values: `Not started` · `In progress` · `Blocked` · `Done`.
@@ -176,13 +176,13 @@ Tick a box only when genuinely verified. `[A]` = Lane A/Docker, `[B]` = Lane B/n
 - [x] Denormal flush in the IIR; integration test exercises bass management through `mix_audio` `[A]`
 
 ### Sprint 8 — Live input robustness
-- [ ] No allocation in the capture callback (allocation harness); `process_into_buffer` + reusable buffers `[A]`
-- [ ] Adaptive/async SRC steered by ring-buffer fill (even at equal nominal rates); drift simulation keeps the ring buffer bounded `[A]`
-- [ ] Underrun applies a short fade/hold (no hard cut) and keeps the ramp time-accurate `[A]`
-- [ ] `voice_volume` reaches input-only voices; `input_mute` restores the prior volume (not hardcoded 1.0); route source channels validated vs device channels `[A]`
-- [ ] Non-f32 input format supported (convert to f32) `[A]`
-- [ ] CoreAudio input device opens and routes into the mix (smoke) `[B]`
-- [ ] ≥30-min two-device (USB mic + separate output) soak shows no periodic dropouts; non-f32 input opens `[C]`
+- [x] No allocation in the capture callback (allocation harness); `process_into_buffer` + reusable buffers `[A]`
+- [x] Adaptive/async SRC steered by ring-buffer fill (even at equal nominal rates); drift simulation keeps the ring buffer bounded `[A]`
+- [x] Underrun applies a short fade/hold (no hard cut) and keeps the ramp time-accurate `[A]`
+- [x] `voice_volume` reaches input-only voices; `input_mute` restores the prior volume (not hardcoded 1.0); route source channels validated vs device channels `[A]`
+- [x] Non-f32 input format supported (convert to f32) `[A]`
+- [x] CoreAudio input device opens and routes into the mix (smoke) `[B]` — `device_smoke_test::default_input_device_opens_and_captures` opens the real input device + runs the capture path on this Mac (Lane B)
+- [ ] ≥30-min two-device (USB mic + separate output) soak shows no periodic dropouts; non-f32 input opens `[C]` — partner's final pass (MANUAL-VERIFICATION.md W-2)
 
 ### Sprint 9 — Cleanup, observability, packaging
 - [ ] Dev scaffolding removed (hardcoded `/Users/bandrews` paths, `--test-*` flags + their divergent paths); dead constants and the stale `#![allow(dead_code)]` "Phase 10" banner deleted; build clean with no `allow(dead_code)` masking `[A]`
