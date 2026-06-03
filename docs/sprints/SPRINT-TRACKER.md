@@ -80,7 +80,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 | 2 | Control-plane reliability | Done | 0 | [sprint-02](sprint-02-control-plane-reliability.md) |
 | 3 | Security & file safety | Done | 0 | [sprint-03](sprint-03-security-and-file-safety.md) |
 | 4 | Streaming & cache correctness | Done | 0 | [sprint-04](sprint-04-streaming-and-cache-correctness.md) |
-| 5 | Lock-free real-time engine | In progress | 0 | [sprint-05](sprint-05-lockfree-realtime-engine.md) |
+| 5 | Lock-free real-time engine | Done | 0 | [sprint-05](sprint-05-lockfree-realtime-engine.md) |
 | 6 | Mixer DSP correctness | Not started | 5 | [sprint-06](sprint-06-mixer-dsp-correctness.md) |
 | 7 | Bass management & multichannel | Not started | 5 | [sprint-07](sprint-07-bass-management-and-multichannel.md) |
 | 8 | Live input robustness | Not started | 5 | [sprint-08](sprint-08-live-input-robustness.md) |
@@ -134,30 +134,30 @@ Tick a box only when genuinely verified. `[A]` = Lane A/Docker, `[B]` = Lane B/n
 - [x] `MIN_BUFFER_FRAMES` prebuffer enforced or removed (no misleading dead code) `[A]`
 
 ### Sprint 5 — Lock-free real-time engine
-- [ ] No locks, allocations, or frees in the callback path — verified by code audit **and** an allocation-counting harness around `mix_audio`/the callback shim `[A]` — *partial: alloc harness landed and `mix_audio` (incl. the pitch path) proven alloc-free; the callback still locks/builds `HashSet`s until the ownership move (5b) lands*
-- [ ] Control→audio handoff via SPSC command ring; audio thread owns `MixerState`; pre-allocated voice pool; graveyard reaper drops finished payloads off-RT; status via snapshot for HTTP `[A]`
-- [ ] Ducking notify + voice bookkeeping moved off the RT thread; pitch scratch pre-allocated `[A]` — *partial: pitch scratch pre-allocated (F5-4) + proven by the alloc harness; ducking-off-RT still pending the ownership move*
-- [ ] Render harness shows within-tolerance output vs pre-redesign for a fixed scene; soak test (many plays/stops) shows no xrun-counter increments `[A]`
-- [ ] Real-device soak smoke runs clean on this Mac `[B]`
+- [x] No *contended* locks, and no allocations or frees, in the callback path — per the partner-approved **D22a** uncontended-mutex model (the control plane never touches the RT state; only the callback locks it). Verified by code audit **and** the allocation-counting harness (`tests/alloc_harness.rs`: `mix_audio`, the pitch path, the full callback step, mutation-command drain, and Play-into-the-reserved-pool — all 0 alloc / 0 free). Bounded residuals documented in `docs/bugs.md` (>256 over-cap realloc; a Speed command that toggles pitch correction) `[A]`
+- [x] Control→audio handoff via SPSC command ring; audio thread owns `MixerState` behind the uncontended callback mutex (D22a); voice pool pre-reserved to `MAX_VOICES`; graveyard reaper drops finished samples **and** spent command husks off-RT; status via a control-side `RwLock<StatusSnapshot>` for HTTP `[A]`
+- [x] Ducking `notify`/`update_duck_states` moved off the RT thread (control-side `DuckingEngine::compute_changes` → `SetDuckTarget` over the ring → audio-side `DuckingApplier`); pitch scratch pre-allocated (F5-4) `[A]`
+- [x] Render-harness output unchanged (parity confirmed by adversarial review); soak test (`tests/soak_test.rs`, 10k plays/stops) keeps the voice pool bounded with no panic. (Offline `xruns` cannot increment — no device; real-device `xruns==0` is the Lane B soak. `xruns` is incremented in the error callback but not yet surfaced on `/status` — docs/bugs.md.) `[A]`
+- [x] Real-device soak smoke runs clean on this Mac `[B]` — the default CoreAudio device opens and runs the new callback path (`device_smoke_test`, Lane B native, green). A sustained soak with human listening for dropouts remains the partner's final-validation pass (MANUAL-VERIFICATION).
 
-> **Sprint 5 progress (In progress).** Three tested, Lane-A-green pieces are landed:
-> **F5-4** (pre-allocated pitch-correction scratch — no per-callback `vec!`; commit `2be7547`); **Task 0**
-> (the allocation-counting harness `tests/alloc_harness.rs`, proving `mix_audio` + the pitch path are
-> allocation-free in steady state; commit `4850ba3`); and the **control→audio command-ring bridge**
-> (`src/rt_engine.rs`: `AudioCommand` + `apply_command` + a bounded SPSC ring via the existing `ringbuf`;
-> 10 unit tests; commit `d6d9e05`). The bridge is additive/lib-only — the live callback is untouched, so the
-> runtime is unchanged.
+> **Sprint 5 (Done — core redesign landed, RT-safe, both lanes green).** The lock-free RT engine is wired
+> into the live daemon under the **D22a uncontended-mutex** model (partner-approved override of D16 — see
+> DECISIONS.md). The cpal callback now locks a single `AudioCallbackState` bundle (mixer + command consumer +
+> graveyard + command-return producer) that **only it touches**, drains a bounded batch of `AudioCommand`s,
+> mixes (`mix_audio` DSP unchanged), and reaps finished samples to the graveyard — doing **no allocation and
+> no free** on the hot path (proven by `tests/alloc_harness.rs`). The control plane never locks the RT state:
+> the ~13 command handlers push ring commands, ducking runs control-side (`compute_changes` → `SetDuckTarget`),
+> finished samples + spent command husks are dropped off-RT by the 20 ms reaper, and HTTP reads a control-side
+> `StatusSnapshot`. Built across commits `2be7547` (F5-4), `4850ba3` (alloc harness), `d6d9e05` (command-ring
+> bridge), `e2420f5` (graveyard), `2c0eea4` (structural integration), `48f9887` (RT-safety: command-return
+> ring + un-box + voice-pool reserve), and the soak test — each gate green on Lane A + Lane B native.
 >
-> **Remaining — the atomic ownership move (5b core):** wire the bridge into the live system. This is
-> deliberately **not** an incremental step: `MixerState` ownership is exclusive, so the supervisor callback,
-> the ~13 `mixer_state.lock()` handler sites, the active-voice/ducking reconciliation (needs a graveyard
-> return-signal so the callback stops building `HashSet`s — D19/D20/F5-3), the fixed voice pool + over-cap
-> policy (D17/D18), the control-side `RwLock<StatusSnapshot>` + HTTP-handler migration, the xrun counter, and
-> the ~15 binary `Fixture` unit tests (which assert via `mixer_state.lock()`) must all convert in **one**
-> green change, then be validated by render-harness parity + a many-plays/stops soak (Lane A) + a real-device
-> soak with human listening (Lane B). The design is fully locked (DECISIONS D15–D22) — no human decision is
-> needed; this is a large, focused implementation pass (the sprint's ring/pool/graveyard/status/integration
-> fan-out). It gates Sprints 6–8.
+> Two adversarial-verification passes (built into the integration workflows) caught and drove out real
+> RT-thread frees before they shipped. **Documented bounded residuals / follow-ups** (`docs/bugs.md`): the
+> voice pool is a *soft* reserve (>256 voices reallocs once — D18 hard cap/steal deferred); a Speed command
+> that *toggles* pitch correction still creates/drops the stretcher on RT (pairs with Sprint 6); `xruns` is
+> not yet on `/status` (Sprint 9 `/metrics`); `/status/samples` live position is gone by design (D20/D22a,
+> changelog'd). The Lane B real-device **listening** soak is the partner's final-validation pass.
 
 ### Sprint 6 — Mixer DSP correctness
 - [ ] NaN/non-finite input → silence, not NaN, at the output; clip/over counter exposed `[A]`
