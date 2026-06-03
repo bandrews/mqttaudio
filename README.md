@@ -158,6 +158,16 @@ Then run with:
 ./mqttaudio --config config.json
 ```
 
+### Hardening (optional)
+
+mqttaudio runs open by default so it stays easy to use on a trusted LAN. Each of these lockdowns is **opt-in** and leaves existing open deployments unchanged when unset:
+
+- **Restrict local file access** — set `security.allowed_directories` to the folders sounds may be loaded from (paths outside them, and traversal/symlink escapes, are rejected). Empty/unset = any local path is allowed.
+- **Encrypt the MQTT connection** — add an `[mqtt.tls]` block (`ca_path` for a private CA, or omit it for public CAs). Plain TCP stays the default on every port, including 8883.
+- **Require an HTTP token** — set `http.require_auth` to require the bearer token on the status/command/WebSocket endpoints (the health endpoint stays open). A warning is logged if the server binds a non-loopback address without auth.
+
+See [Configuration](docs/configuration.md) and [HTTP API](docs/http-api.md) for details.
+
 ## HTTP REST API (Optional)
 
 mqttaudio includes an optional HTTP server that provides REST endpoints mirroring all MQTT commands.  This server can be used in addition to or instead of an MQTT connection.

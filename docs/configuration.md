@@ -136,8 +136,28 @@ MQTT broker connection settings.
 | `topic` | string | *required* | Topic to subscribe to (supports `#` and `+` wildcards) |
 | `username` | string | — | Username for MQTT authentication |
 | `password` | string | — | Password for MQTT authentication |
+| `tls` | object | — | Opt-in TLS settings (see below). Absent = plain TCP. |
 
 **Authentication:** If your MQTT broker requires authentication, provide both `username` and `password`. These can also be passed via command line with `--mqtt-username` and `--mqtt-password`.
+
+**TLS (optional):** TLS is **opt-in** and never enabled implicitly — without a `tls` block the connection is plain TCP on *every* port, including 8883, so an existing plaintext broker keeps working unchanged. Add a `tls` block to encrypt the connection:
+
+```json
+"mqtt": {
+  "server": "broker.example.com",
+  "port": 8883,
+  "topic": "audio/commands",
+  "tls": {
+    "ca_path": "/etc/mqttaudio/broker-ca.pem"
+  }
+}
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ca_path` | string | — | PEM CA certificate to trust (for private/self-signed brokers). Omit to use the system root certificate store (public CAs). |
+
+If you send a `username`/`password` to a non-loopback broker **without** TLS, mqttaudio logs a non-fatal warning that the credentials are travelling in cleartext.
 
 ### audio
 

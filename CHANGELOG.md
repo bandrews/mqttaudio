@@ -46,6 +46,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exponential backoff (re-resolving the device) instead of going permanently silent; if it
   cannot recover, the process exits so a service manager can restart it.
 
+### Security
+
+All of the following lockdowns are **opt-in with backward-compatible defaults** — an existing
+open/anonymous deployment behaves exactly as before unless you configure them.
+
+- **File allowlist enforcement.** When `security.allowed_directories` is set, local file paths are
+  canonicalized and must resolve inside an allowed directory before they are opened, so traversal
+  (`../../etc/passwd`) and symlink escapes are rejected. An empty/absent allowlist preserves allow-all
+  and logs a one-time startup warning.
+- **MQTT TLS.** A new `[mqtt.tls]` block switches the broker connection to TLS; with `ca_path` it
+  trusts a private/self-signed CA, otherwise the system root store. TLS is never enabled implicitly —
+  plain TCP stays the default on every port, including 8883 — so a legacy plaintext broker is never
+  silently broken. A non-fatal warning fires when credentials would be sent in cleartext to a
+  non-loopback broker.
+- **HTTP authentication.** Setting `http.require_auth` requires the bearer token on the
+  status/command/WebSocket endpoints (the health endpoint stays open); tokens are compared in constant
+  time. A loud non-fatal warning fires when the server binds a non-loopback address without auth.
+- **Atomic, size-verified cache writes.** Downloads are written to a temp file and atomically renamed
+  into place, then verified against the expected size on load, so an interrupted download can no longer
+  leave a truncated file that reads back as "valid".
+- **Stable cache keys.** Cache filenames derive from a SHA-256 of the URL instead of a process-seeded
+  hash, so cached entries survive restarts and are reused across runs.
+- **Conditional cache revalidation.** Stale HTTP cache entries are revalidated with a conditional GET
+  (`If-None-Match`/`If-Modified-Since`); a `304` refreshes the entry in place, a `200` re-downloads.
+
 ## [2.0.0] - 2025-10-19
 
 ### Overview

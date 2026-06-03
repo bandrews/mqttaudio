@@ -8,14 +8,15 @@ FROM rust:1.87-bookworm
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libasound2-dev libssl-dev pkg-config build-essential \
-        clang libclang-dev mosquitto mosquitto-clients \
+        clang libclang-dev mosquitto mosquitto-clients openssl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN rustup component add clippy rustfmt
 
 COPY validate-mosquitto.conf /etc/mosquitto/validate.conf
 COPY run-validation.sh /usr/local/bin/run-validation.sh
-RUN chmod +x /usr/local/bin/run-validation.sh
+COPY gen-test-certs.sh /usr/local/bin/gen-test-certs.sh
+RUN chmod +x /usr/local/bin/run-validation.sh /usr/local/bin/gen-test-certs.sh
 
 WORKDIR /build
 CMD ["/usr/local/bin/run-validation.sh"]

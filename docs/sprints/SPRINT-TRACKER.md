@@ -78,7 +78,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 | 0 | Validation harness & Docker pipeline | Done | — | [sprint-00](sprint-00-validation-harness.md) |
 | 1 | Device & format compatibility | Done | 0 | [sprint-01](sprint-01-device-format-compatibility.md) |
 | 2 | Control-plane reliability | Done | 0 | [sprint-02](sprint-02-control-plane-reliability.md) |
-| 3 | Security & file safety | Not started | 0 | [sprint-03](sprint-03-security-and-file-safety.md) |
+| 3 | Security & file safety | Done | 0 | [sprint-03](sprint-03-security-and-file-safety.md) |
 | 4 | Streaming & cache correctness | Not started | 0 | [sprint-04](sprint-04-streaming-and-cache-correctness.md) |
 | 5 | Lock-free real-time engine | Not started | 0 | [sprint-05](sprint-05-lockfree-realtime-engine.md) |
 | 6 | Mixer DSP correctness | Not started | 5 | [sprint-06](sprint-06-mixer-dsp-correctness.md) |
@@ -121,11 +121,11 @@ Tick a box only when genuinely verified. `[A]` = Lane A/Docker, `[B]` = Lane B/n
 - [x] `total_cmp` replaces `partial_cmp().unwrap()`; `ducking_rules.target_volume` validated finite ∈[0,1]; `resolve_*` exits gracefully instead of `expect` `[A]`
 
 ### Sprint 3 — Security & file safety
-- [ ] `allowed_directories` enforced **when configured** (canonicalize + reject); empty list = allow-all preserved with a startup warning; `/etc/passwd` refused under a configured allowlist; tests cover both `[A]`
-- [ ] **Opt-in** MQTT TLS (`mqtt.tls`); default transport stays plain TCP (incl. 8883); TLS connect verified against mosquitto+TLS; plain connect still works `[A]`
-- [ ] Open HTTP mode preserved by default; opt-in `http.require_auth` enforces (incl. status/ws); loud non-fatal warning on non-loopback bind without auth; constant-time token compare; `?token=` convenience kept `[A]`
-- [ ] Disk-cache writes are temp-file+rename with size verify on load; kill-mid-write leaves no "valid" truncated file; stable content hash replaces `DefaultHasher` `[A]`
-- [ ] HTTP revalidation implemented (If-None-Match/If-Modified-Since) **or** dead `revalidate_after_seconds` knob removed `[A]`
+- [x] `allowed_directories` enforced **when configured** (canonicalize + reject); empty list = allow-all preserved with a startup warning; `/etc/passwd` refused under a configured allowlist; tests cover both `[A]`
+- [x] **Opt-in** MQTT TLS (`mqtt.tls`); default transport stays plain TCP (incl. 8883); TLS connect verified against mosquitto+TLS; plain connect still works `[A]`
+- [x] Open HTTP mode preserved by default; opt-in `http.require_auth` enforces (incl. status/ws); loud non-fatal warning on non-loopback bind without auth; constant-time token compare; `?token=` convenience kept `[A]`
+- [x] Disk-cache writes are temp-file+rename with size verify on load; kill-mid-write leaves no "valid" truncated file; stable content hash replaces `DefaultHasher` `[A]`
+- [x] HTTP revalidation implemented (If-None-Match/If-Modified-Since) **or** dead `revalidate_after_seconds` knob removed `[A]`
 
 ### Sprint 4 — Streaming & cache correctness
 - [ ] Looping a still-streaming buffer no longer wraps the growing loaded length (loop deferred until complete / wraps on total estimate); render-harness asserts no tight-loop buzz on a fake incrementally-filled buffer `[A]`
