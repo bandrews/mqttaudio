@@ -8,7 +8,7 @@ use crate::audio::streaming::SampleBuffer;
 use crate::audio::types::DecodedBuffer;
 use crate::config::{DEFAULT_MASTER_GAIN, DEFAULT_OUTPUT_CEILING_DB};
 use ringbuf::HeapConsumer;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Fade state for audio samples
@@ -755,6 +755,153 @@ impl LiveInput {
     }
 }
 
+/// A windowed streamed source: a voice that plays a long, large, or live asset by
+/// consuming decoded f32 frames from a bounded ring that a background task fills off
+/// the audio thread, so it costs `O(window)` memory regardless of the asset's length.
+///
+/// It sits between the two existing voice types. Unlike [`ActiveSample`] its buffer
+/// is a forward-only draining ring, so it supports no random-access feature (seek,
+/// loop-crossfade, reverse, variable speed, or pitch correction); those are rejected
+/// for streamed voices at the command layer. Unlike [`LiveInput`] it has an owner (a
+/// producer task), a lifecycle (prebuffer -> play -> EOF/stop -> reap), fade in/out,
+/// and a completion signal, so a finished cue retires itself and is reaped off-RT.
+///
+/// The per-frame ring consume and the hold-and-fade on underrun are shared with the
+/// live-input path via [`mix_ring_voice_frame`].
+pub struct StreamedSource {
+    /// Unique internal id (assigned by VoiceManager), for stop/selection.
+    pub id: u64,
+
+    /// User-provided sample identifier for targeting commands.
+    pub sample_id: Option<String>,
+
+    /// Voice id this source belongs to (for ducking and voice volume).
+    pub voice_id: String,
+
+    /// Source file path or URL (for targeting by filename and logging).
+    pub file_path: String,
+
+    /// Ring-buffer consumer fed by the background decode task.
+    pub consumer: HeapConsumer<f32>,
+
+    /// Number of channels the producer writes (interleaved).
+    pub input_channels: usize,
+
+    /// Per-source volume (0.0 - 1.0).
+    pub volume: f32,
+
+    /// Voice-level volume (0.0 - 1.0) - current smoothed value.
+    pub voice_volume: f32,
+
+    /// Target voice volume for smooth ramping (0.0 - 1.0).
+    pub target_voice_volume: f32,
+
+    /// Channel routing: vec![(src_channel, dest_channel), ...].
+    pub channel_map: Vec<(usize, usize)>,
+
+    /// Fade state (in/out/none). A completed fade-out drives the source to silence
+    /// and then to completion even if the ring still holds audio.
+    pub fade_state: FadeState,
+
+    /// Set by the producer task when the decoder reaches EOF and will not loop. The
+    /// source is finished once this is set and the ring has drained.
+    producer_done: Arc<AtomicBool>,
+
+    /// Set off the audio thread (by the reaper, on stop or drop) to ask the producer
+    /// task to stop early. Held so the source owns the flag for the producer's life.
+    stop_flag: Arc<AtomicBool>,
+}
+
+impl StreamedSource {
+    /// Build a streamed source over `consumer`, the read end of the ring the producer
+    /// task fills. `producer_done`/`stop_flag` are the shared handles the producer
+    /// task also holds. Voice volume starts at unity and ramps toward
+    /// `target_voice_volume`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        id: u64,
+        voice_id: String,
+        file_path: String,
+        sample_id: Option<String>,
+        consumer: HeapConsumer<f32>,
+        input_channels: usize,
+        volume: f32,
+        channel_map: Vec<(usize, usize)>,
+        producer_done: Arc<AtomicBool>,
+        stop_flag: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            id,
+            sample_id,
+            voice_id,
+            file_path,
+            consumer,
+            input_channels,
+            volume: volume.clamp(0.0, 1.0),
+            voice_volume: 1.0,
+            target_voice_volume: 1.0,
+            channel_map,
+            fade_state: FadeState::None,
+            producer_done,
+            stop_flag,
+        }
+    }
+
+    /// Set the fade state for this source (fade-in on start, fade-out on stop).
+    pub fn set_fade(&mut self, fade_state: FadeState) {
+        self.fade_state = fade_state;
+    }
+
+    /// Ask the producer task to stop and stop feeding the ring. Called off the audio
+    /// thread when the source is reaped.
+    pub fn signal_stop(&self) {
+        self.stop_flag.store(true, Ordering::Release);
+    }
+
+    /// Set target voice volume for smooth ramping.
+    pub fn set_target_voice_volume(&mut self, target: f32) {
+        self.target_voice_volume = target.clamp(0.0, 1.0);
+    }
+
+    /// Advance voice volume toward target by one frame (linear ramp, matching the
+    /// other voices' ~22 ms transition at 44.1 kHz).
+    pub fn advance_voice_volume(&mut self) {
+        const RAMP_RATE: f32 = 0.001;
+
+        if (self.voice_volume - self.target_voice_volume).abs() < RAMP_RATE {
+            self.voice_volume = self.target_voice_volume;
+        } else if self.voice_volume < self.target_voice_volume {
+            self.voice_volume += RAMP_RATE;
+        } else {
+            self.voice_volume -= RAMP_RATE;
+        }
+    }
+
+    /// Whether this source has finished and can be reaped off the audio thread. A
+    /// completed fade-out finishes it even with audio still buffered; otherwise it
+    /// finishes only once the producer has signalled EOF and the ring has drained
+    /// below a full frame.
+    pub fn is_finished(&self) -> bool {
+        if let FadeState::Out { elapsed, duration } = self.fade_state {
+            if elapsed >= duration {
+                return true;
+            }
+        }
+        self.producer_done.load(Ordering::Acquire)
+            && self.consumer.len() < self.input_channels.max(1)
+    }
+}
+
+impl Drop for StreamedSource {
+    /// Dropping a source stops its producer thread, so a source that is reaped (or
+    /// discarded anywhere off the audio thread) never leaves its decoder running on a
+    /// ring no one reads. The audio thread only ever *moves* a finished source into
+    /// the graveyard, so this drop runs off the real-time thread.
+    fn drop(&mut self) {
+        self.signal_stop();
+    }
+}
+
 /// Pre-reserved capacity for the voice pool, so a Play never reallocates the
 /// `active_samples` Vec on the audio thread. Generous headroom over the documented
 /// "20+ simultaneous" target. (Exceeding it reallocates once — see docs/bugs.md.)
@@ -763,6 +910,10 @@ pub const MAX_VOICES: usize = 256;
 /// Pre-reserved capacity for live inputs, so adding a microphone never reallocates
 /// `live_inputs` on the audio thread.
 pub const MAX_LIVE_INPUTS: usize = 16;
+
+/// Pre-reserved capacity for windowed streamed sources, so adding one never
+/// reallocates `streamed_sources` on the audio thread.
+pub const MAX_STREAMED_SOURCES: usize = 64;
 
 /// Convert a level in dBFS to a linear amplitude (0 dBFS == 1.0).
 pub fn db_to_linear(db: f32) -> f32 {
@@ -867,6 +1018,9 @@ pub struct MixerState {
     /// List of active live inputs (microphones)
     pub live_inputs: Vec<LiveInput>,
 
+    /// List of active windowed streamed sources (long, large, or live assets)
+    pub streamed_sources: Vec<StreamedSource>,
+
     /// Number of output channels
     pub output_channels: usize,
 
@@ -906,6 +1060,7 @@ impl MixerState {
         Self {
             active_samples: Vec::with_capacity(MAX_VOICES),
             live_inputs: Vec::with_capacity(MAX_LIVE_INPUTS),
+            streamed_sources: Vec::with_capacity(MAX_STREAMED_SOURCES),
             output_channels,
             ducking_applier: None,
             bass_management: None,
@@ -964,6 +1119,14 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
         let duck = ducking.map_or((1.0, 1.0), |a| a.buffer_endpoints(&input.voice_id));
 
         mix_live_input_into_output(input, output, frames, output_channels, duck);
+    }
+
+    // Mix each windowed streamed source into the output
+    for source in &mut state.streamed_sources {
+        // This voice's duck multipliers at the buffer endpoints (D1/D2).
+        let duck = ducking.map_or((1.0, 1.0), |a| a.buffer_endpoints(&source.voice_id));
+
+        mix_streamed_source_into_output(source, output, frames, output_channels, duck);
     }
 
     // Apply bass management (LFE extraction and crossover filtering)
@@ -1387,19 +1550,70 @@ fn apply_pitch_block(
     }
 }
 
-/// Number of frames over which a live input fades to silence when its ring buffer
+/// Number of frames over which a ring voice fades to silence when its ring buffer
 /// underruns, instead of cutting hard to zero. Short (~1.3 ms at 48 kHz) so the
 /// gap is barely audible, but long enough that the step per frame stays well below
 /// a click (F3). The held frame is the last one read this block, faded out.
 const UNDERRUN_FADE_FRAMES: usize = 64;
 
+/// Consume one frame from a ring voice's `consumer` and mix it into `output` at
+/// `frame_idx` through `channel_map`, scaled by `gain`. On an underrun (fewer than
+/// `input_channels` samples queued) it does not cut to hard silence (an audible
+/// click): it holds the last frame read this block (`last_frame`) and fades it
+/// toward zero over `UNDERRUN_FADE_FRAMES` (`underrun_frames` carries the elapsed
+/// count across the block), so the transition to silence has no hard step (F3).
+///
+/// Shared by the live-input and streamed-source mix paths; allocates nothing, never
+/// blocks, and supports up to 16 input channels.
+#[allow(clippy::too_many_arguments)]
+fn mix_ring_voice_frame(
+    consumer: &mut HeapConsumer<f32>,
+    input_channels: usize,
+    channel_map: &[(usize, usize)],
+    output: &mut [f32],
+    frame_idx: usize,
+    output_channels: usize,
+    gain: f32,
+    last_frame: &mut [f32; 16],
+    underrun_frames: &mut usize,
+) {
+    // Read one frame worth of samples, or — on underrun — hold the last frame and
+    // fade it toward silence so there is no hard cut.
+    let underrun = consumer.len() < input_channels;
+    let fade_gain = if underrun {
+        // Linear fade from the held frame to silence over UNDERRUN_FADE_FRAMES, then
+        // flat silence. Before any frame was read this block last_frame is zero, so
+        // this is silence with no step either way.
+        let g = 1.0 - (*underrun_frames as f32 / UNDERRUN_FADE_FRAMES as f32);
+        *underrun_frames += 1;
+        g.max(0.0)
+    } else {
+        // Read the entire frame from the ring buffer and remember it as the frame to
+        // hold should the next frame underrun.
+        for slot in last_frame.iter_mut().take(input_channels.min(16)) {
+            if let Some(sample) = consumer.pop() {
+                *slot = sample;
+            }
+        }
+        1.0
+    };
+
+    let final_gain = gain * fade_gain;
+    for &(src_ch, dest_ch) in channel_map {
+        if src_ch >= input_channels || dest_ch >= output_channels || src_ch >= 16 {
+            continue;
+        }
+        let dest_idx = frame_idx * output_channels + dest_ch;
+        output[dest_idx] += last_frame[src_ch] * final_gain;
+    }
+}
+
 /// Mix a live input (microphone) into the output buffer.
 ///
-/// On a ring-buffer underrun the input does not cut to hard silence (an audible
-/// click): it holds the last frame read this block and fades it to silence over
-/// `UNDERRUN_FADE_FRAMES`, then stays silent (F3). The voice-volume ramp is
-/// advanced for every frame of the block, underrun frames included, so the ramp
-/// stays time-accurate rather than stalling at the underrun.
+/// The voice-volume ramp is advanced for every frame of the block — underrun frames
+/// included — so it stays time-accurate rather than stalling at an underrun. The
+/// per-frame ring consume and the hold-and-fade on underrun are in
+/// [`mix_ring_voice_frame`] (F3).
 fn mix_live_input_into_output(
     input: &mut LiveInput,
     output: &mut [f32],
@@ -1407,59 +1621,75 @@ fn mix_live_input_into_output(
     output_channels: usize,
     duck: (f32, f32),
 ) {
-    let input_channels = input.input_channels;
-    let base_volume = input.volume;
-
-    // The last frame successfully read from the ring this block, held and faded out
-    // when the ring underruns so the transition to silence has no hard step.
-    // Supports up to 16 input channels.
     let mut last_frame = [0.0f32; 16];
-    // Frames elapsed since the underrun began this block; drives the fade-out gain.
     let mut underrun_frames = 0usize;
 
-    // Read available samples from the ring buffer.
-    // Process frame by frame to handle underruns gracefully.
     for frame_idx in 0..frames {
         // Advance voice volume toward target (smooth ramping to avoid pops). Done
         // every frame — including underrun frames — so the ramp stays time-accurate.
         input.advance_voice_volume();
 
-        // Read one frame worth of samples, or — on underrun — hold the last frame
-        // and fade it toward silence so there is no hard cut.
-        let samples_needed = input_channels;
-        let underrun = input.consumer.len() < samples_needed;
-        let fade_gain = if underrun {
-            // Linear fade from the held frame to silence over UNDERRUN_FADE_FRAMES,
-            // then flat silence. Before any frame was read this block last_frame is
-            // zero, so this is silence with no step either way.
-            let g = 1.0 - (underrun_frames as f32 / UNDERRUN_FADE_FRAMES as f32);
-            underrun_frames += 1;
-            g.max(0.0)
-        } else {
-            // Read the entire frame from the ring buffer and remember it as the
-            // frame to hold should the next frame underrun.
-            for slot in last_frame.iter_mut().take(input_channels.min(16)) {
-                if let Some(sample) = input.consumer.pop() {
-                    *slot = sample;
-                }
-            }
-            1.0
-        };
-
-        // Calculate volume per-frame to handle smooth ramping (incl. the per-frame
-        // duck gain, D2, and the underrun fade-out gain).
+        // input volume * voice volume * per-frame duck gain (D2); the underrun fade
+        // gain is applied inside mix_ring_voice_frame.
         let ducking_multiplier = duck_frame_gain(duck, frame_idx, frames);
-        let final_volume = base_volume * input.voice_volume * ducking_multiplier * fade_gain;
+        let gain = input.volume * input.voice_volume * ducking_multiplier;
 
-        // Apply channel mapping
-        for &(src_ch, dest_ch) in &input.channel_map {
-            if src_ch >= input_channels || dest_ch >= output_channels || src_ch >= 16 {
-                continue;
-            }
+        mix_ring_voice_frame(
+            &mut input.consumer,
+            input.input_channels,
+            &input.channel_map,
+            output,
+            frame_idx,
+            output_channels,
+            gain,
+            &mut last_frame,
+            &mut underrun_frames,
+        );
+    }
+}
 
-            let dest_idx = frame_idx * output_channels + dest_ch;
-            output[dest_idx] += last_frame[src_ch] * final_volume;
-        }
+/// Mix a windowed streamed source into the output buffer.
+///
+/// Like the live-input path it consumes from a ring with a hold-and-fade on underrun
+/// ([`mix_ring_voice_frame`]), but it also applies its fade state (fade-in on start,
+/// fade-out on stop), advancing that fade once per frame, so a stopped cue ramps to
+/// silence with no click.
+fn mix_streamed_source_into_output(
+    source: &mut StreamedSource,
+    output: &mut [f32],
+    frames: usize,
+    output_channels: usize,
+    duck: (f32, f32),
+) {
+    let mut last_frame = [0.0f32; 16];
+    let mut underrun_frames = 0usize;
+
+    for frame_idx in 0..frames {
+        // Advance voice volume toward target every frame so the ramp stays
+        // time-accurate across underruns.
+        source.advance_voice_volume();
+
+        // source volume * voice volume * per-frame duck gain (D2) * fade-in/out
+        // multiplier; the underrun fade gain is applied inside mix_ring_voice_frame.
+        let ducking_multiplier = duck_frame_gain(duck, frame_idx, frames);
+        let fade_multiplier = source.fade_state.multiplier();
+        let gain = source.volume * source.voice_volume * ducking_multiplier * fade_multiplier;
+
+        mix_ring_voice_frame(
+            &mut source.consumer,
+            source.input_channels,
+            &source.channel_map,
+            output,
+            frame_idx,
+            output_channels,
+            gain,
+            &mut last_frame,
+            &mut underrun_frames,
+        );
+
+        // Advance the fade once per frame (the duck fade is advanced once per buffer
+        // in mix_audio; this fade is per-source, so it lives here).
+        source.fade_state.advance();
     }
 }
 
@@ -3997,5 +4227,116 @@ mod tests {
         let result = sample.advance_voice_volume();
         assert!(!result, "Should return false when at target");
         assert_eq!(sample.voice_volume, 0.7);
+    }
+
+    // === StreamedSource Tests ===
+
+    /// Build a streamed source over a ring pre-filled with `data` (interleaved),
+    /// with the EOF flag set to `producer_done`. Reuses the live-input ring helper.
+    fn streamed_with_data(data: &[f32], channels: usize, producer_done: bool) -> StreamedSource {
+        let consumer = create_test_ring_buffer_with_data(data);
+        let channel_map: Vec<(usize, usize)> = (0..channels).map(|c| (c, c)).collect();
+        StreamedSource::new(
+            7,
+            "music".to_string(),
+            "long.wav".to_string(),
+            None,
+            consumer,
+            channels,
+            1.0,
+            channel_map,
+            Arc::new(AtomicBool::new(producer_done)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    #[test]
+    fn streamed_source_not_finished_with_data_and_no_eof() {
+        // Audio queued and the producer has not signalled EOF: still playing.
+        let src = streamed_with_data(&[0.1, 0.2, 0.3, 0.4], 2, false);
+        assert!(!src.is_finished());
+    }
+
+    #[test]
+    fn streamed_source_not_finished_at_eof_while_ring_has_data() {
+        // EOF signalled, but a full frame is still queued: not finished yet.
+        let src = streamed_with_data(&[0.1, 0.2], 2, true);
+        assert!(!src.is_finished());
+    }
+
+    #[test]
+    fn streamed_source_finished_at_eof_once_ring_drained() {
+        // EOF signalled and the ring holds less than a frame: finished.
+        let src = streamed_with_data(&[], 2, true);
+        assert!(src.is_finished());
+    }
+
+    #[test]
+    fn streamed_source_finished_when_fade_out_complete_even_with_data() {
+        // A completed fade-out retires the source even though audio remains queued
+        // and EOF has not been signalled (matches ActiveSample fade-out semantics).
+        let mut src = streamed_with_data(&[0.5; 8], 2, false);
+        src.set_fade(FadeState::Out {
+            elapsed: 10,
+            duration: 10,
+        });
+        assert!(src.is_finished());
+    }
+
+    #[test]
+    fn streamed_source_mix_routes_audio_then_underrun_fades() {
+        // Two stereo frames of 1.0 queued, no fade, unity gain. Past the queued audio
+        // the ring underruns and the held last frame fades toward silence (F3), the
+        // same hold-and-fade the live-input path uses.
+        let mut src = streamed_with_data(&[1.0; 4], 2, true);
+        let frames = 70;
+        let mut output = vec![0.0f32; frames * 2];
+        mix_streamed_source_into_output(&mut src, &mut output, frames, 2, (1.0, 1.0));
+
+        // Frames 0..2 read real audio at unity.
+        assert!((output[0] - 1.0).abs() < 1e-6);
+        assert!((output[2] - 1.0).abs() < 1e-6);
+        // Frame 2 is the first underrun: the held frame (1.0) at full gain (1 - 0/64).
+        assert!((output[4] - 1.0).abs() < 1e-6);
+        // Frame 3 underruns one step further: 1 - 1/64.
+        assert!((output[6] - (1.0 - 1.0 / 64.0)).abs() < 1e-4);
+        // The underrun began at frame 2, so by frame 2+64 = 66 the hold has reached
+        // silence and stays there.
+        assert!(output[66 * 2].abs() < 1e-6);
+        assert!(output[69 * 2].abs() < 1e-6);
+    }
+
+    #[test]
+    fn streamed_source_fade_out_ramps_to_silence() {
+        // A fade-out scales the source down across the block, so the first frame is at
+        // full level and a later frame is quieter — no hard cut.
+        let mut src = streamed_with_data(&[1.0; 40], 2, true); // 20 stereo frames
+        src.set_fade(FadeState::Out {
+            elapsed: 0,
+            duration: 10,
+        });
+        let mut output = vec![0.0f32; 20];
+        mix_streamed_source_into_output(&mut src, &mut output, 10, 2, (1.0, 1.0));
+
+        // Frame 0: 1 - 0/10 = 1.0; frame 5: 1 - 5/10 = 0.5; frame 9: 1 - 9/10 = 0.1.
+        assert!((output[0] - 1.0).abs() < 1e-6);
+        assert!((output[5 * 2] - 0.5).abs() < 1e-6);
+        assert!((output[9 * 2] - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mix_audio_includes_streamed_sources() {
+        // A streamed source pushed into MixerState is mixed by mix_audio just like a
+        // sample or a live input, through the output stage.
+        let src = streamed_with_data(&[0.5; 8], 2, true); // 4 stereo frames at 0.5
+        let mut state = MixerState::new(2);
+        state.streamed_sources.push(src);
+
+        let mut output = vec![0.0f32; 8]; // 4 frames * 2 channels
+        mix_audio(&mut output, &mut state);
+
+        for &s in &output {
+            assert!((s - 0.5).abs() < 1e-4, "expected 0.5, got {s}");
+        }
     }
 }

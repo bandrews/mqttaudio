@@ -9,7 +9,7 @@
 //! resolution) stays on the control thread; only the finished value travels across the ring.
 
 use crate::audio::ducking::DuckTargetChange;
-use crate::audio::mixer::{ActiveSample, FadeState, LiveInput, MixerState};
+use crate::audio::mixer::{ActiveSample, FadeState, LiveInput, MixerState, StreamedSource};
 use crate::mqtt::commands::SampleSelector;
 use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 
@@ -19,11 +19,11 @@ use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 /// side, but ids/volumes/fades are computed by the control thread), so applying a
 /// command never blocks, allocates unboundedly, or does I/O.
 ///
-/// The move-in variants ([`AudioCommand::AddSample`]/[`AudioCommand::AddLiveInput`])
-/// carry their payload inline rather than boxed: draining them moves the value
-/// straight into the mixer, freeing nothing on the real-time thread. This makes the
-/// enum larger, but the command ring is pre-allocated, so it is a one-time memory
-/// cost, not a per-callback allocation.
+/// The move-in variants ([`AudioCommand::AddSample`]/[`AudioCommand::AddLiveInput`]/
+/// [`AudioCommand::AddStreamedSource`]) carry their payload inline rather than boxed:
+/// draining them moves the value straight into the mixer, freeing nothing on the
+/// real-time thread. This makes the enum larger, but the command ring is
+/// pre-allocated, so it is a one-time memory cost, not a per-callback allocation.
 ///
 /// `large_enum_variant` is therefore allowed deliberately: boxing `AddSample` (as the
 /// lint suggests) would put the sample on the heap and free it on the audio thread
@@ -38,7 +38,10 @@ pub enum AudioCommand {
     SetDuckTarget(DuckTargetChange),
     /// Add a live (microphone) input to the mix.
     AddLiveInput(LiveInput),
-    /// Fade out every active sample over `fade_ms` (Stop-all / shutdown).
+    /// Start playing a fully-built windowed streamed source (long/large/live asset).
+    AddStreamedSource(StreamedSource),
+    /// Fade out every active sample and streamed source over `fade_ms` (Stop-all /
+    /// shutdown).
     FadeOutAll { fade_ms: u32 },
     /// Fade out the samples whose internal id is in `ids` (voice stop / fade).
     FadeOutSamples { ids: Vec<u64>, fade_ms: u32 },
@@ -114,6 +117,9 @@ pub fn apply_command(state: &mut MixerState, cmd: AudioCommand, output_sample_ra
         AudioCommand::AddLiveInput(input) => {
             state.live_inputs.push(input);
         }
+        AudioCommand::AddStreamedSource(source) => {
+            state.streamed_sources.push(source);
+        }
         other => apply_mutation(state, &other, output_sample_rate),
     }
 }
@@ -128,12 +134,15 @@ pub fn apply_command(state: &mut MixerState, cmd: AudioCommand, output_sample_ra
 /// [`AudioCommand::SetDuckTarget`]. Because it borrows the command, the caller still
 /// owns the heap-carrying husk afterward and can move it off the real-time thread for
 /// drop instead of freeing it in the callback. The move-in variants
-/// ([`AudioCommand::AddSample`]/[`AudioCommand::AddLiveInput`]) are a no-op here: the
-/// drainer moves those payloads straight into the mixer.
+/// ([`AudioCommand::AddSample`]/[`AudioCommand::AddLiveInput`]/
+/// [`AudioCommand::AddStreamedSource`]) are a no-op here: the drainer moves those
+/// payloads straight into the mixer.
 fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate: u32) {
     match cmd {
         // Handled by move in `drain_commands`/`apply_command`, never by reference.
-        AudioCommand::AddSample(_) | AudioCommand::AddLiveInput(_) => {}
+        AudioCommand::AddSample(_)
+        | AudioCommand::AddLiveInput(_)
+        | AudioCommand::AddStreamedSource(_) => {}
         AudioCommand::SetDuckTarget(change) => {
             if let Some(ref mut applier) = state.ducking_applier {
                 applier.apply_target(change);
@@ -143,6 +152,10 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
             for sample in state.active_samples.iter_mut() {
                 sample.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
             }
+            // Stop-all / shutdown fades windowed sources too.
+            for source in state.streamed_sources.iter_mut() {
+                source.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
+            }
         }
         AudioCommand::FadeOutSamples { ids, fade_ms } => {
             for sample in state.active_samples.iter_mut() {
@@ -150,11 +163,23 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
                     sample.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
                 }
             }
+            // A streamed source shares the sample id space (it is registered with the
+            // voice manager), so a voice stop fades it the same way.
+            for source in state.streamed_sources.iter_mut() {
+                if ids.contains(&source.id) {
+                    source.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
+                }
+            }
         }
         AudioCommand::FadeOutMatching { selector, fade_ms } => {
             for sample in state.active_samples.iter_mut() {
                 if sample_matches(selector, sample) {
                     sample.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
+                }
+            }
+            for source in state.streamed_sources.iter_mut() {
+                if streamed_matches(selector, source) {
+                    source.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
                 }
             }
         }
@@ -167,6 +192,11 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
             for input in state.live_inputs.iter_mut() {
                 if input.voice_id == *voice {
                     input.set_target_voice_volume(*volume);
+                }
+            }
+            for source in state.streamed_sources.iter_mut() {
+                if source.voice_id == *voice {
+                    source.set_target_voice_volume(*volume);
                 }
             }
         }
@@ -243,6 +273,9 @@ pub fn drain_commands(
             Some(AudioCommand::AddLiveInput(input)) => {
                 state.live_inputs.push(input);
             }
+            Some(AudioCommand::AddStreamedSource(source)) => {
+                state.streamed_sources.push(source);
+            }
             Some(cmd) => {
                 apply_mutation(state, &cmd, output_sample_rate);
                 // Move the spent husk to the return ring; the reaper drops it off-RT.
@@ -282,6 +315,8 @@ pub struct AudioCallbackState {
     pub command_returns: CommandReturnProducer,
     /// Audio->reaper return ring producer for off-RT drop of finished samples.
     pub graveyard: GraveyardProducer,
+    /// Audio->reaper return ring producer for off-RT drop of finished streamed sources.
+    pub streamed_graveyard: StreamedGraveyardProducer,
     /// Output sample rate, needed to convert fade durations (ms) into frames
     /// when draining commands.
     pub output_sample_rate: u32,
@@ -315,6 +350,49 @@ pub fn reap_finished(state: &mut MixerState, graveyard: &mut GraveyardProducer) 
     moved
 }
 
+/// Producer half of the audio->reaper return ring for finished streamed sources.
+pub type StreamedGraveyardProducer = HeapProducer<StreamedSource>;
+/// Consumer half of the streamed-source graveyard, drained by the off-RT reaper.
+pub type StreamedGraveyardConsumer = HeapConsumer<StreamedSource>;
+
+/// Create the audio->reaper return ring for finished streamed sources. A ring
+/// separate from the sample [`graveyard_channel`] because the payload type differs;
+/// both are drained by the same off-RT reaper. Moving a finished source here frees
+/// its ring buffer and `Arc`s off the real-time thread.
+pub fn streamed_graveyard_channel(
+    capacity: usize,
+) -> (StreamedGraveyardProducer, StreamedGraveyardConsumer) {
+    HeapRb::<StreamedSource>::new(capacity).split()
+}
+
+/// Move every finished streamed source out of `state` into the graveyard for off-RT
+/// drop, returning how many were moved. Mirrors [`reap_finished`]: if the graveyard is
+/// momentarily full the finished source is left in place (not dropped on the RT
+/// thread) and reaped on a later block.
+pub fn reap_finished_streamed(
+    state: &mut MixerState,
+    graveyard: &mut StreamedGraveyardProducer,
+) -> usize {
+    let mut moved = 0;
+    let mut i = 0;
+    while i < state.streamed_sources.len() {
+        if state.streamed_sources[i].is_finished() {
+            if graveyard.is_full() {
+                // No room to hand off; leave the source for a later block rather than
+                // freeing its ring here. Skip past it so we keep scanning the rest.
+                i += 1;
+                continue;
+            }
+            let finished = state.streamed_sources.swap_remove(i);
+            let _ = graveyard.push(finished);
+            moved += 1;
+        } else {
+            i += 1;
+        }
+    }
+    moved
+}
+
 /// Whether a sample matches a selector (matching is done on the audio side because the
 /// control thread cannot see the live sample list without locking the state).
 fn sample_matches(selector: &SampleSelector, sample: &ActiveSample) -> bool {
@@ -323,6 +401,17 @@ fn sample_matches(selector: &SampleSelector, sample: &ActiveSample) -> bool {
         sample.sample_id.as_deref(),
         &sample.file_path,
         &sample.voice_id,
+    )
+}
+
+/// Whether a streamed source matches a selector. A streamed source carries the same
+/// id/sample_id/file/voice as a sample, so a selector-based fade reaches both.
+fn streamed_matches(selector: &SampleSelector, source: &StreamedSource) -> bool {
+    selector.matches(
+        source.id,
+        source.sample_id.as_deref(),
+        &source.file_path,
+        &source.voice_id,
     )
 }
 
@@ -797,5 +886,189 @@ mod tests {
             drain_commands(&mut rx, &mut state, &mut returns, 48000, 16),
             3
         );
+    }
+
+    /// Build a streamed source over a ring pre-filled with `data` (interleaved), with
+    /// the EOF flag set to `producer_done`. An empty ring + EOF == finished.
+    fn streamed_with(id: u64, voice: &str, data: &[f32], producer_done: bool) -> StreamedSource {
+        use ringbuf::HeapRb;
+        use std::sync::atomic::AtomicBool;
+        let rb = HeapRb::<f32>::new(data.len() + 16);
+        let (mut prod, consumer) = rb.split();
+        prod.push_slice(data);
+        drop(prod); // the consumer keeps the buffered data
+        StreamedSource::new(
+            id,
+            voice.to_string(),
+            "s.wav".to_string(),
+            None,
+            consumer,
+            2,
+            1.0,
+            vec![(0, 0), (1, 1)],
+            Arc::new(AtomicBool::new(producer_done)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn is_fading_out_streamed(source: &StreamedSource) -> bool {
+        matches!(source.fade_state, FadeState::Out { .. })
+    }
+
+    #[test]
+    fn add_streamed_source_pushes_onto_state() {
+        let mut state = state_with(vec![]);
+        apply_command(
+            &mut state,
+            AudioCommand::AddStreamedSource(streamed_with(1, "music", &[], false)),
+            48000,
+        );
+        assert_eq!(state.streamed_sources.len(), 1);
+        assert_eq!(state.streamed_sources[0].id, 1);
+    }
+
+    #[test]
+    fn add_streamed_source_via_drain_moves_into_state() {
+        let (mut tx, mut rx) = command_channel(8);
+        tx.push(AudioCommand::AddStreamedSource(streamed_with(
+            1,
+            "music",
+            &[],
+            false,
+        )))
+        .ok()
+        .expect("push add streamed");
+        let mut state = state_with(vec![]);
+        let (mut returns, mut ret_rx) = command_return_channel(8);
+        let applied = drain_commands(&mut rx, &mut state, &mut returns, 48000, 16);
+        assert_eq!(applied, 1);
+        assert_eq!(state.streamed_sources.len(), 1);
+        // A move-in command leaves nothing on the return ring (no heap to drop off-RT).
+        assert!(ret_rx.pop().is_none());
+    }
+
+    #[test]
+    fn fade_out_samples_fades_matching_streamed_source() {
+        // A streamed source shares the sample id space (registered with the voice
+        // manager), so a voice stop (FadeOutSamples by id) fades it too.
+        let mut state = state_with(vec![]);
+        state
+            .streamed_sources
+            .push(streamed_with(1, "music", &[0.5; 8], false));
+        state
+            .streamed_sources
+            .push(streamed_with(2, "bed", &[0.5; 8], false));
+        apply_command(
+            &mut state,
+            AudioCommand::FadeOutSamples {
+                ids: vec![2],
+                fade_ms: 10,
+            },
+            48000,
+        );
+        assert!(!is_fading_out_streamed(&state.streamed_sources[0]));
+        assert!(is_fading_out_streamed(&state.streamed_sources[1]));
+    }
+
+    #[test]
+    fn fade_out_matching_fades_streamed_source_by_voice() {
+        let mut state = state_with(vec![]);
+        state
+            .streamed_sources
+            .push(streamed_with(1, "music", &[0.5; 8], false));
+        state
+            .streamed_sources
+            .push(streamed_with(2, "bed", &[0.5; 8], false));
+        apply_command(
+            &mut state,
+            AudioCommand::FadeOutMatching {
+                selector: selector_voice("bed"),
+                fade_ms: 10,
+            },
+            48000,
+        );
+        assert!(!is_fading_out_streamed(&state.streamed_sources[0]));
+        assert!(is_fading_out_streamed(&state.streamed_sources[1]));
+    }
+
+    #[test]
+    fn fade_out_all_fades_streamed_sources_too() {
+        let mut state = state_with(vec![]);
+        state
+            .streamed_sources
+            .push(streamed_with(1, "music", &[0.5; 8], false));
+        apply_command(&mut state, AudioCommand::FadeOutAll { fade_ms: 10 }, 48000);
+        assert!(is_fading_out_streamed(&state.streamed_sources[0]));
+    }
+
+    #[test]
+    fn set_voice_volume_targets_streamed_sources() {
+        let mut state = state_with(vec![]);
+        state
+            .streamed_sources
+            .push(streamed_with(1, "music", &[], false));
+        apply_command(
+            &mut state,
+            AudioCommand::SetVoiceVolume {
+                voice: "music".to_string(),
+                volume: 0.3,
+            },
+            48000,
+        );
+        assert!((state.streamed_sources[0].target_voice_volume - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reap_moves_finished_streamed_source_to_graveyard() {
+        let mut state = state_with(vec![]);
+        // Finished: EOF signalled and the ring is empty.
+        state
+            .streamed_sources
+            .push(streamed_with(1, "music", &[], true));
+        // Still playing: audio queued, no EOF.
+        state
+            .streamed_sources
+            .push(streamed_with(2, "bed", &[0.5; 8], false));
+
+        let (mut tx, mut rx) = streamed_graveyard_channel(8);
+        let moved = reap_finished_streamed(&mut state, &mut tx);
+
+        assert_eq!(moved, 1);
+        assert_eq!(state.streamed_sources.len(), 1);
+        assert_eq!(state.streamed_sources[0].id, 2, "the playing source stays");
+        assert_eq!(
+            rx.pop().map(|s| s.id),
+            Some(1),
+            "the finished one is reaped"
+        );
+    }
+
+    #[test]
+    fn reap_leaves_finished_streamed_source_when_graveyard_full() {
+        let mut state = state_with(vec![]);
+        state
+            .streamed_sources
+            .push(streamed_with(1, "music", &[], true));
+
+        let (mut tx, mut rx) = streamed_graveyard_channel(1);
+        tx.push(streamed_with(2, "x", &[], true))
+            .ok()
+            .expect("fill ring");
+        assert!(tx.is_full());
+
+        let moved = reap_finished_streamed(&mut state, &mut tx);
+        assert_eq!(moved, 0, "nothing can be handed off when the ring is full");
+        assert_eq!(
+            state.streamed_sources.len(),
+            1,
+            "the finished source is left in place, not dropped on the RT thread"
+        );
+
+        // Once the reaper drains the ring, the next reap hands the source off.
+        let _ = rx.pop();
+        let moved = reap_finished_streamed(&mut state, &mut tx);
+        assert_eq!(moved, 1);
+        assert!(state.streamed_sources.is_empty());
+        assert_eq!(rx.pop().map(|s| s.id), Some(1));
     }
 }

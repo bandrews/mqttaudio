@@ -1,7 +1,7 @@
 // ABOUTME: MQTT command parsing and validation.
 // ABOUTME: Converts JSON messages to internal command types.
 
-use crate::config::ChannelRef;
+use crate::config::{ChannelRef, LoadMode};
 use serde::{Deserialize, Serialize};
 
 /// MQTT command envelope supporting both flattened and nested formats.
@@ -140,8 +140,12 @@ pub struct PlayMessage {
     pub loop_mode: Option<bool>, // Loop playback continuously
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crossfade_ms: Option<u32>, // Crossfade duration at loop boundaries (0 = disabled)
-                                   // Future fields for later phases:
-                                   // pub max_play_length: Option<i32>,    // Future
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<LoadMode>, // Load strategy override: auto|full|stream
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_ms: Option<u32>, // Windowed-source ring depth override (streamed plays)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prebuffer_ms: Option<u32>, // Windowed-source prebuffer override (streamed plays)
 }
 
 /// Voice stop command parameters
@@ -285,6 +289,9 @@ pub enum AudioCommand {
         start_position_ms: Option<u64>, // Start playback at this offset
         loop_mode: bool,                // Loop playback continuously
         crossfade_ms: u32,              // Crossfade duration at loop boundaries (0 = disabled)
+        mode: LoadMode,                 // Resolved load strategy (auto|full|stream)
+        window_ms: Option<u32>,         // Windowed-source ring depth override
+        prebuffer_ms: Option<u32>,      // Windowed-source prebuffer override
     },
     StopAll,
     VoiceStop {
@@ -448,6 +455,9 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 start_position_ms: play_msg.start_position_ms,
                 loop_mode: play_msg.loop_mode.unwrap_or(false),
                 crossfade_ms: play_msg.crossfade_ms.unwrap_or(0),
+                mode: play_msg.mode.unwrap_or_default(),
+                window_ms: play_msg.window_ms,
+                prebuffer_ms: play_msg.prebuffer_ms,
             })
         }
         "stopall" | "soundStopAll" => Ok(AudioCommand::StopAll),
@@ -1525,6 +1535,43 @@ mod tests {
         match cmd {
             AudioCommand::Play { crossfade_ms, .. } => {
                 assert_eq!(crossfade_ms, 0); // Defaults to 0 (disabled)
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_with_stream_mode_and_window() {
+        let json = r#"{"command": "play", "message": {"file": "long.wav", "mode": "stream", "window_ms": 2000, "prebuffer_ms": 100}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play {
+                mode,
+                window_ms,
+                prebuffer_ms,
+                ..
+            } => {
+                assert_eq!(mode, LoadMode::Stream);
+                assert_eq!(window_ms, Some(2000));
+                assert_eq!(prebuffer_ms, Some(100));
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_defaults_mode_to_auto() {
+        // Omitting mode/window/prebuffer is backward compatible and resolves to Auto.
+        let json = r#"{"command": "play", "message": {"file": "sfx.wav"}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play {
+                mode,
+                window_ms,
+                prebuffer_ms,
+                ..
+            } => {
+                assert_eq!(mode, LoadMode::Auto);
+                assert_eq!(window_ms, None);
+                assert_eq!(prebuffer_ms, None);
             }
             _ => panic!("Expected Play command"),
         }

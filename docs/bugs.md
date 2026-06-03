@@ -5,6 +5,22 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 
 ## Deferred to a later sprint
 
+- **HTTP `mode=stream` falls back to a full load (windowed-streaming redesign S1 — intentional, S2 closes).**
+  Windowed streaming of `http://`/`https://` sources is deferred to S2, where the load-strategy decision
+  already probes the source and can reuse the same connection (avoiding a double GET). Today the Play arm
+  logs a warning and loads the URL fully (`src/main.rs`, `handle_command` Play branch). Local-file
+  `mode=stream` is fully implemented in S1.
+- **A long file still streams from the start of each play; auto-windowing is S2 (redesign S1).** S1 gives
+  bounded-memory, low-latency windowed playback when `mode=stream` is set explicitly. The auto-decision that
+  *forces* windowing for over-budget assets — the never-OOM guarantee for a 2-hour cue played with the
+  default `mode=auto` — is S2 (the memory budget + `plan_load`). Until then, `mode=auto`/`full` use the
+  existing full-load path.
+- **The seek/speed gate for streamed voices is voice-keyed and best-effort (redesign S1 — LOW).**
+  `selector_targets_streamed_voice` (`src/main.rs`) warns when a Seek/Speed selector names a voice that has a
+  streamed source. A selector that targets a streamed source by `file`/`id` only, or a voice that mixes
+  streamed and full-load sources, may not warn — but the command is a structural no-op on streamed sources
+  regardless (they live in a separate voice list the sample-targeted commands never touch), so this is a UX
+  nicety, not a correctness gap.
 - **`handle_command`'s own "Invalid JSON" 400 branch is unreachable (Sprint 9 F10 — discovered, LOW).**
   `src/http/handlers.rs` `handle_command` extracts `Json(body): Json<Value>` then maps a
   `serde_json::to_string(&body)` failure to `400 + CommandResponse::error("Invalid JSON: ...")`. But by the

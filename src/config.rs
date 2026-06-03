@@ -223,6 +223,15 @@ pub struct CacheConfig {
     /// When true (default): App waits for all files to load before accepting commands.
     /// When false: App starts immediately, files load in background (lazy-load).
     pub precache_blocking: bool,
+    /// Window (ring) depth in milliseconds for windowed streamed sources. Bounds the
+    /// resident memory of each streamed voice independently of the asset's length.
+    pub stream_window_ms: u32,
+    /// Milliseconds of audio to prebuffer before a streamed source starts playing, so
+    /// the first audio is glitch-free.
+    pub stream_prebuffer_ms: u32,
+    /// Maximum milliseconds to wait for the prebuffer before starting anyway, so a slow
+    /// source never stalls playback (the underrun fade covers any gap).
+    pub stream_prebuffer_deadline_ms: u32,
 }
 
 impl Default for CacheConfig {
@@ -234,6 +243,9 @@ impl Default for CacheConfig {
             precache: Vec::new(),
             max_memory_mb: 512,
             precache_blocking: true,
+            stream_window_ms: 1500,
+            stream_prebuffer_ms: 150,
+            stream_prebuffer_deadline_ms: 300,
         }
     }
 }
@@ -389,6 +401,24 @@ impl ResamplerQuality {
             ResamplerQuality::Maximum => 256,
         }
     }
+}
+
+/// How a Play chooses between fully loading an asset into memory (full random access:
+/// seek/loop/pitch) and windowed streaming (bounded memory, low time-to-first-sample).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum LoadMode {
+    /// Pick automatically from the asset's estimated size/duration and the memory
+    /// budget (the windowed path is forced when a full load would not fit).
+    #[default]
+    Auto,
+    /// Force a full in-memory load: all features (seek/loop/crossfade/reverse/speed/
+    /// pitch), at the cost of full decode latency and resident memory.
+    Full,
+    /// Force windowed streaming: bounded memory and low latency, but forward playback
+    /// only (no seek/loop-crossfade/reverse/variable-speed/pitch).
+    Stream,
 }
 
 /// Advanced configuration settings.
@@ -808,6 +838,22 @@ impl Config {
         // Buffer size must be reasonable
         if self.audio.buffer_size < 64 || self.audio.buffer_size > 8192 {
             errors.push("audio.buffer_size must be between 64 and 8192".to_string());
+        }
+
+        // Streamed-source window and prebuffer must be sane and consistent.
+        if self.cache.stream_window_ms < 100 || self.cache.stream_window_ms > 60000 {
+            errors.push("cache.stream_window_ms must be between 100 and 60000".to_string());
+        }
+        if self.cache.stream_prebuffer_ms > self.cache.stream_window_ms {
+            errors.push(
+                "cache.stream_prebuffer_ms must not exceed cache.stream_window_ms".to_string(),
+            );
+        }
+        if self.cache.stream_prebuffer_deadline_ms < self.cache.stream_prebuffer_ms {
+            errors.push(
+                "cache.stream_prebuffer_deadline_ms must be >= cache.stream_prebuffer_ms"
+                    .to_string(),
+            );
         }
 
         // Channel volumes must be 0.0 to 1.0
@@ -1931,6 +1977,67 @@ mod tests {
         let config = Config::default();
         // Default is blocking (true) - wait for all files before accepting commands
         assert!(config.cache.precache_blocking);
+    }
+
+    #[test]
+    fn test_cache_stream_knob_defaults() {
+        let config = Config::default();
+        assert_eq!(config.cache.stream_window_ms, 1500);
+        assert_eq!(config.cache.stream_prebuffer_ms, 150);
+        assert_eq!(config.cache.stream_prebuffer_deadline_ms, 300);
+    }
+
+    #[test]
+    fn test_cache_stream_knobs_parse_and_are_backward_compatible() {
+        // A config that omits the stream knobs keeps the defaults (backward compat).
+        let legacy: Config =
+            serde_json::from_str(r#"{"mqtt": {"topic": "t"}, "cache": {"max_memory_mb": 256}}"#)
+                .unwrap();
+        assert_eq!(legacy.cache.stream_window_ms, 1500);
+
+        // Explicit values are honoured.
+        let config: Config = serde_json::from_str(
+            r#"{"mqtt": {"topic": "t"}, "cache": {"stream_window_ms": 2000, "stream_prebuffer_ms": 200, "stream_prebuffer_deadline_ms": 400}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.cache.stream_window_ms, 2000);
+        assert_eq!(config.cache.stream_prebuffer_ms, 200);
+        assert_eq!(config.cache.stream_prebuffer_deadline_ms, 400);
+    }
+
+    #[test]
+    fn test_load_mode_serde_lowercase_and_default() {
+        assert_eq!(
+            serde_json::from_str::<LoadMode>("\"auto\"").unwrap(),
+            LoadMode::Auto
+        );
+        assert_eq!(
+            serde_json::from_str::<LoadMode>("\"full\"").unwrap(),
+            LoadMode::Full
+        );
+        assert_eq!(
+            serde_json::from_str::<LoadMode>("\"stream\"").unwrap(),
+            LoadMode::Stream
+        );
+        assert_eq!(LoadMode::default(), LoadMode::Auto);
+    }
+
+    #[test]
+    fn test_validate_rejects_inconsistent_stream_config() {
+        // Prebuffer larger than the window is contradictory.
+        let mut config = Config::default();
+        config.mqtt.topic = Some("t".to_string());
+        config.cache.stream_window_ms = 500;
+        config.cache.stream_prebuffer_ms = 1000;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("stream_prebuffer_ms")));
+
+        // A zero window is rejected.
+        let mut config = Config::default();
+        config.mqtt.topic = Some("t".to_string());
+        config.cache.stream_window_ms = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("stream_window_ms")));
     }
 
     #[test]

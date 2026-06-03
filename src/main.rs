@@ -410,6 +410,7 @@ async fn main() {
     let mixer = MixerState {
         active_samples: Vec::with_capacity(audio::mixer::MAX_VOICES),
         live_inputs: Vec::with_capacity(audio::mixer::MAX_LIVE_INPUTS),
+        streamed_sources: Vec::with_capacity(audio::mixer::MAX_STREAMED_SOURCES),
         output_channels,
         ducking_applier,
         bass_management,
@@ -426,6 +427,9 @@ async fn main() {
     // return ring so the callback never frees their heap.
     let (cmd_tx, cmd_rx) = rt_engine::command_channel(1024);
     let (grave_tx, mut grave_rx) = rt_engine::graveyard_channel(1024);
+    // Bounded well above MAX_STREAMED_SOURCES so the callback can always hand a
+    // finished source off for off-RT drop.
+    let (streamed_grave_tx, mut streamed_grave_rx) = rt_engine::streamed_graveyard_channel(256);
     let (cmd_return_tx, mut cmd_return_rx) = rt_engine::command_return_channel(1024);
 
     // Initialize audio inputs from config.
@@ -547,6 +551,7 @@ async fn main() {
         commands: cmd_rx,
         command_returns: cmd_return_tx,
         graveyard: grave_tx,
+        streamed_graveyard: streamed_grave_tx,
         output_sample_rate,
     }));
     let xruns = Arc::new(AtomicU64::new(0));
@@ -557,6 +562,7 @@ async fn main() {
     // snapshot the HTTP handlers read. `active_counts` drives ducking restore;
     // `playing` mirrors the live sample list for status (position excluded).
     let mut active_counts: HashMap<String, usize> = HashMap::new();
+    let mut streamed_voices: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut playing: HashMap<u64, http::SampleStatus> = HashMap::new();
     let status_snapshot = Arc::new(RwLock::new(http::StatusSnapshot {
         active_samples: 0,
@@ -745,6 +751,7 @@ async fn main() {
                             cmd_tx: &mut cmd_tx,
                             ducking_engine: &mut ducking_engine,
                             active_counts: &mut active_counts,
+                            streamed_voices: &mut streamed_voices,
                             playing: &mut playing,
                             snapshot: &status_snapshot,
                             ducking_snapshot: &ducking_snapshot,
@@ -763,10 +770,12 @@ async fn main() {
             _ = reaper_tick.tick() => {
                 reap_finished_samples(
                     &mut grave_rx,
+                    &mut streamed_grave_rx,
                     &mut cmd_return_rx,
                     &mut cmd_tx,
                     ducking_engine.as_mut(),
                     &mut active_counts,
+                    &mut streamed_voices,
                     &mut playing,
                     &status_snapshot,
                     &ducking_snapshot,
@@ -908,18 +917,47 @@ fn notify_voice_activity(
     }
 }
 
-/// Drain the graveyard and the command-return ring, dropping both finished samples
-/// and spent mutation commands off the audio thread, and reconcile control-side
-/// voice activity. When a voice's last sample finishes, the ducking engine computes
-/// restore targets that are sent back to the audio thread. Refreshes the status
-/// snapshot if anything was reaped.
+/// Reconcile control-side bookkeeping for one finished voice-bearing entry (a sample
+/// or a streamed source): drop it from the live `playing` map and decrement its
+/// voice's active count; when that count reaches zero, restore the voice through the
+/// shared notify path (which, for a ducking primary, recomputes restore targets sent
+/// back to the audio thread). Returns whether the voice's count reached zero (it is
+/// now fully idle), so the caller can drop it from the streamed-voice set.
+fn reconcile_finished_voice(
+    voice: &str,
+    id: u64,
+    cmd_tx: &mut rt_engine::CommandProducer,
+    ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
+    active_counts: &mut std::collections::HashMap<String, usize>,
+    playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
+    ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
+) -> bool {
+    playing.remove(&id);
+    if let Some(count) = active_counts.get_mut(voice) {
+        *count -= 1;
+        if *count == 0 {
+            active_counts.remove(voice);
+            notify_voice_activity(voice, false, ducking_engine, cmd_tx, ducking_snapshot);
+            return true;
+        }
+    }
+    false
+}
+
+/// Drain the sample and streamed-source graveyards and the command-return ring,
+/// dropping finished voices and spent mutation commands off the audio thread, and
+/// reconcile control-side voice activity. When a voice's last sample or source
+/// finishes, the ducking engine computes restore targets that are sent back to the
+/// audio thread. Refreshes the status snapshot if anything was reaped.
 #[allow(clippy::too_many_arguments)]
 fn reap_finished_samples(
     grave_rx: &mut rt_engine::GraveyardConsumer,
+    streamed_grave_rx: &mut rt_engine::StreamedGraveyardConsumer,
     cmd_return_rx: &mut rt_engine::CommandReturnConsumer,
     cmd_tx: &mut rt_engine::CommandProducer,
     mut ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
     active_counts: &mut std::collections::HashMap<String, usize>,
+    streamed_voices: &mut std::collections::HashSet<String>,
     playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
     snapshot: &std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
     ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
@@ -938,24 +976,40 @@ fn reap_finished_samples(
         let id = finished.id;
         // Dropping `finished` here is the off-RT free of the sample's buffers.
         drop(finished);
-
-        playing.remove(&id);
-        reaped += 1;
-
-        if let Some(count) = active_counts.get_mut(&voice) {
-            *count -= 1;
-            if *count == 0 {
-                active_counts.remove(&voice);
-                // Voice's last sample finished: restore through the shared notify path.
-                notify_voice_activity(
-                    &voice,
-                    false,
-                    ducking_engine.as_deref_mut(),
-                    cmd_tx,
-                    ducking_snapshot,
-                );
-            }
+        if reconcile_finished_voice(
+            &voice,
+            id,
+            cmd_tx,
+            ducking_engine.as_deref_mut(),
+            active_counts,
+            playing,
+            ducking_snapshot,
+        ) {
+            streamed_voices.remove(&voice);
         }
+        reaped += 1;
+    }
+
+    // Finished streamed sources reconcile the same way. The off-RT drop frees the
+    // source's ring buffer and Arcs here (never in the callback) and, via the
+    // source's Drop, signals its producer thread to stop (a no-op once it has already
+    // exited at EOF).
+    while let Some(finished) = streamed_grave_rx.pop() {
+        let voice = finished.voice_id.clone();
+        let id = finished.id;
+        drop(finished);
+        if reconcile_finished_voice(
+            &voice,
+            id,
+            cmd_tx,
+            ducking_engine.as_deref_mut(),
+            active_counts,
+            playing,
+            ducking_snapshot,
+        ) {
+            streamed_voices.remove(&voice);
+        }
+        reaped += 1;
     }
 
     if reaped > 0 {
@@ -973,6 +1027,9 @@ struct CommandCtx<'a> {
     cmd_tx: &'a mut rt_engine::CommandProducer,
     ducking_engine: &'a mut Option<audio::ducking::DuckingEngine>,
     active_counts: &'a mut std::collections::HashMap<String, usize>,
+    /// Voices that currently have a windowed/streamed source, so the seek/speed gate
+    /// can warn that those commands do not apply to them.
+    streamed_voices: &'a mut std::collections::HashSet<String>,
     playing: &'a mut std::collections::HashMap<u64, http::SampleStatus>,
     snapshot: &'a std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
     ducking_snapshot: &'a std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
@@ -1001,6 +1058,201 @@ impl CommandCtx<'_> {
     }
 }
 
+/// Start a windowed streamed play of a local file: spawn the bounded-ring producer,
+/// gate on a prebuffer for a glitch-free start, then hand a `StreamedSource` to the
+/// audio thread. Streamed voices play forward only — seek/loop-crossfade/reverse/
+/// speed/pitch do not apply (the producer loops by re-opening; the seek/speed command
+/// arms warn for these voices). Bypasses the cache, so it enforces the file allowlist.
+#[allow(clippy::too_many_arguments)]
+async fn handle_stream_play(
+    file: String,
+    id: Option<String>,
+    volume: f32,
+    voice: Option<String>,
+    channel_map: Option<Vec<mqtt::commands::ChannelMapping>>,
+    fade_in: Option<u32>,
+    loop_mode: bool,
+    window_ms: Option<u32>,
+    prebuffer_ms: Option<u32>,
+    ctx: &mut CommandCtx<'_>,
+) {
+    use std::sync::atomic::Ordering;
+    let config = ctx.config;
+    let output_sample_rate = ctx.output_sample_rate;
+
+    // A streamed play bypasses the cache, so enforce the file allowlist here.
+    if !config::Config::is_path_allowed(
+        std::path::Path::new(&file),
+        &config.security.allowed_directories,
+    ) {
+        tracing::error!(
+            "Streamed play of {} rejected: not permitted by allowed_directories",
+            file
+        );
+        return;
+    }
+
+    let voice_id = voice.unwrap_or_else(next_auto_voice_id);
+
+    // Window + prebuffer (per-play override beats config).
+    let window_ms = window_ms.unwrap_or(config.cache.stream_window_ms);
+    let prebuffer_ms = prebuffer_ms.unwrap_or(config.cache.stream_prebuffer_ms);
+    let deadline_ms = config.cache.stream_prebuffer_deadline_ms.max(prebuffer_ms);
+    let rate = output_sample_rate as usize;
+    let window_frames = (window_ms as usize * rate / 1000).max(1);
+    let prebuffer_frames = prebuffer_ms as usize * rate / 1000;
+    let quality = config.advanced.resampler_quality;
+
+    // Open + probe is blocking, so run it off the async runtime; the producer then
+    // streams on its own dedicated thread.
+    let spawn_file = file.clone();
+    let handles = match tokio::task::spawn_blocking(move || {
+        audio::streamed_source::spawn_local_file_stream(
+            spawn_file,
+            output_sample_rate,
+            quality,
+            window_frames,
+            loop_mode,
+        )
+    })
+    .await
+    {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
+            tracing::error!("Failed to start streamed source for {}: {}", file, e);
+            return;
+        }
+        Err(e) => {
+            tracing::error!("Streamed source spawn task failed for {}: {}", file, e);
+            return;
+        }
+    };
+
+    // Gate on the prebuffer so the first audio is glitch-free, but never wait past the
+    // deadline (start anyway; the underrun fade covers any gap). Polling with a tokio
+    // sleep never blocks a worker thread.
+    let started = tokio::time::Instant::now();
+    let deadline = std::time::Duration::from_millis(deadline_ms as u64);
+    loop {
+        let buffered = handles.frames_buffered.load(Ordering::Acquire);
+        if buffered >= prebuffer_frames || handles.producer_done.load(Ordering::Acquire) {
+            break;
+        }
+        if started.elapsed() >= deadline {
+            tracing::warn!(
+                "Streamed source {} hit the {}ms prebuffer deadline with {}/{} frames; \
+                 starting anyway",
+                file,
+                deadline_ms,
+                buffered,
+                prebuffer_frames
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Resolve the internal id and the voice's current volume.
+    let mut voice_mgr = ctx.voice_manager.lock();
+    let internal_id = voice_mgr.add_sample_to_voice(&voice_id);
+    let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
+    drop(voice_mgr);
+
+    // Channel routing: resolve aliases if given, else default 1:1 over decoded channels.
+    let channels = handles.channels;
+    let resolved_map: Vec<(usize, usize)> = match channel_map {
+        Some(map) => {
+            let mut out = Vec::with_capacity(map.len());
+            for m in &map {
+                match (
+                    config.resolve_channel(&m.src),
+                    config.resolve_channel(&m.dest),
+                ) {
+                    (Ok(s), Ok(d)) => out.push((s, d)),
+                    (Err(e), _) | (_, Err(e)) => {
+                        tracing::error!("Failed to resolve channel alias for streamed play: {}", e);
+                        return;
+                    }
+                }
+            }
+            out
+        }
+        None => (0..channels).map(|c| (c, c)).collect(),
+    };
+
+    let mut source = audio::mixer::StreamedSource::new(
+        internal_id,
+        voice_id.clone(),
+        file.clone(),
+        id.clone(),
+        handles.consumer,
+        channels,
+        volume,
+        resolved_map,
+        handles.producer_done,
+        handles.stop_flag,
+    );
+    // Start at the voice's current level (no ramp), like a sample play.
+    source.voice_volume = voice_volume;
+    source.target_voice_volume = voice_volume;
+    if let Some(fade_ms) = fade_in {
+        source.set_fade(audio::mixer::FadeState::fade_in(
+            fade_ms,
+            output_sample_rate,
+        ));
+    }
+
+    let status = http::SampleStatus {
+        internal_id: source.id,
+        sample_id: source.sample_id.clone(),
+        voice_id: voice_id.clone(),
+        file_path: source.file_path.clone(),
+        total_frames: 0, // unbounded / unknown for a stream
+        sample_rate: output_sample_rate,
+        volume: source.volume,
+        voice_volume: source.voice_volume,
+        speed: 1.0,
+        loop_mode,
+    };
+
+    let became_active = !ctx.active_counts.contains_key(&voice_id);
+    if became_active {
+        notify_voice_activity(
+            &voice_id,
+            true,
+            ctx.ducking_engine.as_mut(),
+            ctx.cmd_tx,
+            ctx.ducking_snapshot,
+        );
+    }
+    *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
+    ctx.playing.insert(status.internal_id, status);
+    ctx.streamed_voices.insert(voice_id.clone());
+    ctx.send(rt_engine::AudioCommand::AddStreamedSource(source));
+    ctx.refresh();
+    tracing::info!(
+        "Now streaming {} (voice '{}'); {} active voices",
+        file,
+        voice_id,
+        ctx.playing.len()
+    );
+}
+
+/// Whether a selector targets a voice that currently has a windowed/streamed source.
+/// Streamed voices are forward-only, so seek/speed/pitch do not apply. Best-effort:
+/// it matches on the selector's voice (the common case) and is used only to warn — a
+/// stray seek/speed would be a structural no-op on streamed sources anyway, since they
+/// live in a separate voice list the sample-targeted commands never touch.
+fn selector_targets_streamed_voice(
+    selector: &mqtt::commands::SampleSelector,
+    streamed_voices: &std::collections::HashSet<String>,
+) -> bool {
+    selector
+        .voice
+        .as_deref()
+        .is_some_and(|v| streamed_voices.contains(v))
+}
+
 /// Apply a single parsed command to the shared audio state.
 async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<'_>) {
     let cache_manager = ctx.cache_manager;
@@ -1022,7 +1274,39 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             start_position_ms,
             loop_mode,
             crossfade_ms,
+            mode,
+            window_ms,
+            prebuffer_ms,
         } => {
+            // An explicit windowed/streamed play takes the bounded-memory producer
+            // path for local files (low time-to-first-sample, O(window) memory). HTTP
+            // windowed streaming is S2; until then an HTTP mode=stream falls through to
+            // the full load with a note.
+            let is_http = file.starts_with("http://") || file.starts_with("https://");
+            if mode == config::LoadMode::Stream {
+                if is_http {
+                    tracing::warn!(
+                        "mode=stream is not yet supported for HTTP ({}); loading fully",
+                        file
+                    );
+                } else {
+                    handle_stream_play(
+                        file,
+                        id,
+                        volume,
+                        voice,
+                        channel_map,
+                        fade_in,
+                        loop_mode,
+                        window_ms,
+                        prebuffer_ms,
+                        ctx,
+                    )
+                    .await;
+                    return;
+                }
+            }
+
             // Load file (with streaming support for faster startup)
             let mut cache_mgr = cache_manager.lock().await;
             let buffer_result = cache_mgr
@@ -1429,6 +1713,11 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         } => {
             if selector.is_empty() {
                 tracing::warn!("Seek command with empty selector - no samples targeted");
+            } else if selector_targets_streamed_voice(&selector, ctx.streamed_voices) {
+                tracing::warn!(
+                    "Seek is not supported for windowed/streamed voices; ignoring (a streamed \
+                     source plays forward only)"
+                );
             } else {
                 // The audio thread matches the selector against the live samples
                 // and converts ms to frames per sample's rate.
@@ -1446,6 +1735,11 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         } => {
             if selector.is_empty() {
                 tracing::warn!("Speed command with empty selector - no samples targeted");
+            } else if selector_targets_streamed_voice(&selector, ctx.streamed_voices) {
+                tracing::warn!(
+                    "Speed/pitch is not supported for windowed/streamed voices; ignoring (a \
+                     streamed source plays forward only)"
+                );
             } else {
                 let mode = if pitch_correction {
                     "pitch-corrected"
@@ -1600,9 +1894,12 @@ mod tests {
         cmd_return_rx: rt_engine::CommandReturnConsumer,
         grave_tx: rt_engine::GraveyardProducer,
         grave_rx: rt_engine::GraveyardConsumer,
+        streamed_grave_tx: rt_engine::StreamedGraveyardProducer,
+        streamed_grave_rx: rt_engine::StreamedGraveyardConsumer,
         mixer: MixerState,
         ducking_engine: Option<DuckingEngine>,
         active_counts: HashMap<String, usize>,
+        streamed_voices: std::collections::HashSet<String>,
         playing: HashMap<u64, http::SampleStatus>,
         snapshot: Arc<RwLock<http::StatusSnapshot>>,
         ducking_snapshot: Arc<RwLock<HashMap<String, f32>>>,
@@ -1633,6 +1930,7 @@ mod tests {
             let (cmd_tx, cmd_rx) = rt_engine::command_channel(1024);
             let (cmd_return_tx, cmd_return_rx) = rt_engine::command_return_channel(1024);
             let (grave_tx, grave_rx) = rt_engine::graveyard_channel(1024);
+            let (streamed_grave_tx, streamed_grave_rx) = rt_engine::streamed_graveyard_channel(256);
             Self {
                 cache_manager: Arc::new(tokio::sync::Mutex::new(cache)),
                 voice_manager: Arc::new(Mutex::new(VoiceManager::new())),
@@ -1642,9 +1940,12 @@ mod tests {
                 cmd_return_rx,
                 grave_tx,
                 grave_rx,
+                streamed_grave_tx,
+                streamed_grave_rx,
                 mixer,
                 ducking_engine,
                 active_counts: HashMap::new(),
+                streamed_voices: std::collections::HashSet::new(),
                 playing: HashMap::new(),
                 snapshot: Arc::new(RwLock::new(http::StatusSnapshot {
                     active_samples: 0,
@@ -1668,6 +1969,7 @@ mod tests {
                 cmd_tx: &mut self.cmd_tx,
                 ducking_engine: &mut self.ducking_engine,
                 active_counts: &mut self.active_counts,
+                streamed_voices: &mut self.streamed_voices,
                 playing: &mut self.playing,
                 snapshot: &self.snapshot,
                 ducking_snapshot: &self.ducking_snapshot,
@@ -1697,10 +1999,12 @@ mod tests {
         fn reap(&mut self) {
             reap_finished_samples(
                 &mut self.grave_rx,
+                &mut self.streamed_grave_rx,
                 &mut self.cmd_return_rx,
                 &mut self.cmd_tx,
                 self.ducking_engine.as_mut(),
                 &mut self.active_counts,
+                &mut self.streamed_voices,
                 &mut self.playing,
                 &self.snapshot,
                 &self.ducking_snapshot,
@@ -1734,6 +2038,27 @@ mod tests {
             start_position_ms: None,
             loop_mode: false,
             crossfade_ms: 0,
+            mode: config::LoadMode::Auto,
+            window_ms: None,
+            prebuffer_ms: None,
+        }
+    }
+
+    /// A windowed/streamed Play (mode=stream) of the test WAV into `voice`.
+    fn play_stream(voice: Option<&str>) -> AudioCommand {
+        AudioCommand::Play {
+            file: TEST_WAV.to_string(),
+            id: None,
+            volume: 1.0,
+            voice: voice.map(str::to_string),
+            channel_map: None,
+            fade_in: None,
+            start_position_ms: None,
+            loop_mode: false,
+            crossfade_ms: 0,
+            mode: config::LoadMode::Stream,
+            window_ms: Some(200),
+            prebuffer_ms: Some(20),
         }
     }
 
@@ -1772,6 +2097,57 @@ mod tests {
         assert_ne!(v0, v1, "two no-voice Plays must get distinct voice ids");
     }
 
+    fn seek_voice(voice: &str, position_ms: u64) -> AudioCommand {
+        AudioCommand::Seek {
+            selector: mqtt::commands::SampleSelector {
+                internal_id: None,
+                id: None,
+                file: None,
+                voice: Some(voice.to_string()),
+            },
+            position_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_play_emits_add_streamed_source_and_tracks_the_voice() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_stream(Some("bed"))).await;
+        fixture.drain();
+
+        // The windowed path adds a StreamedSource, not an ActiveSample.
+        assert_eq!(fixture.mixer.streamed_sources.len(), 1);
+        assert!(fixture.mixer.active_samples.is_empty());
+        assert_eq!(fixture.mixer.streamed_sources[0].voice_id, "bed");
+        // The voice is tracked so the seek/speed gate can warn for it.
+        assert!(fixture.streamed_voices.contains("bed"));
+    }
+
+    #[tokio::test]
+    async fn seek_on_a_streamed_voice_is_gated_and_pushes_nothing() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_stream(Some("bed"))).await;
+        fixture.drain(); // consume the AddStreamedSource; the ring is now empty
+
+        // A seek targeting the streamed voice is skipped (the gate warns instead of
+        // pushing a SeekMatching that would be a no-op on a forward-only ring).
+        fixture.run(seek_voice("bed", 1000)).await;
+        assert!(
+            fixture.cmd_rx.pop().is_none(),
+            "seek on a streamed voice must push no command"
+        );
+
+        // A seek on a normal voice still pushes (positive control).
+        fixture.run(seek_voice("other", 1000)).await;
+        assert!(
+            matches!(
+                fixture.cmd_rx.pop(),
+                Some(rt_engine::AudioCommand::SeekMatching { .. })
+            ),
+            "seek on a normal voice must still push SeekMatching"
+        );
+    }
+
     /// A Play of the test WAV with explicit `loop_mode`/`crossfade_ms`, for the
     /// crossfade-without-loop warning (F8).
     fn play_crossfade(loop_mode: bool, crossfade_ms: u32) -> AudioCommand {
@@ -1785,6 +2161,9 @@ mod tests {
             start_position_ms: None,
             loop_mode,
             crossfade_ms,
+            mode: config::LoadMode::Auto,
+            window_ms: None,
+            prebuffer_ms: None,
         }
     }
 
@@ -2316,6 +2695,88 @@ mod tests {
             .expect("graveyard has room");
     }
 
+    /// Push a finished streamed source for `voice` into the streamed graveyard,
+    /// mirroring the RT thread reaping it, so the control-side reaper can reconcile it.
+    fn finish_streamed_source(fixture: &mut Fixture, voice: &str, id: u64) {
+        use std::sync::atomic::AtomicBool;
+        let (_producer, consumer) = ringbuf::HeapRb::<f32>::new(16).split();
+        let source = audio::mixer::StreamedSource::new(
+            id,
+            voice.to_string(),
+            "stream.wav".to_string(),
+            None,
+            consumer,
+            2,
+            1.0,
+            vec![(0, 0), (1, 1)],
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        fixture
+            .streamed_grave_tx
+            .push(source)
+            .ok()
+            .expect("streamed graveyard has room");
+    }
+
+    #[tokio::test]
+    async fn reaper_reconciles_a_finished_streamed_source() {
+        let mut fixture = Fixture::new(vec![]);
+
+        // A streamed voice is active (as the Play stream branch will register it).
+        fixture.active_counts.insert("bed".to_string(), 1);
+
+        // The RT thread hands a finished streamed source to the streamed graveyard;
+        // the control-side reaper drains it and clears the voice's active count.
+        finish_streamed_source(&mut fixture, "bed", 42);
+        fixture.reap();
+
+        assert!(
+            !fixture.active_counts.contains_key("bed"),
+            "a finished streamed source must clear its voice's active count off-RT"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaper_restores_ducking_when_last_streamed_source_finishes() {
+        // A streamed source acting as a ducking primary must restore the ducked voice
+        // when it finishes, through the same notify path as a sample (the reaper
+        // reconciles samples and streamed sources identically).
+        let rule = DuckingRule {
+            primary_voice: "bed".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0,
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        // Music plays; the streamed "bed" primary becomes active and ducks music.
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+        fixture.active_counts.insert("bed".to_string(), 1);
+        fixture.notify_voice("bed", true);
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            assert!(
+                applier.get_multiplier("music", 1) < 0.2,
+                "music should be ducked while the streamed bed is active"
+            );
+        }
+
+        // The streamed bed finishes: the reaper restores music toward full volume.
+        finish_streamed_source(&mut fixture, "bed", 7);
+        fixture.reap();
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            assert!(
+                (applier.get_multiplier("music", 1) - 1.0).abs() < 1e-6,
+                "music must restore once the streamed bed finishes"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn reaper_restores_ducking_and_clears_voice_when_last_sample_finishes() {
         let rule = DuckingRule {
@@ -2476,6 +2937,7 @@ mod tests {
         match cmd {
             rt_engine::AudioCommand::AddSample(_) => "AddSample",
             rt_engine::AudioCommand::AddLiveInput(_) => "AddLiveInput",
+            rt_engine::AudioCommand::AddStreamedSource(_) => "AddStreamedSource",
             rt_engine::AudioCommand::SetDuckTarget(_) => "SetDuckTarget",
             rt_engine::AudioCommand::FadeOutAll { .. } => "FadeOutAll",
             rt_engine::AudioCommand::FadeOutSamples { .. } => "FadeOutSamples",
