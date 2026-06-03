@@ -21,6 +21,19 @@ pub struct MqttConfig {
     /// MQTT broker password for authentication
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// Opt-in TLS. When present, the broker connection uses TLS; absent = plain TCP
+    /// (the default, even on port 8883, so a legacy plain broker is never broken).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<MqttTlsConfig>,
+}
+
+/// Opt-in MQTT TLS configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct MqttTlsConfig {
+    /// Path to a PEM CA certificate to trust (for self-signed / private brokers).
+    /// When omitted, the system root certificate store is used (public CAs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_path: Option<String>,
 }
 
 impl Default for MqttConfig {
@@ -33,6 +46,7 @@ impl Default for MqttConfig {
             reconnect_delay_seconds: 10,
             username: None,
             password: None,
+            tls: None,
         }
     }
 }

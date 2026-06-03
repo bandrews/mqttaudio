@@ -311,15 +311,7 @@ async fn main() {
     // Connect to MQTT broker if enabled
     let mqtt_connection = if mqtt_enabled {
         let topic = config.mqtt.topic.as_ref().unwrap();
-        match mqtt::client::connect_mqtt(
-            &config.mqtt.server,
-            config.mqtt.port,
-            topic,
-            config.mqtt.username.as_deref(),
-            config.mqtt.password.as_deref(),
-        )
-        .await
-        {
+        match mqtt::client::connect_mqtt(&config.mqtt, topic).await {
             Ok((c, el)) => Some((c, el)),
             Err(e) => {
                 tracing::error!("Failed to connect to MQTT broker: {}", e);
