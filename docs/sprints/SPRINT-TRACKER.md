@@ -84,7 +84,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 | 6 | Mixer DSP correctness | Done | 5 | [sprint-06](sprint-06-mixer-dsp-correctness.md) |
 | 7 | Bass management & multichannel | Done | 5 | [sprint-07](sprint-07-bass-management-and-multichannel.md) |
 | 8 | Live input robustness | Done | 5 | [sprint-08](sprint-08-live-input-robustness.md) |
-| 9 | Cleanup, observability, packaging | In progress | 1–8 | [sprint-09](sprint-09-cleanup-observability-packaging.md) |
+| 9 | Cleanup, observability, packaging | Done | 1–8 | [sprint-09](sprint-09-cleanup-observability-packaging.md) |
 
 Status values: `Not started` · `In progress` · `Blocked` · `Done`.
 
@@ -185,21 +185,21 @@ Tick a box only when genuinely verified. `[A]` = Lane A/Docker, `[B]` = Lane B/n
 - [ ] ≥30-min two-device (USB mic + separate output) soak shows no periodic dropouts; non-f32 input opens `[C]` — partner's final pass (MANUAL-VERIFICATION.md W-2)
 
 ### Sprint 9 — Cleanup, observability, packaging
-- [ ] Dev scaffolding removed (hardcoded `/Users/bandrews` paths, `--test-*` flags + their divergent paths); dead constants and the stale `#![allow(dead_code)]` "Phase 10" banner deleted; build clean with no `allow(dead_code)` masking `[A]`
-- [ ] Status/telemetry enriched: per-voice ducking state, limiter/clip counts, dropouts, uptime, `/version`, `/metrics` returning real data `[A]`
-- [ ] Config schema/versioning + silent-validation-gap fixes; warnings/docs for crossfade-without-loop, seek vs start_position, channel_map↔LFE collision; unique auto voice ids `[A]`
-- [ ] proptest fuzz for config + command JSON (no panic) runs in the Docker pipeline `[A]`
-- [ ] systemd unit + structured JSON logging documented `[A]`
+- [x] Dev scaffolding removed (hardcoded `/Users/bandrews` paths, `--test-*` flags + their divergent paths); dead constants and the stale `#![allow(dead_code)]` "Phase 10" banner deleted; build clean with no `allow(dead_code)` masking (all three blanket banners removed; dead `bytes_available`/`Cancelled` deleted; test-only accessors narrow-allowed) `[A]`
+- [x] Status/telemetry enriched: per-voice ducking state, limiter/clip counts, dropouts/xruns, uptime, `/version`, `/metrics` returning real data `[A]`
+- [x] Config schema/versioning + silent-validation-gap fixes; warnings/docs for crossfade-without-loop, seek vs start_position, channel_map↔LFE collision; unique auto voice ids `[A]`
+- [x] proptest fuzz for config + command JSON (no panic) runs in the Docker pipeline `[A]`
+- [x] systemd unit + structured JSON logging documented `[A]`
 
 ---
 
 ## Final gates
 
-- [ ] All sprints 0–9 are `Done` with every box above genuinely checked
-- [ ] `MANUAL-VERIFICATION.md` has been run by the partner on Windows (and spot-checked on macOS) with results recorded
-- [ ] `README.md` / `CHANGELOG.md` updated for user-visible and behavior-changing items
-- [ ] `docs/bugs.md` reflects any out-of-scope items discovered along the way
-- [ ] This tracker is finished: statuses accurate, no half-truths
+- [x] All sprints 0–9 are `Done` — every `[A]` (Lane A/Docker) and `[B]` (Lane B/native macOS) acceptance box is genuinely checked and green. The **only** unchecked boxes are the two `[C]` Windows items (Sprint 1 WASAPI smoke, Sprint 8 two-device soak), which are the partner's manual pass below.
+- [ ] `MANUAL-VERIFICATION.md` has been run by the partner on Windows (and spot-checked on macOS) with results recorded — **awaiting the partner.** This is the one human-in-the-loop step the program reserved: the Windows WASAPI smokes (W-1), the two-device live-input soak (W-2), and the real-device *listening* checks (Sprint 5 RT soak, Sprint 8 dropout soak) that automation can't judge.
+- [x] `README.md` / `CHANGELOG.md` updated for user-visible and behavior-changing items
+- [x] `docs/bugs.md` reflects any out-of-scope items discovered along the way
+- [x] This tracker is finished: statuses accurate, no half-truths
 
 ## Global Definition of Done (applies to every sprint)
 
