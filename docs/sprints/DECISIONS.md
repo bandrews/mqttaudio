@@ -90,6 +90,19 @@ Rationale is given so you understand intent and can judge whether new evidence t
 - **D22 · Phasing.** Land 5a (rings + control-side status, callback still functions, remove the `active_voices`
   callback lock) before 5b (move `MixerState` ownership + pool + graveyard, delete the remaining callback lock
   and per-buffer `HashSet`s). Each phase must keep the render-harness output within tolerance.
+- **D22a · OVERRIDE of D16's "callback owns `MixerState`, no lock" (decided with the partner, 2026-06-03).**
+  *New evidence:* mixing must run inside cpal's callback (cpal is the clock), but the supervisor **rebuilds that
+  callback closure on device errors** (Sprint 1 recovery). A recreated closure cannot carry persistent *owned*
+  state — the `MixerState` and the command-ring **consumer** would be lost on every rebuild, orphaning the
+  control-side producer. The strictly-lock-free alternatives are a dedicated mixing thread feeding cpal via an
+  output ring (you then build your own audio clock — real underrun/latency risk) or an `unsafe` raw pointer in
+  the hot path. *Decision:* keep `Arc<Mutex<AudioCallbackState>>` (bundling `MixerState` + the command-ring
+  consumer + the graveyard producer), but the **control thread never locks it** — all mutations go through the
+  command ring, all status through the control-side snapshot. Only the callback locks it (uncontended,
+  allocation-free) and the supervisor during a rebuild. This eliminates the real targets of D16 (priority
+  inversion, lock poisoning, per-buffer `HashSet` allocation, RT-thread frees) and passes the allocation
+  harness; it keeps one uncontended lock, so acceptance boxes 1–2 are read as **"no *contended* locks; the
+  control plane never touches RT state; the callback does no allocation or free."** Partner-approved.
 
 ## Sprint 6 — Mixer DSP
 
