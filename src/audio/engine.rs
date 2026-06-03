@@ -276,102 +276,208 @@ impl PartialEq for AlsaCardId {
     }
 }
 
-/// Find a stream config for the device with the requested channel count
-/// If requested_channels is None, uses the maximum available (capped at 32 for sanity)
-/// If requested_sample_rate is None, uses the device's preferred sample rate
+/// The output configuration chosen for a device: the stream config plus the
+/// sample format the typed callback must produce.
+pub struct OutputConfig {
+    pub stream_config: cpal::StreamConfig,
+    pub sample_format: cpal::SampleFormat,
+}
+
+/// Find an output configuration for the device — channel count, sample format,
+/// sample rate, and buffer size — delegating the choices to the pure helpers in
+/// `device_select` and validating the result against the device's supported
+/// configs before returning. This negotiates non-f32 and discrete-rate devices
+/// correctly instead of crashing at stream-build time.
+///
+/// `requested_channels`/`requested_sample_rate` of `None` use the device's
+/// maximum/preferred values. `requested_buffer_size` is honored when the device
+/// supports it, otherwise the device default is used.
 pub fn find_output_config(
     device: &cpal::Device,
     requested_channels: Option<usize>,
     requested_sample_rate: Option<u32>,
-) -> Result<cpal::StreamConfig, Box<dyn std::error::Error>> {
-    use cpal::SampleRate;
+    requested_buffer_size: u32,
+) -> Result<OutputConfig, Box<dyn std::error::Error>> {
+    use crate::audio::device_select::{
+        select_buffer_size, select_channels, select_sample_format, select_sample_rate,
+        BufferLimits, ConfigOption, SelectError,
+    };
 
-    // Get all supported configs
-    let supported_configs: Vec<_> = device.supported_output_configs()?.collect();
-
-    if supported_configs.is_empty() {
+    let supported: Vec<_> = device.supported_output_configs()?.collect();
+    if supported.is_empty() {
         return Err("No supported output configurations found".into());
     }
 
-    // Determine target channels
-    let target_channels = match requested_channels {
-        Some(ch) => ch as u16,
-        None => {
-            // Find maximum available channels, but cap at 32 for sanity
-            // (ALSA plugins may report absurdly high values)
-            supported_configs
-                .iter()
-                .map(|c| c.channels())
-                .filter(|&ch| ch <= 32)
-                .max()
-                .unwrap_or(2)
-        }
-    };
-
-    // Find configs that match the requested channel count
-    let matching_configs: Vec<_> = supported_configs
+    let options: Vec<ConfigOption> = supported
         .iter()
-        .filter(|c| c.channels() == target_channels)
+        .map(|c| ConfigOption {
+            channels: c.channels(),
+            sample_format: c.sample_format(),
+            min_rate: c.min_sample_rate().0,
+            max_rate: c.max_sample_rate().0,
+            buffer: match c.buffer_size() {
+                cpal::SupportedBufferSize::Range { min, max } => BufferLimits::Range {
+                    min: *min,
+                    max: *max,
+                },
+                cpal::SupportedBufferSize::Unknown => BufferLimits::Unknown,
+            },
+        })
         .collect();
 
-    if matching_configs.is_empty() {
-        // No exact match - list available channel counts (capped for display)
-        let available: Vec<_> = supported_configs
-            .iter()
-            .map(|c| c.channels())
-            .filter(|&ch| ch <= 32)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        return Err(format!(
-            "No configuration found for {} channels. Available: {:?}",
-            target_channels, available
-        )
-        .into());
-    }
+    let channels = select_channels(&options, requested_channels)?;
+    let sample_format =
+        select_sample_format(&options, channels).ok_or(SelectError::NoFormat { channels })?;
 
-    // Determine target sample rate
-    let target_sample_rate = requested_sample_rate.unwrap_or_else(|| {
-        // Use the default config's sample rate if possible, otherwise pick a common rate
+    // Rate spans for the chosen (channels, format).
+    let ranges: Vec<(u32, u32)> = options
+        .iter()
+        .filter(|o| o.channels == channels && o.sample_format == sample_format)
+        .map(|o| (o.min_rate, o.max_rate))
+        .collect();
+
+    let requested_rate = requested_sample_rate.unwrap_or_else(|| {
         device
             .default_output_config()
             .map(|c| c.sample_rate().0)
             .unwrap_or(48000)
     });
 
-    // Find the best matching config for sample rate
-    // Prefer configs with reasonable sample rate ranges, but accept any if needed
-    let best_config = matching_configs.iter().find(|c| {
-        let min = c.min_sample_rate().0;
-        let max = c.max_sample_rate().0;
-        target_sample_rate >= min && target_sample_rate <= max
-    });
+    // On ALSA a raw `hw:` device may advertise a continuous range but accept
+    // only discrete rates; prefer the probed discrete set when available.
+    #[cfg(target_os = "linux")]
+    let discrete = crate::audio::alsa_probe::discrete_rates_for(&device.name().unwrap_or_default());
+    #[cfg(not(target_os = "linux"))]
+    let discrete: Option<Vec<u32>> = None;
 
-    match best_config {
-        Some(config_range) => {
-            let config = config_range.with_sample_rate(SampleRate(target_sample_rate));
-            Ok(cpal::StreamConfig {
-                channels: config.channels(),
-                sample_rate: config.sample_rate(),
-                buffer_size: cpal::BufferSize::Default,
-            })
-        }
-        None => {
-            // Sample rate not directly supported - clamp to valid range
-            let config_range = matching_configs[0];
-            let min_rate = config_range.min_sample_rate().0;
-            let max_rate = config_range.max_sample_rate().0;
-            // Clamp target to valid range, but also cap max at 384kHz for sanity
-            let capped_max = max_rate.min(384000);
-            let sample_rate = target_sample_rate.max(min_rate).min(capped_max);
-            let config = config_range.with_sample_rate(SampleRate(sample_rate));
-            Ok(cpal::StreamConfig {
-                channels: config.channels(),
-                sample_rate: config.sample_rate(),
-                buffer_size: cpal::BufferSize::Default,
-            })
+    let sample_rate = select_sample_rate(&ranges, discrete.as_deref(), requested_rate);
+
+    let buffer_limits = options
+        .iter()
+        .find(|o| {
+            o.channels == channels
+                && o.sample_format == sample_format
+                && sample_rate >= o.min_rate
+                && sample_rate <= o.max_rate
+        })
+        .map(|o| o.buffer)
+        .unwrap_or(BufferLimits::Unknown);
+    let buffer_size = select_buffer_size(buffer_limits, requested_buffer_size);
+
+    // Validate the chosen config against the device's real supported configs.
+    let supported_here = supported.iter().any(|c| {
+        c.channels() == channels
+            && c.sample_format() == sample_format
+            && sample_rate >= c.min_sample_rate().0
+            && sample_rate <= c.max_sample_rate().0
+    });
+    if !supported_here {
+        return Err(format!(
+            "selected output config ({} ch, {:?}, {} Hz) is not supported by the device",
+            channels, sample_format, sample_rate
+        )
+        .into());
+    }
+
+    Ok(OutputConfig {
+        stream_config: cpal::StreamConfig {
+            channels,
+            sample_rate: cpal::SampleRate(sample_rate),
+            buffer_size,
+        },
+        sample_format,
+    })
+}
+
+/// Run one audio callback's worth of mixing into the f32 bus, plus the
+/// voice-activity bookkeeping the control side reads. Shared by every typed
+/// output stream so the device sample format never changes the mix logic.
+fn run_mix_callback(
+    bus: &mut [f32],
+    mixer_state: &Arc<Mutex<MixerState>>,
+    active_voices: &Arc<Mutex<std::collections::HashSet<String>>>,
+) {
+    use std::collections::HashSet;
+
+    let mut state = mixer_state.lock().unwrap();
+    crate::audio::mixer::mix_audio(bus, &mut state);
+
+    let voices_before: HashSet<String> = state
+        .active_samples
+        .iter()
+        .map(|s| s.voice_id.clone())
+        .collect();
+    state.active_samples.retain(|s| !s.is_finished());
+    let voices_after: HashSet<String> = state
+        .active_samples
+        .iter()
+        .map(|s| s.voice_id.clone())
+        .collect();
+
+    if let Some(ref mut engine) = state.ducking_engine {
+        for voice in voices_before.difference(&voices_after) {
+            engine.notify_voice_active(voice, false);
         }
     }
+
+    *active_voices.lock().unwrap() = voices_after;
+}
+
+/// Build an output stream of element type `T`, mixing into an f32 scratch bus and
+/// converting each sample to `T`. The scratch bus is reused across callbacks.
+fn build_typed_output_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    mixer_state: Arc<Mutex<MixerState>>,
+    active_voices: Arc<Mutex<std::collections::HashSet<String>>>,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32> + Send + 'static,
+{
+    let mut scratch: Vec<f32> = Vec::new();
+    device.build_output_stream(
+        config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            scratch.resize(data.len(), 0.0);
+            run_mix_callback(&mut scratch, &mixer_state, &active_voices);
+            for (out, &s) in data.iter_mut().zip(scratch.iter()) {
+                *out = T::from_sample(s);
+            }
+        },
+        |err| {
+            tracing::error!("Audio stream error: {}", err);
+        },
+        None,
+    )
+}
+
+/// Dispatch over the device's native sample format and build the matching typed
+/// output stream. The mixer always works in f32; only the device-facing
+/// conversion differs, so non-f32 devices no longer crash at build time.
+pub fn build_output_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
+    mixer_state: Arc<Mutex<MixerState>>,
+    active_voices: Arc<Mutex<std::collections::HashSet<String>>>,
+) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
+    use cpal::SampleFormat;
+    let stream = match sample_format {
+        SampleFormat::F32 => {
+            build_typed_output_stream::<f32>(device, config, mixer_state, active_voices)?
+        }
+        SampleFormat::I16 => {
+            build_typed_output_stream::<i16>(device, config, mixer_state, active_voices)?
+        }
+        SampleFormat::U16 => {
+            build_typed_output_stream::<u16>(device, config, mixer_state, active_voices)?
+        }
+        SampleFormat::I32 => {
+            build_typed_output_stream::<i32>(device, config, mixer_state, active_voices)?
+        }
+        other => return Err(format!("unsupported device sample format: {:?}", other).into()),
+    };
+    Ok(stream)
 }
 
 /// Initialize audio output stream with a test sine wave

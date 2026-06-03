@@ -159,6 +159,15 @@ fn probe_device_capabilities(name: &str) -> Result<NativeCapabilities, String> {
     })
 }
 
+/// Probe an ALSA device's discrete output sample rates, if it advertises a
+/// discrete set. Returns `None` if the device can't be probed or exposes a
+/// continuous rate range. Used to steer rate selection for raw `hw:` devices.
+pub fn discrete_rates_for(name: &str) -> Option<Vec<u32>> {
+    probe_device_capabilities(name)
+        .ok()
+        .and_then(|caps| caps.discrete_rates)
+}
+
 /// Get card ID (short name) from ALSA
 #[allow(dead_code)]
 fn get_card_id(card_index: i32) -> Option<String> {

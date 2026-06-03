@@ -370,10 +370,11 @@ async fn main() {
     };
 
     let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
-    let stream_config = match audio::engine::find_output_config(
+    let output_config = match audio::engine::find_output_config(
         &device,
         config.audio.channels,
         Some(config.audio.sample_rate),
+        config.audio.buffer_size,
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -390,12 +391,15 @@ async fn main() {
         }
     };
 
+    let stream_config = output_config.stream_config;
+    let sample_format = output_config.sample_format;
     let output_sample_rate = stream_config.sample_rate.0;
     let output_channels = stream_config.channels as usize;
 
     tracing::info!("Audio device: {}", device_name);
     tracing::info!("  Sample rate: {} Hz", output_sample_rate);
     tracing::info!("  Channels: {}", output_channels);
+    tracing::info!("  Sample format: {:?}", sample_format);
 
     // Create mixer state and voice manager
     use audio::ducking::DuckingEngine;
@@ -571,53 +575,31 @@ async fn main() {
         }
     }
 
-    let mixer_state_clone = mixer_state.clone();
-    let active_voices_clone = active_voices.clone();
+    // Start audio stream — build a typed stream that matches the device's
+    // native sample format and convert the f32 mix bus to it per sample.
+    let stream = match audio::engine::build_output_stream(
+        &device,
+        &stream_config,
+        sample_format,
+        mixer_state.clone(),
+        active_voices.clone(),
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to build audio stream: {}", e);
+            #[cfg(target_os = "linux")]
+            tracing::error!(
+                "On ALSA, a raw 'hw:' device may require its native format; try a \
+                 'plughw:' or 'default' device, which converts formats automatically."
+            );
+            std::process::exit(1);
+        }
+    };
 
-    // Start audio stream
-    let stream = device
-        .build_output_stream(
-            &stream_config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let mut state = mixer_state_clone.lock().unwrap();
-                audio::mixer::mix_audio(data, &mut state);
-
-                // Track which voices had samples before cleanup
-                let voices_before: HashSet<String> = state
-                    .active_samples
-                    .iter()
-                    .map(|s| s.voice_id.clone())
-                    .collect();
-
-                // Remove finished samples
-                state.active_samples.retain(|s| !s.is_finished());
-
-                // Track which voices have samples after cleanup
-                let voices_after: HashSet<String> = state
-                    .active_samples
-                    .iter()
-                    .map(|s| s.voice_id.clone())
-                    .collect();
-
-                // Notify ducking engine of voices that became inactive
-                if let Some(ref mut engine) = state.ducking_engine {
-                    for voice in voices_before.difference(&voices_after) {
-                        engine.notify_voice_active(voice, false);
-                    }
-                }
-
-                // Update active voices tracker
-                let mut active = active_voices_clone.lock().unwrap();
-                *active = voices_after;
-            },
-            |err| {
-                tracing::error!("Audio stream error: {}", err);
-            },
-            None,
-        )
-        .expect("Failed to build audio stream");
-
-    stream.play().expect("Failed to start audio stream");
+    if let Err(e) = stream.play() {
+        tracing::error!("Failed to start audio stream: {}", e);
+        std::process::exit(1);
+    }
     tracing::info!("Audio stream started");
 
     // Create command channel

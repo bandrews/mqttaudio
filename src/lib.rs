@@ -6,6 +6,7 @@ pub mod audio {
     pub mod chunked_resampler;
     pub mod decoder;
     pub mod device;
+    pub mod device_select;
     pub mod ducking;
     pub mod engine;
     pub mod input;
