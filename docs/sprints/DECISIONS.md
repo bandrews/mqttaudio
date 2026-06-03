@@ -158,3 +158,48 @@ Rationale is given so you understand intent and can judge whether new evidence t
 - **D41 · Small feature-conflict fixes.** `seek` clamps against `total_frames_or_estimate` (consistent with
   `start_position`); warn when `crossfade_ms` is set without `loop:true`; document the `channel_map`→LFE
   bypass. All low-risk; just do them.
+
+## Streaming, Memory-Budget & Freshness Redesign (owner Q&A, 2026-06-03)
+
+A customer plays big, long, non-looping game cues (up to ~2 hours, possibly 5.1). Everything previously
+played fully-resident as f32 PCM, so a 2-hour 5.1 cue was ~8.3 GB for one file and `max_memory_mb` was a
+soft cap that over-allocated rather than refusing. These decisions make playback safe for both tiny
+seek/loop/pitch SFX and 2-hour beds that must never OOM.
+
+- **D42 · Two voice classes, not one windowed buffer.** Keep the fully-resident `ActiveSample` (random-access:
+  seek, loop-crossfade, reverse, speed, pitch) and add a **restricted** `StreamedSource` sibling: a bounded
+  draining `HeapRb<f32>` ring fed by a background decoder, `O(window)` memory, forward-only. Seek/speed/
+  loop-crossfade are **rejected (warn)** for streamed voices at the command layer. *Why:* the mixer's advanced
+  features are fundamentally random-access; a draining ring cannot support them, so windowing is a sibling, not
+  an extension. `StreamedSource` reuses the Sprint-8 live-input ring-mix body via a shared
+  `mix_ring_voice_frame` helper.
+- **D43 · Memory budget auto-detects by default, even for legacy configs.** `max_memory_mb: 0` now resolves to
+  **bounded-auto** (≈40% of *available* RAM, clamped to `[floor_mb 128, ceiling_mb 1024]`), not unlimited.
+  Explicit `{mode: unlimited}` is a deliberate opt-out; explicit `max_memory_mb: N` (N>0) is still honoured;
+  `memory_budget` (if present) wins over the legacy field. Autodetect-None ⇒ ceiling, **never** unlimited.
+  *Behavior change* — changelog + README it. *Why:* never camp all RAM on a 2 GB Pi; safe by default.
+- **D44 · The budget is the hard never-OOM override.** A cheap header-only probe (symphonia `n_frames`/channels,
+  dropped before any decode) estimates decoded bytes *before* decoding. If the estimate exceeds live budget
+  headroom, the asset is **force-routed to the streamed voice** — even over `mode=full` (logged). Precedence:
+  per-play `mode` > config `load_mode` > size/duration heuristic; **budget-won't-fit beats all of them.**
+  Unknown HTTP size ⇒ Windowed. *Why:* a 2-hour file can never be chosen for full-load.
+- **D45 · Auto-window large assets by default.** Full-load stays for small assets (`full_load_max_bytes` 32 MiB
+  decoded, `full_load_max_seconds` 60); bigger/longer auto-windows. Per-play `mode` override always available
+  (still cap-bounded). *Behavior change* (those assets lose seek/loop/pitch) — documented with the override path.
+- **D46 · Freshness defaults to stale-while-revalidate.** `FreshnessMode { Trusting(default) | Dev | Pinned }`.
+  **HTTP SWR:** a warm hit past the window returns the current `Arc` *immediately* and refreshes out-of-band
+  (background conditional GET; 304 bumps `validated_at`, 200 swaps only the map slot for the next play — the
+  playing voice keeps its own `Arc`, and `evict_one` protects `strong_count>1`); the foreground get **never**
+  awaits the network, and the background task never holds the cache mutex across the await. **Local:** re-`stat`
+  (mtime+size, one syscall) on a warm hit and re-decode only on change. `Dev` checks every play (HTTP window→0);
+  `Pinned` skips all checks. Fixes the warm-hit-never-revalidates short-circuit. *Why:* fast warm plays that
+  still pick up changed assets without ever blocking a play on the network.
+- **D47 · `cache_reload { file }` command (MQTT + HTTP).** Invalidate then re-precache, so the next play is both
+  fresh and instant. *Why:* content pipelines republish an asset and want the next cue to reflect it now.
+- **D48 · Runtime memory-pressure monitoring deferred.** Static cap + startup autodetect only; recommend OS
+  `cgroup`/systemd `MemoryMax` for the daemon. `detect_available_memory()` / `with_resolved_cap` seams are left
+  for a future controller. *Why:* owner flagged the dynamic-shrinking test burden as not worth it now (YAGNI).
+- **D49 · HTTP windowed streaming + incremental disk persist deferred.** The first client is disk-focused;
+  windowed HTTP playback and tee-to-disk-on-stream are scoped out and recorded in `docs/bugs.md` with the
+  reuse points (`http_stream.rs` buffered bytes → atomic rename to `cache_filename_for_url`). *Why:* YAGNI for
+  the first client; the seams exist when a streaming-HTTP client appears.

@@ -31,6 +31,19 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   streamed and full-load sources, may not warn — but the command is a structural no-op on streamed sources
   regardless (they live in a separate voice list the sample-targeted commands never touch), so this is a UX
   nicety, not a correctness gap.
+- **Per-streamed-source gauge telemetry is deferred (redesign S4 — LOW).** `/metrics` exposes the cache as
+  whole-system gauges (`cache.memory_bytes`/`memory_entries`/`memory_headroom_bytes`/`disk_bytes`, all real),
+  and the per-play windowing decision and its reason (estimated decoded MB vs. cache headroom MB) are emitted
+  as `tracing::info!` events in `should_window_local` (`src/main.rs`). What is **not** surfaced is
+  *per-streamed-source* runtime state: each windowed voice's ring fill level, its cumulative underrun-frame
+  count, and a live full-vs-windowed-per-voice list on `/status`. The control plane cannot read `MixerState`
+  (D22a), so these would need the audio thread to publish per-source atomics (ring fill, underrun counter) over
+  a side channel into the control-side snapshot — the same plumbing pattern as the xruns `Arc<AtomicU64>`, but
+  per voice. Deferred as low value for the disk-focused first client: the never-OOM guarantee is observable
+  today via `memory_headroom_bytes` (→ 0 is the pressure signal) and the windowing logs, and glitch-freeness is
+  gated by the alloc harness + render tests, not a runtime metric. The absolute resolved memory cap is logged
+  once at startup (`CacheManager::with_resolved_cap`) rather than re-exposed on `/metrics`; add a
+  `cache.memory_cap_bytes` gauge alongside the per-source atomics if a dashboard needs the denominator.
 - **`handle_command`'s own "Invalid JSON" 400 branch is unreachable (Sprint 9 F10 — discovered, LOW).**
   `src/http/handlers.rs` `handle_command` extracts `Json(body): Json<Value>` then maps a
   `serde_json::to_string(&body)` failure to `400 + CommandResponse::error("Invalid JSON: ...")`. But by the

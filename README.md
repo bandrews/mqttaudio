@@ -195,6 +195,41 @@ A few mixer behaviors are worth knowing (see `docs/configuration.md` for the ful
   pitch. Note that speeds **above** `1.0` without pitch correction will alias (no anti-aliasing on the
   fast path) — use pitch correction for clean large speed-ups.
 
+### Large files, memory, and streaming
+
+mqttaudio keeps memory bounded automatically, so a long cue — even a 2-hour 5.1 mix — never has to fit in RAM:
+
+- **Auto-windowing (default).** Every `play` decodes to f32 in memory, costing roughly
+  `duration × rate × channels × 4 bytes` — about **1.4 GB/hour stereo** and **4.2 GB/hour for 5.1** at 48 kHz.
+  By default (`mode=auto`) mqttaudio probes the file's header and, if its decoded size or duration exceeds the
+  thresholds **or would not fit the memory budget**, plays it through a bounded **window** (a fixed ring,
+  default 1.5 s) fed by a background decoder — `O(window)` memory and a low time-to-first-sample — instead of
+  fully decoding it. Small assets (SFX, voiceovers) still fully load, with all features.
+- **Windowed voices play forward only.** Seek, loop-crossfade, reverse, variable speed, and pitch correction
+  do not apply to a windowed (streamed) voice. Force a full load with `"mode": "full"` on the `play` (it still
+  cannot exceed the memory cap), or force windowing with `"mode": "stream"`. Tune the defaults with
+  `cache.load_mode`, `cache.full_load_max_bytes`, `cache.full_load_max_seconds`, and `cache.stream_window_ms`.
+  (Windowed streaming currently applies to local files; HTTP URLs full-load.)
+- **Memory budget (never camps all RAM).** The decoded-audio cache has a hard cap. By default it auto-detects
+  a bounded size — about 40 % of *available* RAM, clamped to `[128 MiB, 1 GiB]` — so it is safe on a 2 GB
+  Raspberry Pi without starving other processes. Override with `cache.memory_budget`:
+  `{"mode":"auto","fraction":0.4,"floor_mb":128,"ceiling_mb":1024}`, `{"mode":"explicit","mb":512}`, or
+  `{"mode":"unlimited"}` (opt out — risks OOM). The simple `cache.max_memory_mb` still works: `0` (the
+  default) = auto, a positive value = an explicit MiB cap. `GET /metrics` reports the cache's resident bytes,
+  entries, and headroom.
+
+### Cache freshness
+
+By default a warm cache serves instantly but still picks up changes:
+
+- **Local files:** on each play the file's mtime+size are checked (a cheap stat); if it changed on disk it is
+  re-decoded. Edit an asset and the next play hears it — no restart.
+- **Remote (HTTP) files:** refreshed in the background by a periodic tick past the revalidation window, so a
+  play never blocks on the network.
+- Set `cache.freshness` to `trusting` (default), `dev` (re-check every load), or `pinned` (never auto-check),
+  or override per play with `"freshness": "..."`. The `cache_reload` command (MQTT, or `POST /cache/reload`)
+  forces an entry fresh+instant — handy after a content pipeline republishes an asset.
+
 ### Live input behavior
 
 When `config.inputs` is configured to mix a microphone or line input (see

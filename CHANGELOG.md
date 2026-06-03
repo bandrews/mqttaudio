@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Windowed streaming for big local files (`mode=stream`, and via the default `mode=auto`).** A `play` of a
+  large or long local file is now played through a bounded ring (a fixed window, default 1.5 s) fed by a
+  background decoder, instead of being fully decoded into memory — so a multi-hour cue costs `O(window)`
+  memory with a low time-to-first-sample. The Play command accepts an optional `mode`
+  (`auto`|`full`|`stream`, default `auto`) plus `window_ms`/`prebuffer_ms` overrides;
+  `cache.stream_window_ms` / `stream_prebuffer_ms` / `stream_prebuffer_deadline_ms` set the defaults.
+  Windowed (streamed) voices play forward only — seek, loop-crossfade, reverse, variable speed, and pitch
+  correction do not apply to them. (HTTP windowed streaming is not yet implemented; HTTP plays full-load.)
+- **Auto memory budget + hard cache cap (never OOM).** The decoded-audio cache now has a hard cap. By default
+  it auto-detects a bounded size from available system memory (≈40 %, clamped to [128 MiB, 1 GiB]) so the
+  daemon never camps all RAM, and `mode=auto` automatically windows any local asset whose estimated decoded
+  size would not fit the budget — so a 2-hour 5.1 cue can never OOM the box under the default mode. New
+  `cache.memory_budget` (`{"mode":"auto"|"explicit"|"unlimited", ...}`), `cache.load_mode`,
+  `cache.full_load_max_bytes`, and `cache.full_load_max_seconds` knobs tune it. `/metrics` now reports the
+  cache's resident bytes, entries, headroom, and on-disk bytes.
+- **Cache freshness: local edits picked up, remote entries refreshed in the background.** Editing a local
+  asset between plays now takes effect — on a warm cache hit the file's mtime+size are checked and it is
+  re-decoded if it changed. Remote (HTTP) entries are refreshed out-of-band by a periodic freshness tick
+  (never blocking a play on the network). `cache.freshness` (`trusting`|`dev`|`pinned`, default `trusting`)
+  and a per-play `freshness` override control it. A new `cache_reload` command (MQTT, and `POST /cache/reload`)
+  invalidates an entry and re-precaches it, so a content pipeline can force fresh+instant on republish.
 - **Output limiter configuration.** Two new `audio` keys control the final output stage: `output_ceiling_db`
   (the limiter ceiling in dBFS, default `-1.0`, must be between `-60.0` and `0.0`) and `master_gain` (a
   linear bus gain applied before limiting, default `1.0`, between `0.0` and `8.0`).
@@ -49,6 +70,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`cache.max_memory_mb: 0` now means auto-detect a bounded cap, not unlimited.** Previously `0` (and the
+  former `512` default) meant an unlimited cache, which could OOM the box on a big file. `0` is the new
+  default and resolves to the auto memory budget. A positive `max_memory_mb` is still an explicit hard cap
+  and always wins; set `cache.memory_budget: {"mode":"unlimited"}` to opt back into no cap.
+- **Large local assets played with the default `mode=auto` now stream (windowed) instead of fully loading.**
+  This trades seek/loop/pitch on those large assets for bounded memory and a low time-to-first-sample; set
+  `mode=full` per play (or raise `cache.full_load_max_bytes` / `cache.full_load_max_seconds`) to keep
+  full-loading them.
 - **Output overload is now a soft-knee limiter instead of a brickwall clamp.** The summed bus was previously
   hard-clamped to ±1.0 (mislabeled "saturation"), which flat-tops the waveform and adds harmonic distortion
   past full scale. It now passes through a soft-knee limiter at a configurable ceiling (default `-1.0` dBFS,

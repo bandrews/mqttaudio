@@ -48,6 +48,10 @@ Play an audio file.
 | `fade_in` | integer | 0 | Fade-in duration (milliseconds) |
 | `start_position_ms` | integer | 0 | Start position (milliseconds) |
 | `channel_map` | array | auto | Channel routing (see below) |
+| `mode` | string | `auto` | Load strategy: `auto` (decide by size/duration + memory budget), `full` (always in-memory), or `stream` (window a big/long local file). A windowed voice plays forward only |
+| `window_ms` | integer | config | Windowed-source ring depth override (streamed plays) |
+| `prebuffer_ms` | integer | config | Windowed-source prebuffer override (streamed plays) |
+| `freshness` | string | config | Cache freshness override: `trusting`, `dev`, or `pinned` |
 
 **Channel Mapping:**
 
@@ -288,6 +292,18 @@ Remove a specific file from cache.
 {
   "command": "cache_invalidate",
   "file": "https://example.com/updated-file.wav"
+}
+```
+
+### cache_reload
+
+Invalidate a cached entry and immediately re-precache it, so the next play is both fresh and instant. Useful
+after a content pipeline republishes an asset.
+
+```json
+{
+  "command": "cache_reload",
+  "file": "/sounds/updated-cue.wav"
 }
 ```
 

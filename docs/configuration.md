@@ -274,7 +274,16 @@ File caching settings.
 | `directory` | string | `~/.mqttaudio/cache` | Disk cache directory |
 | `precache` | array | `[]` | Files or directories to cache on startup |
 | `precache_blocking` | boolean | `true` | Block startup until precache completes |
-| `max_memory_mb` | integer | `512` | Maximum memory cache size in MB (0 = unlimited) |
+| `max_memory_mb` | integer | `0` | Simple memory-cache cap in MB. `0` (default) = auto-detect a bounded cap; a positive value is an explicit hard cap. Overridden by `memory_budget`. **(Changed: `0` no longer means unlimited.)** |
+| `memory_budget` | object | *auto* | Advanced budget: `{"mode":"auto","fraction":0.4,"floor_mb":128,"ceiling_mb":1024}`, `{"mode":"explicit","mb":512}`, or `{"mode":"unlimited"}`. When present, overrides `max_memory_mb` |
+| `load_mode` | string | `auto` | Default load strategy: `auto` (decide from size/duration + the budget), `full`, or `stream` |
+| `full_load_max_bytes` | integer | `33554432` | `auto` threshold: a local asset whose estimated decoded size exceeds this is windowed (streamed) |
+| `full_load_max_seconds` | integer | `60` | `auto` threshold: a local asset longer than this is windowed |
+| `stream_window_ms` | integer | `1500` | Windowed-source ring depth in ms (bounds per-stream memory) |
+| `stream_prebuffer_ms` | integer | `150` | Audio prebuffered before a windowed source starts playing |
+| `stream_prebuffer_deadline_ms` | integer | `300` | Max wait for the prebuffer before starting anyway |
+| `freshness` | string | `trusting` | `trusting` (serve cache, refresh remote in background), `dev` (re-check every load), or `pinned` (never auto-check) |
+| `revalidate_after_seconds` | integer | `300` | Revalidate a remote (HTTP) cache entry once it is older than this |
 
 #### Precaching
 
