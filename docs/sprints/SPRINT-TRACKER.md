@@ -15,13 +15,21 @@ sprints **in order**; do not start a sprint whose dependencies are not `Done`.
 These rules are non-negotiable and override any urge to move fast. They mirror `CLAUDE.md`, especially
 its MOST IMPORTANT NOTE.
 
+**Decisions are pre-locked in [`DECISIONS.md`](DECISIONS.md).** It resolves every design/behavior choice in
+this program; any "sign-off", "partner", "decide", or "consult" wording left in a sprint file is **superseded**
+by it — treat those as already decided and keep moving. You may **overrule** a locked decision only when
+implementation uncovers new evidence that a different choice is clearly better (record it per `DECISIONS.md`).
+**Never block the program waiting on a human.** If something truly needs human intervention and has no other
+resolution — a genuine last resort — add it to [`NEEDS-HUMAN.md`](NEEDS-HUMAN.md), skip **only** that item, and
+complete everything else in the sprint.
+
 - **Doing it right beats doing it fast.** You are not in a rush. Tedious, systematic work is usually the
   correct solution. Never skip steps.
 - **Never fake completion.** The worst thing you can do is declare a sprint finished when it is not.
   Do not mark an acceptance box checked unless you have *actually verified* it.
 - **Never disable, delete, `#[ignore]`, or comment out a test or code path to make things "pass."**
-  If a test fails, fix the root cause. If you believe a test is wrong, STOP and ask the partner — do not
-  silently weaken it. (Gating device-opening tests behind the documented `--ignored` flag for Lane B is
+  If a test fails, fix the root cause. If you believe a test is wrong, don't silently weaken it — log it in
+  `NEEDS-HUMAN.md` and move on. (Gating device-opening tests behind the documented `--ignored` flag for Lane B is
   the *only* sanctioned use of `#[ignore]`, and it is set up once in Sprint 0.)
 - **Root cause only.** No symptom patches or workarounds. Follow the systematic debugging process in
   `CLAUDE.md`: investigate → reproduce → single hypothesis → minimal change → verify.
@@ -32,8 +40,9 @@ its MOST IMPORTANT NOTE.
 - **Green gate, every sprint.** A sprint is not `Done` until `scripts/validate.sh` (Lane A, Docker) and
   `scripts/validate.sh --native` (Lane B, this Mac) both exit 0, with **zero build warnings** and clippy
   clean. `cargo build --release` building without warnings is a hard rule.
-- **If you get stuck or in over your head, STOP and ask the partner.** Especially for Sprint 5
-  (architectural change) and anything needing human judgment.
+- **Don't halt the program.** Resolve blockers from `DECISIONS.md` and the code; override a locked decision if
+  new evidence demands it. Only as a true last resort — when something genuinely needs a human and has no other
+  path — log it in `NEEDS-HUMAN.md`, skip that one item, and finish everything else in the sprint.
 - **Log out-of-scope discoveries** in `docs/bugs.md`; commit each
   sprint on a branch with a clear message.
 
@@ -130,7 +139,6 @@ Tick a box only when genuinely verified. `[A]` = Lane A/Docker, `[B]` = Lane B/n
 - [ ] Ducking notify + voice bookkeeping moved off the RT thread; pitch scratch pre-allocated `[A]`
 - [ ] Render harness shows within-tolerance output vs pre-redesign for a fixed scene; soak test (many plays/stops) shows no xrun-counter increments `[A]`
 - [ ] Real-device soak smoke runs clean on this Mac `[B]`
-- [ ] Partner consulted before starting (architectural change) `[ ]`
 
 ### Sprint 6 — Mixer DSP correctness
 - [ ] NaN/non-finite input → silence, not NaN, at the output; clip/over counter exposed `[A]`

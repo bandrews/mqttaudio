@@ -34,7 +34,7 @@ Two scoping facts that shape this sprint:
   `state.bass_management` is `Some` (`mixer.rs:580`). So every finding here affects **only users who opt in** by
   setting `bass_management.enabled = true`. That is why effort is **M**, not L.
 - **One item is a design decision, not a forced fix.** The "double bass" finding describes a recognized
-  *LFE+Main* mode, so it needs a **default + docs decision with partner sign-off**, not a unilateral behavior
+  *LFE+Main* mode, so it needs a **default + docs decision per DECISIONS.md**, not a unilateral behavior
   change (see Caveats and the changelog section).
 
 This sprint depends on Sprint 5 (lock-free RT engine) because the denormal-flush change touches the per-sample
@@ -48,7 +48,7 @@ post-Sprint-5 callback/ownership model rather than the current `Arc<Mutex<MixerS
   the single 2nd-order sections in `BassManagement` (`bass_management.rs:16-63`, `147-167`, `205`, `210`).
 - LFE gain compensation so sub level is independent of active source-channel count
   (`bass_management.rs:192-216`).
-- A **default + docs decision** for `remove_bass_from_sources` (partner sign-off), plus a one-time
+- A **default + docs decision** for `remove_bass_from_sources` (the locked decision in DECISIONS.md), plus a one-time
   construction-time warning when `lfe_channel >= output_channels`, and documentation of the additive-LFE /
   LFE-collision behavior.
 - Denormal flush-to-zero in the biquad IIR (`bass_management.rs:90-102`).
@@ -81,7 +81,7 @@ re-verified against current source before writing.
    - **Caveat (over-stated):** this is the recognized **LFE+Main / "Double Bass"** mode (AVRs expose it
      deliberately; `test_bass_management_adds_to_existing_lfe` at `bass_management.rs:640-680` shows the author
      intended it as selectable). So the **fix is a default + docs decision**, not a forced behavior change —
-     **partner sign-off required** (see Caveats and changelog).
+     **decided upfront in DECISIONS.md** (see Caveats and changelog).
 
 2. **2nd-order Butterworth crossover → 180° cancellation at fc (not Linkwitz-Riley)** — MEDIUM (confirmed;
    over-stated as high).
@@ -109,7 +109,7 @@ re-verified against current source before writing.
      device channel count, so it's only caught at runtime by this in-range guard.
    - **Fix:** emit a **one-time warning at construction** when `lfe_channel >= output_channels`
      (`main.rs:422` already has `output_channels` in scope at the `BassManagement::new` call). Optional, behind
-     the partner decision: fold extracted bass back into the mains when no LFE exists.
+     the DECISIONS.md (D32) option: fold extracted bass back into the mains when no LFE exists.
 
 5. **Content routed directly to the LFE index is summed-on-top unfiltered** — LOW.
    - Verified: the LFE index is added to, not replaced — `output[lfe_idx] += lfe_sum;` (`bass_management.rs:216`);
@@ -117,7 +117,7 @@ re-verified against current source before writing.
    - Evidence: if another voice routes full-range material to the LFE output index, it is mixed with the
      bass-managed sum rather than crossed over — a collision, arguably intended (additive LFE).
    - **Fix:** **document** that the LFE output index receives (directly-routed content) + (extracted bass);
-     optionally low-pass the final LFE bus after summation. Document-only unless the partner asks for the LP.
+     optionally low-pass the final LFE bus after summation. Document-only unless DECISIONS.md changes it for the LP.
 
 6. **Denormals in the biquad/IIR processed every sample → CPU spikes** — LOW (from RT-safety).
    - Verified: the biquad `process()` (`bass_management.rs:90-102`) is a transposed direct-form-II IIR with
@@ -136,7 +136,7 @@ re-verified against current source before writing.
   depends on physical speaker placement the software can't control. Treat them as quality/correctness fixes, not
   glitch/crash fixes.
 - **Finding 1 is not a unilateral code change.** Do **not** silently flip `remove_bass_from_sources` for users.
-  The deliverable is a *decision* (change the default, or document loudly) made **with the partner** and a docs
+  The deliverable is a *decision* (change the default, or document loudly) made per **DECISIONS.md** and a docs
   update — see the changelog section.
 - **The denormal item (6) is NOT the NaN finding.** NaN/non-finite sanitisation of the summed mix is Sprint 6's
   job (`mixer.rs:584-587`). Here we only flush *finite-but-denormal* biquad state. Don't add NaN handling in this
@@ -184,7 +184,7 @@ test in this file.
    - Then normalize `lfe_sum` by the number of **active** source channels actually contributing this frame
      (channels that pass the `src_ch >= output_channels || src_ch == lfe_ch` guard at `:197`), computed once per
      `process()` call (not per frame). Prefer count-normalization for the default; only add a configurable LFE
-     gain knob if the partner wants one (note it as a possible follow-up — YAGNI otherwise).
+     gain knob if wanted later (note it as a possible follow-up — YAGNI otherwise).
    - Update `test_bass_management_extracts_to_lfe` / `test_bass_management_adds_to_existing_lfe`
      (`bass_management.rs:457-495`, `:640-680`) only if their absolute power assertions move; keep their intent.
      If an assertion has to change, say so loudly in the commit message — do not quietly retune a passing test.
@@ -204,7 +204,7 @@ test in this file.
      place — `process()` runs on the audio thread and must not log per-call; `main.rs:422` passes
      `output_channels` in.) Test: construct with an out-of-range LFE and assert the warning is emitted (capture
      via a tracing test subscriber; test output must be pristine — assert the message, don't let it leak).
-   - **Partner decision (finding 1):** change `remove_bass_from_sources` default to `true` when enabled, **or**
+   - **Locked decision (DECISIONS.md D30):** change `remove_bass_from_sources` default to `true` when enabled, **or**
      keep `false` and document the additive LFE+Main behavior loudly in `README.md`. Do **not** implement either
      until signed off. Whichever is chosen, document it.
    - Document the LFE-collision behavior (finding 5) in `README.md`: the LFE output index receives directly-routed
@@ -222,7 +222,7 @@ test in this file.
   render test.
 - **Touch (docs):** `README.md` (LFE+Main behavior, LFE-collision note, the `remove_bass_from_sources` default
   decision), and `docs/bugs.md` for any out-of-scope discoveries.
-- **Do not touch:** `mixer.rs:584-587` (Sprint 6 limiter), `config.rs` schema unless the partner approves a new
+- **Do not touch:** `mixer.rs:584-587` (Sprint 6 limiter), `config.rs` schema unless DECISIONS.md changes it a new
   LFE-gain field.
 
 ## Verification
@@ -259,9 +259,9 @@ test in this file.
 
 ## Behavior-change / changelog notes
 
-- **Behavior-changing — needs partner sign-off (finding 1):** the `remove_bass_from_sources` default decision.
+- **Behavior-changing — is decided upfront in DECISIONS.md (finding 1):** the `remove_bass_from_sources` default decision.
   If the default is flipped to `true` when bass management is enabled, that **changes the audio** for anyone who
-  enabled bass management and relied on the additive LFE+Main behavior. **Stop and get explicit partner approval**
+  enabled bass management and relied on the additive LFE+Main behavior. **Implement the locked decision (DECISIONS.md)**
   before changing the default; document the chosen behavior in `README.md` and `CHANGELOG.md` either way.
 - **Behavior-changing (audio):** the LR4 crossover changes the acoustic response (steeper slopes, flat in-phase
   sum at fc) and the LFE count-normalization changes sub level (a 2-source setup is ~6 dB quieter in the sub than
@@ -276,6 +276,6 @@ Lane A green · Lane B green (host suite, no regression) · LR4 crossover landed
 assertion · LFE count-normalization landed with a count-independence assertion · denormal flush landed with a
 settling assertion · the `mix_audio` bass-managed integration test landed (Sprint-0 gap closed) ·
 construction-time out-of-range-LFE warning landed and asserted · `remove_bass_from_sources` default **decided
-with partner sign-off** and documented · LFE+Main and LFE-collision behavior documented in `README.md` · no
+per DECISIONS.md** and documented · LFE+Main and LFE-collision behavior documented in `README.md` · no
 existing test weakened or ignored · `docs/bugs.md` updated for any out-of-scope finds · committed atomically to
 the branch as units complete · `cargo build --release` warning-free.

@@ -8,11 +8,12 @@
 | Lanes | A (Docker), B (native macOS) |
 | Subagents | YES (ring / voice pool / graveyard / status snapshot / integration) |
 
-> **⚠️ ARCHITECTURAL CHANGE — DISCUSS WITH PARTNER BEFORE STARTING.** Per `CLAUDE.md` ("We discuss
-> architectural decisions … together before implementation") and the Charter ("If you get stuck or in over
-> your head, STOP and ask the partner. Especially for Sprint 5"). The final acceptance box —
-> *"Partner consulted before starting (architectural change)"* — cannot be self-checked. Get explicit
-> sign-off on the design below, then proceed.
+> **The design for this redesign is locked in `DECISIONS.md` (D15–D22) — proceed without consulting.** The
+> handoff primitive (existing `ringbuf`), `MixerState` ownership, voice-pool cap (default 256) + over-cap
+> policy, graveyard reaper, and status mechanism (control-side `RwLock<StatusSnapshot>`, no new dep) are all
+> decided. You may overrule a locked choice only if implementation uncovers new evidence (record it per
+> `DECISIONS.md`). If something *truly* needs a human and has no other resolution, log it in `NEEDS-HUMAN.md`
+> and continue the rest of the sprint — do not halt.
 >
 > **Do NOT throw away the mixer DSP.** `CLAUDE.md`: "YOU MUST NEVER throw away or rewrite implementations
 > without EXPLICIT permission." This sprint **wraps** `mix_audio` and changes *how state reaches the
@@ -53,8 +54,9 @@ poisoning; this sprint removes the callback locks entirely, which is the real fi
   into a lock-free queue.
 - Moving **voice-activity bookkeeping + ducking `notify_voice_active`** off the RT thread. The callback emits
   a lock-free "voice finished" signal; the control thread reconciles activity and drives `update_duck_states`.
-- A **status snapshot** (arc-swap or triple-buffer) published by the audio side and read by HTTP status
-  handlers — they never touch the callback's state.
+- A **status snapshot** maintained by the **control thread** (from commands it sent + completion signals from
+  the graveyard ring) in a `RwLock<StatusSnapshot>`, read by HTTP status handlers — they never touch the
+  callback's state, and the RT thread never builds status (DECISIONS.md D20; no new dependency).
 - A **pre-allocated pitch scratch buffer** owned by `ActiveSample`/`PitchCorrector`, sized to
   `max_frames * channels`, replacing the per-callback `vec![0.0f32; …]` (`src/audio/mixer.rs:797-798`).
 - An **allocation-counting test harness** (custom global allocator gated to a test, or an allocation counter)
@@ -87,7 +89,8 @@ against current source.** Severities as given in the brief. Read each cited regi
   (`src/http/handlers.rs:570`, `:601`, `:671`); `active_voices` is locked by the Play handler
   (`src/main.rs:780`). A control-plane thread holding either lock blocks the RT thread for an unbounded time.
 - **Fix:** Audio thread **owns** `MixerState`. Control → audio mutations go through an SPSC command ring;
-  HTTP/status reads a **published snapshot** (arc-swap / triple-buffer). The callback locks nothing.
+  HTTP/status reads a **control-thread-maintained snapshot** (`RwLock<StatusSnapshot>`, DECISIONS.md D20). The
+  callback locks nothing.
 
 ### F5-2 — Callback builds two `HashSet<String>` per buffer, cloning every voice_id, and moves one into a mutex · CRITICAL · confirmed
 - **Statement:** Each buffer the callback heap-allocates two `HashSet<String>` (cloning each sample's
@@ -206,7 +209,7 @@ Each owns its module + tests; the integration agent wires them into `main.rs` an
    - **Failing test first:** `status_snapshot_reflects_published_state` — publish a snapshot, read it from a
      simulated HTTP handler, assert it matches; assert reading does **not** touch `MixerState`.
    - Use `arc-swap` (single new dep) **or** a hand-rolled triple-buffer. Prefer `arc-swap` for simplicity
-     (YAGNI vs. hand-rolling); **flag the new dependency for partner sign-off.** Publisher = the audio side
+     (YAGNI vs. hand-rolling); **flag the new dependency per DECISIONS.md.** Publisher = the audio side
      (cheap pointer swap, allocation-free on the swap itself; building the snapshot happens off-RT or is
      pre-sized). Migrate `handlers.rs` status reads to the snapshot.
 
@@ -283,7 +286,7 @@ Each owns its module + tests; the integration agent wires them into `main.rs` an
   - `src/audio/ducking.rs` — no DSP change; ensure `notify_voice_active`/`update_duck_states`
     (`:140-251`) are only invoked from the control thread now.
   - `src/audio/pitch_correction.rs` — add scratch ownership if the scratch lives here.
-  - `Cargo.toml` — `arc-swap` (or none if triple-buffer is hand-rolled). **Partner sign-off on the new dep.**
+  - `Cargo.toml` — `arc-swap` (or none if triple-buffer is hand-rolled). **No new dependency needed (DECISIONS.md D15/D20).**
 
 ## Verification
 
@@ -306,18 +309,18 @@ Each owns its module + tests; the integration agent wires them into `main.rs` an
 - [ ] Ducking notify + voice bookkeeping moved off the RT thread; pitch scratch pre-allocated `[A]`
 - [ ] Render harness shows within-tolerance output vs pre-redesign for a fixed scene; soak test (many plays/stops) shows no xrun-counter increments `[A]`
 - [ ] Real-device soak smoke runs clean on this Mac `[B]`
-- [ ] Partner consulted before starting (architectural change) `[ ]`
 
 ## Behavior-change / changelog notes
 
 - **No audible behavior change is intended.** The render-harness parity assertion is the proof; if it can't
   stay within tolerance, you've changed mixing behavior and must STOP and narrow the change.
-- **Behavior-changing / partner sign-off required before starting:**
-  - The architectural redesign itself (RT-engine ownership model) — **partner sign-off (Charter + CLAUDE.md).**
-  - New dependency `arc-swap` (if chosen over a hand-rolled triple-buffer) — **partner sign-off.**
+- **Behavior-changing (all locked in DECISIONS.md, D15–D22 — proceed without consulting):**
+  - The architectural redesign itself (RT-engine ownership model) — design locked in DECISIONS.md.
+  - **No new dependency:** command/return rings use the existing `ringbuf`; the status snapshot is a
+    control-side `RwLock<StatusSnapshot>` (DECISIONS.md D15/D20).
   - Voice-pool **fixed capacity** introduces a hard cap on simultaneous voices where today `Vec::push` grows
     unbounded. This is a user-visible behavior change (over-cap plays are rejected/back-pressured instead of
-    always accepted). **Decide the cap + the over-cap policy with the partner; document in `README.md` /
+    always accepted). **Cap + over-cap policy per DECISIONS.md (D17/D18); document in `README.md` /
     `CHANGELOG.md`.**
 - **New observable:** an `xruns` counter on the status endpoint (additive; document in `README.md`).
 - Internal-only (no changelog): callback no longer locks/allocs; ducking recompute relocated to the control
@@ -325,7 +328,6 @@ Each owns its module + tests; the integration agent wires them into `main.rs` an
 
 ## Definition of Done
 
-Partner consulted and signed off on the design (and any new dep + voice-cap policy) **before** coding ·
 Lane A green (allocation harness proves zero allocs/frees; render parity within tolerance; soak shows
 `xruns == 0`) · Lane B green incl. real-device soak smoke · `mix_audio` DSP unchanged (wrapped, not rewritten) ·
 no callback locks remain (`src/main.rs:556`, `:580` deleted) · pitch scratch pre-allocated

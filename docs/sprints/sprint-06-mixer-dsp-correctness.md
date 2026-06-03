@@ -132,7 +132,7 @@ Severity is the audit's reconciled verdict. `file:line` re-verified against curr
   allows magnitudes to 100.0 without pitch correction (`mixer.rs:278`).
 - **Fix:** either band-limited/cubic interpolation for the fast path, or **cap** the max non-pitch speed well
   below 100× and **document** the lo-fi tradeoff. Decision required (see Caveats); default to documenting +
-  a sane cap unless the partner wants the resampler routed in.
+  a sane cap unless DECISIONS.md changes it the resampler routed in.
 
 ### F9 — Reverse playback interpolates with the WRONG neighbor — HIGH (confirmed)
 - **Statement:** reverse uses `src_frame-1` instead of `src_frame+1`; correct is
@@ -270,7 +270,7 @@ Severity is the audit's reconciled verdict. `file:line` re-verified against curr
 - **D1 effect is "too-fast but smooth," not an xrun.** Correct it, but the audible severity is moderate; the
   intra-buffer inconsistency (sample 2 ≠ sample 1) is the subtler half.
 - **F7/F8/R1 are LOW/optional.** Prefer documenting + a minimal guard (per-route gain, speed cap, doc note)
-  over a large refactor unless the partner asks. These are decision items, not mandates.
+  over a large refactor unless DECISIONS.md changes it. These are decision items, not mandates.
 - **Bass-management findings are explicitly Sprint 7**, even though the F3 NaN guard protects the bass IIR.
 
 ## Tasks (ordered, TDD — failing test first, minimum code, confirm green)
@@ -372,7 +372,7 @@ sequence in the same loop).
     not truncated). Then flush/drain the stretcher at EOF (`mixer.rs:783-789`) instead of overshooting and
     returning silence.
 
-17. **F7/F8/R1 decisions (LOW/optional).** Decide with the partner: per-route gain (F7), speed cap +
+17. **F7/F8/R1 decisions (LOW/optional).** Implement the locked decision (DECISIONS.md): per-route gain (F7), speed cap +
     doc (F8), `Cubic` resampler (R1). Implement only what's agreed; otherwise add documentation + a minimal
     guard and log the deferral in `docs/bugs.md`.
 
@@ -434,12 +434,11 @@ device behavior this sprint). Concretely, Lane A must show:
 
 ## Behavior-change / changelog notes
 
-These change observable behavior — document in `CHANGELOG.md`/`README.md`; **flag F4 and D3 for partner
-sign-off** (they alter how existing configs/commands behave):
+These change observable behavior — document in `CHANGELOG.md`/`README.md`; **implement F4 and D3 per DECISIONS.md** (they alter how existing configs/commands behave):
 
-- **F4 (sign-off):** Play `volume > 1.0` is now clamped to 1.0 (previously amplified). Anyone relying on
+- **F4 (DECISIONS.md):** Play `volume > 1.0` is now clamped to 1.0 (previously amplified). Anyone relying on
   Play to boost above unity will hear a level change. (Aligns Play with the runtime `Volume` command.)
-- **D3 (sign-off):** Duck **restore** now uses the rule's `fade_duration_ms` instead of a fixed 2000 ms.
+- **D3 (DECISIONS.md):** Duck **restore** now uses the rule's `fade_duration_ms` instead of a fixed 2000 ms.
   Configs that depended on the slow 2 s release will recover faster.
 - **F2:** output overload is now a soft-knee/tanh limiter at a configurable ceiling (+ optional master gain)
   rather than a brickwall clamp — quieter, less harsh near 0 dBFS; new `output_ceiling`/`master_gain` config
@@ -453,7 +452,7 @@ sign-off** (they alter how existing configs/commands behave):
 ## Definition of Done
 
 Lane A green · Lane B green (host suite + Sprint 5's device smoke; no new device behavior) · every finding
-F1–F12, D1–D5 (+ agreed F7/F8/R1) has a harness assertion that passed · partner signed off on F4 and D3 ·
+F1–F12, D1–D5 (+ agreed F7/F8/R1) has a harness assertion that passed · F4 and D3 implemented per DECISIONS.md ·
 no locks/allocations re-introduced in the callback (Sprint 5 invariant holds — re-audit the touched paths) ·
 `CHANGELOG.md`/`README.md` updated for behavior changes · deferred LOW/
 optional items logged in `docs/bugs.md` · committed on a branch · `cargo build --release` warning-free, clippy

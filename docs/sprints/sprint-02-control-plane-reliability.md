@@ -113,7 +113,7 @@ that *looks* healthy while being non-functional:
   consistency). Keep the callback's lock sections panic-free regardless. **Sprint 5 removes the callback locks
   entirely** — do not redesign here; pick the smaller of the two options and apply it uniformly to the shared
   mutexes.
-- **DECISION NEEDED (partner sign-off):** parking_lot (new dependency, cleanest) vs. a recovering-lock helper
+- **DECISION NEEDED (the locked decision in DECISIONS.md):** parking_lot (new dependency, cleanest) vs. a recovering-lock helper
   (no new dep, more call-site churn). Pick one and note it in the changelog.
 
 ### F4 — No SIGINT/SIGTERM handler or fade-out on exit in the production daemon `[MEDIUM]`
@@ -222,15 +222,15 @@ that *looks* healthy while being non-functional:
    - *Harness check:* no audio-output assertion needed (this is control-plane), but confirm an existing Sprint 0
      `handle_command` Play test still lands the expected `ActiveSample` (behavior-preserving).
 
-3. **F3 — RT-shared state no longer poison-bricks audio (partner-signed lock choice).**
+3. **F3 — RT-shared state no longer poison-bricks audio (DECISIONS.md lock choice (D5)).**
    - *Failing test first:* `tests/poison_recovery_test.rs` — construct the shared mixer state the way `main`
      does; spawn a task that locks it and panics while holding the guard (poisoning it under std semantics);
      then assert the audio-callback lock path still acquires and runs `mix_audio` without panicking. On current
      code (`.lock().unwrap()`) this panics; after the fix it succeeds.
-   - *Minimal code:* per the partner-chosen option — either swap the RT-shared mutexes to `parking_lot::Mutex`
+   - *Minimal code:* per the DECISIONS.md option (D5) — either swap the RT-shared mutexes to `parking_lot::Mutex`
      (add `parking_lot` to `Cargo.toml`; non-poisoning, `.lock()` returns the guard directly) **or** replace
      `.lock().unwrap()` with `.lock().unwrap_or_else(|e| e.into_inner())` on the shared mutexes. Apply uniformly;
-     keep callback lock sections panic-free. **Get partner sign-off on the choice before implementing** (new dep
+     keep callback lock sections panic-free. **Get the locked decision in DECISIONS.md on the choice before implementing** (new dep
      vs. call-site churn) — see DECISION NEEDED in F3.
 
 4. **F6 — `total_cmp` + validate ducking `target_volume`.** (Do this near F3 — same panic-poison family.)
@@ -329,11 +329,11 @@ device-specific assertion is added here.)
 
 - **F1 (behavior change):** The daemon now re-subscribes on every (re)connect, so it recovers MQTT command
   handling after a broker restart instead of going silently deaf. User-visible reliability change — changelog it.
-- **F3 (behavior change + PARTNER SIGN-OFF):** RT-shared mutexes change from poison-propagating
+- **F3 (behavior change + DECIDED UPFRONT (DECISIONS.md)):** RT-shared mutexes change from poison-propagating
   `.lock().unwrap()` to either `parking_lot::Mutex` (**new dependency**) or a PoisonError-recovering lock.
   Recovering from a poisoned lock means continuing past a prior panic with possibly-inconsistent state — an
   intentional trade chosen so a single handler panic cannot permanently silence audio (Sprint 5 removes these
-  locks). **Get partner approval on the lock choice; record it in the changelog.**
+  locks). **Use the DECISIONS.md D5 lock choice (parking_lot); record it in the changelog.**
 - **F4 (behavior change):** SIGINT/SIGTERM now triggers a short fade-out + cache-metadata flush before exit
   (previously an immediate hard kill). Changes shutdown audio behavior (no more mid-buffer click) — changelog it.
 - **F5 (behavior change):** The MQTT producer may now **drop** commands under sustained overflow (with logging/
@@ -347,7 +347,7 @@ device-specific assertion is added here.)
 ## Definition of Done
 
 Lane A green (build `-D warnings`, clippy clean, `fmt --check`, full test suite incl. the broker-restart
-integration test) · all six acceptance boxes genuinely checked · F3 lock choice approved by the partner and
+integration test) · all six acceptance boxes genuinely checked · F3 lock choice per DECISIONS.md (D5) and
 recorded · new tests landed for F1–F6 (F7 by review) · the disk-write atomicity item left to Sprint 3 and the
 device-error recovery left to Sprint 1 (referenced, not implemented) · out-of-scope discoveries logged to
 `docs/bugs.md` · committed atomically to the branch as units complete · `cargo build --release` warning-free.

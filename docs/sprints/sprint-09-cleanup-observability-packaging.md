@@ -50,7 +50,7 @@ asserted only structurally.
   `cache/mod.rs:292`): these are **Sprint 4** (tracker §Sprint 4). If Sprint 4 wired or removed them, they will
   already be warning-clean; if it left them dead, that is Sprint 4's box, not this one. This sprint must not
   delete or rewire them — only confirm the build is clean and, if a residual dead-code warning remains there,
-  raise it with the partner rather than silencing it.
+  log it in `docs/bugs.md` (and `NEEDS-HUMAN.md` if it blocks the gate) rather than silencing it.
 - `ducking_rules.target_volume` finite-∈[0,1] validation is **Sprint 2** (tracker §Sprint 2, `total_cmp` line).
   This sprint adds the *other* validation gaps (channel sanity, message clarity, schema version) and does not
   re-implement the ducking-rule numeric check.
@@ -137,7 +137,7 @@ against the current tree before writing.
   later `voice_stop`/`voice_fade_out`/`voice_volume` on one affects the other and ducking tracks them together.
 - **Fix:** Append a uniqueness suffix — the monotonic `VoiceManager` sample id or a process-global
   `AtomicU64` counter — e.g. `_auto_<millis>_<n>`. **Behavior change** (the emitted voice-id string format
-  changes); changelog + partner sign-off (see below).
+  changes); changelog + the locked decision in DECISIONS.md (see below).
 
 ### F6 (FEATURE-CONFLICT, low) — `seek` clamps to loaded frames while `start_position_ms` uses the total estimate
 - **Statement:** Seeking forward in a still-loading stream lands at the loaded edge, inconsistent with
@@ -241,8 +241,8 @@ against the current tree before writing.
 - **`MIN_BUFFER_FRAMES`, `mark_playing`, `cleanup_completed_loads` are NOT this sprint's to fix.** They are
   Sprint 4 (streaming/cache). The dump's general cleanup ask mentions them, but the tracker assigns them to
   Sprint 4. Verified they still exist (`streaming.rs:270`; `cache/memory.rs:181`; `cache/mod.rs:292`) and carry
-  `#[allow(dead_code)]`. Only confirm the build is clean; if a residual warning there breaks the gate, raise it
-  with the partner — do **not** silence or rewire it under this sprint.
+  `#[allow(dead_code)]`. Only confirm the build is clean; if a residual warning there breaks the gate, note it
+  in `NEEDS-HUMAN.md` and leave it for Sprint 4 — do **not** silence or rewire it under this sprint.
 - **`ducking_rules.target_volume` finite-∈[0,1] validation is Sprint 2**, not here. This sprint's config work is
   schema versioning, channel-sanity, message clarity, and the four feature-interaction warnings/docs only.
 - **F7 (channel_map↔LFE) and F8 (crossfade-without-loop) are documentation/warning items**, not behavior fixes.
@@ -285,7 +285,7 @@ Cleanup/removal tasks are guarded by the existing test suite + the `-D warnings`
    `handle_command` from Sprint 0's extraction, or the existing dispatch) and asserting the two resulting
    `ActiveSample.voice_id` strings differ even when generated in the same millisecond (inject/stub the counter
    or call the id-builder directly). Implement by appending a process-global `AtomicU64` (or the `VoiceManager`
-   sample id) to `_auto_<millis>` at `main.rs:659-664`. **Behavior change — changelog + sign-off.**
+   sample id) to `_auto_<millis>` at `main.rs:659-664`. **Behavior change — changelog (decided in DECISIONS.md).**
 
 6. **Seek/start_position consistency (F6).** Write a failing test on a streaming buffer asserting that a forward
    `seek` past the loaded edge lands at the requested frame (clamped to `total_frames_or_estimate()`), matching
@@ -382,8 +382,7 @@ Cleanup/removal tasks are guarded by the existing test suite + the `-D warnings`
 
 These items change observable behavior — record in `CHANGELOG.md`:
 - **F5 — auto voice-id format changes** from `_auto_<millis>` to `_auto_<millis>_<n>`. Any client or script
-  relying on the exact auto-id string, or on same-ms plays sharing a voice, is affected. **Requires partner
-  sign-off** before implementing (it is a user-visible string contract).
+  relying on the exact auto-id string, or on same-ms plays sharing a voice, is affected. **Decided upfront in DECISIONS.md** before implementing (it is a user-visible string contract).
 - **F6 — `seek` on a streaming buffer** now clamps to `total_frames_or_estimate()` rather than the loaded-edge,
   so forward seeks into a still-loading region land at the requested time (silence until loaded) instead of the
   last loaded frame. Changelog note.
@@ -401,6 +400,6 @@ they must be invisible to the running daemon's real command path.
 Lane A green (build `-D warnings` with **no** `chunked_resampler` `allow(dead_code)` banner and no new blanket
 allows · clippy · fmt · full test suite · proptest suite · new HTTP/WebSocket/status tests) · Lane B green
 (host suite, no regression) · `/version` + `/metrics` return real data · systemd unit + JSON logging documented
-in `README.md` · behavior changes (F5, F6) in `CHANGELOG.md` with F5 partner sign-off obtained · out-of-scope/
+in `README.md` · behavior changes (F5, F6) in `CHANGELOG.md` with F5 decisions taken per DECISIONS.md · out-of-scope/
 surfaced gaps logged in `docs/bugs.md` · committed atomically to the branch as units complete ·
 `cargo build --release` warning-free.

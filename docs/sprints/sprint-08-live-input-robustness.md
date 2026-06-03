@@ -297,12 +297,12 @@ write the minimum code, confirm green.
 User-visible behavior changes — record in `CHANGELOG.md`/`README.md`:
 
 - **`input_mute` now restores the prior volume on unmute** instead of forcing 1.0. Anyone relying on unmute
-  bumping a calibrated input to full level will see a difference. **Partner sign-off** recommended (it changes a
+  bumping a calibrated input to full level will see a difference. **Decided upfront** in DECISIONS.md (it changes a
   documented command's effect).
 - **`voice_volume` now affects input-only voices.** Previously a no-op unless a sample shared the voice id;
   scripts that sent `voice_volume` to a mic voice expecting nothing will now change input level.
 - **Live-input voices can now trigger ducking** as a `primary_voice`. A config that listed a mic as a ducking
-  primary was silently inert and will now actually duck. **Partner sign-off** recommended (changes audible mix
+  primary was silently inert and will now actually duck. **Decided upfront** in DECISIONS.md (changes audible mix
   for existing configs).
 - **Equal-rate inputs now go through async SRC** rather than raw passthrough (drift control). Inaudible in
   steady state, but it is a path change worth noting; if any pitch wobble is observed, the steering gain is too
@@ -315,6 +315,6 @@ Lane A green · Lane B green (incl. real CoreAudio **input** open + route smoke)
 alloc in the resampling capture callback · drift simulation keeps the ring buffer bounded · underrun fade/hold
 + time-accurate ramp landed · `voice_volume`/`input_mute`/route-validation/input-ducking-trigger fixes landed
 with tests · non-f32 input dispatch landed · **W-2** refined in `MANUAL-VERIFICATION.md` · behavior changes in
-`CHANGELOG.md`/`README.md` with partner sign-off on the mute-restore, input-voice_volume, and input-ducking
+`CHANGELOG.md`/`README.md` per DECISIONS.md on the mute-restore, input-voice_volume, and input-ducking
 changes · out-of-scope discoveries logged to `docs/bugs.md` · committed on a
 branch · `cargo build --release` warning-free.

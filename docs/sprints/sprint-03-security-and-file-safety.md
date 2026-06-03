@@ -158,9 +158,9 @@ filesystem and HTTP stack with no gatekeeping. Verified against current source:
 - **Severity:** MEDIUM.
 - **Fix (decision):** Either implement conditional revalidation (when `last_validated` is older than
   `revalidate_after_seconds`, conditional GET; `304` → refresh, `200` → replace via the atomic-write path) **or**
-  delete the dead knob + unused validators. Don't leave validated-but-unused config. Partner sign-off (Caveats).
+  delete the dead knob + unused validators. Don't leave validated-but-unused config. Locked in DECISIONS.md (D10).
 
-## Caveats (decisions requiring sign-off)
+## Caveats (decisions — locked in DECISIONS.md)
 
 - **Open mode is a supported configuration, not a bug (overarching).** The default posture stays open and
   anonymous; every control added here is opt-in. The non-negotiable changes are: make the allowlist *work when
@@ -171,7 +171,7 @@ filesystem and HTTP stack with no gatekeeping. Verified against current source:
 - **Default MQTT transport (F3.2).** Stays plain TCP even on 8883; TLS is purely opt-in. (Auto-enabling TLS on
   8883 would break legacy plain-8883 brokers — explicitly avoided.)
 - **Revalidation vs. removal (F3.6).** Implementing conditional GET adds network round-trips on cache hits;
-  removing the knob drops a documented feature. Get partner direction. Either way, no validated-but-ignored field
+  removing the knob drops a documented feature. Follow DECISIONS.md (D10). Either way, no validated-but-ignored field
   may remain.
 - **Nothing here is refuted.** All six findings were re-verified against current source. The reframing is about
   *how* (opt-in vs forced), not *whether* the gaps exist.
@@ -231,7 +231,7 @@ filesystem and HTTP stack with no gatekeeping. Verified against current source:
    - Implement with `sha2` truncated to 12 hex chars (matching the comment's intent) or `blake3`. Bump
      `CacheMetadata::default().version` (`disk.rs:44`) and discard older-version entries on load.
 
-6. **Revalidation decision (F3.6).** Per Caveats sign-off — implement conditional GET (test `304`/`200` against
+6. **Revalidation decision (F3.6).** Per DECISIONS.md (D10) — implement conditional GET (test `304`/`200` against
    a local Lane-A test server) **or** remove the dead `revalidate_after_seconds` + unused validators (test that
    config no longer needs the field) and note in README.
 
@@ -292,7 +292,7 @@ keep working untouched. New, opt-in, or non-breaking:
 - **Cache hash change** bumps `CacheMetadata.version`, invalidating existing cached entries on first run after
   upgrade (they re-download). Internal, not user-facing config.
 - **Revalidation** either adds conditional GETs on cache hits or removes the `revalidate_after_seconds` field —
-  **partner sign-off required** (Caveats).
+  **decided upfront in DECISIONS.md** (Caveats).
 
 ## Definition of Done
 

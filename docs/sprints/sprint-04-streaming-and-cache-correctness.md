@@ -168,7 +168,7 @@ into the running daemon, and that a documented prebuffer threshold is never enfo
   comment so it no longer promises behavior that does not exist. The simplest honest change (removal +
   doc fix) is acceptable per YAGNI unless the prebuffer is wanted; if F1 is fixed by "don't start a looping
   play until complete," a prebuffer is independently low-value for non-looping streams, so removal is the
-  likely choice — confirm with the partner if uncertain (see Behavior-change notes).
+  likely choice — follow DECISIONS.md (see Behavior-change notes).
 
 ## Caveats (refuted / over-stated — do not chase ghosts)
 
@@ -249,7 +249,7 @@ needed — `StreamingBuffer::new`, `append`, and `mark_complete` are already pub
    - If **enforcing:** write a failing test first that a streaming play does not emit leading silence beyond
      a tolerance, then gate stream start on `frames_available() >= MIN_BUFFER_FRAMES` with a timeout. Given
      YAGNI and that F1 already restricts looping until complete, removal is the likely smallest change —
-     **flag for partner sign-off** before deleting if there is any doubt the prebuffer is wanted.
+     **flag per DECISIONS.md** before deleting if there is any doubt the prebuffer is wanted.
 
 5. **Build/lint/format clean.** `cargo build --release` with zero warnings, `cargo clippy --all-targets
    -- -D warnings`, `cargo fmt --check`. Removing `#[allow(dead_code)]` from now-used functions must not
@@ -317,13 +317,11 @@ These are user-visible behavior changes — note them in `CHANGELOG.md` / `READM
 - **Replaying a finished streamed URL now serves a cached buffer** instead of re-streaming, and streamed
   audio now counts against the configured memory limit / participates in LRU. This changes memory-usage
   reporting and eviction timing — note it.
-- **`MIN_BUFFER_FRAMES` removal (if chosen)** is an internal/doc change but corrects a documentation claim;
-  if the prebuffer is *enforced* instead, that adds a small startup delay (bounded by the timeout) to
-  streaming playback — **that is a user-visible behavior change and needs partner sign-off** before landing.
-- **Partner sign-off:** required before (a) enforcing a prebuffer (adds startup latency) and (b) deleting
-  `MIN_BUFFER_FRAMES` if there is any intent to keep prebuffering — confirm the chosen F4 direction with
-  the partner. The F3 "drop the playing-protection design" option also changes a documented guarantee;
-  confirm before removing rather than wiring.
+- **`MIN_BUFFER_FRAMES` (F4):** per DECISIONS.md **D14** the dead constant + misleading comment are **removed**;
+  no prebuffer is added (silence-until-loaded is acceptable). Internal/doc change only — no user-visible behavior
+  change. If, while implementing, leading silence proves objectionable, note a follow-up in `docs/bugs.md`.
+- **Eviction protection (F3):** per DECISIONS.md **D12**, rely on `Arc` keep-alive (skip eviction when
+  `strong_count() > 1`) and fix the size accounting; the dead `mark_playing` design is removed, not wired.
 
 ## Definition of Done
 
@@ -332,6 +330,6 @@ above) · F1 loop-wrap fixed and proven by a render-harness test on a fake incre
 buffer · F2 promotion + bounded `active_loads` + cache-hit-on-replay landed · F3 eviction protection wired
 (or design dropped with honest accounting) and size accounting fixed · F4 resolved (enforced or removed,
 no misleading dead code/doc) · out-of-scope discoveries logged in `docs/bugs.md` · `CHANGELOG.md`/`README.md`
-updated for the behavior changes · partner sign-off obtained for any prebuffer-enforcement / dropped
+updated for the behavior changes · decisions taken per DECISIONS.md for any prebuffer-enforcement / dropped
 guarantee · committed atomically to the branch as units complete · `cargo build --release` warning-free.
 No test disabled, `#[ignore]`d, or weakened to pass.

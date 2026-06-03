@@ -322,10 +322,10 @@ These are user-visible / behavior-changing and belong in `CHANGELOG.md` / `READM
 - **Sample-rate selection now picks the nearest device-supported (discrete) rate** and validates the config
   before building; some devices may negotiate a different rate than the previous arithmetic clamp produced. (F4)
 
-> **Partner sign-off:** Tasks 6 (typed-stream dispatch / convert shim) and 3+2 (channel fallback semantics)
-> change runtime audio behavior and the negotiated device format. Surface the behavior-change list above to
-> the partner before marking the sprint Done. The zero-fill-extra-channels choice (F3) is a routing decision —
-> confirm it with the partner rather than, e.g., refusing the open.
+> **Decided upfront (DECISIONS.md D1–D4):** Tasks 6 (typed-stream dispatch / convert shim) and 3+2 (channel
+> fallback semantics) change runtime audio behavior and the negotiated device format. Record the
+> behavior-change list above in `CHANGELOG.md` before marking the sprint Done. The zero-fill-extra-channels
+> choice (F3) is a routing decision — implement it per DECISIONS.md (D1) rather than, e.g., refusing the open.
 
 ## Definition of Done
 
@@ -333,6 +333,6 @@ Lane A green · Lane B green (incl. the real CoreAudio `--list-devices` + play s
 dispatch) · pure-helper unit tests + the render-harness convert-shim test landed · `.expect` replaced with a
 graceful path · F1–F7 fixes implemented at root cause (no tests disabled/`#[ignore]`d to pass, no symptom
 patches) · clock-drift left untouched for Sprint 8 · **W-1** refined in `MANUAL-VERIFICATION.md` (not
-duplicated) · behavior-change list reviewed with the partner · `CHANGELOG.md`/`README.md` updated ·
+duplicated) · behavior-change list recorded in the changelog · `CHANGELOG.md`/`README.md` updated ·
 out-of-scope discoveries logged in `docs/bugs.md` · committed atomically to the branch as units complete ·
 `cargo build --release` warning-free.
