@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Looping a still-downloading stream no longer buzzes.** A `loop: true` play of an HTTP/streaming
+  source now plays forward (emitting silence past the loaded edge) and only begins looping once the
+  stream is fully downloaded, instead of replaying a tiny growing prefix in a tight buzz. A looped
+  stream therefore takes until download-complete to start its first loop.
+- **Finished streamed URLs are promoted to the memory cache.** Replaying a URL that finished streaming
+  now serves the cached, fully-decoded buffer instead of re-streaming it, and streamed audio now counts
+  against the configured memory limit and participates in LRU eviction. Memory-usage reporting and
+  eviction timing change accordingly; a buffer that is still playing is never evicted (it is kept alive
+  by its reference, so the size accounting stays accurate).
+
 - **MQTT re-subscription on reconnect.** The daemon now re-subscribes to its command topic on every
   broker (re)connect, so it recovers command handling after a broker restart instead of going silently
   deaf.

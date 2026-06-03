@@ -262,11 +262,6 @@ impl SampleBuffer {
     }
 }
 
-/// Minimum frames of data required before starting playback.
-/// At 48kHz, 2560 frames = ~53ms = ~5 callback buffers at 512 frames/callback.
-#[allow(dead_code)] // Used by tests and future buffering logic
-pub const MIN_BUFFER_FRAMES: usize = 2560;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,15 +411,6 @@ mod tests {
         assert_eq!(buf.get_sample_or_silence(0, 0), 0.3);
         assert_eq!(buf.get_sample_or_silence(0, 1), 0.4);
         assert_eq!(buf.get_sample_or_silence(1, 0), 0.0); // Not loaded yet
-    }
-
-    #[test]
-    fn test_min_buffer_frames_constant() {
-        // Verify the constant is reasonable for 48kHz playback
-        // 2560 frames at 48000Hz = 53.3ms
-        let duration_ms = MIN_BUFFER_FRAMES as f64 / 48000.0 * 1000.0;
-        assert!(duration_ms > 50.0);
-        assert!(duration_ms < 60.0);
     }
 
     #[test]

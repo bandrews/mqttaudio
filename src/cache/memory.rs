@@ -2,7 +2,7 @@
 // ABOUTME: Provides fast access to frequently used samples with LRU eviction.
 
 use crate::audio::types::DecodedBuffer;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -23,8 +23,6 @@ pub struct MemoryCache {
     max_size_bytes: Option<usize>,
     /// Current total size of cached data in bytes
     current_size_bytes: usize,
-    /// Keys of buffers currently being played (protected from eviction)
-    playing: HashSet<String>,
 }
 
 impl MemoryCache {
@@ -34,7 +32,6 @@ impl MemoryCache {
             entries: HashMap::new(),
             max_size_bytes: None,
             current_size_bytes: 0,
-            playing: HashSet::new(),
         }
     }
 
@@ -46,7 +43,6 @@ impl MemoryCache {
             entries: HashMap::new(),
             max_size_bytes: if max_size == 0 { None } else { Some(max_size) },
             current_size_bytes: 0,
-            playing: HashSet::new(),
         }
     }
 
@@ -113,14 +109,15 @@ impl MemoryCache {
         self.current_size_bytes += size;
     }
 
-    /// Evict the least recently used entry that is not currently playing.
-    /// Returns true if an entry was evicted, false if no evictable entries.
+    /// Evict the least recently used entry that no one is still playing.
+    /// A buffer is "in use" when something outside the cache holds an `Arc` to it
+    /// (`strong_count > 1`); those are skipped so a playing sample is never evicted
+    /// out from under its accounting. Returns true if an entry was evicted.
     fn evict_one(&mut self) -> bool {
-        // Find the LRU entry that is not playing
         let lru_key = self
             .entries
             .iter()
-            .filter(|(key, _)| !self.playing.contains(*key))
+            .filter(|(_, entry)| Arc::strong_count(&entry.buffer) == 1)
             .min_by_key(|(_, entry)| entry.last_access)
             .map(|(key, _)| key.clone());
 
@@ -138,7 +135,6 @@ impl MemoryCache {
     pub fn remove(&mut self, key: &str) -> bool {
         if let Some(entry) = self.entries.remove(key) {
             self.current_size_bytes -= entry.size_bytes;
-            self.playing.remove(key);
             true
         } else {
             false
@@ -150,7 +146,6 @@ impl MemoryCache {
         let count = self.entries.len();
         self.entries.clear();
         self.current_size_bytes = 0;
-        self.playing.clear();
         tracing::info!("Cleared {} decoded buffers from memory cache", count);
     }
 
@@ -175,26 +170,6 @@ impl MemoryCache {
     /// (same as current_size_bytes, kept for API compatibility)
     pub fn memory_usage_bytes(&self) -> usize {
         self.current_size_bytes
-    }
-
-    /// Mark a buffer as currently playing (protected from eviction)
-    #[allow(dead_code)]
-    pub fn mark_playing(&mut self, key: &str) {
-        if self.entries.contains_key(key) {
-            self.playing.insert(key.to_string());
-        }
-    }
-
-    /// Mark a buffer as no longer playing (can be evicted)
-    #[allow(dead_code)]
-    pub fn mark_not_playing(&mut self, key: &str) {
-        self.playing.remove(key);
-    }
-
-    /// Check if a buffer is currently marked as playing
-    #[allow(dead_code)]
-    pub fn is_playing(&self, key: &str) -> bool {
-        self.playing.contains(key)
     }
 }
 
@@ -443,41 +418,96 @@ mod tests {
     }
 
     #[test]
+    fn externally_referenced_buffer_is_not_evicted() {
+        let buffer_size = 2 * 10000 * 4;
+        let mut cache = MemoryCache::with_max_size(buffer_size * 2);
+
+        // A "playing" buffer: we keep an Arc to it, exactly as an ActiveSample does.
+        let playing = Arc::new(create_test_buffer(2, 10000));
+        cache.put("playing.wav".to_string(), playing.clone());
+
+        // An unreferenced buffer (the temporary Arc is dropped after put).
+        cache.put(
+            "other.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        // Make `other` the most-recently-used (and drop the returned Arc immediately,
+        // so it stays unreferenced and therefore evictable).
+        let _ = cache.get("other.wav");
+
+        // Adding a third buffer forces an eviction. The still-referenced buffer must
+        // survive even though it is the least-recently-used.
+        cache.put(
+            "third.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+
+        assert!(
+            cache.contains("playing.wav"),
+            "a buffer still referenced by a player must not be evicted"
+        );
+        assert!(
+            !cache.contains("other.wav"),
+            "the unreferenced LRU entry should be evicted instead"
+        );
+        // Accounting reflects exactly the two resident buffers.
+        assert_eq!(cache.memory_usage_bytes(), buffer_size * 2);
+    }
+
+    #[test]
     fn test_playing_entries_never_evicted() {
         let buffer_size = 2 * 10000 * 4;
         let mut cache = MemoryCache::with_max_size(buffer_size * 2);
 
-        // Add two buffers
-        let buffer1 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("first.wav".to_string(), buffer1);
+        // Keep an external Arc to "first", so it counts as playing (strong_count > 1).
+        let first = Arc::new(create_test_buffer(2, 10000));
+        cache.put("first.wav".to_string(), first.clone());
 
-        let buffer2 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("second.wav".to_string(), buffer2);
+        cache.put(
+            "second.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
 
-        // Mark first as playing
-        cache.mark_playing("first.wav");
-
-        // Add third buffer - should evict second (first is protected)
-        let buffer3 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("third.wav".to_string(), buffer3);
-        assert!(cache.contains("first.wav")); // protected
+        // Add third buffer - should evict second (first is protected by its live Arc)
+        cache.put(
+            "third.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        assert!(cache.contains("first.wav")); // protected (still referenced)
         assert!(!cache.contains("second.wav")); // evicted
         assert!(cache.contains("third.wav"));
     }
 
     #[test]
-    fn test_mark_not_playing() {
+    fn test_buffer_evictable_after_external_ref_dropped() {
         let buffer_size = 2 * 10000 * 4;
         let mut cache = MemoryCache::with_max_size(buffer_size * 2);
 
-        let buffer1 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("first.wav".to_string(), buffer1);
+        // While "first" is referenced it is protected from eviction.
+        let first = Arc::new(create_test_buffer(2, 10000));
+        cache.put("first.wav".to_string(), first.clone());
+        cache.put(
+            "second.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        cache.put(
+            "third.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        assert!(cache.contains("first.wav"), "protected while referenced");
 
-        cache.mark_playing("first.wav");
-        assert!(cache.is_playing("first.wav"));
-
-        cache.mark_not_playing("first.wav");
-        assert!(!cache.is_playing("first.wav"));
+        // Drop the external reference; "first" is now just another cache entry.
+        drop(first);
+        // Touch the survivor so "first" is the LRU, then force another eviction.
+        let _ = cache.get("third.wav");
+        cache.put(
+            "fourth.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        assert!(
+            !cache.contains("first.wav"),
+            "evictable once no longer referenced"
+        );
     }
 
     #[test]
@@ -486,26 +516,29 @@ mod tests {
         // Limit that fits 3 buffers
         let mut cache = MemoryCache::with_max_size(buffer_size * 3);
 
-        // Add 3 buffers
-        let buffer1 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("first.wav".to_string(), buffer1);
-        let buffer2 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("second.wav".to_string(), buffer2);
-        let buffer3 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("third.wav".to_string(), buffer3);
+        cache.put(
+            "first.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        cache.put(
+            "second.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        // Keep an external Arc to "third", so it is protected (playing).
+        let third = Arc::new(create_test_buffer(2, 10000));
+        cache.put("third.wav".to_string(), third.clone());
 
         // Access second
         let _ = cache.get("second.wav");
 
-        // Mark third as playing
-        cache.mark_playing("third.wav");
-
         // Add fourth buffer - should evict first (LRU and not protected)
-        let buffer4 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("fourth.wav".to_string(), buffer4);
+        cache.put(
+            "fourth.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
         assert!(!cache.contains("first.wav")); // evicted (oldest, not protected)
         assert!(cache.contains("second.wav")); // kept (accessed more recently)
-        assert!(cache.contains("third.wav")); // kept (playing)
+        assert!(cache.contains("third.wav")); // kept (referenced/playing)
         assert!(cache.contains("fourth.wav")); // just added
     }
 

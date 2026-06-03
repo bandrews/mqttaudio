@@ -30,6 +30,15 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   non-f32 crash and the gating acceptance criteria. Pick it up when a real device exposes the mismatch
   (also a fit for Sprint 9's device cleanup). Prefix broadening is the cheap first step.
 
+- **Chunked-vs-one-shot resampler divergence (Sprint 4 caveat — LOW, consistency-only).** The streaming
+  decode path resamples in chunks (`StreamingDecoder` + `ChunkedResampler`), zero-padding the final
+  partial chunk and truncating to the expected frame count without compensating rubato's startup delay,
+  while disk-cache hits and local files use the one-shot `decoder::decode_file`. The two produce slightly
+  different PCM for the same source (the `matches_full_decode` test tolerates the diff); it is not an
+  audible glitch. Sprint 4's promotion (F2) means a streamed URL resolves to the one-shot path on replay,
+  so the divergence only affects the first, still-streaming play. Left for Sprint 9 cleanup — do not
+  rewrite the resampler for this.
+
 ## Architectural notes
 
 - **Binary re-declares modules instead of using the library crate.** `src/main.rs` declares its own

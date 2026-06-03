@@ -379,6 +379,23 @@ impl ActiveSample {
         }
     }
 
+    /// The frame count to wrap against when looping, or `None` if looping must
+    /// not engage yet.
+    ///
+    /// A still-streaming buffer reports only the frames decoded so far, so
+    /// wrapping against it would replay an ever-growing prefix (an audible buzz).
+    /// Looping is therefore deferred until the buffer is `Complete`, when
+    /// `frames()` is the true total; until then the sample plays forward and the
+    /// callback emits silence past the loaded edge.
+    fn loop_boundary(&self) -> Option<usize> {
+        if self.loop_mode && self.buffer.is_complete() {
+            let frames = self.buffer.frames();
+            (frames > 0).then_some(frames)
+        } else {
+            None
+        }
+    }
+
     /// Advance the playback position by the given number of output frames,
     /// accounting for playback speed (including negative for reverse).
     /// Handles looping by wrapping position to other end of buffer.
@@ -386,9 +403,8 @@ impl ActiveSample {
     fn advance_position(&mut self, output_frames: usize) -> usize {
         let advance = output_frames as f64 * self.speed as f64;
         let new_pos = self.position as f64 + self.fractional_position + advance;
-        let buffer_frames = self.buffer.frames();
 
-        if self.loop_mode && buffer_frames > 0 {
+        if let Some(buffer_frames) = self.loop_boundary() {
             // Handle looping
             if new_pos < 0.0 {
                 // Reverse playback wrapped past start - loop to end
@@ -616,7 +632,10 @@ fn mix_sample_into_output(
     let is_reverse = speed < 0.0;
     let buffer_frames = sample.buffer.frames();
     let buffer_channels = sample.buffer.channels();
-    let loop_mode = sample.loop_mode;
+    // Looping only engages once the buffer is complete (see loop_boundary); a
+    // still-streaming buffer plays forward and emits silence past the loaded edge
+    // rather than wrapping against its growing prefix.
+    let loop_mode = sample.loop_boundary().is_some();
     let sample_volume = sample.volume;
 
     // Calculate current precise position (integer + fractional parts)

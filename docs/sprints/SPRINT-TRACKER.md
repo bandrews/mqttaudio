@@ -79,7 +79,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 | 1 | Device & format compatibility | Done | 0 | [sprint-01](sprint-01-device-format-compatibility.md) |
 | 2 | Control-plane reliability | Done | 0 | [sprint-02](sprint-02-control-plane-reliability.md) |
 | 3 | Security & file safety | Done | 0 | [sprint-03](sprint-03-security-and-file-safety.md) |
-| 4 | Streaming & cache correctness | Not started | 0 | [sprint-04](sprint-04-streaming-and-cache-correctness.md) |
+| 4 | Streaming & cache correctness | In progress | 0 | [sprint-04](sprint-04-streaming-and-cache-correctness.md) |
 | 5 | Lock-free real-time engine | Not started | 0 | [sprint-05](sprint-05-lockfree-realtime-engine.md) |
 | 6 | Mixer DSP correctness | Not started | 5 | [sprint-06](sprint-06-mixer-dsp-correctness.md) |
 | 7 | Bass management & multichannel | Not started | 5 | [sprint-07](sprint-07-bass-management-and-multichannel.md) |

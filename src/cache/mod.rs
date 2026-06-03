@@ -94,13 +94,20 @@ impl CacheManager {
 
     /// Get or load an audio file with streaming support.
     /// Returns a SampleBuffer that may be either complete (from cache) or
-    /// streaming (still loading). For streaming buffers, playback can begin
-    /// as soon as MIN_BUFFER_FRAMES are available.
+    /// streaming (still loading). A streaming buffer is returned immediately and
+    /// playback begins right away; the audio callback emits silence for any frame
+    /// that has not been decoded yet, so early frames may be silent until data
+    /// arrives.
     pub async fn get_or_load_streaming(
         &mut self,
         file_path: &str,
         target_sample_rate: u32,
     ) -> Result<SampleBuffer, Box<dyn std::error::Error + Send + Sync>> {
+        // Promote any finished streaming loads to the memory cache and drop their
+        // active_loads entries first, so a replay of a now-complete URL is served
+        // from cache instead of rejoining a stale streaming buffer.
+        self.cleanup_completed_loads();
+
         // Check memory cache first - return as Complete
         if let Some(buffer) = self.memory_cache.get(file_path) {
             tracing::debug!("Memory cache hit for: {}", file_path);
@@ -324,8 +331,6 @@ impl CacheManager {
     }
 
     /// Clean up completed loads and promote to memory cache
-    // Allow dead_code until Phase 10 connects streaming to main.rs
-    #[allow(dead_code)]
     pub fn cleanup_completed_loads(&mut self) {
         let completed: Vec<String> = self
             .active_loads
@@ -592,5 +597,39 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("allowed_directories"));
+    }
+
+    #[tokio::test]
+    async fn completed_streaming_load_is_promoted_and_active_loads_bounded() {
+        let cache_dir = TempDir::new().unwrap();
+        let mut cm =
+            CacheManager::with_quality(cache_dir.path().to_path_buf(), ResamplerQuality::default())
+                .unwrap();
+        let url = "http://example.com/sound.wav";
+
+        // Simulate a finished streaming decode: a Complete buffer tracked in
+        // active_loads (no network needed).
+        let mut sb = StreamingBuffer::new(2, 48000, Some(4));
+        sb.append(&[0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]); // 4 stereo frames
+        sb.mark_complete();
+        cm.active_loads.insert(
+            url.to_string(),
+            ActiveLoad {
+                buffer: Arc::new(RwLock::new(sb)),
+                path: url.to_string(),
+            },
+        );
+
+        // Replaying the URL must serve the promoted Complete cache entry rather
+        // than rejoining the streaming buffer, and must drop the active_loads entry.
+        let buf = cm.get_or_load_streaming(url, 48000).await.unwrap();
+        assert!(
+            matches!(buf, SampleBuffer::Complete(_)),
+            "replay should return a Complete (cached) buffer, not a Streaming one"
+        );
+        assert!(
+            cm.active_loads.is_empty(),
+            "a completed load must be removed from active_loads"
+        );
     }
 }
