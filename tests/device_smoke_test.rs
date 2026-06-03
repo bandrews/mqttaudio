@@ -5,6 +5,7 @@ use cpal::traits::StreamTrait;
 use mqttaudio::audio::engine::{build_output_stream, find_output_config, find_output_device};
 use mqttaudio::audio::mixer::MixerState;
 use std::collections::HashSet;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// Open the real default output device and run a brief stream through the actual
@@ -39,6 +40,7 @@ fn default_output_device_opens_and_runs() {
         output_config.sample_format,
         mixer_state,
         active_voices,
+        Arc::new(AtomicBool::new(false)),
     )
     .expect("build an output stream via the format dispatch");
 

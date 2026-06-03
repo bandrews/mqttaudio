@@ -12,6 +12,7 @@ pub mod audio {
     pub mod input;
     pub mod mixer;
     pub mod pitch_correction;
+    pub mod rebuild;
     pub mod resampler;
     pub mod streaming;
     pub mod streaming_decoder;

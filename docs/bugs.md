@@ -27,6 +27,16 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 - **Hardcoded `/Users/bandrews/...` paths (Sprint 9, D39).** `audio::engine::test_mixer` embeds absolute
   developer paths for its test files. Sprint 9 removes `test_mixer`/`--test-mixer` and the dev scaffolding.
 
+- **ALSA name matcher hardening deferred (Sprint 1 F6 — LOW, Linux-only).** `try_match_alsa_device` /
+  `extract_alsa_card_from_name` in `src/audio/engine.rs` compare only the card identifier (ignoring the
+  DEV/subdevice), miss some prefixes (`hdmi:`/`iec958:`), and re-read `/proc/asound/cards` per comparison.
+  This is the *secondary* device-resolution path — the exact enumerated-name match is tried first and
+  handles the common case — so the realistic worst case is right-card/wrong-subdevice or a missed `hdmi:`
+  device when selecting by a non-enumerated name. The fix (subdevice comparison + a cached `/proc` map) is
+  Linux-only and can only be verified in Lane A; it was deferred to keep Sprint 1 focused on the critical
+  non-f32 crash and the gating acceptance criteria. Pick it up when a real device exposes the mismatch
+  (also a fit for Sprint 9's device cleanup). Prefix broadening is the cheap first step.
+
 ## Architectural notes
 
 - **Binary re-declares modules instead of using the library crate.** `src/main.rs` declares its own

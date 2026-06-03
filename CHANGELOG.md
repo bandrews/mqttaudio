@@ -5,6 +5,32 @@ All notable changes to mqttaudio will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Output device sample-format negotiation.** The output stream is now built to match
+  the device's native sample format (I16/U16/I32/F32) using an internal f32 mix bus and
+  a per-sample convert shim, instead of assuming f32. Non-f32 Windows WASAPI shared-mode
+  and ALSA `hw:` devices no longer crash at startup.
+- **Channel-count fallback.** Requesting a channel count the device does not expose
+  exactly now opens the next-larger configuration (extra channels stay silent) instead
+  of exiting.
+- **Sample-rate selection.** The nearest device-supported rate is chosen (honoring
+  discrete-rate devices) and validated against the device's supported configs before the
+  stream is built; the previous arithmetic clamp could pick an unsupported rate.
+- **`audio.buffer_size` is now honored** via `BufferSize::Fixed` when the device supports
+  it (previously the validated value was ignored). Latency/period size may change for
+  existing configs.
+
+### Fixed
+
+- **No startup panic on non-f32 devices.** Stream-build failures now exit gracefully (on
+  Linux with a `plughw:`/`default` recommendation) instead of panicking.
+- **Output auto-recovery.** A fatal output-device error now rebuilds the stream with
+  exponential backoff (re-resolving the device) instead of going permanently silent; if it
+  cannot recover, the process exits so a service manager can restart it.
+
 ## [2.0.0] - 2025-10-19
 
 ### Overview

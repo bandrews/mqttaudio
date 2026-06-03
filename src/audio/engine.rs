@@ -7,7 +7,7 @@ use crate::audio::types::DeviceConfig;
 use crate::config::ResamplerQuality;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// List available audio output devices
@@ -430,6 +430,7 @@ fn build_typed_output_stream<T>(
     config: &cpal::StreamConfig,
     mixer_state: Arc<Mutex<MixerState>>,
     active_voices: Arc<Mutex<std::collections::HashSet<String>>>,
+    error_flag: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
     T: cpal::SizedSample + cpal::FromSample<f32> + Send + 'static,
@@ -444,8 +445,10 @@ where
                 *out = T::from_sample(s);
             }
         },
-        |err| {
+        move |err| {
             tracing::error!("Audio stream error: {}", err);
+            // Signal the supervisor to rebuild; the cpal callback must not do it.
+            error_flag.store(true, Ordering::Relaxed);
         },
         None,
     )
@@ -460,24 +463,138 @@ pub fn build_output_stream(
     sample_format: cpal::SampleFormat,
     mixer_state: Arc<Mutex<MixerState>>,
     active_voices: Arc<Mutex<std::collections::HashSet<String>>>,
+    error_flag: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     use cpal::SampleFormat;
     let stream = match sample_format {
-        SampleFormat::F32 => {
-            build_typed_output_stream::<f32>(device, config, mixer_state, active_voices)?
-        }
-        SampleFormat::I16 => {
-            build_typed_output_stream::<i16>(device, config, mixer_state, active_voices)?
-        }
-        SampleFormat::U16 => {
-            build_typed_output_stream::<u16>(device, config, mixer_state, active_voices)?
-        }
-        SampleFormat::I32 => {
-            build_typed_output_stream::<i32>(device, config, mixer_state, active_voices)?
-        }
+        SampleFormat::F32 => build_typed_output_stream::<f32>(
+            device,
+            config,
+            mixer_state,
+            active_voices,
+            error_flag,
+        )?,
+        SampleFormat::I16 => build_typed_output_stream::<i16>(
+            device,
+            config,
+            mixer_state,
+            active_voices,
+            error_flag,
+        )?,
+        SampleFormat::U16 => build_typed_output_stream::<u16>(
+            device,
+            config,
+            mixer_state,
+            active_voices,
+            error_flag,
+        )?,
+        SampleFormat::I32 => build_typed_output_stream::<i32>(
+            device,
+            config,
+            mixer_state,
+            active_voices,
+            error_flag,
+        )?,
         other => return Err(format!("unsupported device sample format: {:?}", other).into()),
     };
     Ok(stream)
+}
+
+/// Own and supervise the output stream on a dedicated thread. On a fatal stream
+/// error the supervisor rebuilds it — re-resolving the device by name and reusing
+/// the original negotiated config (so the mixer's channel count and resample
+/// target stay valid) — with exponential backoff. If the device cannot be
+/// rebuilt after the backoff is exhausted, the process exits so a service manager
+/// (e.g. systemd) can restart with a fresh full setup. Returns when `shutdown`
+/// is set.
+pub fn spawn_output_supervisor(
+    device_name: Option<String>,
+    config: cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
+    mixer_state: Arc<Mutex<MixerState>>,
+    active_voices: Arc<Mutex<std::collections::HashSet<String>>>,
+    shutdown: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use crate::audio::rebuild::RebuildPolicy;
+    use std::time::{Duration, Instant};
+
+    std::thread::spawn(move || {
+        let mut policy = RebuildPolicy::new();
+        let mut ever_succeeded = false;
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
+            }
+
+            let error_flag = Arc::new(AtomicBool::new(false));
+            let built = (|| -> Result<cpal::Stream, Box<dyn std::error::Error>> {
+                let device = find_output_device(device_name.as_deref())?;
+                let stream = build_output_stream(
+                    &device,
+                    &config,
+                    sample_format,
+                    mixer_state.clone(),
+                    active_voices.clone(),
+                    error_flag.clone(),
+                )?;
+                stream.play()?;
+                Ok(stream)
+            })();
+
+            match built {
+                Ok(stream) => {
+                    tracing::info!("Audio stream started ({:?})", sample_format);
+                    ever_succeeded = true;
+                    let started = Instant::now();
+                    // Hold the stream alive until a fatal error or shutdown.
+                    while !error_flag.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    drop(stream);
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // A stable run that then errors is a transient blip: reset the
+                    // backoff and rebuild immediately. Rapid failures fall through
+                    // to the growing backoff below.
+                    if started.elapsed() >= Duration::from_secs(5) {
+                        policy.reset();
+                        tracing::warn!(
+                            "Audio stream error after a stable run; rebuilding output..."
+                        );
+                        continue;
+                    }
+                    tracing::warn!("Audio stream failed shortly after start; backing off...");
+                }
+                Err(e) => {
+                    tracing::error!("Audio output unavailable: {}", e);
+                    if !ever_succeeded {
+                        // A startup misconfiguration won't self-heal; fail fast.
+                        #[cfg(target_os = "linux")]
+                        tracing::error!(
+                            "On ALSA, a raw 'hw:' device may require its native format; try a \
+                             'plughw:' or 'default' device, which converts formats automatically."
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            match policy.next_delay() {
+                Some(delay) => {
+                    tracing::info!("Retrying output device in {:?}", delay);
+                    std::thread::sleep(delay);
+                }
+                None => {
+                    tracing::error!(
+                        "Output device could not be (re)built after several attempts; \
+                         exiting for a service-manager restart."
+                    );
+                    std::process::exit(1);
+                }
+            }
+        }
+    })
 }
 
 /// Initialize audio output stream with a test sine wave

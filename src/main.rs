@@ -9,7 +9,7 @@ mod mqtt;
 mod voice;
 
 use clap::Parser;
-use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::traits::DeviceTrait;
 use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
@@ -577,30 +577,18 @@ async fn main() {
 
     // Start audio stream — build a typed stream that matches the device's
     // native sample format and convert the f32 mix bus to it per sample.
-    let stream = match audio::engine::build_output_stream(
-        &device,
-        &stream_config,
+    // Supervise the output stream on its own thread so a fatal device error
+    // rebuilds it (with backoff) instead of going permanently silent. The
+    // supervisor re-resolves the device by name and reuses this negotiated
+    // config, exiting for a service-manager restart if it can't recover.
+    let _output_supervisor = audio::engine::spawn_output_supervisor(
+        config.audio.device.clone(),
+        stream_config,
         sample_format,
         mixer_state.clone(),
         active_voices.clone(),
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("Failed to build audio stream: {}", e);
-            #[cfg(target_os = "linux")]
-            tracing::error!(
-                "On ALSA, a raw 'hw:' device may require its native format; try a \
-                 'plughw:' or 'default' device, which converts formats automatically."
-            );
-            std::process::exit(1);
-        }
-    };
-
-    if let Err(e) = stream.play() {
-        tracing::error!("Failed to start audio stream: {}", e);
-        std::process::exit(1);
-    }
-    tracing::info!("Audio stream started");
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
 
     // Create command channel
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(100);
@@ -676,9 +664,6 @@ async fn main() {
             }
         }
     }
-
-    // Keep stream alive
-    drop(stream);
 }
 
 /// Bundles the shared state a single command operates on.

@@ -28,8 +28,28 @@ panicked here. This is the headline compatibility fix and cannot be exercised on
 2. Start against a broker: `mqttaudio.exe --server localhost --topic audio/commands`
 3. Play a known WAV: `mosquitto_pub -t audio/commands -m "{\"command\":\"play\",\"file\":\"C:\\path\\to\\test.wav\"}"`
 
-**Expected:** process does **not** panic at startup; logs show the negotiated device format (e.g. I16) and
-sample rate; audio plays cleanly with no distortion. Repeat with `--sample-rate 44100` and `--channels 2`.
+**Expected:** process does **not** panic at startup; the log line `Sample format: I16` (or `I32`/`F32`)
+reports the negotiated device format alongside the channels and rate; audio plays cleanly with no
+distortion. Repeat with `--sample-rate 44100` and `--channels 2`. If a second device exposes a different
+native format (e.g. I32), repeat against it and confirm the logged `Sample format:` changes accordingly.
+
+**Result:** _(record PASS/FAIL + notes + date)_
+
+---
+
+## W-3 — Output auto-recovers from a device error  _(added by Sprint 1)_
+
+**Why manual:** requires physically removing/re-adding the output device (or switching the default), which
+cannot be reproduced in Lane A or Lane B.
+
+**Steps:**
+1. Start playback of a looping WAV on a removable output device (USB / Bluetooth / HDMI).
+2. While it plays, unplug (or disable) that device, wait ~5 seconds, then re-plug/re-enable it.
+
+**Expected:** the log shows an audio stream error followed by a rebuild attempt ("Audio stream error … /
+rebuilding output"); within a few seconds of the device returning, audio resumes on it **without** restarting
+the process. If the device stays gone, the process exits non-zero (for a service-manager restart) rather than
+hanging silently.
 
 **Result:** _(record PASS/FAIL + notes + date)_
 
