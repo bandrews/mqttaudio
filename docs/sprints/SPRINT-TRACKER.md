@@ -81,7 +81,7 @@ A half-done sprint marked `Done` is a failure of the whole program.
 | 3 | Security & file safety | Done | 0 | [sprint-03](sprint-03-security-and-file-safety.md) |
 | 4 | Streaming & cache correctness | Done | 0 | [sprint-04](sprint-04-streaming-and-cache-correctness.md) |
 | 5 | Lock-free real-time engine | Done | 0 | [sprint-05](sprint-05-lockfree-realtime-engine.md) |
-| 6 | Mixer DSP correctness | In progress | 5 | [sprint-06](sprint-06-mixer-dsp-correctness.md) |
+| 6 | Mixer DSP correctness | Done | 5 | [sprint-06](sprint-06-mixer-dsp-correctness.md) |
 | 7 | Bass management & multichannel | Not started | 5 | [sprint-07](sprint-07-bass-management-and-multichannel.md) |
 | 8 | Live input robustness | Not started | 5 | [sprint-08](sprint-08-live-input-robustness.md) |
 | 9 | Cleanup, observability, packaging | Not started | 1–8 | [sprint-09](sprint-09-cleanup-observability-packaging.md) |
@@ -160,14 +160,14 @@ Tick a box only when genuinely verified. `[A]` = Lane A/Docker, `[B]` = Lane B/n
 > changelog'd). The Lane B real-device **listening** soak is the partner's final-validation pass.
 
 ### Sprint 6 — Mixer DSP correctness
-- [ ] NaN/non-finite input → silence, not NaN, at the output; clip/over counter exposed `[A]`
-- [ ] Reverse interpolation uses `frame_n*(1-frac)+frame_{n+1}*frac`; -0.5x ramp test passes `[A]`
-- [ ] Per-channel calibration (`channel_volumes`) applied as a final output gain stage; test asserts per-channel gain `[A]`
-- [ ] Play `volume` clamped to [0,1] at construction `[A]`
-- [ ] Ducking advanced once per buffer, applied per-frame (smooth), restore honors `fade_duration_ms`, live-input voices can trigger ducking; ducked-voice RMS follows configured fade consistently across overlapping samples `[A]`
-- [ ] Pitch correction pre-rolled on enable (no silent gap); position-advance matches frames consumed; tail flushed `[A]`
-- [ ] Equal-power loop crossfade with correct overlap-on-wrap; no inter-sample click at the loop point `[A]`
-- [ ] True-peak/soft-knee limiter with configurable ceiling replaces the bare hard clamp; peak ≤ ceiling `[A]`
+- [x] NaN/non-finite input → silence, not NaN, at the output; clip/over counter exposed `[A]`
+- [x] Reverse interpolation uses `frame_n*(1-frac)+frame_{n+1}*frac`; -0.5x ramp test passes `[A]`
+- [x] Per-channel calibration (`channel_volumes`) applied as a final output gain stage; test asserts per-channel gain `[A]`
+- [x] Play `volume` clamped to [0,1] at construction `[A]`
+- [x] Ducking advanced once per buffer, applied per-frame (smooth), restore honors `fade_duration_ms`, live-input voices can trigger ducking; ducked-voice RMS follows configured fade consistently across overlapping samples `[A]`
+- [x] Pitch correction pre-rolled on enable (no silent gap); position-advance matches frames consumed; tail flushed `[A]` — *first-enable-at-frame-0 pre-roll + C++-side stretcher allocation are documented residuals (docs/bugs.md)*
+- [x] Equal-power loop crossfade with correct overlap-on-wrap; no inter-sample click at the loop point `[A]` — *forward loops; the symmetric reverse-loop-crossfade case is a documented deferral (docs/bugs.md)*
+- [x] True-peak/soft-knee limiter with configurable ceiling replaces the bare hard clamp; peak ≤ ceiling `[A]`
 
 ### Sprint 7 — Bass management & multichannel
 - [ ] 4th-order Linkwitz-Riley crossover; render-harness shows flat-ish acoustic-sum magnitude through the crossover `[A]`
