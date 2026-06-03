@@ -10,7 +10,7 @@ use crate::audio::decoder;
 use crate::audio::streaming::{SampleBuffer, StreamingBuffer};
 use crate::audio::streaming_decoder::StreamingDecoder;
 use crate::audio::types::DecodedBuffer;
-use crate::config::{MemoryCap, ResamplerQuality};
+use crate::config::{FreshnessMode, MemoryCap, ResamplerQuality};
 use disk::{CacheError, DiskCache};
 use memory::MemoryCache;
 use std::collections::HashMap;
@@ -39,6 +39,9 @@ pub struct CacheManager {
     allowed_directories: Vec<String>,
     /// Revalidate a disk-cached HTTP entry once it is older than this many seconds.
     revalidate_after_seconds: u64,
+    /// mtime + size recorded when a local file was decoded, so a later load can cheaply
+    /// detect an edit and re-decode (path -> (mtime, size)).
+    local_stats: HashMap<String, (std::time::SystemTime, u64)>,
 }
 
 impl CacheManager {
@@ -95,7 +98,36 @@ impl CacheManager {
             active_loads: HashMap::new(),
             allowed_directories,
             revalidate_after_seconds,
+            local_stats: HashMap::new(),
         })
+    }
+
+    /// Record the current mtime + size of a local file after decoding it, so a later
+    /// load can cheaply detect an edit. Best-effort: a stat failure records nothing.
+    fn record_local_stat(&mut self, path: &str) {
+        if let Ok(meta) = std::fs::metadata(path) {
+            if let Ok(mtime) = meta.modified() {
+                self.local_stats
+                    .insert(path.to_string(), (mtime, meta.len()));
+            }
+        }
+    }
+
+    /// Whether a local file changed on disk since it was cached (mtime or size differs
+    /// from what was recorded at decode). A missing recorded stat or an unreadable file
+    /// reads as "unchanged", so a transient stat error never thrashes the cache.
+    fn local_file_changed(&self, path: &str) -> bool {
+        let Some((cached_mtime, cached_size)) = self.local_stats.get(path) else {
+            return false;
+        };
+        match std::fs::metadata(path) {
+            Ok(meta) => {
+                let size_changed = meta.len() != *cached_size;
+                let mtime_changed = meta.modified().map(|m| m != *cached_mtime).unwrap_or(false);
+                size_changed || mtime_changed
+            }
+            Err(_) => false,
+        }
     }
 
     /// Bytes of new decoded data the memory cache could accept right now (after
@@ -126,26 +158,54 @@ impl CacheManager {
         Self::with_quality(cache_dir, ResamplerQuality::default())
     }
 
-    /// Get or load an audio file with streaming support.
-    /// Returns a SampleBuffer that may be either complete (from cache) or
-    /// streaming (still loading). A streaming buffer is returned immediately and
-    /// playback begins right away; the audio callback emits silence for any frame
-    /// that has not been decoded yet, so early frames may be silent until data
-    /// arrives.
+    /// Get or load an audio file with streaming support, using the default (trusting)
+    /// freshness. The convenience entry point for precache and tests; the Play path
+    /// uses [`get_or_load_streaming_with_freshness`] to honour a per-play override.
     pub async fn get_or_load_streaming(
         &mut self,
         file_path: &str,
         target_sample_rate: u32,
+    ) -> Result<SampleBuffer, Box<dyn std::error::Error + Send + Sync>> {
+        self.get_or_load_streaming_with_freshness(
+            file_path,
+            target_sample_rate,
+            FreshnessMode::Trusting,
+        )
+        .await
+    }
+
+    /// Get or load an audio file with streaming support, applying `freshness`.
+    /// Returns a SampleBuffer that may be either complete (from cache) or streaming
+    /// (still loading). A streaming buffer is returned immediately and playback begins
+    /// right away; the audio callback emits silence for any frame that has not been
+    /// decoded yet. In trusting/dev freshness a changed local file is re-decoded; in
+    /// pinned the cached copy is served directly.
+    pub async fn get_or_load_streaming_with_freshness(
+        &mut self,
+        file_path: &str,
+        target_sample_rate: u32,
+        freshness: FreshnessMode,
     ) -> Result<SampleBuffer, Box<dyn std::error::Error + Send + Sync>> {
         // Promote any finished streaming loads to the memory cache and drop their
         // active_loads entries first, so a replay of a now-complete URL is served
         // from cache instead of rejoining a stale streaming buffer.
         self.cleanup_completed_loads();
 
-        // Check memory cache first - return as Complete
+        // Check memory cache first - return as Complete. For a local file in
+        // trusting/dev freshness, a cheap stat picks up an on-disk edit and re-decodes
+        // it; pinned (and remote, here) serve the cached copy directly.
         if let Some(buffer) = self.memory_cache.get(file_path) {
-            tracing::debug!("Memory cache hit for: {}", file_path);
-            return Ok(SampleBuffer::Complete(buffer));
+            let is_http = file_path.starts_with("http://") || file_path.starts_with("https://");
+            if !is_http && freshness != FreshnessMode::Pinned && self.local_file_changed(file_path)
+            {
+                tracing::info!("Local file changed on disk; reloading: {}", file_path);
+                self.memory_cache.remove(file_path);
+                self.local_stats.remove(file_path);
+                // Fall through to re-decode below rather than return the stale buffer.
+            } else {
+                tracing::debug!("Memory cache hit for: {}", file_path);
+                return Ok(SampleBuffer::Complete(buffer));
+            }
         }
 
         // Check if already loading - return existing streaming buffer
@@ -211,6 +271,8 @@ impl CacheManager {
         let arc_buffer = Arc::new(buffer);
         self.memory_cache
             .put(file_path.to_string(), arc_buffer.clone());
+        // Remember the file's mtime+size so a later load can detect an edit (freshness).
+        self.record_local_stat(file_path);
         Ok(SampleBuffer::Complete(arc_buffer))
     }
 
@@ -510,6 +572,7 @@ impl CacheManager {
     /// Invalidate a specific file from both caches
     pub fn invalidate(&mut self, file_path: &str) -> Result<(), CacheError> {
         self.memory_cache.remove(file_path);
+        self.local_stats.remove(file_path);
         self.disk_cache.remove_entry(file_path)?;
         tracing::info!("Invalidated cache for: {}", file_path);
         Ok(())
@@ -664,6 +727,143 @@ mod tests {
         assert!(
             cm.active_loads.is_empty(),
             "a completed load must be removed from active_loads"
+        );
+    }
+
+    /// Two test WAVs of clearly different length, used to detect a re-decode.
+    const SHORT_WAV: &str = "tests/audio/test_440hz_2s.wav";
+    const LONG_WAV: &str = "tests/audio/test_beep_5s.wav";
+
+    fn wavs_present() -> bool {
+        std::path::Path::new(SHORT_WAV).exists() && std::path::Path::new(LONG_WAV).exists()
+    }
+
+    #[tokio::test]
+    async fn local_freshness_reloads_a_changed_file_in_trusting_but_not_pinned() {
+        if !wavs_present() {
+            eprintln!("skipping: test WAVs not found");
+            return;
+        }
+        let work = TempDir::new().unwrap();
+        let asset = work.path().join("asset.wav");
+        std::fs::copy(SHORT_WAV, &asset).unwrap();
+        let asset_str = asset.to_string_lossy().into_owned();
+
+        let cache_dir = TempDir::new().unwrap();
+        let mut cm =
+            CacheManager::with_quality(cache_dir.path().to_path_buf(), ResamplerQuality::Fast)
+                .unwrap();
+
+        // First load: the ~2 s clip; its mtime+size are recorded.
+        let b1 = cm
+            .get_or_load_streaming_with_freshness(&asset_str, 48000, FreshnessMode::Trusting)
+            .await
+            .unwrap();
+        let frames1 = b1.frames();
+        assert!(
+            (80_000..=110_000).contains(&frames1),
+            "2 s ~= 96000 frames, got {frames1}"
+        );
+
+        // Replace the asset with the ~5 s clip (changes size and mtime).
+        std::fs::copy(LONG_WAV, &asset).unwrap();
+
+        // Pinned never re-checks: it serves the stale cached 2 s buffer.
+        let bp = cm
+            .get_or_load_streaming_with_freshness(&asset_str, 48000, FreshnessMode::Pinned)
+            .await
+            .unwrap();
+        assert_eq!(
+            bp.frames(),
+            frames1,
+            "pinned must serve the stale cached buffer"
+        );
+
+        // Trusting re-stats, sees the change, and reloads the longer clip.
+        let b2 = cm
+            .get_or_load_streaming_with_freshness(&asset_str, 48000, FreshnessMode::Trusting)
+            .await
+            .unwrap();
+        assert!(
+            b2.frames() > frames1 + 50_000,
+            "trusting must reload the changed (longer) file, got {} vs {}",
+            b2.frames(),
+            frames1
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_local_file_is_served_from_cache_not_redecoded() {
+        if !wavs_present() {
+            eprintln!("skipping: test WAVs not found");
+            return;
+        }
+        let work = TempDir::new().unwrap();
+        let asset = work.path().join("asset.wav");
+        std::fs::copy(SHORT_WAV, &asset).unwrap();
+        let asset_str = asset.to_string_lossy().into_owned();
+
+        let cache_dir = TempDir::new().unwrap();
+        let mut cm =
+            CacheManager::with_quality(cache_dir.path().to_path_buf(), ResamplerQuality::Fast)
+                .unwrap();
+
+        let b1 = cm
+            .get_or_load_streaming_with_freshness(&asset_str, 48000, FreshnessMode::Trusting)
+            .await
+            .unwrap();
+        // No change on disk: the second load returns the SAME cached Arc (not a redecode).
+        let b2 = cm
+            .get_or_load_streaming_with_freshness(&asset_str, 48000, FreshnessMode::Trusting)
+            .await
+            .unwrap();
+        match (b1, b2) {
+            (SampleBuffer::Complete(a), SampleBuffer::Complete(b)) => {
+                assert!(
+                    Arc::ptr_eq(&a, &b),
+                    "an unchanged file must serve the same cached Arc"
+                );
+            }
+            _ => panic!("expected Complete buffers"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_via_invalidate_then_precache_picks_up_a_changed_file() {
+        if !wavs_present() {
+            eprintln!("skipping: test WAVs not found");
+            return;
+        }
+        let work = TempDir::new().unwrap();
+        let asset = work.path().join("asset.wav");
+        std::fs::copy(SHORT_WAV, &asset).unwrap();
+        let asset_str = asset.to_string_lossy().into_owned();
+
+        let cache_dir = TempDir::new().unwrap();
+        let mut cm =
+            CacheManager::with_quality(cache_dir.path().to_path_buf(), ResamplerQuality::Fast)
+                .unwrap();
+
+        let frames1 = cm
+            .get_or_load_streaming(&asset_str, 48000)
+            .await
+            .unwrap()
+            .frames();
+
+        // Republish a longer asset, then run the cache_reload mechanism (invalidate +
+        // precache), as a content pipeline would after publishing.
+        std::fs::copy(LONG_WAV, &asset).unwrap();
+        cm.invalidate(&asset_str).unwrap();
+        cm.precache_streaming(&asset_str, 48000).await.unwrap();
+
+        let frames2 = cm
+            .get_or_load_streaming(&asset_str, 48000)
+            .await
+            .unwrap()
+            .frames();
+        assert!(
+            frames2 > frames1 + 50_000,
+            "reload must serve the republished (longer) file, got {frames2} vs {frames1}"
         );
     }
 }

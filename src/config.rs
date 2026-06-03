@@ -246,6 +246,9 @@ pub struct CacheConfig {
     pub full_load_max_bytes: u64,
     /// Auto threshold: a local asset longer than this many seconds is windowed.
     pub full_load_max_seconds: u32,
+    /// Default freshness policy: `trusting` (serve cache, refresh in the background),
+    /// `dev` (re-check every load), or `pinned` (never auto-check).
+    pub freshness: FreshnessMode,
 }
 
 impl Default for CacheConfig {
@@ -264,6 +267,7 @@ impl Default for CacheConfig {
             load_mode: LoadMode::Auto,
             full_load_max_bytes: 32 * 1024 * 1024,
             full_load_max_seconds: 60,
+            freshness: FreshnessMode::Trusting,
         }
     }
 }
@@ -542,6 +546,24 @@ pub enum MemoryCap {
     Unlimited,
     /// A hard cap in bytes.
     Bytes(usize),
+}
+
+/// How aggressively the cache checks whether an asset changed before serving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum FreshnessMode {
+    /// Serve the cached copy immediately; pick up local changes via a cheap `stat`
+    /// each load, and refresh remote entries in the background once past the
+    /// revalidation window. Never blocks a play on the network. (Default.)
+    #[default]
+    Trusting,
+    /// Check on every load: re-`stat` local files each play and revalidate remote
+    /// entries with no freshness window, so an edited asset is picked up immediately.
+    /// For active development.
+    Dev,
+    /// Never auto-check; changes are picked up only via an explicit reload or restart.
+    Pinned,
 }
 
 /// Advanced configuration settings.
@@ -2143,6 +2165,24 @@ mod tests {
             LoadMode::Stream
         );
         assert_eq!(LoadMode::default(), LoadMode::Auto);
+    }
+
+    #[test]
+    fn test_freshness_mode_serde_and_default() {
+        assert_eq!(
+            serde_json::from_str::<FreshnessMode>("\"trusting\"").unwrap(),
+            FreshnessMode::Trusting
+        );
+        assert_eq!(
+            serde_json::from_str::<FreshnessMode>("\"dev\"").unwrap(),
+            FreshnessMode::Dev
+        );
+        assert_eq!(
+            serde_json::from_str::<FreshnessMode>("\"pinned\"").unwrap(),
+            FreshnessMode::Pinned
+        );
+        assert_eq!(FreshnessMode::default(), FreshnessMode::Trusting);
+        assert_eq!(Config::default().cache.freshness, FreshnessMode::Trusting);
     }
 
     #[test]

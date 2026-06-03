@@ -88,6 +88,7 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         .route("/precache", post(handlers::handle_precache))
         .route("/cache/clear", post(handlers::handle_cache_clear))
         .route("/cache/invalidate", post(handlers::handle_cache_invalidate))
+        .route("/cache/reload", post(handlers::handle_cache_reload))
         .route("/voice/stop", post(handlers::handle_voice_stop))
         .route("/voice/fade_out", post(handlers::handle_voice_fade_out))
         .route("/voice/volume", post(handlers::handle_voice_volume))

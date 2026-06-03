@@ -474,6 +474,24 @@ pub async fn handle_cache_invalidate(
     }
 }
 
+pub async fn handle_cache_reload(
+    State(state): State<AppState>,
+    Json(params): Json<CacheInvalidateParams>,
+) -> impl IntoResponse {
+    let command = json!({
+        "command": "cache_reload",
+        "message": { "file": params.file }
+    });
+
+    match send_command(&state, &command.to_string()).await {
+        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CommandResponse::error(&e)),
+        ),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct VoiceStopParams {
     voice: String,

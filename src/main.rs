@@ -1358,6 +1358,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             mode,
             window_ms,
             prebuffer_ms,
+            freshness,
         } => {
             // Windowed streaming applies to local files (HTTP windowed streaming is
             // deferred to a later sprint). `mode=stream` is explicit; `auto`/`full` are
@@ -1391,10 +1392,12 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 );
             }
 
-            // Load file (full in-memory load, with streaming support for faster startup)
+            // Load file (full in-memory load, with streaming support for faster startup).
+            // A per-play freshness override beats the configured default.
+            let resolved_freshness = freshness.unwrap_or(config.cache.freshness);
             let mut cache_mgr = cache_manager.lock().await;
             let buffer_result = cache_mgr
-                .get_or_load_streaming(&file, output_sample_rate)
+                .get_or_load_streaming_with_freshness(&file, output_sample_rate, resolved_freshness)
                 .await;
             drop(cache_mgr);
 
@@ -1769,6 +1772,22 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 }
             }
         }
+        mqtt::commands::AudioCommand::CacheReload { file } => {
+            // Invalidate then re-precache, so the next play is both fresh and instant —
+            // the explicit refresh path for a content pipeline that just republished
+            // an asset (no per-load freshness cost).
+            let mut cache_mgr = cache_manager.lock().await;
+            if let Err(e) = cache_mgr.invalidate(&file) {
+                tracing::error!("Failed to invalidate {} for reload: {}", file, e);
+            }
+            match cache_mgr
+                .precache_streaming(&file, output_sample_rate)
+                .await
+            {
+                Ok(()) => tracing::info!("Reloaded cache for: {}", file),
+                Err(e) => tracing::error!("Failed to reload {}: {}", file, e),
+            }
+        }
         mqtt::commands::AudioCommand::InputVolume {
             input,
             volume: new_volume,
@@ -2125,6 +2144,7 @@ mod tests {
             mode: config::LoadMode::Auto,
             window_ms: None,
             prebuffer_ms: None,
+            freshness: None,
         }
     }
 
@@ -2143,6 +2163,7 @@ mod tests {
             mode: config::LoadMode::Stream,
             window_ms: Some(200),
             prebuffer_ms: Some(20),
+            freshness: None,
         }
     }
 
@@ -2302,6 +2323,7 @@ mod tests {
             mode: config::LoadMode::Auto,
             window_ms: None,
             prebuffer_ms: None,
+            freshness: None,
         }
     }
 
