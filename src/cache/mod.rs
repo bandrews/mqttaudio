@@ -434,6 +434,11 @@ impl CacheManager {
         Ok(())
     }
 
+    /// Flush the disk-cache metadata to disk (called on graceful shutdown).
+    pub fn flush_metadata(&self) -> Result<(), CacheError> {
+        self.disk_cache.save_metadata()
+    }
+
     /// Get memory cache statistics
     pub fn memory_stats(&self) -> CacheStats {
         CacheStats {

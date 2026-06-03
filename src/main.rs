@@ -655,20 +655,34 @@ async fn main() {
         config: &config,
     };
 
-    while let Some(payload) = cmd_rx.recv().await {
-        // Expand macros before parsing
-        let expanded = match mqtt::commands::expand_macros(&payload, &config.macros) {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::error!("Macro expansion error: {}", e);
-                continue;
-            }
-        };
+    loop {
+        tokio::select! {
+            maybe_payload = cmd_rx.recv() => {
+                let payload = match maybe_payload {
+                    Some(p) => p,
+                    None => break, // command channel closed
+                };
 
-        match mqtt::commands::parse_command(&expanded) {
-            Ok(cmd) => handle_command(cmd, &command_ctx).await,
-            Err(e) => {
-                tracing::error!("Failed to parse command: {}", e);
+                // Expand macros before parsing
+                let expanded = match mqtt::commands::expand_macros(&payload, &config.macros) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        tracing::error!("Macro expansion error: {}", e);
+                        continue;
+                    }
+                };
+
+                match mqtt::commands::parse_command(&expanded) {
+                    Ok(cmd) => handle_command(cmd, &command_ctx).await,
+                    Err(e) => {
+                        tracing::error!("Failed to parse command: {}", e);
+                    }
+                }
+            }
+            _ = shutdown_signal() => {
+                tracing::info!("Shutdown signal received");
+                shutdown(&command_ctx).await;
+                break;
             }
         }
     }
@@ -1283,6 +1297,66 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
     }
 }
 
+/// Resolve when the process receives SIGINT (Ctrl-C) or, on unix, SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to install SIGTERM handler: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+/// Graceful shutdown: fade out active samples, let the callback drain the fade,
+/// then flush cache metadata before the process exits.
+async fn shutdown(ctx: &CommandCtx<'_>) {
+    const SHUTDOWN_FADE_MS: u32 = 50;
+
+    {
+        let mut state = ctx.mixer_state.lock();
+        let count = state.active_samples.len();
+        for sample in state.active_samples.iter_mut() {
+            sample.set_fade(audio::mixer::FadeState::fade_out(
+                SHUTDOWN_FADE_MS,
+                ctx.output_sample_rate,
+            ));
+        }
+        tracing::info!("Shutdown: fading out {} active samples", count);
+    }
+
+    // Let the audio callback drain the fade so output ends on silence, not a click.
+    tokio::time::sleep(std::time::Duration::from_millis(
+        SHUTDOWN_FADE_MS as u64 + 30,
+    ))
+    .await;
+
+    // Flush cache metadata to disk.
+    let cache_mgr = ctx.cache_manager.lock().await;
+    if let Err(e) = cache_mgr.flush_metadata() {
+        tracing::error!("Failed to flush cache metadata on shutdown: {}", e);
+    }
+    drop(cache_mgr);
+
+    tracing::info!("Shutdown complete");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1489,5 +1563,30 @@ mod tests {
                 "expected music ducked toward 0.1, got {multiplier}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn shutdown_fades_samples_and_flushes_metadata() {
+        let fixture = Fixture::new(None);
+        handle_command(play(Some("v"), 1.0), &fixture.ctx()).await;
+        assert_eq!(fixture.mixer_state.lock().active_samples.len(), 1);
+
+        shutdown(&fixture.ctx()).await;
+
+        // Every active sample now has a fade-out applied (drained to silence by the
+        // real callback at runtime; here we just assert the fade was set).
+        {
+            let state = fixture.mixer_state.lock();
+            assert!(!state.active_samples.is_empty());
+            for sample in &state.active_samples {
+                assert!(matches!(sample.fade_state, FadeState::Out { .. }));
+            }
+        }
+        // Cache metadata was flushed to disk on shutdown.
+        let metadata = fixture._cache_dir.path().join("metadata.json");
+        assert!(
+            metadata.exists(),
+            "metadata.json should be flushed on shutdown"
+        );
     }
 }

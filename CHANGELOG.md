@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stall keepalive and get the broker to drop the session. (HTTP command delivery is unchanged.)
 - **Invalid ducking targets are rejected.** A non-finite or out-of-range `ducking_rules[*].target_volume`
   now fails configuration validation instead of being accepted.
+- **Graceful shutdown.** SIGINT/SIGTERM now fades out active samples and flushes cache metadata before the
+  process exits, instead of cutting audio mid-buffer (no more shutdown click).
 
 - **Output device sample-format negotiation.** The output stream is now built to match
   the device's native sample format (I16/U16/I32/F32) using an internal f32 mix bus and
