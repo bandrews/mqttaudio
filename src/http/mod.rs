@@ -30,8 +30,28 @@ pub struct AppState {
     pub cache_manager: Arc<tokio::sync::Mutex<CacheManager>>,
     /// Optional auth token for Bearer authentication
     pub auth_token: Option<String>,
+    /// Opt-in: require a valid token on ALL routes (status + ws included).
+    pub require_auth: bool,
     /// Log broadcaster for WebSocket clients
     pub log_broadcaster: Arc<LogBroadcaster>,
+}
+
+/// Return a warning when the HTTP control API is exposed on a non-loopback
+/// address without authentication. Pure, for testing and a startup log.
+pub fn exposure_warning(
+    addr: &SocketAddr,
+    auth_token: &Option<String>,
+    require_auth: bool,
+) -> Option<String> {
+    if !addr.ip().is_loopback() && auth_token.is_none() && !require_auth {
+        Some(format!(
+            "HTTP control API exposed on {} without authentication. Set http.auth_token \
+             and http.require_auth to restrict access, or bind to 127.0.0.1.",
+            addr
+        ))
+    } else {
+        None
+    }
 }
 
 /// Start the HTTP server.
@@ -51,6 +71,7 @@ pub async fn start_server(
         voice_manager,
         cache_manager,
         auth_token: config.auth_token.clone(),
+        require_auth: config.require_auth,
         log_broadcaster: log_broadcaster.clone(),
     };
 
@@ -60,6 +81,9 @@ pub async fn start_server(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
 
+    if let Some(warning) = exposure_warning(&actual_addr, &config.auth_token, config.require_auth) {
+        tracing::warn!("{}", warning);
+    }
     tracing::info!("HTTP server listening on http://{}", actual_addr);
 
     // Spawn the server in the background

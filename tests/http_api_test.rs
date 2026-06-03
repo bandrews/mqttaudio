@@ -36,9 +36,18 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         voice_manager,
         cache_manager,
         auth_token: None,
+        require_auth: false,
         log_broadcaster: Arc::new(LogBroadcaster::new()),
     };
 
+    (state, cmd_rx)
+}
+
+/// Create a test AppState with a token AND require_auth enabled (all routes gated).
+fn create_test_state_require_auth(token: &str) -> (AppState, mpsc::Receiver<String>) {
+    let (mut state, cmd_rx) = create_test_state();
+    state.auth_token = Some(token.to_string());
+    state.require_auth = true;
     (state, cmd_rx)
 }
 
@@ -692,4 +701,56 @@ async fn test_samples_endpoint_position_ms_handles_zero_sample_rate() {
         position_ms, 0,
         "position_ms should be 0 when sample_rate is 0"
     );
+}
+
+#[tokio::test]
+async fn test_require_auth_protects_status_routes() {
+    let (state, _rx) = create_test_state_require_auth("tok");
+    let app = create_router(state, false, false);
+
+    // Without a token, even /status is now 401.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/status")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // With the Bearer token, /status returns 200.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/status")
+        .header(header::AUTHORIZATION, "Bearer tok")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_health_open_even_under_require_auth() {
+    let (state, _rx) = create_test_state_require_auth("tok");
+    let app = create_router(state, false, false);
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/health")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[test]
+fn test_exposure_warning_only_when_exposed_without_auth() {
+    use mqttaudio::http::exposure_warning;
+    use std::net::SocketAddr;
+
+    let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+    let exposed: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+
+    assert!(exposure_warning(&exposed, &None, false).is_some());
+    assert!(exposure_warning(&loopback, &None, false).is_none());
+    assert!(exposure_warning(&exposed, &Some("t".to_string()), false).is_none());
+    assert!(exposure_warning(&exposed, &None, true).is_none());
 }

@@ -381,6 +381,10 @@ pub struct HttpConfig {
     pub websocket_enabled: bool,
     /// Allow CORS from any origin (useful for web admin panels)
     pub cors_permissive: bool,
+    /// Opt-in: require a valid token on ALL routes (including status and ws).
+    /// Default false preserves the open status/health/ws endpoints.
+    #[serde(default)]
+    pub require_auth: bool,
 }
 
 impl Default for HttpConfig {
@@ -392,6 +396,7 @@ impl Default for HttpConfig {
             auth_token: None,
             websocket_enabled: true,
             cors_permissive: false,
+            require_auth: false,
         }
     }
 }
