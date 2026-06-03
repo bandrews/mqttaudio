@@ -323,4 +323,58 @@ mod tests {
             "a looping producer must keep producing past one file length, got {total}"
         );
     }
+
+    /// Performance: windowed playback starts after a small fixed prebuffer, not after
+    /// decoding the whole file — so time-to-first-sample does not grow with length
+    /// (the reason a multi-hour cue is playable as fast as a short one). With a small
+    /// window and no consumer draining, the producer parks on back-pressure once the
+    /// ring is full, far from EOF, proving the prebuffer gate fires before full decode.
+    #[test]
+    fn windowed_time_to_first_sample_is_low_and_precedes_full_decode() {
+        if !test_wav_available() {
+            eprintln!("skipping: {TEST_WAV} not found");
+            return;
+        }
+        let window_frames = 4800; // 0.1 s ring
+        let prebuffer_frames = 2400; // 0.05 s — the gate the control side waits for
+
+        let start = std::time::Instant::now();
+        let handles = spawn_local_file_stream(
+            TEST_WAV.to_string(),
+            48000,
+            ResamplerQuality::Fast,
+            window_frames,
+            false,
+        )
+        .unwrap();
+
+        // Wait (bounded) for the prebuffer to fill, recording how long it took.
+        let mut ttfs = None;
+        for _ in 0..5000 {
+            if handles.frames_buffered.load(Ordering::Acquire) >= prebuffer_frames {
+                ttfs = Some(start.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let ttfs = ttfs.expect("prebuffer must fill");
+
+        // The producer is parked on back-pressure (ring full at window_frames, nothing
+        // drained), nowhere near the ~96000-frame EOF: playback starts on the prebuffer,
+        // not on full decode. This is what makes TTFS independent of file length.
+        assert!(
+            !handles.producer_done.load(Ordering::Acquire),
+            "prebuffer-ready must precede full decode (windowed start, not full decode)"
+        );
+
+        // Low in absolute terms — a generous bound (real value is single-digit ms) that
+        // still flags a regression that waits on a long decode before the first sample.
+        assert!(
+            ttfs < Duration::from_millis(500),
+            "windowed time-to-first-sample too high: {ttfs:?}"
+        );
+        eprintln!("windowed TTFS (spawn -> {prebuffer_frames}-frame prebuffer): {ttfs:?}");
+
+        handles.stop_flag.store(true, Ordering::Release);
+    }
 }
