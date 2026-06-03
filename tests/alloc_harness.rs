@@ -4,8 +4,10 @@
 use mqttaudio::audio::ducking::{DuckTargetChange, DuckingApplier};
 use mqttaudio::audio::mixer::{mix_audio, ActiveSample};
 use mqttaudio::audio::test_support::{decoded, sine, SceneBuilder};
+use mqttaudio::mqtt::commands::SampleSelector;
 use mqttaudio::rt_engine::{
-    command_channel, drain_commands, graveyard_channel, reap_finished, AudioCallbackState,
+    command_channel, command_return_channel, drain_commands, graveyard_channel, reap_finished,
+    AudioCallbackState, AudioCommand,
 };
 use parking_lot::Mutex;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -196,13 +198,16 @@ fn callback_step_is_allocation_free_after_warmup() {
         .ducking(applier)
         .build();
 
-    // Bundle the mixer with an (empty) command consumer and graveyard producer
-    // behind one uncontended mutex, exactly as the running engine does.
+    // Bundle the mixer with an (empty) command consumer, command-return producer,
+    // and graveyard producer behind one uncontended mutex, exactly as the running
+    // engine does.
     let (_cmd_tx, cmd_rx) = command_channel(1024);
+    let (cmd_return_tx, _cmd_return_rx) = command_return_channel(1024);
     let (grave_tx, _grave_rx) = graveyard_channel(1024);
     let callback_state = Mutex::new(AudioCallbackState {
         mixer,
         commands: cmd_rx,
+        command_returns: cmd_return_tx,
         graveyard: grave_tx,
         output_sample_rate: SR,
     });
@@ -216,10 +221,11 @@ fn callback_step_is_allocation_free_after_warmup() {
         let AudioCallbackState {
             mixer,
             commands,
+            command_returns,
             graveyard,
             output_sample_rate,
         } = acs;
-        drain_commands(commands, mixer, *output_sample_rate, 64);
+        drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
         mix_audio(block, mixer);
         reap_finished(mixer, graveyard);
     };
@@ -243,5 +249,172 @@ fn callback_step_is_allocation_free_after_warmup() {
     assert_eq!(
         deallocs, 0,
         "callback step freed {deallocs} times across 8 blocks"
+    );
+}
+
+#[test]
+fn draining_mutation_commands_is_free_free() {
+    // Draining control->audio mutation commands in the callback must not allocate
+    // OR FREE on the RT thread. Each command carries heap (SampleSelector strings,
+    // voice strings); if the callback drops the consumed command, that heap is freed
+    // on the audio thread. The fix routes spent commands to a return ring for off-RT
+    // drop, so a drain frees nothing here.
+    let one = ActiveSample::new(
+        1,
+        "music".to_string(),
+        decoded(sine(440.0, SR, SR as usize, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "a".to_string(),
+    );
+    let two = ActiveSample::new(
+        2,
+        "music".to_string(),
+        decoded(sine(330.0, SR, SR as usize, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "b".to_string(),
+    );
+    let mixer = SceneBuilder::new(2).sample(one).sample(two).build();
+
+    let (mut cmd_tx, cmd_rx) = command_channel(1024);
+    let (cmd_return_tx, _cmd_return_rx) = command_return_channel(1024);
+    let (grave_tx, _grave_rx) = graveyard_channel(1024);
+    let callback_state = Mutex::new(AudioCallbackState {
+        mixer,
+        commands: cmd_rx,
+        command_returns: cmd_return_tx,
+        graveyard: grave_tx,
+        output_sample_rate: SR,
+    });
+    let mut block = vec![0.0f32; BLOCK * 2];
+
+    let step = |callback_state: &Mutex<AudioCallbackState>, block: &mut [f32]| {
+        let mut guard = callback_state.lock();
+        let acs = &mut *guard;
+        let AudioCallbackState {
+            mixer,
+            commands,
+            command_returns,
+            graveyard,
+            output_sample_rate,
+        } = acs;
+        drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
+        mix_audio(block, mixer);
+        reap_finished(mixer, graveyard);
+    };
+
+    // Warm up off the armed region.
+    for _ in 0..4 {
+        step(&callback_state, &mut block);
+    }
+
+    // Pre-build heap-owning mutation commands (these allocate now, before arming)
+    // and queue them; pushing moves them into the pre-allocated ring (no alloc).
+    let sel = |voice: &str| SampleSelector {
+        internal_id: None,
+        id: None,
+        file: None,
+        voice: Some(voice.to_string()),
+    };
+    let commands = vec![
+        AudioCommand::FadeOutMatching {
+            selector: sel("music"),
+            fade_ms: 10,
+        },
+        AudioCommand::SeekMatching {
+            selector: sel("music"),
+            position_ms: 100,
+        },
+        AudioCommand::SetVoiceVolume {
+            voice: "music".to_string(),
+            volume: 0.5,
+        },
+        AudioCommand::SetVolumeMatching {
+            selector: sel("music"),
+            volume: 0.8,
+        },
+    ];
+    for c in commands {
+        let _ = cmd_tx.push(c);
+    }
+
+    // One armed step drains all four commands.
+    let (allocs, deallocs) = count_allocs(|| {
+        step(&callback_state, &mut block);
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "draining mutation commands must not allocate on the RT thread, got {allocs}"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "draining mutation commands must not free heap on the RT thread, got {deallocs}"
+    );
+}
+
+#[test]
+fn adding_a_sample_into_the_reserved_pool_is_free_free() {
+    // A Play (AddSample) into a voice pool with spare capacity must not allocate or
+    // free on the RT thread: the un-boxed sample moves into the pre-reserved Vec.
+    // Production reserves MAX_VOICES up front; here we reserve a small headroom.
+    let mut mixer = SceneBuilder::new(2).build();
+    mixer.active_samples.reserve(8);
+
+    let (mut cmd_tx, cmd_rx) = command_channel(1024);
+    let (cmd_return_tx, _cmd_return_rx) = command_return_channel(1024);
+    let (grave_tx, _grave_rx) = graveyard_channel(1024);
+    let callback_state = Mutex::new(AudioCallbackState {
+        mixer,
+        commands: cmd_rx,
+        command_returns: cmd_return_tx,
+        graveyard: grave_tx,
+        output_sample_rate: SR,
+    });
+    let mut block = vec![0.0f32; BLOCK * 2];
+
+    let step = |callback_state: &Mutex<AudioCallbackState>, block: &mut [f32]| {
+        let mut guard = callback_state.lock();
+        let acs = &mut *guard;
+        let AudioCallbackState {
+            mixer,
+            commands,
+            command_returns,
+            graveyard,
+            output_sample_rate,
+        } = acs;
+        drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
+        mix_audio(block, mixer);
+        reap_finished(mixer, graveyard);
+    };
+
+    for _ in 0..4 {
+        step(&callback_state, &mut block);
+    }
+
+    // Build the sample (its channel_map / buffer Arc allocate here, before arming)
+    // and queue it; pushing moves it into the pre-allocated ring.
+    let sample = ActiveSample::new(
+        9,
+        "v".to_string(),
+        decoded(sine(220.0, SR, 1000, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "p".to_string(),
+    );
+    let _ = cmd_tx.push(AudioCommand::AddSample(sample));
+
+    let (allocs, deallocs) = count_allocs(|| {
+        step(&callback_state, &mut block);
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "adding a sample into the reserved pool must not allocate on the RT thread, got {allocs}"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "adding a sample into the reserved pool must not free on the RT thread, got {deallocs}"
     );
 }

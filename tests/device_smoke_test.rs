@@ -4,7 +4,9 @@
 use cpal::traits::StreamTrait;
 use mqttaudio::audio::engine::{build_output_stream, find_output_config, find_output_device};
 use mqttaudio::audio::mixer::MixerState;
-use mqttaudio::rt_engine::{command_channel, graveyard_channel, AudioCallbackState};
+use mqttaudio::rt_engine::{
+    command_channel, command_return_channel, graveyard_channel, AudioCallbackState,
+};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
@@ -34,13 +36,16 @@ fn default_output_device_opens_and_runs() {
         bass_management: None,
     };
 
-    // The callback owns the bundled mixer + command consumer + graveyard producer
-    // behind one uncontended mutex; an empty mixer produces silence.
+    // The callback owns the bundled mixer + command consumer + command-return
+    // producer + graveyard producer behind one uncontended mutex; an empty mixer
+    // produces silence.
     let (_cmd_tx, cmd_rx) = command_channel(1024);
+    let (cmd_return_tx, _cmd_return_rx) = command_return_channel(1024);
     let (grave_tx, _grave_rx) = graveyard_channel(1024);
     let callback_state = Arc::new(Mutex::new(AudioCallbackState {
         mixer,
         commands: cmd_rx,
+        command_returns: cmd_return_tx,
         graveyard: grave_tx,
         output_sample_rate,
     }));

@@ -130,9 +130,11 @@ pub struct DuckingEngine {
     #[allow(dead_code)]
     duck_states: HashMap<String, DuckState>,
 
-    /// Last target volume emitted per voice, so `compute_changes` only emits a
-    /// change when the resolved target actually moves.
-    last_targets: HashMap<String, f32>,
+    /// Last (target volume, fade frames) emitted per voice, so `compute_changes`
+    /// only emits a change when the resolved target OR the fade length moves. Tracking
+    /// the fade too means a same-target/faster-fade rule activating mid-fade still
+    /// re-arms the applier with the shorter fade.
+    last_changes: HashMap<String, (f32, usize)>,
 }
 
 impl DuckingEngine {
@@ -158,7 +160,7 @@ impl DuckingEngine {
             sample_rate,
             active_voices: HashMap::new(),
             duck_states: HashMap::new(),
-            last_targets: HashMap::new(),
+            last_changes: HashMap::new(),
         }
     }
 
@@ -210,12 +212,20 @@ impl DuckingEngine {
     pub fn compute_changes(&mut self, voice_id: &str, is_active: bool) -> Vec<DuckTargetChange> {
         self.active_voices.insert(voice_id.to_string(), is_active);
 
+        // A voice never ducked is at rest: full volume with the default restore
+        // fade. Comparing against that resting state (not a bare 1.0) means a
+        // non-ducked voice does not spuriously emit just because its resolved
+        // restore fade differs from a zero sentinel.
+        let resting = (1.0, self.ms_to_frames(2000));
+
         let mut changes = Vec::new();
         for voice in self.potential_voices() {
             let (target, fade_frames) = self.resolve_target(&voice);
-            let last = self.last_targets.get(&voice).copied().unwrap_or(1.0);
-            if (target - last).abs() > f32::EPSILON {
-                self.last_targets.insert(voice.clone(), target);
+            let (last_target, last_fade) =
+                self.last_changes.get(&voice).copied().unwrap_or(resting);
+            if (target - last_target).abs() > f32::EPSILON || fade_frames != last_fade {
+                self.last_changes
+                    .insert(voice.clone(), (target, fade_frames));
                 changes.push(DuckTargetChange {
                     voice,
                     target_volume: target,
@@ -863,6 +873,51 @@ mod tests {
         assert_eq!(restore.len(), 1);
         assert_eq!(restore[0].voice, "music");
         assert!((restore[0].target_volume - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn compute_changes_emits_on_faster_fade_same_target() {
+        // Two rules duck "music" to the SAME target but with different fade times.
+        // When the faster-fading primary activates mid-fade, the resolved target is
+        // unchanged but the fade accelerates; compute_changes must emit so the
+        // applier re-arms with the shorter fade (the old engine always re-armed).
+        let rules = vec![
+            create_test_rule("narration", vec!["music"], 0.2, 2000),
+            create_test_rule("dialog", vec!["music"], 0.2, 500),
+        ];
+        let mut engine = DuckingEngine::new(rules, 48000);
+
+        // Narration starts: music ducks to 0.2 over 2000ms (96000 frames).
+        let first = engine.compute_changes("narration", true);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].voice, "music");
+        assert!((first[0].target_volume - 0.2).abs() < 1e-6);
+        assert_eq!(first[0].fade_frames, 96000);
+
+        // Dialog starts: same 0.2 target, but the fastest applicable fade is now
+        // 500ms (24000 frames). The target did not move, yet a change MUST be
+        // emitted to accelerate the fade.
+        let second = engine.compute_changes("dialog", true);
+        assert_eq!(
+            second.len(),
+            1,
+            "a faster fade to the same target must emit a change, got {:?}",
+            second
+        );
+        assert_eq!(second[0].voice, "music");
+        assert!((second[0].target_volume - 0.2).abs() < 1e-6);
+        assert_eq!(
+            second[0].fade_frames, 24000,
+            "the emitted change must carry the faster fade"
+        );
+
+        // Re-asserting dialog's activity changes nothing (same target, same fade).
+        let again = engine.compute_changes("dialog", true);
+        assert!(
+            again.is_empty(),
+            "no change expected when target and fade are unchanged, got {:?}",
+            again
+        );
     }
 
     #[test]

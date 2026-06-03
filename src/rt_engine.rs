@@ -18,14 +18,20 @@ use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 /// Every variant carries already-resolved data (selectors are matched on the audio
 /// side, but ids/volumes/fades are computed by the control thread), so applying a
 /// command never blocks, allocates unboundedly, or does I/O.
+///
+/// The move-in variants ([`AudioCommand::AddSample`]/[`AudioCommand::AddLiveInput`])
+/// carry their payload inline rather than boxed: draining them moves the value
+/// straight into the mixer, freeing nothing on the real-time thread. This makes the
+/// enum larger, but the command ring is pre-allocated, so it is a one-time memory
+/// cost, not a per-callback allocation.
 pub enum AudioCommand {
     /// Start playing a fully-built sample. Ducking for the sample's voice is
     /// driven separately via [`AudioCommand::SetDuckTarget`].
-    AddSample(Box<ActiveSample>),
+    AddSample(ActiveSample),
     /// Apply a resolved ducking target change (computed on the control thread).
     SetDuckTarget(DuckTargetChange),
     /// Add a live (microphone) input to the mix.
-    AddLiveInput(Box<LiveInput>),
+    AddLiveInput(LiveInput),
     /// Fade out every active sample over `fade_ms` (Stop-all / shutdown).
     FadeOutAll { fade_ms: u32 },
     /// Fade out the samples whose internal id is in `ids` (voice stop / fade).
@@ -67,62 +73,103 @@ pub fn command_channel(capacity: usize) -> (CommandProducer, CommandConsumer) {
     HeapRb::<AudioCommand>::new(capacity).split()
 }
 
-/// Apply one resolved command to the audio thread's `MixerState`.
+/// Producer half of the audio->reaper command-return ring (held by the audio thread).
+pub type CommandReturnProducer = HeapProducer<AudioCommand>;
+/// Consumer half of the command-return ring, drained by the off-RT reaper.
+pub type CommandReturnConsumer = HeapConsumer<AudioCommand>;
+
+/// Create the audio->reaper command-return ring. Spent mutation commands are moved
+/// here by the callback (after their effect is applied) and dropped off the
+/// real-time thread by the reaper, so their `String`/`Vec`/`SampleSelector` heap is
+/// never freed in the callback. Mirrors the sample [`graveyard_channel`].
+pub fn command_return_channel(capacity: usize) -> (CommandReturnProducer, CommandReturnConsumer) {
+    HeapRb::<AudioCommand>::new(capacity).split()
+}
+
+/// Apply one resolved command to the audio thread's `MixerState`, consuming it.
 ///
 /// `output_sample_rate` is needed to convert fade durations (ms) into sample counts.
+///
+/// This is the by-value entry point used by unit tests, which are not real-time:
+/// it may drop the consumed command's heap (`String`/`Vec`/`SampleSelector`) itself.
+/// The audio callback never calls this — it uses [`drain_commands`], which routes a
+/// spent command's heap to a return ring for off-RT drop. Reachable from the library
+/// API and the rt_engine unit tests; the binary's non-test code only uses
+/// `drain_commands`, so it is dead there.
+#[allow(dead_code)]
 pub fn apply_command(state: &mut MixerState, cmd: AudioCommand, output_sample_rate: u32) {
     match cmd {
         AudioCommand::AddSample(sample) => {
-            state.active_samples.push(*sample);
-        }
-        AudioCommand::SetDuckTarget(change) => {
-            if let Some(ref mut applier) = state.ducking_applier {
-                applier.apply_target(&change);
-            }
+            state.active_samples.push(sample);
         }
         AudioCommand::AddLiveInput(input) => {
-            state.live_inputs.push(*input);
+            state.live_inputs.push(input);
+        }
+        other => apply_mutation(state, &other, output_sample_rate),
+    }
+}
+
+/// Apply a read-only mutation command to the `MixerState` by reference.
+///
+/// Handles every variant that only *reads* its payload (selector/ids/voice/change)
+/// and mutates the mixer: [`AudioCommand::FadeOutAll`], [`AudioCommand::FadeOutSamples`],
+/// [`AudioCommand::FadeOutMatching`], [`AudioCommand::SetVoiceVolume`],
+/// [`AudioCommand::SetInputVolume`], [`AudioCommand::SeekMatching`],
+/// [`AudioCommand::SetSpeedMatching`], [`AudioCommand::SetVolumeMatching`], and
+/// [`AudioCommand::SetDuckTarget`]. Because it borrows the command, the caller still
+/// owns the heap-carrying husk afterward and can move it off the real-time thread for
+/// drop instead of freeing it in the callback. The move-in variants
+/// ([`AudioCommand::AddSample`]/[`AudioCommand::AddLiveInput`]) are a no-op here: the
+/// drainer moves those payloads straight into the mixer.
+fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate: u32) {
+    match cmd {
+        // Handled by move in `drain_commands`/`apply_command`, never by reference.
+        AudioCommand::AddSample(_) | AudioCommand::AddLiveInput(_) => {}
+        AudioCommand::SetDuckTarget(change) => {
+            if let Some(ref mut applier) = state.ducking_applier {
+                applier.apply_target(change);
+            }
         }
         AudioCommand::FadeOutAll { fade_ms } => {
             for sample in state.active_samples.iter_mut() {
-                sample.set_fade(FadeState::fade_out(fade_ms, output_sample_rate));
+                sample.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
             }
         }
         AudioCommand::FadeOutSamples { ids, fade_ms } => {
             for sample in state.active_samples.iter_mut() {
                 if ids.contains(&sample.id) {
-                    sample.set_fade(FadeState::fade_out(fade_ms, output_sample_rate));
+                    sample.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
                 }
             }
         }
         AudioCommand::FadeOutMatching { selector, fade_ms } => {
             for sample in state.active_samples.iter_mut() {
-                if sample_matches(&selector, sample) {
-                    sample.set_fade(FadeState::fade_out(fade_ms, output_sample_rate));
+                if sample_matches(selector, sample) {
+                    sample.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
                 }
             }
         }
         AudioCommand::SetVoiceVolume { voice, volume } => {
             for sample in state.active_samples.iter_mut() {
-                if sample.voice_id == voice {
-                    sample.set_target_voice_volume(volume);
+                if sample.voice_id == *voice {
+                    sample.set_target_voice_volume(*volume);
                 }
             }
             for input in state.live_inputs.iter_mut() {
-                if input.voice_id == voice {
-                    input.set_target_voice_volume(volume);
+                if input.voice_id == *voice {
+                    input.set_target_voice_volume(*volume);
                 }
             }
         }
         AudioCommand::SetInputVolume { input, volume } => {
-            apply_input_volume(state, &input, volume);
+            apply_input_volume(state, input, *volume);
         }
         AudioCommand::SeekMatching {
             selector,
             position_ms,
         } => {
             for sample in state.active_samples.iter_mut() {
-                if sample_matches(&selector, sample) {
+                if sample_matches(selector, sample) {
                     let target =
                         ((position_ms * sample.buffer.sample_rate() as u64) / 1000) as usize;
                     sample.position = target.min(sample.buffer.frames().saturating_sub(1));
@@ -135,14 +182,14 @@ pub fn apply_command(state: &mut MixerState, cmd: AudioCommand, output_sample_ra
             pitch_correction,
         } => {
             for sample in state.active_samples.iter_mut() {
-                if sample_matches(&selector, sample) {
-                    sample.set_speed_with_mode(speed, pitch_correction);
+                if sample_matches(selector, sample) {
+                    sample.set_speed_with_mode(*speed, *pitch_correction);
                 }
             }
         }
         AudioCommand::SetVolumeMatching { selector, volume } => {
             for sample in state.active_samples.iter_mut() {
-                if sample_matches(&selector, sample) {
+                if sample_matches(selector, sample) {
                     sample.volume = volume.clamp(0.0, 1.0);
                 }
             }
@@ -152,21 +199,37 @@ pub fn apply_command(state: &mut MixerState, cmd: AudioCommand, output_sample_ra
 
 /// Drain up to `max` queued commands and apply them, returning how many were applied.
 /// Bounded so a flood of commands can never make a single callback do unbounded work.
+///
+/// A heap-owning mutation command is applied by reference and then *moved* into
+/// `returns` (the command-return ring) for drop on the off-RT reaper, so its
+/// `String`/`Vec`/`SampleSelector` heap is never freed on the audio thread. The
+/// move-in variants are moved straight into the mixer (no free either). If the
+/// return ring is momentarily full the spent command is dropped in place as a
+/// fallback (rare; the ring is sized generously).
 pub fn drain_commands(
     consumer: &mut CommandConsumer,
     state: &mut MixerState,
+    returns: &mut CommandReturnProducer,
     output_sample_rate: u32,
     max: usize,
 ) -> usize {
     let mut applied = 0;
     while applied < max {
         match consumer.pop() {
+            Some(AudioCommand::AddSample(sample)) => {
+                state.active_samples.push(sample);
+            }
+            Some(AudioCommand::AddLiveInput(input)) => {
+                state.live_inputs.push(input);
+            }
             Some(cmd) => {
-                apply_command(state, cmd, output_sample_rate);
-                applied += 1;
+                apply_mutation(state, &cmd, output_sample_rate);
+                // Move the spent husk to the return ring; the reaper drops it off-RT.
+                let _ = returns.push(cmd);
             }
             None => break,
         }
+        applied += 1;
     }
     applied
 }
@@ -193,6 +256,9 @@ pub struct AudioCallbackState {
     pub mixer: MixerState,
     /// Control->audio command ring consumer, drained at the top of each callback.
     pub commands: CommandConsumer,
+    /// Audio->reaper command-return ring producer. Spent heap-owning mutation
+    /// commands are moved here for off-RT drop instead of being freed in the callback.
+    pub command_returns: CommandReturnProducer,
     /// Audio->reaper return ring producer for off-RT drop of finished samples.
     pub graveyard: GraveyardProducer,
     /// Output sample rate, needed to convert fade durations (ms) into frames
@@ -203,13 +269,21 @@ pub struct AudioCallbackState {
 /// Move every finished sample out of `state` into the graveyard for off-RT drop,
 /// returning how many were moved. The callback calls this instead of `retain`, so the
 /// per-sample `channel_map`/`PitchCorrector` frees happen on the reaper thread, never
-/// on the RT thread. If the graveyard is momentarily full the sample is dropped in
-/// place as a fallback (rare; the ring is sized generously).
+/// on the RT thread. If the graveyard is momentarily full, the finished sample is
+/// *left in place* (not removed and not dropped) so the callback never frees a buffer;
+/// it is reaped on a later block once the reaper has drained the ring (rare; the ring
+/// is sized generously).
 pub fn reap_finished(state: &mut MixerState, graveyard: &mut GraveyardProducer) -> usize {
     let mut moved = 0;
     let mut i = 0;
     while i < state.active_samples.len() {
         if state.active_samples[i].is_finished() {
+            if graveyard.is_full() {
+                // No room to hand off; leave the sample for a later block rather
+                // than freeing it here. Skip past it so we keep scanning the rest.
+                i += 1;
+                continue;
+            }
             let finished = state.active_samples.swap_remove(i);
             let _ = graveyard.push(finished);
             moved += 1;
@@ -299,7 +373,7 @@ mod tests {
         let mut state = state_with(vec![]);
         apply_command(
             &mut state,
-            AudioCommand::AddSample(Box::new(sample(1, "music", None, "a.wav"))),
+            AudioCommand::AddSample(sample(1, "music", None, "a.wav")),
             48000,
         );
         assert_eq!(state.active_samples.len(), 1);
@@ -434,20 +508,84 @@ mod tests {
     #[test]
     fn ring_delivers_commands_in_order() {
         let (mut tx, mut rx) = command_channel(8);
-        tx.push(AudioCommand::AddSample(Box::new(sample(
-            1, "music", None, "a",
-        ))))
-        .ok()
-        .expect("push add");
+        tx.push(AudioCommand::AddSample(sample(1, "music", None, "a")))
+            .ok()
+            .expect("push add");
         tx.push(AudioCommand::FadeOutAll { fade_ms: 10 })
             .ok()
             .expect("push fade");
 
         let mut state = state_with(vec![]);
-        let applied = drain_commands(&mut rx, &mut state, 48000, 16);
+        let (mut returns, _ret_rx) = command_return_channel(8);
+        let applied = drain_commands(&mut rx, &mut state, &mut returns, 48000, 16);
         assert_eq!(applied, 2);
         assert_eq!(state.active_samples.len(), 1);
         assert!(is_fading_out(&state.active_samples[0]));
+    }
+
+    #[test]
+    fn drain_routes_spent_mutation_to_return_ring() {
+        // A heap-owning mutation command must be moved to the return ring after its
+        // effect is applied, so the audio thread never drops its heap. The move-in
+        // AddSample is consumed into the mixer and must NOT appear in the ring.
+        let (mut tx, mut rx) = command_channel(8);
+        tx.push(AudioCommand::AddSample(sample(1, "music", None, "a")))
+            .ok()
+            .expect("push add");
+        tx.push(AudioCommand::FadeOutMatching {
+            selector: selector_voice("music"),
+            fade_ms: 10,
+        })
+        .ok()
+        .expect("push fade");
+
+        let mut state = state_with(vec![]);
+        let (mut returns, mut ret_rx) = command_return_channel(8);
+        let applied = drain_commands(&mut rx, &mut state, &mut returns, 48000, 16);
+
+        assert_eq!(applied, 2);
+        // The AddSample was moved into the mixer and its fade applied.
+        assert_eq!(state.active_samples.len(), 1);
+        assert!(is_fading_out(&state.active_samples[0]));
+        // Exactly one spent husk (the FadeOutMatching) was returned for off-RT drop.
+        assert!(
+            matches!(ret_rx.pop(), Some(AudioCommand::FadeOutMatching { .. })),
+            "the spent mutation command must be routed to the return ring"
+        );
+        assert!(
+            ret_rx.pop().is_none(),
+            "the move-in AddSample must not be routed to the return ring"
+        );
+    }
+
+    #[test]
+    fn reap_leaves_finished_sample_when_graveyard_full() {
+        // With no room in the graveyard, a finished sample must stay in
+        // active_samples (not be freed on the RT thread); it is reaped next block.
+        let mut done = sample(1, "a", None, "a");
+        done.position = 1000; // past the 100-frame buffer -> is_finished()
+        let mut state = state_with(vec![done]);
+
+        // A capacity-1 ring that is already full.
+        let (mut tx, mut rx) = graveyard_channel(1);
+        tx.push(sample(2, "b", None, "b")).ok().expect("fill ring");
+        assert!(tx.is_full());
+
+        let moved = reap_finished(&mut state, &mut tx);
+        assert_eq!(moved, 0, "nothing can be handed off when the ring is full");
+        assert_eq!(
+            state.active_samples.len(),
+            1,
+            "the finished sample is left in place, not dropped on the RT thread"
+        );
+        assert_eq!(state.active_samples[0].id, 1);
+
+        // Once the reaper drains the ring, the next reap hands the sample off.
+        let _ = rx.pop();
+        let moved = reap_finished(&mut state, &mut tx);
+        assert_eq!(moved, 1);
+        assert!(state.active_samples.is_empty());
+        assert_eq!(rx.pop().map(|s| s.id), Some(1));
     }
 
     #[test]
@@ -479,8 +617,15 @@ mod tests {
                 .expect("push");
         }
         let mut state = state_with(vec![]);
+        let (mut returns, _ret_rx) = command_return_channel(8);
         // Only two drained this pass; the rest remain queued for the next callback.
-        assert_eq!(drain_commands(&mut rx, &mut state, 48000, 2), 2);
-        assert_eq!(drain_commands(&mut rx, &mut state, 48000, 16), 3);
+        assert_eq!(
+            drain_commands(&mut rx, &mut state, &mut returns, 48000, 2),
+            2
+        );
+        assert_eq!(
+            drain_commands(&mut rx, &mut state, &mut returns, 48000, 16),
+            3
+        );
     }
 }

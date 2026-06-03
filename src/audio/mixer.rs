@@ -521,6 +521,15 @@ impl LiveInput {
     }
 }
 
+/// Pre-reserved capacity for the voice pool, so a Play never reallocates the
+/// `active_samples` Vec on the audio thread. Generous headroom over the documented
+/// "20+ simultaneous" target. (Exceeding it reallocates once — see docs/bugs.md.)
+pub const MAX_VOICES: usize = 256;
+
+/// Pre-reserved capacity for live inputs, so adding a microphone never reallocates
+/// `live_inputs` on the audio thread.
+pub const MAX_LIVE_INPUTS: usize = 16;
+
 /// Mixer state shared between engine and audio callback
 pub struct MixerState {
     /// List of currently playing samples
@@ -543,8 +552,8 @@ impl MixerState {
     #[cfg(test)]
     pub fn new(output_channels: usize) -> Self {
         Self {
-            active_samples: Vec::new(),
-            live_inputs: Vec::new(),
+            active_samples: Vec::with_capacity(MAX_VOICES),
+            live_inputs: Vec::with_capacity(MAX_LIVE_INPUTS),
             output_channels,
             ducking_applier: None,
             bass_management: None,

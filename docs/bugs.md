@@ -5,6 +5,27 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 
 ## Deferred to a later sprint
 
+- **Voice pool is a soft reserve, not a hard cap (Sprint 5, D17/D18).** `active_samples`/`live_inputs` are now
+  pre-reserved to `MAX_VOICES` (256) / `MAX_LIVE_INPUTS` (16) at construction (`src/audio/mixer.rs`), so a Play
+  never reallocates the Vec on the RT thread in practice — well past the documented "20+ simultaneous" target.
+  But it is a *soft* reserve: exceeding the reservation makes `drain_commands`' `AddSample` push reallocate the
+  backing store once, on the audio thread. The locked D18 over-cap policy (steal the oldest non-looping voice,
+  else reject the new Play — both moving the displaced/rejected sample to the graveyard for off-RT drop) is not
+  yet implemented; it needs the graveyard producer threaded into `drain_commands`. Until then the alloc gate
+  proves the common case (`adding_a_sample_into_the_reserved_pool_is_free_free`) but not the >256 over-cap path.
+
+- **A Speed command that TOGGLES pitch correction still allocates/frees on the RT thread (Sprint 5/9).**
+  `SetSpeedMatching { pitch_correction }` is applied on the audio thread by `apply_mutation` ->
+  `ActiveSample::set_speed_with_mode`, which calls `enable_pitch_correction` (constructs a signalsmith
+  `Stretch`/`PitchCorrector`) or `disable_pitch_correction` (drops it). When the command flips the mode on a
+  *live* voice, that create/drop happens in the callback — a heap allocation and/or free on the RT thread.
+  The command-return ring (Sprint 5) keeps the *command husk's* heap off the RT thread, but not this
+  corrector lifecycle. The alloc gate (`tests/alloc_harness.rs::draining_mutation_commands_is_free_free`)
+  deliberately does **not** toggle pitch, so it stays green; this residual is real but out of scope here.
+  Eliminating it needs the control thread to pre-build the `PitchCorrector` and send it inside the command,
+  and to return the displaced corrector via a graveyard for off-RT drop (mirroring the sample graveyard) —
+  a separate, larger change. Pairs with the Sprint-6 pitch-correction work.
+
 - **`xruns` counter is incremented but not surfaced on `/status` (Sprint 5).** The lock-free RT engine
   creates an `xruns: AtomicU64` (`src/main.rs:553`), passes it to the output supervisor, and increments it
   in the cpal error callback (`src/audio/engine.rs`), but it is not yet plumbed into the control-side

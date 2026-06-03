@@ -404,11 +404,12 @@ fn run_mix_callback(bus: &mut [f32], callback_state: &Arc<Mutex<AudioCallbackSta
     let AudioCallbackState {
         mixer,
         commands,
+        command_returns,
         graveyard,
         output_sample_rate,
     } = acs;
 
-    crate::rt_engine::drain_commands(commands, mixer, *output_sample_rate, 64);
+    crate::rt_engine::drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
     crate::audio::mixer::mix_audio(bus, mixer);
     crate::rt_engine::reap_finished(mixer, graveyard);
 }

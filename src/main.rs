@@ -448,18 +448,21 @@ async fn main() {
     };
 
     let mixer = MixerState {
-        active_samples: Vec::new(),
-        live_inputs: Vec::new(),
+        active_samples: Vec::with_capacity(audio::mixer::MAX_VOICES),
+        live_inputs: Vec::with_capacity(audio::mixer::MAX_LIVE_INPUTS),
         output_channels,
         ducking_applier,
         bass_management,
     };
 
-    // Control->audio command ring and audio->reaper graveyard ring. The control
-    // thread holds the command producer and graveyard consumer; the audio
-    // callback owns the bundle behind one uncontended mutex (D15/D22a).
+    // Control->audio command ring, audio->reaper graveyard ring, and audio->reaper
+    // command-return ring. The control thread holds the command producer and the two
+    // reaper consumers; the audio callback owns the bundle behind one uncontended
+    // mutex (D15/D22a). Spent heap-owning mutation commands travel back over the
+    // return ring so the callback never frees their heap.
     let (cmd_tx, cmd_rx) = rt_engine::command_channel(1024);
     let (grave_tx, mut grave_rx) = rt_engine::graveyard_channel(1024);
+    let (cmd_return_tx, mut cmd_return_rx) = rt_engine::command_return_channel(1024);
 
     // Initialize audio inputs from config.
     // Keep active input streams alive - they will be kept alive until the app exits.
@@ -523,7 +526,7 @@ async fn main() {
                     // Add to the mix via the command ring (drained once the
                     // output stream starts).
                     if cmd_tx
-                        .push(rt_engine::AudioCommand::AddLiveInput(Box::new(live_input)))
+                        .push(rt_engine::AudioCommand::AddLiveInput(live_input))
                         .is_err()
                     {
                         tracing::error!("Command ring full while adding live input {}", idx);
@@ -547,6 +550,7 @@ async fn main() {
     let callback_state = Arc::new(Mutex::new(rt_engine::AudioCallbackState {
         mixer,
         commands: cmd_rx,
+        command_returns: cmd_return_tx,
         graveyard: grave_tx,
         output_sample_rate,
     }));
@@ -756,6 +760,7 @@ async fn main() {
             _ = reaper_tick.tick() => {
                 reap_finished_samples(
                     &mut grave_rx,
+                    &mut cmd_return_rx,
                     &mut cmd_tx,
                     ducking_engine.as_mut(),
                     &mut active_counts,
@@ -791,13 +796,15 @@ fn refresh_snapshot(
     guard.inputs = inputs.to_vec();
 }
 
-/// Drain the graveyard, dropping finished samples off the audio thread, and
-/// reconcile control-side voice activity. When a voice's last sample finishes,
-/// the ducking engine computes restore targets that are sent back to the audio
-/// thread. Refreshes the status snapshot if anything was reaped.
+/// Drain the graveyard and the command-return ring, dropping both finished samples
+/// and spent mutation commands off the audio thread, and reconcile control-side
+/// voice activity. When a voice's last sample finishes, the ducking engine computes
+/// restore targets that are sent back to the audio thread. Refreshes the status
+/// snapshot if anything was reaped.
 #[allow(clippy::too_many_arguments)]
 fn reap_finished_samples(
     grave_rx: &mut rt_engine::GraveyardConsumer,
+    cmd_return_rx: &mut rt_engine::CommandReturnConsumer,
     cmd_tx: &mut rt_engine::CommandProducer,
     mut ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
     active_counts: &mut std::collections::HashMap<String, usize>,
@@ -806,6 +813,12 @@ fn reap_finished_samples(
     inputs: &[http::InputStatus],
     output_channels: usize,
 ) {
+    // Drop spent mutation commands the callback returned, off the audio thread.
+    // Their String/Vec/SampleSelector heap is freed here, never in the callback.
+    while let Some(spent) = cmd_return_rx.pop() {
+        drop(spent);
+    }
+
     let mut reaped = 0;
     while let Some(finished) = grave_rx.pop() {
         let voice = finished.voice_id.clone();
@@ -1067,7 +1080,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     }
                     *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
                     ctx.playing.insert(status.internal_id, status);
-                    ctx.send(rt_engine::AudioCommand::AddSample(Box::new(sample)));
+                    ctx.send(rt_engine::AudioCommand::AddSample(sample));
                     ctx.refresh();
                     tracing::info!("Now playing {} active samples", ctx.playing.len());
                 }
@@ -1410,6 +1423,10 @@ mod tests {
         voice_manager: Arc<Mutex<VoiceManager>>,
         cmd_tx: rt_engine::CommandProducer,
         cmd_rx: rt_engine::CommandConsumer,
+        cmd_return_tx: rt_engine::CommandReturnProducer,
+        cmd_return_rx: rt_engine::CommandReturnConsumer,
+        grave_tx: rt_engine::GraveyardProducer,
+        grave_rx: rt_engine::GraveyardConsumer,
         mixer: MixerState,
         ducking_engine: Option<DuckingEngine>,
         active_counts: HashMap<String, usize>,
@@ -1436,18 +1453,24 @@ mod tests {
                 )
             };
             let mixer = MixerState {
-                active_samples: Vec::new(),
-                live_inputs: Vec::new(),
+                active_samples: Vec::with_capacity(audio::mixer::MAX_VOICES),
+                live_inputs: Vec::with_capacity(audio::mixer::MAX_LIVE_INPUTS),
                 output_channels: 2,
                 ducking_applier,
                 bass_management: None,
             };
             let (cmd_tx, cmd_rx) = rt_engine::command_channel(1024);
+            let (cmd_return_tx, cmd_return_rx) = rt_engine::command_return_channel(1024);
+            let (grave_tx, grave_rx) = rt_engine::graveyard_channel(1024);
             Self {
                 cache_manager: Arc::new(tokio::sync::Mutex::new(cache)),
                 voice_manager: Arc::new(Mutex::new(VoiceManager::new())),
                 cmd_tx,
                 cmd_rx,
+                cmd_return_tx,
+                cmd_return_rx,
+                grave_tx,
+                grave_rx,
                 mixer,
                 ducking_engine,
                 active_counts: HashMap::new(),
@@ -1484,9 +1507,32 @@ mod tests {
         }
 
         /// Apply every queued audio command to the mixer, as the audio callback
-        /// would, so the test can assert the resulting `MixerState`.
+        /// would, so the test can assert the resulting `MixerState`. Spent mutation
+        /// commands are routed to the return ring, mirroring the callback.
         fn drain(&mut self) {
-            rt_engine::drain_commands(&mut self.cmd_rx, &mut self.mixer, SR, 1024);
+            rt_engine::drain_commands(
+                &mut self.cmd_rx,
+                &mut self.mixer,
+                &mut self.cmd_return_tx,
+                SR,
+                1024,
+            );
+        }
+
+        /// Drive the control-side reaper exactly as the 20ms tick does, draining
+        /// the graveyard and command-return rings and reconciling voice activity.
+        fn reap(&mut self) {
+            reap_finished_samples(
+                &mut self.grave_rx,
+                &mut self.cmd_return_rx,
+                &mut self.cmd_tx,
+                self.ducking_engine.as_mut(),
+                &mut self.active_counts,
+                &mut self.playing,
+                &self.snapshot,
+                &self.inputs,
+                2,
+            );
         }
     }
 
@@ -1638,6 +1684,154 @@ mod tests {
                 multiplier < 0.2,
                 "expected music ducked toward 0.1, got {multiplier}"
             );
+        }
+    }
+
+    /// Move the (single) active sample for `voice` out of the mixer into the
+    /// graveyard, mirroring the RT thread reaping a finished sample, so the
+    /// control-side reaper can then reconcile it.
+    fn finish_voice_sample(fixture: &mut Fixture, voice: &str) {
+        let idx = fixture
+            .mixer
+            .active_samples
+            .iter()
+            .position(|s| s.voice_id == voice)
+            .expect("an active sample for the voice");
+        let finished = fixture.mixer.active_samples.swap_remove(idx);
+        fixture
+            .grave_tx
+            .push(finished)
+            .ok()
+            .expect("graveyard has room");
+    }
+
+    #[tokio::test]
+    async fn reaper_restores_ducking_and_clears_voice_when_last_sample_finishes() {
+        let rule = DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0, // instant, for a deterministic assertion
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        // Background music + the ducking primary both play and are applied.
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.run(play(Some("narration"), 1.0)).await;
+        fixture.drain();
+
+        // Music is ducked while narration is active.
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            assert!(
+                applier.get_multiplier("music", 1) < 0.2,
+                "music should be ducked while narration plays"
+            );
+        }
+        assert_eq!(fixture.active_counts.get("narration"), Some(&1));
+        assert_eq!(fixture.playing.len(), 2);
+
+        // The narration sample finishes: the RT thread hands it to the graveyard.
+        finish_voice_sample(&mut fixture, "narration");
+        fixture.reap();
+
+        // (a) The voice's count hit 0 and the voice was removed.
+        assert!(
+            !fixture.active_counts.contains_key("narration"),
+            "narration should be cleared from active_counts"
+        );
+        // (c) The snapshot/playing map dropped the finished sample.
+        assert_eq!(fixture.playing.len(), 1, "the finished sample is removed");
+        assert!(
+            fixture.playing.values().all(|s| s.voice_id == "music"),
+            "only the music sample remains in the playing map"
+        );
+        {
+            let snap = fixture.snapshot.read().unwrap();
+            assert_eq!(snap.active_samples, 1);
+        }
+
+        // (b) A restore SetDuckTarget (target 1.0) for "music" was emitted on the
+        // command ring; applying it restores music toward full volume.
+        let restore = fixture.cmd_rx.pop().expect("a restore command on the ring");
+        match restore {
+            rt_engine::AudioCommand::SetDuckTarget(change) => {
+                assert_eq!(change.voice, "music");
+                assert!(
+                    (change.target_volume - 1.0).abs() < 1e-6,
+                    "restore target must be 1.0, got {}",
+                    change.target_volume
+                );
+                // Applying the restore and advancing the full fade brings music back
+                // to full volume (the restore fades over the resolved restore time).
+                let fade = change.fade_frames.max(1);
+                let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+                applier.apply_target(&change);
+                assert!(
+                    (applier.get_multiplier("music", fade) - 1.0).abs() < 1e-6,
+                    "music should be restored to full volume after the restore fade"
+                );
+            }
+            other => panic!(
+                "expected a SetDuckTarget restore, got {:?}",
+                other_variant(&other)
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn reaper_does_not_restore_while_voice_still_has_samples() {
+        let rule = DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0,
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        // Music plus TWO narration samples (count == 2).
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.run(play(Some("narration"), 1.0)).await;
+        fixture.run(play(Some("narration"), 1.0)).await;
+        fixture.drain();
+        assert_eq!(fixture.active_counts.get("narration"), Some(&2));
+
+        // Drain the duck command the second narration Play may have queued so the
+        // ring only holds whatever the reaper emits next.
+        while fixture.cmd_rx.pop().is_some() {}
+
+        // One narration sample finishes, but the voice is still active (count -> 1).
+        finish_voice_sample(&mut fixture, "narration");
+        fixture.reap();
+
+        // The guard holds: the voice is NOT cleared and NO restore is emitted early.
+        assert_eq!(
+            fixture.active_counts.get("narration"),
+            Some(&1),
+            "narration still has one sample, count must be 1"
+        );
+        assert!(
+            fixture.cmd_rx.pop().is_none(),
+            "no restore should be emitted while the voice still has samples"
+        );
+        assert_eq!(fixture.playing.len(), 2, "one narration + music remain");
+    }
+
+    /// Describe a command variant for panic messages without requiring `Debug` on
+    /// the payloads (which carry non-Debug ring consumers).
+    fn other_variant(cmd: &rt_engine::AudioCommand) -> &'static str {
+        match cmd {
+            rt_engine::AudioCommand::AddSample(_) => "AddSample",
+            rt_engine::AudioCommand::AddLiveInput(_) => "AddLiveInput",
+            rt_engine::AudioCommand::SetDuckTarget(_) => "SetDuckTarget",
+            rt_engine::AudioCommand::FadeOutAll { .. } => "FadeOutAll",
+            rt_engine::AudioCommand::FadeOutSamples { .. } => "FadeOutSamples",
+            rt_engine::AudioCommand::FadeOutMatching { .. } => "FadeOutMatching",
+            rt_engine::AudioCommand::SetVoiceVolume { .. } => "SetVoiceVolume",
+            rt_engine::AudioCommand::SetInputVolume { .. } => "SetInputVolume",
+            rt_engine::AudioCommand::SeekMatching { .. } => "SeekMatching",
+            rt_engine::AudioCommand::SetSpeedMatching { .. } => "SetSpeedMatching",
+            rt_engine::AudioCommand::SetVolumeMatching { .. } => "SetVolumeMatching",
         }
     }
 
