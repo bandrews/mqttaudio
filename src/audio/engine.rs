@@ -5,10 +5,11 @@ use crate::audio::decoder;
 use crate::audio::mixer::{ActiveSample, MixerState};
 use crate::audio::types::DeviceConfig;
 use crate::config::ResamplerQuality;
+use crate::rt_engine::AudioCallbackState;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Stream;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// List available audio output devices
@@ -390,38 +391,26 @@ pub fn find_output_config(
     })
 }
 
-/// Run one audio callback's worth of mixing into the f32 bus, plus the
-/// voice-activity bookkeeping the control side reads. Shared by every typed
-/// output stream so the device sample format never changes the mix logic.
-fn run_mix_callback(
-    bus: &mut [f32],
-    mixer_state: &Arc<Mutex<MixerState>>,
-    active_voices: &Arc<Mutex<std::collections::HashSet<String>>>,
-) {
-    use std::collections::HashSet;
+/// Run one audio callback's worth of work into the f32 bus: drain the pending
+/// control commands, mix, then reap finished samples into the graveyard for an
+/// off-RT drop. Shared by every typed output stream so the device sample format
+/// never changes the mix logic. The control thread never locks this state —
+/// mutations arrive over the command ring and voice/ducking reconciliation is
+/// done control-side — so this lock is uncontended (D22a).
+fn run_mix_callback(bus: &mut [f32], callback_state: &Arc<Mutex<AudioCallbackState>>) {
+    let mut guard = callback_state.lock();
+    let acs = &mut *guard;
+    // Destructure for disjoint &mut borrows of the bundled fields.
+    let AudioCallbackState {
+        mixer,
+        commands,
+        graveyard,
+        output_sample_rate,
+    } = acs;
 
-    let mut state = mixer_state.lock();
-    crate::audio::mixer::mix_audio(bus, &mut state);
-
-    let voices_before: HashSet<String> = state
-        .active_samples
-        .iter()
-        .map(|s| s.voice_id.clone())
-        .collect();
-    state.active_samples.retain(|s| !s.is_finished());
-    let voices_after: HashSet<String> = state
-        .active_samples
-        .iter()
-        .map(|s| s.voice_id.clone())
-        .collect();
-
-    if let Some(ref mut engine) = state.ducking_engine {
-        for voice in voices_before.difference(&voices_after) {
-            engine.notify_voice_active(voice, false);
-        }
-    }
-
-    *active_voices.lock() = voices_after;
+    crate::rt_engine::drain_commands(commands, mixer, *output_sample_rate, 64);
+    crate::audio::mixer::mix_audio(bus, mixer);
+    crate::rt_engine::reap_finished(mixer, graveyard);
 }
 
 /// Build an output stream of element type `T`, mixing into an f32 scratch bus and
@@ -429,8 +418,8 @@ fn run_mix_callback(
 fn build_typed_output_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    mixer_state: Arc<Mutex<MixerState>>,
-    active_voices: Arc<Mutex<std::collections::HashSet<String>>>,
+    callback_state: Arc<Mutex<AudioCallbackState>>,
+    xruns: Arc<AtomicU64>,
     error_flag: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, cpal::BuildStreamError>
 where
@@ -441,13 +430,14 @@ where
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             scratch.resize(data.len(), 0.0);
-            run_mix_callback(&mut scratch, &mixer_state, &active_voices);
+            run_mix_callback(&mut scratch, &callback_state);
             for (out, &s) in data.iter_mut().zip(scratch.iter()) {
                 *out = T::from_sample(s);
             }
         },
         move |err| {
             tracing::error!("Audio stream error: {}", err);
+            xruns.fetch_add(1, Ordering::Relaxed);
             // Signal the supervisor to rebuild; the cpal callback must not do it.
             error_flag.store(true, Ordering::Relaxed);
         },
@@ -462,40 +452,24 @@ pub fn build_output_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     sample_format: cpal::SampleFormat,
-    mixer_state: Arc<Mutex<MixerState>>,
-    active_voices: Arc<Mutex<std::collections::HashSet<String>>>,
+    callback_state: Arc<Mutex<AudioCallbackState>>,
+    xruns: Arc<AtomicU64>,
     error_flag: Arc<AtomicBool>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     use cpal::SampleFormat;
     let stream = match sample_format {
-        SampleFormat::F32 => build_typed_output_stream::<f32>(
-            device,
-            config,
-            mixer_state,
-            active_voices,
-            error_flag,
-        )?,
-        SampleFormat::I16 => build_typed_output_stream::<i16>(
-            device,
-            config,
-            mixer_state,
-            active_voices,
-            error_flag,
-        )?,
-        SampleFormat::U16 => build_typed_output_stream::<u16>(
-            device,
-            config,
-            mixer_state,
-            active_voices,
-            error_flag,
-        )?,
-        SampleFormat::I32 => build_typed_output_stream::<i32>(
-            device,
-            config,
-            mixer_state,
-            active_voices,
-            error_flag,
-        )?,
+        SampleFormat::F32 => {
+            build_typed_output_stream::<f32>(device, config, callback_state, xruns, error_flag)?
+        }
+        SampleFormat::I16 => {
+            build_typed_output_stream::<i16>(device, config, callback_state, xruns, error_flag)?
+        }
+        SampleFormat::U16 => {
+            build_typed_output_stream::<u16>(device, config, callback_state, xruns, error_flag)?
+        }
+        SampleFormat::I32 => {
+            build_typed_output_stream::<i32>(device, config, callback_state, xruns, error_flag)?
+        }
         other => return Err(format!("unsupported device sample format: {:?}", other).into()),
     };
     Ok(stream)
@@ -512,8 +486,8 @@ pub fn spawn_output_supervisor(
     device_name: Option<String>,
     config: cpal::StreamConfig,
     sample_format: cpal::SampleFormat,
-    mixer_state: Arc<Mutex<MixerState>>,
-    active_voices: Arc<Mutex<std::collections::HashSet<String>>>,
+    callback_state: Arc<Mutex<AudioCallbackState>>,
+    xruns: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     use crate::audio::rebuild::RebuildPolicy;
@@ -534,8 +508,8 @@ pub fn spawn_output_supervisor(
                     &device,
                     &config,
                     sample_format,
-                    mixer_state.clone(),
-                    active_voices.clone(),
+                    callback_state.clone(),
+                    xruns.clone(),
                     error_flag.clone(),
                 )?;
                 stream.play()?;
@@ -824,7 +798,7 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
         active_samples,
         live_inputs: Vec::new(),
         output_channels,
-        ducking_engine: None,
+        ducking_applier: None,
         bass_management: None,
     }));
 

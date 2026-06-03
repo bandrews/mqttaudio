@@ -8,6 +8,7 @@
 //! async, or allocating work (cache loads, voice-manager bookkeeping, channel-alias
 //! resolution) stays on the control thread; only the finished value travels across the ring.
 
+use crate::audio::ducking::DuckTargetChange;
 use crate::audio::mixer::{ActiveSample, FadeState, LiveInput, MixerState};
 use crate::mqtt::commands::SampleSelector;
 use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
@@ -18,12 +19,11 @@ use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 /// side, but ids/volumes/fades are computed by the control thread), so applying a
 /// command never blocks, allocates unboundedly, or does I/O.
 pub enum AudioCommand {
-    /// Start playing a fully-built sample. `notify_active` mirrors the control thread's
-    /// view that this sample's voice just became active (drives ducking).
-    AddSample {
-        sample: Box<ActiveSample>,
-        notify_active: bool,
-    },
+    /// Start playing a fully-built sample. Ducking for the sample's voice is
+    /// driven separately via [`AudioCommand::SetDuckTarget`].
+    AddSample(Box<ActiveSample>),
+    /// Apply a resolved ducking target change (computed on the control thread).
+    SetDuckTarget(DuckTargetChange),
     /// Add a live (microphone) input to the mix.
     AddLiveInput(Box<LiveInput>),
     /// Fade out every active sample over `fade_ms` (Stop-all / shutdown).
@@ -72,16 +72,13 @@ pub fn command_channel(capacity: usize) -> (CommandProducer, CommandConsumer) {
 /// `output_sample_rate` is needed to convert fade durations (ms) into sample counts.
 pub fn apply_command(state: &mut MixerState, cmd: AudioCommand, output_sample_rate: u32) {
     match cmd {
-        AudioCommand::AddSample {
-            sample,
-            notify_active,
-        } => {
-            if notify_active {
-                if let Some(ref mut engine) = state.ducking_engine {
-                    engine.notify_voice_active(&sample.voice_id, true);
-                }
-            }
+        AudioCommand::AddSample(sample) => {
             state.active_samples.push(*sample);
+        }
+        AudioCommand::SetDuckTarget(change) => {
+            if let Some(ref mut applier) = state.ducking_applier {
+                applier.apply_target(&change);
+            }
         }
         AudioCommand::AddLiveInput(input) => {
             state.live_inputs.push(*input);
@@ -185,6 +182,24 @@ pub fn graveyard_channel(capacity: usize) -> (GraveyardProducer, GraveyardConsum
     HeapRb::<ActiveSample>::new(capacity).split()
 }
 
+/// The state the cpal output callback owns behind one `Arc<Mutex<>>`: the
+/// `MixerState` it mixes, the command-ring consumer it drains, and the graveyard
+/// producer it reaps finished samples into. The control thread never locks this;
+/// it mutates only through the command ring and reads status from a snapshot, so
+/// the lock is uncontended (held only by the callback and, briefly, the
+/// supervisor during a device rebuild).
+pub struct AudioCallbackState {
+    /// The mixer the callback advances each block.
+    pub mixer: MixerState,
+    /// Control->audio command ring consumer, drained at the top of each callback.
+    pub commands: CommandConsumer,
+    /// Audio->reaper return ring producer for off-RT drop of finished samples.
+    pub graveyard: GraveyardProducer,
+    /// Output sample rate, needed to convert fade durations (ms) into frames
+    /// when draining commands.
+    pub output_sample_rate: u32,
+}
+
 /// Move every finished sample out of `state` into the graveyard for off-RT drop,
 /// returning how many were moved. The callback calls this instead of `retain`, so the
 /// per-sample `channel_map`/`PitchCorrector` frees happen on the reaper thread, never
@@ -237,6 +252,7 @@ fn apply_input_volume(state: &mut MixerState, input: &str, volume: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::ducking::{DuckTargetChange, DuckingApplier};
     use crate::audio::types::DecodedBuffer;
     use std::sync::Arc;
 
@@ -260,7 +276,7 @@ mod tests {
             active_samples: samples,
             live_inputs: Vec::new(),
             output_channels: 2,
-            ducking_engine: None,
+            ducking_applier: None,
             bass_management: None,
         }
     }
@@ -283,14 +299,34 @@ mod tests {
         let mut state = state_with(vec![]);
         apply_command(
             &mut state,
-            AudioCommand::AddSample {
-                sample: Box::new(sample(1, "music", None, "a.wav")),
-                notify_active: false,
-            },
+            AudioCommand::AddSample(Box::new(sample(1, "music", None, "a.wav"))),
             48000,
         );
         assert_eq!(state.active_samples.len(), 1);
         assert_eq!(state.active_samples[0].id, 1);
+    }
+
+    #[test]
+    fn set_duck_target_ducks_the_voice() {
+        let mut state = state_with(vec![]);
+        state.ducking_applier = Some(DuckingApplier::new());
+
+        apply_command(
+            &mut state,
+            AudioCommand::SetDuckTarget(DuckTargetChange {
+                voice: "music".to_string(),
+                target_volume: 0.2,
+                fade_frames: 0, // instant, for a deterministic assertion
+            }),
+            48000,
+        );
+
+        let applier = state.ducking_applier.as_mut().unwrap();
+        let multiplier = applier.get_multiplier("music", 1);
+        assert!(
+            (multiplier - 0.2).abs() < 1e-4,
+            "expected music ducked to 0.2, got {multiplier}"
+        );
     }
 
     #[test]
@@ -398,10 +434,9 @@ mod tests {
     #[test]
     fn ring_delivers_commands_in_order() {
         let (mut tx, mut rx) = command_channel(8);
-        tx.push(AudioCommand::AddSample {
-            sample: Box::new(sample(1, "music", None, "a")),
-            notify_active: false,
-        })
+        tx.push(AudioCommand::AddSample(Box::new(sample(
+            1, "music", None, "a",
+        ))))
         .ok()
         .expect("push add");
         tx.push(AudioCommand::FadeOutAll { fade_ms: 10 })

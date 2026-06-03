@@ -5,6 +5,20 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 
 ## Deferred to a later sprint
 
+- **`xruns` counter is incremented but not surfaced on `/status` (Sprint 5).** The lock-free RT engine
+  creates an `xruns: AtomicU64` (`src/main.rs:553`), passes it to the output supervisor, and increments it
+  in the cpal error callback (`src/audio/engine.rs`), but it is not yet plumbed into the control-side
+  `StatusSnapshot` or the `/status` JSON. Sprint 5's acceptance ("expose it on the status snapshot for the
+  soak test") and Sprint 9's `/metrics` work still need to wire it through. The counter is live and usable
+  by a soak test that holds the `Arc<AtomicU64>` directly; only the HTTP exposure is missing.
+
+- **`/status/samples` live position is gone by design (Sprint 5 / D20 / D22a).** Because the control plane
+  never reads `MixerState` (D22a), the status snapshot is control-side and cannot see audio-thread-owned
+  playback position. `/status/samples` therefore reports `position`/`position_ms`/`progress_percent` as 0
+  (static metadata and `total_ms` are still accurate). If live position is wanted back, it must be fed to
+  the control thread over a dedicated channel (the audio thread publishing per-voice positions), not by
+  locking the callback state. Recorded as a deliberate behavior change, not a regression; changelog'd.
+
 - **`DiskCache` uses `DefaultHasher` for cache keys (Sprint 3).** `src/cache/disk.rs:~147` derives the
   on-disk filename from `std::collections::hash_map::DefaultHasher`, which is not guaranteed stable across
   releases/platforms. Sprint 3 should switch to a stable content hash (truncated SHA-256 / xxhash).

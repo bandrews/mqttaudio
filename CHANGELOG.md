@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`/status/samples` no longer reports live per-sample playback position.** HTTP status is now served
+  from a control-side snapshot (the audio thread owns playback state lock-free, so the control plane never
+  reads it). The endpoint still reports each sample's static metadata — `id`, `voice`, `file`,
+  `total_frames`, `total_ms`, `sample_rate`, `volume`, `voice_volume`, `speed`, `loop_mode` — but
+  `position`, `position_ms`, and `progress_percent` are now always `0`. (Lock-free RT engine, Sprint 5.)
 - **Looping a still-downloading stream no longer buzzes.** A `loop: true` play of an HTTP/streaming
   source now plays forward (emitting silence past the loaded edge) and only begins looping once the
   stream is fully downloaded, instead of replaying a tiny growing prefix in a tight buzz. A looped

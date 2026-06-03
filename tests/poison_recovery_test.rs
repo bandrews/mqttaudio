@@ -11,7 +11,7 @@ fn panic_while_holding_mixer_lock_does_not_brick_the_callback() {
         active_samples: Vec::new(),
         live_inputs: Vec::new(),
         output_channels: 2,
-        ducking_engine: None,
+        ducking_applier: None,
         bass_management: None,
     }));
 

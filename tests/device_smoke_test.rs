@@ -4,9 +4,9 @@
 use cpal::traits::StreamTrait;
 use mqttaudio::audio::engine::{build_output_stream, find_output_config, find_output_device};
 use mqttaudio::audio::mixer::MixerState;
+use mqttaudio::rt_engine::{command_channel, graveyard_channel, AudioCallbackState};
 use parking_lot::Mutex;
-use std::collections::HashSet;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 
 /// Open the real default output device and run a brief stream through the actual
@@ -24,23 +24,35 @@ fn default_output_device_opens_and_runs() {
     let output_config =
         find_output_config(&device, None, Some(48000), 512).expect("an output config");
     let channels = output_config.stream_config.channels as usize;
+    let output_sample_rate = output_config.stream_config.sample_rate.0;
 
-    let mixer_state = Arc::new(Mutex::new(MixerState {
+    let mixer = MixerState {
         active_samples: Vec::new(),
         live_inputs: Vec::new(),
         output_channels: channels,
-        ducking_engine: None,
+        ducking_applier: None,
         bass_management: None,
+    };
+
+    // The callback owns the bundled mixer + command consumer + graveyard producer
+    // behind one uncontended mutex; an empty mixer produces silence.
+    let (_cmd_tx, cmd_rx) = command_channel(1024);
+    let (grave_tx, _grave_rx) = graveyard_channel(1024);
+    let callback_state = Arc::new(Mutex::new(AudioCallbackState {
+        mixer,
+        commands: cmd_rx,
+        graveyard: grave_tx,
+        output_sample_rate,
     }));
-    let active_voices = Arc::new(Mutex::new(HashSet::new()));
+    let xruns = Arc::new(AtomicU64::new(0));
 
     // Build through the real format dispatch; an empty mixer produces silence.
     let stream = build_output_stream(
         &device,
         &output_config.stream_config,
         output_config.sample_format,
-        mixer_state,
-        active_voices,
+        callback_state,
+        xruns,
         Arc::new(AtomicBool::new(false)),
     )
     .expect("build an output stream via the format dispatch");

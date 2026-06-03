@@ -6,6 +6,7 @@ mod cache;
 mod config;
 mod http;
 mod mqtt;
+mod rt_engine;
 mod voice;
 
 use clap::Parser;
@@ -390,19 +391,27 @@ async fn main() {
     tracing::info!("  Sample format: {:?}", sample_format);
 
     // Create mixer state and voice manager
-    use audio::ducking::DuckingEngine;
+    use audio::ducking::{DuckingApplier, DuckingEngine};
     use audio::mixer::MixerState;
     use parking_lot::Mutex;
-    use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, RwLock};
     use voice::VoiceManager;
 
-    // Create ducking engine from config rules
-    let ducking_engine = if !config.ducking_rules.is_empty() {
+    // The ducking engine that resolves rules lives on the control thread (it is
+    // driven by command sends and graveyard completions, never by the callback);
+    // the audio thread only applies the resolved targets via a DuckingApplier.
+    let mut ducking_engine = if !config.ducking_rules.is_empty() {
         Some(DuckingEngine::new(
             config.ducking_rules.clone(),
             output_sample_rate,
         ))
+    } else {
+        None
+    };
+    let ducking_applier = if ducking_engine.is_some() {
+        Some(DuckingApplier::new())
     } else {
         None
     };
@@ -438,17 +447,27 @@ async fn main() {
         None
     };
 
-    let mixer_state = Arc::new(Mutex::new(MixerState {
+    let mixer = MixerState {
         active_samples: Vec::new(),
         live_inputs: Vec::new(),
         output_channels,
-        ducking_engine,
+        ducking_applier,
         bass_management,
-    }));
+    };
 
-    // Initialize audio inputs from config
-    // Keep active input streams alive - they will be kept alive until the app exits
+    // Control->audio command ring and audio->reaper graveyard ring. The control
+    // thread holds the command producer and graveyard consumer; the audio
+    // callback owns the bundle behind one uncontended mutex (D15/D22a).
+    let (cmd_tx, cmd_rx) = rt_engine::command_channel(1024);
+    let (grave_tx, mut grave_rx) = rt_engine::graveyard_channel(1024);
+
+    // Initialize audio inputs from config.
+    // Keep active input streams alive - they will be kept alive until the app exits.
+    // Live inputs are added to the mix by command (AddLiveInput); their static
+    // status is recorded for the control-side snapshot.
     let mut _active_inputs: Vec<audio::input::ActiveInput> = Vec::new();
+    let mut input_statuses: Vec<http::InputStatus> = Vec::new();
+    let mut cmd_tx = cmd_tx;
     for (idx, input_config) in config.inputs.iter().enumerate() {
         let stream_config = audio::input::InputStreamConfig {
             device_name: input_config.device.clone(),
@@ -494,8 +513,21 @@ async fn main() {
                         channel_map,
                     );
 
-                    // Add to mixer state
-                    mixer_state.lock().live_inputs.push(live_input);
+                    input_statuses.push(http::InputStatus {
+                        index: input_statuses.len(),
+                        voice_id: input_config.voice_id.clone(),
+                        volume: input_config.volume,
+                        channels: active_input.channels,
+                    });
+
+                    // Add to the mix via the command ring (drained once the
+                    // output stream starts).
+                    if cmd_tx
+                        .push(rt_engine::AudioCommand::AddLiveInput(Box::new(live_input)))
+                        .is_err()
+                    {
+                        tracing::error!("Command ring full while adding live input {}", idx);
+                    }
                 }
 
                 // Keep the stream alive by storing it
@@ -511,10 +543,28 @@ async fn main() {
         }
     }
 
+    // The bundle the cpal callback owns. The control thread never locks this.
+    let callback_state = Arc::new(Mutex::new(rt_engine::AudioCallbackState {
+        mixer,
+        commands: cmd_rx,
+        graveyard: grave_tx,
+        output_sample_rate,
+    }));
+    let xruns = Arc::new(AtomicU64::new(0));
+
     let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));
 
-    // Track active voices for ducking notifications
-    let active_voices: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Control-side voice activity bookkeeping and the authoritative status
+    // snapshot the HTTP handlers read. `active_counts` drives ducking restore;
+    // `playing` mirrors the live sample list for status (position excluded).
+    let mut active_counts: HashMap<String, usize> = HashMap::new();
+    let mut playing: HashMap<u64, http::SampleStatus> = HashMap::new();
+    let status_snapshot = Arc::new(RwLock::new(http::StatusSnapshot {
+        active_samples: 0,
+        output_channels,
+        samples: Vec::new(),
+        inputs: input_statuses.clone(),
+    }));
 
     // Create cache manager using config
     let cache_dir = config.cache_directory();
@@ -606,21 +656,21 @@ async fn main() {
         config.audio.device.clone(),
         stream_config,
         sample_format,
-        mixer_state.clone(),
-        active_voices.clone(),
+        callback_state.clone(),
+        xruns.clone(),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
 
-    // Create command channel
-    let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(100);
+    // Create the text-command channel (HTTP/MQTT payloads -> control loop).
+    let (text_tx, mut text_rx) = mpsc::channel::<String>(100);
 
     // Start HTTP server if enabled
     if config.http.enabled {
-        let http_cmd_tx = cmd_tx.clone();
+        let http_cmd_tx = text_tx.clone();
         match http::start_server(
             &config.http,
             http_cmd_tx,
-            mixer_state.clone(),
+            status_snapshot.clone(),
             voice_manager.clone(),
             cache_manager.clone(),
         )
@@ -641,7 +691,7 @@ async fn main() {
 
     // Spawn MQTT event processor if connected
     if let Some((client, eventloop)) = mqtt_connection {
-        let mqtt_cmd_tx = cmd_tx.clone();
+        let mqtt_cmd_tx = text_tx.clone();
         let mqtt_topic = config.mqtt.topic.clone().unwrap_or_default();
         tokio::spawn(async move {
             mqtt::client::process_mqtt_events(client, mqtt_topic, eventloop, mqtt_cmd_tx).await;
@@ -652,26 +702,21 @@ async fn main() {
         );
     }
 
-    // Keep cmd_tx alive if only HTTP is running (no MQTT)
-    let _cmd_tx_keepalive = cmd_tx;
+    // Keep the text-command sender alive if only HTTP is running (no MQTT)
+    let _text_tx_keepalive = text_tx;
 
     // Main command processing loop
     if mqtt_enabled || http_enabled {
         tracing::info!("Command processing loop started");
     }
 
-    let command_ctx = CommandCtx {
-        cache_manager: &cache_manager,
-        voice_manager: &voice_manager,
-        mixer_state: &mixer_state,
-        active_voices: &active_voices,
-        output_sample_rate,
-        config: &config,
-    };
+    // Periodic reaper: drains finished samples returned by the audio thread,
+    // decrements voice activity, and lets the ducking engine restore voices.
+    let mut reaper_tick = tokio::time::interval(std::time::Duration::from_millis(20));
 
     loop {
         tokio::select! {
-            maybe_payload = cmd_rx.recv() => {
+            maybe_payload = text_rx.recv() => {
                 let payload = match maybe_payload {
                     Some(p) => p,
                     None => break, // command channel closed
@@ -687,37 +732,149 @@ async fn main() {
                 };
 
                 match mqtt::commands::parse_command(&expanded) {
-                    Ok(cmd) => handle_command(cmd, &command_ctx).await,
+                    Ok(cmd) => {
+                        let mut ctx = CommandCtx {
+                            cache_manager: &cache_manager,
+                            voice_manager: &voice_manager,
+                            cmd_tx: &mut cmd_tx,
+                            ducking_engine: &mut ducking_engine,
+                            active_counts: &mut active_counts,
+                            playing: &mut playing,
+                            snapshot: &status_snapshot,
+                            inputs: &input_statuses,
+                            output_channels,
+                            output_sample_rate,
+                            config: &config,
+                        };
+                        handle_command(cmd, &mut ctx).await;
+                    }
                     Err(e) => {
                         tracing::error!("Failed to parse command: {}", e);
                     }
                 }
             }
+            _ = reaper_tick.tick() => {
+                reap_finished_samples(
+                    &mut grave_rx,
+                    &mut cmd_tx,
+                    ducking_engine.as_mut(),
+                    &mut active_counts,
+                    &mut playing,
+                    &status_snapshot,
+                    &input_statuses,
+                    output_channels,
+                );
+            }
             _ = shutdown_signal() => {
                 tracing::info!("Shutdown signal received");
-                shutdown(&command_ctx).await;
+                shutdown(&mut cmd_tx, &cache_manager).await;
                 break;
             }
         }
     }
 }
 
-/// Bundles the shared state a single command operates on.
+/// Rebuild the control-side status snapshot from the live sample map and the
+/// configured inputs. Cheap; called whenever the playing set changes.
+fn refresh_snapshot(
+    snapshot: &std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
+    playing: &std::collections::HashMap<u64, http::SampleStatus>,
+    inputs: &[http::InputStatus],
+    output_channels: usize,
+) {
+    let mut samples: Vec<http::SampleStatus> = playing.values().cloned().collect();
+    samples.sort_by_key(|s| s.internal_id);
+    let mut guard = snapshot.write().unwrap();
+    guard.active_samples = samples.len();
+    guard.output_channels = output_channels;
+    guard.samples = samples;
+    guard.inputs = inputs.to_vec();
+}
+
+/// Drain the graveyard, dropping finished samples off the audio thread, and
+/// reconcile control-side voice activity. When a voice's last sample finishes,
+/// the ducking engine computes restore targets that are sent back to the audio
+/// thread. Refreshes the status snapshot if anything was reaped.
+#[allow(clippy::too_many_arguments)]
+fn reap_finished_samples(
+    grave_rx: &mut rt_engine::GraveyardConsumer,
+    cmd_tx: &mut rt_engine::CommandProducer,
+    mut ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
+    active_counts: &mut std::collections::HashMap<String, usize>,
+    playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
+    snapshot: &std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
+    inputs: &[http::InputStatus],
+    output_channels: usize,
+) {
+    let mut reaped = 0;
+    while let Some(finished) = grave_rx.pop() {
+        let voice = finished.voice_id.clone();
+        let id = finished.id;
+        // Dropping `finished` here is the off-RT free of the sample's buffers.
+        drop(finished);
+
+        playing.remove(&id);
+        reaped += 1;
+
+        if let Some(count) = active_counts.get_mut(&voice) {
+            *count -= 1;
+            if *count == 0 {
+                active_counts.remove(&voice);
+                if let Some(engine) = ducking_engine.as_mut() {
+                    for change in engine.compute_changes(&voice, false) {
+                        let _ = cmd_tx.push(rt_engine::AudioCommand::SetDuckTarget(change));
+                    }
+                }
+            }
+        }
+    }
+
+    if reaped > 0 {
+        refresh_snapshot(snapshot, playing, inputs, output_channels);
+    }
+}
+
+/// Bundles the control-side state a single command operates on. All audio-state
+/// mutations are sent to the audio thread through `cmd_tx`; the control thread
+/// owns the ducking engine, voice-activity counts, live sample map, and the
+/// status snapshot, and never touches the audio thread's `MixerState`.
 struct CommandCtx<'a> {
     cache_manager: &'a std::sync::Arc<tokio::sync::Mutex<cache::CacheManager>>,
     voice_manager: &'a std::sync::Arc<parking_lot::Mutex<voice::VoiceManager>>,
-    mixer_state: &'a std::sync::Arc<parking_lot::Mutex<audio::mixer::MixerState>>,
-    active_voices: &'a std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    cmd_tx: &'a mut rt_engine::CommandProducer,
+    ducking_engine: &'a mut Option<audio::ducking::DuckingEngine>,
+    active_counts: &'a mut std::collections::HashMap<String, usize>,
+    playing: &'a mut std::collections::HashMap<u64, http::SampleStatus>,
+    snapshot: &'a std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
+    inputs: &'a [http::InputStatus],
+    output_channels: usize,
     output_sample_rate: u32,
     config: &'a config::Config,
 }
 
+impl CommandCtx<'_> {
+    /// Push a resolved command to the audio thread, logging if the ring is full.
+    fn send(&mut self, command: rt_engine::AudioCommand) {
+        if self.cmd_tx.push(command).is_err() {
+            tracing::error!("Audio command ring full; command dropped");
+        }
+    }
+
+    /// Rebuild the status snapshot from the current live sample map and inputs.
+    fn refresh(&self) {
+        refresh_snapshot(
+            self.snapshot,
+            self.playing,
+            self.inputs,
+            self.output_channels,
+        );
+    }
+}
+
 /// Apply a single parsed command to the shared audio state.
-async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>) {
+async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<'_>) {
     let cache_manager = ctx.cache_manager;
     let voice_manager = ctx.voice_manager;
-    let mixer_state = ctx.mixer_state;
-    let active_voices = ctx.active_voices;
     let output_sample_rate = ctx.output_sample_rate;
     let config = ctx.config;
     use audio::mixer::ActiveSample;
@@ -884,26 +1041,35 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
                         tracing::debug!("Applied {}ms fade in to voice '{}'", fade_ms, voice_id);
                     }
 
-                    // Notify ducking engine if voice became active
-                    let mut active_voices_guard = active_voices.lock();
-                    let was_active = active_voices_guard.contains(&voice_id);
-                    if !was_active {
-                        active_voices_guard.insert(voice_id.clone());
-                        drop(active_voices_guard);
+                    // Record the control-side status before the sample is moved
+                    // into the command (live position stays audio-thread-owned).
+                    let status = http::SampleStatus {
+                        internal_id: sample.id,
+                        sample_id: sample.sample_id.clone(),
+                        voice_id: voice_id.clone(),
+                        file_path: sample.file_path.clone(),
+                        total_frames: sample.buffer.frames(),
+                        sample_rate: sample.buffer.sample_rate(),
+                        volume: sample.volume,
+                        voice_volume: sample.voice_volume,
+                        speed: sample.speed,
+                        loop_mode: sample.loop_mode,
+                    };
 
-                        // Notify ducking engine that voice became active
-                        let mut state = mixer_state.lock();
-                        if let Some(ref mut engine) = state.ducking_engine {
-                            engine.notify_voice_active(&voice_id, true);
+                    // Voice became active: compute and forward ducking targets.
+                    let became_active = !ctx.active_counts.contains_key(&voice_id);
+                    if became_active {
+                        if let Some(engine) = ctx.ducking_engine.as_mut() {
+                            for change in engine.compute_changes(&voice_id, true) {
+                                ctx.send(rt_engine::AudioCommand::SetDuckTarget(change));
+                            }
                         }
-                        state.active_samples.push(sample);
-                        tracing::info!("Now playing {} active samples", state.active_samples.len());
-                    } else {
-                        drop(active_voices_guard);
-                        let mut state = mixer_state.lock();
-                        state.active_samples.push(sample);
-                        tracing::info!("Now playing {} active samples", state.active_samples.len());
                     }
+                    *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
+                    ctx.playing.insert(status.internal_id, status);
+                    ctx.send(rt_engine::AudioCommand::AddSample(Box::new(sample)));
+                    ctx.refresh();
+                    tracing::info!("Now playing {} active samples", ctx.playing.len());
                 }
                 Err(e) => {
                     tracing::error!("Failed to load {}: {}", file, e);
@@ -911,24 +1077,14 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             }
         }
         mqtt::commands::AudioCommand::StopAll => {
-            // Apply quick 10ms fade-out to prevent clicks/pops
+            // Apply quick 10ms fade-out to prevent clicks/pops. The audio thread
+            // fades and finishes the samples; the reaper then reconciles voice
+            // activity and the snapshot from the graveyard returns.
             const STOP_FADE_MS: u32 = 10;
-
-            let mut state = mixer_state.lock();
-            let count = state.active_samples.len();
-
-            for sample in state.active_samples.iter_mut() {
-                sample.set_fade(audio::mixer::FadeState::fade_out(
-                    STOP_FADE_MS,
-                    output_sample_rate,
-                ));
-            }
-            drop(state);
-
-            // Note: Samples will be automatically removed by the audio callback
-            // when the fade completes (is_finished() returns true).
-            // Voice cleanup also happens automatically.
-
+            let count = ctx.playing.len();
+            ctx.send(rt_engine::AudioCommand::FadeOutAll {
+                fade_ms: STOP_FADE_MS,
+            });
             tracing::info!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS);
         }
         mqtt::commands::AudioCommand::VoiceStop { voice } => {
@@ -943,26 +1099,16 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             if sample_ids.is_empty() {
                 tracing::warn!("Voice '{}' not found or already empty", voice);
             } else {
-                // Apply fade-out to all samples in the voice
-                let mut state = mixer_state.lock();
-                let mut updated_count = 0;
-                for sample in state.active_samples.iter_mut() {
-                    if sample_ids.contains(&sample.id) {
-                        sample.set_fade(audio::mixer::FadeState::fade_out(
-                            STOP_FADE_MS,
-                            output_sample_rate,
-                        ));
-                        updated_count += 1;
-                    }
-                }
-                drop(state);
-
                 tracing::info!(
                     "Stopping voice '{}': {} samples ({}ms fade-out)",
                     voice,
-                    updated_count,
+                    sample_ids.len(),
                     STOP_FADE_MS
                 );
+                ctx.send(rt_engine::AudioCommand::FadeOutSamples {
+                    ids: sample_ids,
+                    fade_ms: STOP_FADE_MS,
+                });
             }
         }
         mqtt::commands::AudioCommand::VoiceFadeOut { voice, time_ms } => {
@@ -974,26 +1120,16 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             if sample_ids.is_empty() {
                 tracing::warn!("Voice '{}' not found or already empty", voice);
             } else {
-                // Apply fade out to all samples in the voice
-                let mut state = mixer_state.lock();
-                let mut updated_count = 0;
-                for sample in state.active_samples.iter_mut() {
-                    if sample_ids.contains(&sample.id) {
-                        sample.set_fade(audio::mixer::FadeState::fade_out(
-                            time_ms,
-                            output_sample_rate,
-                        ));
-                        updated_count += 1;
-                    }
-                }
-                drop(state);
-
                 tracing::info!(
                     "Applied {}ms fade out to voice '{}' ({} samples)",
                     time_ms,
                     voice,
-                    updated_count
+                    sample_ids.len()
                 );
+                ctx.send(rt_engine::AudioCommand::FadeOutSamples {
+                    ids: sample_ids,
+                    fade_ms: time_ms,
+                });
             }
         }
         mqtt::commands::AudioCommand::VoiceVolume {
@@ -1007,35 +1143,20 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             drop(voice_mgr);
 
             if success {
-                // Update all active samples and live inputs in this voice with smooth ramping
-                let mut state = mixer_state.lock();
-                let mut sample_count = 0;
-                let mut input_count = 0;
-
-                for sample in state.active_samples.iter_mut() {
-                    if sample.voice_id == voice {
-                        // Set target for smooth ramping (avoids pops)
-                        sample.set_target_voice_volume(actual_volume);
-                        sample_count += 1;
+                // The audio thread ramps samples and live inputs in this voice
+                // toward the new target (SetVoiceVolume covers both).
+                ctx.send(rt_engine::AudioCommand::SetVoiceVolume {
+                    voice: voice.clone(),
+                    volume: actual_volume,
+                });
+                // Keep the status snapshot's per-sample voice volume in step.
+                for status in ctx.playing.values_mut() {
+                    if status.voice_id == voice {
+                        status.voice_volume = actual_volume;
                     }
                 }
-
-                for input in state.live_inputs.iter_mut() {
-                    if input.voice_id == voice {
-                        // Set target for smooth ramping (avoids pops)
-                        input.set_target_voice_volume(actual_volume);
-                        input_count += 1;
-                    }
-                }
-                drop(state);
-
-                tracing::info!(
-                    "Set voice '{}' volume to {:.2} (updated {} samples, {} inputs)",
-                    voice,
-                    actual_volume,
-                    sample_count,
-                    input_count
-                );
+                ctx.refresh();
+                tracing::info!("Set voice '{}' volume to {:.2}", voice, actual_volume);
             } else {
                 tracing::warn!("Voice '{}' not found", voice);
             }
@@ -1097,73 +1218,24 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             input,
             volume: new_volume,
         } => {
-            let mut state = mixer_state.lock();
-            let mut found = false;
-
-            // Try to find by index first
-            if let Ok(idx) = input.parse::<usize>() {
-                if idx < state.live_inputs.len() {
-                    state.live_inputs[idx].volume = new_volume.clamp(0.0, 1.0);
-                    tracing::info!(
-                        "Set input {} volume to {:.2}",
-                        idx,
-                        state.live_inputs[idx].volume
-                    );
-                    found = true;
-                }
-            }
-
-            // Try to find by voice_id if not found by index
-            if !found {
-                for live_input in state.live_inputs.iter_mut() {
-                    if live_input.voice_id == input {
-                        live_input.volume = new_volume.clamp(0.0, 1.0);
-                        tracing::info!("Set input '{}' volume to {:.2}", input, live_input.volume);
-                        found = true;
-                        break;
-                    }
-                }
-            }
-
-            if !found {
-                tracing::warn!("Input '{}' not found", input);
-            }
+            // The audio thread resolves the input by index or voice id and clamps.
+            tracing::info!("Set input '{}' volume to {:.2}", input, new_volume);
+            ctx.send(rt_engine::AudioCommand::SetInputVolume {
+                input,
+                volume: new_volume,
+            });
         }
         mqtt::commands::AudioCommand::InputMute { input, mute } => {
-            let mut state = mixer_state.lock();
-            let mut found = false;
-
-            // Try to find by index first
-            if let Ok(idx) = input.parse::<usize>() {
-                if idx < state.live_inputs.len() {
-                    // Mute by setting volume to 0, unmute restores to 1.0
-                    // Note: This is a simple mute - a more sophisticated version
-                    // would store the previous volume
-                    state.live_inputs[idx].volume = if mute { 0.0 } else { 1.0 };
-                    tracing::info!("Input {} {}", idx, if mute { "muted" } else { "unmuted" });
-                    found = true;
-                }
-            }
-
-            // Try to find by voice_id if not found by index
-            if !found {
-                for live_input in state.live_inputs.iter_mut() {
-                    if live_input.voice_id == input {
-                        live_input.volume = if mute { 0.0 } else { 1.0 };
-                        tracing::info!(
-                            "Input '{}' {}",
-                            input,
-                            if mute { "muted" } else { "unmuted" }
-                        );
-                        found = true;
-                        break;
-                    }
-                }
-            }
-
-            if !found {
-                tracing::warn!("Input '{}' not found", input);
-            }
+            // Mute by setting volume to 0, unmute restores to 1.0.
+            tracing::info!(
+                "Input '{}' {}",
+                input,
+                if mute { "muted" } else { "unmuted" }
+            );
+            ctx.send(rt_engine::AudioCommand::SetInputVolume {
+                input,
+                volume: if mute { 0.0 } else { 1.0 },
+            });
         }
         mqtt::commands::AudioCommand::Seek {
             selector,
@@ -1172,32 +1244,13 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             if selector.is_empty() {
                 tracing::warn!("Seek command with empty selector - no samples targeted");
             } else {
-                let mut state = mixer_state.lock();
-                let mut updated_count = 0;
-
-                for sample in state.active_samples.iter_mut() {
-                    if selector.matches(
-                        sample.id,
-                        sample.sample_id.as_deref(),
-                        &sample.file_path,
-                        &sample.voice_id,
-                    ) {
-                        // Convert milliseconds to frames
-                        let target_frame =
-                            ((position_ms * sample.buffer.sample_rate() as u64) / 1000) as usize;
-                        // Clamp to buffer bounds
-                        sample.position =
-                            target_frame.min(sample.buffer.frames().saturating_sub(1));
-                        updated_count += 1;
-                    }
-                }
-                drop(state);
-
-                if updated_count > 0 {
-                    tracing::info!("Seeked {} samples to {}ms", updated_count, position_ms);
-                } else {
-                    tracing::warn!("Seek command matched no active samples");
-                }
+                // The audio thread matches the selector against the live samples
+                // and converts ms to frames per sample's rate.
+                tracing::info!("Seeking matching samples to {}ms", position_ms);
+                ctx.send(rt_engine::AudioCommand::SeekMatching {
+                    selector,
+                    position_ms,
+                });
             }
         }
         mqtt::commands::AudioCommand::Speed {
@@ -1208,37 +1261,25 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             if selector.is_empty() {
                 tracing::warn!("Speed command with empty selector - no samples targeted");
             } else {
-                let mut state = mixer_state.lock();
-                let mut updated_count = 0;
-
-                for sample in state.active_samples.iter_mut() {
-                    if selector.matches(
-                        sample.id,
-                        sample.sample_id.as_deref(),
-                        &sample.file_path,
-                        &sample.voice_id,
-                    ) {
-                        sample.set_speed_with_mode(speed, pitch_correction);
-                        updated_count += 1;
+                let mode = if pitch_correction {
+                    "pitch-corrected"
+                } else {
+                    "normal"
+                };
+                tracing::info!("Set speed to {}x ({}) for matching samples", speed, mode);
+                // Keep the snapshot's per-sample speed in step for samples the
+                // control thread knows match the selector.
+                for status in ctx.playing.values_mut() {
+                    if sample_status_matches(&selector, status) {
+                        status.speed = speed;
                     }
                 }
-                drop(state);
-
-                if updated_count > 0 {
-                    let mode = if pitch_correction {
-                        "pitch-corrected"
-                    } else {
-                        "normal"
-                    };
-                    tracing::info!(
-                        "Set speed to {}x ({}) for {} samples",
-                        speed,
-                        mode,
-                        updated_count
-                    );
-                } else {
-                    tracing::warn!("Speed command matched no active samples");
-                }
+                ctx.send(rt_engine::AudioCommand::SetSpeedMatching {
+                    selector,
+                    speed,
+                    pitch_correction,
+                });
+                ctx.refresh();
             }
         }
         mqtt::commands::AudioCommand::Stop {
@@ -1250,65 +1291,42 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>)
             } else {
                 // Default to 10ms fade for smooth stop if not specified
                 let fade_ms = fade_out_ms.unwrap_or(10);
-
-                let mut state = mixer_state.lock();
-                let mut updated_count = 0;
-
-                for sample in state.active_samples.iter_mut() {
-                    if selector.matches(
-                        sample.id,
-                        sample.sample_id.as_deref(),
-                        &sample.file_path,
-                        &sample.voice_id,
-                    ) {
-                        sample.set_fade(audio::mixer::FadeState::fade_out(
-                            fade_ms,
-                            output_sample_rate,
-                        ));
-                        updated_count += 1;
-                    }
-                }
-                drop(state);
-
-                if updated_count > 0 {
-                    tracing::info!(
-                        "Stopping {} samples ({}ms fade-out)",
-                        updated_count,
-                        fade_ms
-                    );
-                } else {
-                    tracing::warn!("Stop command matched no active samples");
-                }
+                tracing::info!("Stopping matching samples ({}ms fade-out)", fade_ms);
+                ctx.send(rt_engine::AudioCommand::FadeOutMatching { selector, fade_ms });
             }
         }
         mqtt::commands::AudioCommand::Volume { selector, volume } => {
             if selector.is_empty() {
                 tracing::warn!("Volume command with empty selector - no samples targeted");
             } else {
-                let mut state = mixer_state.lock();
-                let mut updated_count = 0;
-
-                for sample in state.active_samples.iter_mut() {
-                    if selector.matches(
-                        sample.id,
-                        sample.sample_id.as_deref(),
-                        &sample.file_path,
-                        &sample.voice_id,
-                    ) {
-                        sample.volume = volume.clamp(0.0, 1.0);
-                        updated_count += 1;
+                tracing::info!("Set volume to {:.2} for matching samples", volume);
+                // Keep the snapshot's per-sample volume in step.
+                let clamped = volume.clamp(0.0, 1.0);
+                for status in ctx.playing.values_mut() {
+                    if sample_status_matches(&selector, status) {
+                        status.volume = clamped;
                     }
                 }
-                drop(state);
-
-                if updated_count > 0 {
-                    tracing::info!("Set volume to {:.2} for {} samples", volume, updated_count);
-                } else {
-                    tracing::warn!("Volume command matched no active samples");
-                }
+                ctx.send(rt_engine::AudioCommand::SetVolumeMatching { selector, volume });
+                ctx.refresh();
             }
         }
     }
+}
+
+/// Whether a control-side sample status matches a selector. Mirrors the
+/// audio-side matching so the status snapshot can track selector-targeted
+/// changes the control thread can see (the audio thread remains authoritative).
+fn sample_status_matches(
+    selector: &mqtt::commands::SampleSelector,
+    status: &http::SampleStatus,
+) -> bool {
+    selector.matches(
+        status.internal_id,
+        status.sample_id.as_deref(),
+        &status.file_path,
+        &status.voice_id,
+    )
 }
 
 /// Resolve when the process receives SIGINT (Ctrl-C) or, on unix, SIGTERM.
@@ -1338,22 +1356,18 @@ async fn shutdown_signal() {
     }
 }
 
-/// Graceful shutdown: fade out active samples, let the callback drain the fade,
-/// then flush cache metadata before the process exits.
-async fn shutdown(ctx: &CommandCtx<'_>) {
+/// Graceful shutdown: fade out active samples via the command ring, let the
+/// callback drain the fade, then flush cache metadata before the process exits.
+async fn shutdown(
+    cmd_tx: &mut rt_engine::CommandProducer,
+    cache_manager: &std::sync::Arc<tokio::sync::Mutex<cache::CacheManager>>,
+) {
     const SHUTDOWN_FADE_MS: u32 = 50;
 
-    {
-        let mut state = ctx.mixer_state.lock();
-        let count = state.active_samples.len();
-        for sample in state.active_samples.iter_mut() {
-            sample.set_fade(audio::mixer::FadeState::fade_out(
-                SHUTDOWN_FADE_MS,
-                ctx.output_sample_rate,
-            ));
-        }
-        tracing::info!("Shutdown: fading out {} active samples", count);
-    }
+    tracing::info!("Shutdown: fading out active samples");
+    let _ = cmd_tx.push(rt_engine::AudioCommand::FadeOutAll {
+        fade_ms: SHUTDOWN_FADE_MS,
+    });
 
     // Let the audio callback drain the fade so output ends on silence, not a click.
     tokio::time::sleep(std::time::Duration::from_millis(
@@ -1362,7 +1376,7 @@ async fn shutdown(ctx: &CommandCtx<'_>) {
     .await;
 
     // Flush cache metadata to disk.
-    let cache_mgr = ctx.cache_manager.lock().await;
+    let cache_mgr = cache_manager.lock().await;
     if let Err(e) = cache_mgr.flush_metadata() {
         tracing::error!("Failed to flush cache metadata on shutdown: {}", e);
     }
@@ -1374,57 +1388,105 @@ async fn shutdown(ctx: &CommandCtx<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audio::ducking::{DuckingEngine, DuckingRule};
+    use audio::ducking::{DuckingApplier, DuckingEngine, DuckingRule};
     use audio::mixer::{FadeState, MixerState};
     use mqtt::commands::{AudioCommand, SampleSelector};
     use parking_lot::Mutex;
-    use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::collections::HashMap;
+    use std::sync::{Arc, RwLock};
     use voice::VoiceManager;
 
     const TEST_WAV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/audio/test_440hz_2s.wav");
     const SR: u32 = 48000;
 
-    /// Owns the shared state needed to drive `handle_command` in tests.
+    /// Owns the control-side state needed to drive `handle_command` in tests and
+    /// the audio-side `MixerState` the resulting commands are applied to. The
+    /// control thread never touches `MixerState` directly: `handle_command` pushes
+    /// `rt_engine::AudioCommand`s onto the ring, and `drain` applies them to the
+    /// mixer exactly as the audio callback would — so a test asserts the same end
+    /// state the running engine would reach.
     struct Fixture {
         cache_manager: Arc<tokio::sync::Mutex<cache::CacheManager>>,
         voice_manager: Arc<Mutex<VoiceManager>>,
-        mixer_state: Arc<Mutex<MixerState>>,
-        active_voices: Arc<Mutex<HashSet<String>>>,
+        cmd_tx: rt_engine::CommandProducer,
+        cmd_rx: rt_engine::CommandConsumer,
+        mixer: MixerState,
+        ducking_engine: Option<DuckingEngine>,
+        active_counts: HashMap<String, usize>,
+        playing: HashMap<u64, http::SampleStatus>,
+        snapshot: Arc<RwLock<http::StatusSnapshot>>,
+        inputs: Vec<http::InputStatus>,
         config: config::Config,
         _cache_dir: tempfile::TempDir,
     }
 
     impl Fixture {
-        fn new(ducking_engine: Option<DuckingEngine>) -> Self {
+        /// Build a fixture. When `ducking_rules` is non-empty, a control-side
+        /// `DuckingEngine` resolves rules and the mixer carries a `DuckingApplier`
+        /// that applies the resolved `SetDuckTarget` commands — mirroring runtime.
+        fn new(ducking_rules: Vec<DuckingRule>) -> Self {
             let cache_dir = tempfile::tempdir().unwrap();
             let cache = cache::CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
-            let mixer_state = MixerState {
+            let (ducking_engine, ducking_applier) = if ducking_rules.is_empty() {
+                (None, None)
+            } else {
+                (
+                    Some(DuckingEngine::new(ducking_rules, SR)),
+                    Some(DuckingApplier::new()),
+                )
+            };
+            let mixer = MixerState {
                 active_samples: Vec::new(),
                 live_inputs: Vec::new(),
                 output_channels: 2,
-                ducking_engine,
+                ducking_applier,
                 bass_management: None,
             };
+            let (cmd_tx, cmd_rx) = rt_engine::command_channel(1024);
             Self {
                 cache_manager: Arc::new(tokio::sync::Mutex::new(cache)),
                 voice_manager: Arc::new(Mutex::new(VoiceManager::new())),
-                mixer_state: Arc::new(Mutex::new(mixer_state)),
-                active_voices: Arc::new(Mutex::new(HashSet::new())),
+                cmd_tx,
+                cmd_rx,
+                mixer,
+                ducking_engine,
+                active_counts: HashMap::new(),
+                playing: HashMap::new(),
+                snapshot: Arc::new(RwLock::new(http::StatusSnapshot {
+                    active_samples: 0,
+                    output_channels: 2,
+                    samples: Vec::new(),
+                    inputs: Vec::new(),
+                })),
+                inputs: Vec::new(),
                 config: config::Config::default(),
                 _cache_dir: cache_dir,
             }
         }
 
-        fn ctx(&self) -> CommandCtx<'_> {
-            CommandCtx {
+        /// Run a parsed command through `handle_command`, pushing the resulting
+        /// audio commands onto the ring (but not yet applying them to the mixer).
+        async fn run(&mut self, cmd: AudioCommand) {
+            let mut ctx = CommandCtx {
                 cache_manager: &self.cache_manager,
                 voice_manager: &self.voice_manager,
-                mixer_state: &self.mixer_state,
-                active_voices: &self.active_voices,
+                cmd_tx: &mut self.cmd_tx,
+                ducking_engine: &mut self.ducking_engine,
+                active_counts: &mut self.active_counts,
+                playing: &mut self.playing,
+                snapshot: &self.snapshot,
+                inputs: &self.inputs,
+                output_channels: 2,
                 output_sample_rate: SR,
                 config: &self.config,
-            }
+            };
+            handle_command(cmd, &mut ctx).await;
+        }
+
+        /// Apply every queued audio command to the mixer, as the audio callback
+        /// would, so the test can assert the resulting `MixerState`.
+        fn drain(&mut self) {
+            rt_engine::drain_commands(&mut self.cmd_rx, &mut self.mixer, SR, 1024);
         }
     }
 
@@ -1444,34 +1506,35 @@ mod tests {
 
     #[tokio::test]
     async fn play_adds_active_sample_and_marks_voice_active() {
-        let fixture = Fixture::new(None);
-        handle_command(play(Some("music"), 0.5), &fixture.ctx()).await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("music"), 0.5)).await;
+        fixture.drain();
 
-        let state = fixture.mixer_state.lock();
-        assert_eq!(state.active_samples.len(), 1);
-        let sample = &state.active_samples[0];
+        assert_eq!(fixture.mixer.active_samples.len(), 1);
+        let sample = &fixture.mixer.active_samples[0];
         assert_eq!(sample.voice_id, "music");
         assert_eq!(sample.volume, 0.5);
         assert_eq!(sample.position, 0);
         assert!(matches!(sample.fade_state, FadeState::None));
         assert_eq!(sample.crossfade_samples, 0);
 
-        assert!(fixture.active_voices.lock().contains("music"));
+        // The control thread tracks the voice as active for ducking/status.
+        assert!(fixture.active_counts.contains_key("music"));
     }
 
     #[tokio::test]
     async fn play_with_fade_in_sets_fade_state() {
-        let fixture = Fixture::new(None);
+        let mut fixture = Fixture::new(vec![]);
         let mut cmd = play(Some("music"), 1.0);
         if let AudioCommand::Play { fade_in, .. } = &mut cmd {
             *fade_in = Some(100);
         }
-        handle_command(cmd, &fixture.ctx()).await;
+        fixture.run(cmd).await;
+        fixture.drain();
 
-        let state = fixture.mixer_state.lock();
         // 100 ms at 48 kHz = 4800 frames
         assert!(matches!(
-            state.active_samples[0].fade_state,
+            fixture.mixer.active_samples[0].fade_state,
             FadeState::In {
                 elapsed: 0,
                 duration: 4800
@@ -1481,25 +1544,25 @@ mod tests {
 
     #[tokio::test]
     async fn stop_all_applies_fade_out_to_every_sample() {
-        let fixture = Fixture::new(None);
-        handle_command(play(Some("a"), 1.0), &fixture.ctx()).await;
-        handle_command(play(Some("b"), 1.0), &fixture.ctx()).await;
-        assert_eq!(fixture.mixer_state.lock().active_samples.len(), 2);
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("a"), 1.0)).await;
+        fixture.run(play(Some("b"), 1.0)).await;
+        // StopAll fades whatever is active; draining in order adds both samples
+        // before the fade-out is applied, exactly as the callback would.
+        fixture.run(AudioCommand::StopAll).await;
+        fixture.drain();
 
-        handle_command(AudioCommand::StopAll, &fixture.ctx()).await;
-
-        let state = fixture.mixer_state.lock();
-        assert_eq!(state.active_samples.len(), 2);
-        for sample in &state.active_samples {
+        assert_eq!(fixture.mixer.active_samples.len(), 2);
+        for sample in &fixture.mixer.active_samples {
             assert!(matches!(sample.fade_state, FadeState::Out { .. }));
         }
     }
 
     #[tokio::test]
     async fn stop_by_voice_selector_fades_only_matching_samples() {
-        let fixture = Fixture::new(None);
-        handle_command(play(Some("music"), 1.0), &fixture.ctx()).await;
-        handle_command(play(Some("sfx"), 1.0), &fixture.ctx()).await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.run(play(Some("sfx"), 1.0)).await;
 
         let stop = AudioCommand::Stop {
             selector: SampleSelector {
@@ -1510,11 +1573,11 @@ mod tests {
             },
             fade_out_ms: Some(50),
         };
-        handle_command(stop, &fixture.ctx()).await;
+        fixture.run(stop).await;
+        fixture.drain();
 
         let expected_duration = 50 * SR as usize / 1000; // 2400 frames
-        let state = fixture.mixer_state.lock();
-        for sample in &state.active_samples {
+        for sample in &fixture.mixer.active_samples {
             if sample.voice_id == "music" {
                 assert!(matches!(
                     sample.fade_state,
@@ -1528,20 +1591,17 @@ mod tests {
 
     #[tokio::test]
     async fn voice_volume_sets_ramp_target_without_jumping() {
-        let fixture = Fixture::new(None);
-        handle_command(play(Some("music"), 1.0), &fixture.ctx()).await;
-
-        handle_command(
-            AudioCommand::VoiceVolume {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture
+            .run(AudioCommand::VoiceVolume {
                 voice: "music".to_string(),
                 volume: 0.3,
-            },
-            &fixture.ctx(),
-        )
-        .await;
+            })
+            .await;
+        fixture.drain();
 
-        let state = fixture.mixer_state.lock();
-        let sample = &state.active_samples[0];
+        let sample = &fixture.mixer.active_samples[0];
         assert!((sample.target_voice_volume - 0.3).abs() < 1e-6);
         // Current voice volume is ramped over time, so it must not jump immediately.
         assert!((sample.voice_volume - 1.0).abs() < 1e-6);
@@ -1555,23 +1615,25 @@ mod tests {
             target_volume: 0.1,
             fade_duration_ms: 0, // instant, for a deterministic assertion
         };
-        let fixture = Fixture::new(Some(DuckingEngine::new(vec![rule], SR)));
+        let mut fixture = Fixture::new(vec![rule]);
 
-        // Background music starts first. It is not a ducking primary, so it stays full.
-        handle_command(play(Some("music"), 1.0), &fixture.ctx()).await;
+        // Background music starts first. It is not a ducking primary, so it stays
+        // full: the control engine resolves no target change for "music".
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
         {
-            let mut state = fixture.mixer_state.lock();
-            let engine = state.ducking_engine.as_mut().unwrap();
-            assert!((engine.get_multiplier("music", 1) - 1.0).abs() < 1e-6);
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            assert!((applier.get_multiplier("music", 1) - 1.0).abs() < 1e-6);
         }
 
-        // The primary voice starts: handle_command must notify the ducking engine,
-        // which ducks "music".
-        handle_command(play(Some("narration"), 1.0), &fixture.ctx()).await;
+        // The primary voice starts: handle_command must drive the control-side
+        // ducking engine, which emits a SetDuckTarget that ducks "music" once the
+        // mixer's applier applies it.
+        fixture.run(play(Some("narration"), 1.0)).await;
+        fixture.drain();
         {
-            let mut state = fixture.mixer_state.lock();
-            let engine = state.ducking_engine.as_mut().unwrap();
-            let multiplier = engine.get_multiplier("music", 1);
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            let multiplier = applier.get_multiplier("music", 1);
             assert!(
                 multiplier < 0.2,
                 "expected music ducked toward 0.1, got {multiplier}"
@@ -1581,20 +1643,17 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_fades_samples_and_flushes_metadata() {
-        let fixture = Fixture::new(None);
-        handle_command(play(Some("v"), 1.0), &fixture.ctx()).await;
-        assert_eq!(fixture.mixer_state.lock().active_samples.len(), 1);
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("v"), 1.0)).await;
 
-        shutdown(&fixture.ctx()).await;
+        shutdown(&mut fixture.cmd_tx, &fixture.cache_manager).await;
+        fixture.drain();
 
         // Every active sample now has a fade-out applied (drained to silence by the
         // real callback at runtime; here we just assert the fade was set).
-        {
-            let state = fixture.mixer_state.lock();
-            assert!(!state.active_samples.is_empty());
-            for sample in &state.active_samples {
-                assert!(matches!(sample.fade_state, FadeState::Out { .. }));
-            }
+        assert!(!fixture.mixer.active_samples.is_empty());
+        for sample in &fixture.mixer.active_samples {
+            assert!(matches!(sample.fade_state, FadeState::Out { .. }));
         }
         // Cache metadata was flushed to disk on shutdown.
         let metadata = fixture._cache_dir.path().join("metadata.json");

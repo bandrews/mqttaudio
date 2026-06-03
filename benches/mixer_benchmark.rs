@@ -30,7 +30,7 @@ fn create_mixer_state(num_samples: usize, output_channels: usize) -> MixerState 
         active_samples: Vec::new(),
         live_inputs: Vec::new(),
         output_channels,
-        ducking_engine: None,
+        ducking_applier: None,
         bass_management: None,
     };
 
@@ -62,7 +62,7 @@ fn create_mixer_state_with_routing(
         active_samples: Vec::new(),
         live_inputs: Vec::new(),
         output_channels: dest_channels,
-        ducking_engine: None,
+        ducking_applier: None,
         bass_management: None,
     };
 

@@ -2,7 +2,20 @@
 // ABOUTME: Manages ducking rules, voice activity tracking, and smooth fade calculations.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+
+/// A resolved change to one voice's ducking target, computed by the control
+/// thread and sent to the audio thread to apply. Carries the new target volume
+/// (>= 1.0 means restore) and the fade length in frames.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DuckTargetChange {
+    /// Voice whose ducking target is changing.
+    pub voice: String,
+    /// Target multiplier for the voice (>= 1.0 restores to full volume).
+    pub target_volume: f32,
+    /// Fade duration in frames for the transition.
+    pub fade_frames: usize,
+}
 
 /// Ducking rule from configuration
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -111,8 +124,15 @@ pub struct DuckingEngine {
     /// Active voices (voice_id -> has_active_samples)
     active_voices: HashMap<String, bool>,
 
-    /// Duck states per voice
+    /// Duck states per voice. Retained for the reference ducking path the unit
+    /// tests validate against; the audio thread keeps its own state in
+    /// `DuckingApplier`, so the binary never reaches this field.
+    #[allow(dead_code)]
     duck_states: HashMap<String, DuckState>,
+
+    /// Last target volume emitted per voice, so `compute_changes` only emits a
+    /// change when the resolved target actually moves.
+    last_targets: HashMap<String, f32>,
 }
 
 impl DuckingEngine {
@@ -138,10 +158,15 @@ impl DuckingEngine {
             sample_rate,
             active_voices: HashMap::new(),
             duck_states: HashMap::new(),
+            last_targets: HashMap::new(),
         }
     }
 
-    /// Notify engine that a voice's activity state has changed
+    /// Notify engine that a voice's activity state has changed, recomputing the
+    /// internal duck states. This is the reference path the unit tests validate
+    /// the control-side `compute_changes` + `DuckingApplier` against; the running
+    /// system drives ducking through `compute_changes` instead.
+    #[allow(dead_code)]
     pub fn notify_voice_active(&mut self, voice_id: &str, is_active: bool) {
         tracing::debug!("Voice '{}' activity changed: {}", voice_id, is_active);
 
@@ -156,8 +181,10 @@ impl DuckingEngine {
         self.update_duck_states();
     }
 
-    /// Get ducking multiplier for a voice and advance its fade state
-    /// This is called from the mixer callback for each sample
+    /// Get the ducking multiplier for a voice and advance its fade state, using
+    /// the engine's own duck states. Retained as the reference path for tests;
+    /// the audio thread uses `DuckingApplier::get_multiplier` at runtime.
+    #[allow(dead_code)]
     pub fn get_multiplier(&mut self, voice_id: &str, frames: usize) -> f32 {
         if let Some(state) = self.duck_states.get_mut(voice_id) {
             state.advance_and_get_multiplier(frames)
@@ -176,7 +203,66 @@ impl DuckingEngine {
             .unwrap_or(1.0)
     }
 
-    /// Update all duck states based on current voice activity
+    /// Record a voice activity change and compute the resulting target changes,
+    /// without owning any duck state. The control thread calls this and forwards
+    /// each [`DuckTargetChange`] to the audio thread; only voices whose resolved
+    /// target actually moved are emitted.
+    pub fn compute_changes(&mut self, voice_id: &str, is_active: bool) -> Vec<DuckTargetChange> {
+        self.active_voices.insert(voice_id.to_string(), is_active);
+
+        let mut changes = Vec::new();
+        for voice in self.potential_voices() {
+            let (target, fade_frames) = self.resolve_target(&voice);
+            let last = self.last_targets.get(&voice).copied().unwrap_or(1.0);
+            if (target - last).abs() > f32::EPSILON {
+                self.last_targets.insert(voice.clone(), target);
+                changes.push(DuckTargetChange {
+                    voice,
+                    target_volume: target,
+                    fade_frames,
+                });
+            }
+        }
+        changes
+    }
+
+    /// Every voice that could be ducked or could trigger ducking across all rules.
+    fn potential_voices(&self) -> HashSet<String> {
+        let mut voices = HashSet::new();
+        for rule in &self.rules {
+            voices.insert(rule.primary_voice.clone());
+            for ducked_voice in &rule.ducked_voices {
+                voices.insert(ducked_voice.clone());
+            }
+        }
+        voices
+    }
+
+    /// Resolve the target multiplier and fade length (in frames) for a voice
+    /// given the current active set. No applicable rule means restore to full
+    /// volume over the default restore time.
+    fn resolve_target(&self, voice_id: &str) -> (f32, usize) {
+        let applicable_rules = self.find_applicable_rules(voice_id);
+        if applicable_rules.is_empty() {
+            (1.0, self.ms_to_frames(2000))
+        } else {
+            let target = applicable_rules
+                .iter()
+                .map(|r| r.target_volume)
+                .min_by(|a, b| a.total_cmp(b))
+                .unwrap();
+            let fade_duration_ms = applicable_rules
+                .iter()
+                .map(|r| r.fade_duration_ms)
+                .min()
+                .unwrap();
+            (target, self.ms_to_frames(fade_duration_ms))
+        }
+    }
+
+    /// Update all duck states based on current voice activity. Part of the
+    /// reference ducking path exercised by the unit tests (see `notify_voice_active`).
+    #[allow(dead_code)]
     fn update_duck_states(&mut self) {
         // Get all voices that might need ducking (any voice in any rule)
         let mut all_potential_voices: std::collections::HashSet<String> =
@@ -290,6 +376,55 @@ impl DuckingEngine {
     /// Convert milliseconds to frames based on sample rate
     fn ms_to_frames(&self, ms: u32) -> usize {
         ((ms as f32 / 1000.0) * self.sample_rate as f32) as usize
+    }
+}
+
+/// Applies pre-resolved ducking target changes and advances the per-voice fades.
+/// This is the audio-thread half of ducking: it owns only the duck states and is
+/// driven entirely by [`DuckTargetChange`]s computed on the control thread, so the
+/// rule evaluation and active-voice bookkeeping stay off the real-time path.
+#[derive(Default)]
+pub struct DuckingApplier {
+    /// Duck states per voice.
+    duck_states: HashMap<String, DuckState>,
+}
+
+impl DuckingApplier {
+    /// Create an applier with no ducked voices.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply a resolved target change, starting a duck or restore fade for the voice.
+    pub fn apply_target(&mut self, change: &DuckTargetChange) {
+        let state = self
+            .duck_states
+            .entry(change.voice.clone())
+            .or_insert_with(DuckState::new);
+        if change.target_volume >= 1.0 {
+            state.begin_restore(change.fade_frames);
+        } else {
+            state.begin_duck(change.target_volume, change.fade_frames);
+        }
+    }
+
+    /// Get the ducking multiplier for a voice and advance its fade state.
+    /// Called from the mixer callback for each sample.
+    pub fn get_multiplier(&mut self, voice_id: &str, frames: usize) -> f32 {
+        if let Some(state) = self.duck_states.get_mut(voice_id) {
+            state.advance_and_get_multiplier(frames)
+        } else {
+            1.0
+        }
+    }
+
+    /// Get the ducking multiplier without advancing (for testing).
+    #[cfg(test)]
+    fn peek_multiplier(&self, voice_id: &str) -> f32 {
+        self.duck_states
+            .get(voice_id)
+            .map(|s| s.get_multiplier())
+            .unwrap_or(1.0)
     }
 }
 
@@ -671,5 +806,103 @@ mod tests {
             "Expected between 0.1 and 0.2, got {}",
             restoring
         );
+    }
+
+    #[test]
+    fn applier_ducks_then_restores() {
+        let mut applier = DuckingApplier::new();
+
+        // Duck "music" to 0.2 over 1000ms (48000 frames).
+        applier.apply_target(&DuckTargetChange {
+            voice: "music".to_string(),
+            target_volume: 0.2,
+            fade_frames: 48000,
+        });
+        applier.get_multiplier("music", 48000);
+        assert!(
+            (applier.peek_multiplier("music") - 0.2).abs() < 0.01,
+            "expected ducked to ~0.2, got {}",
+            applier.peek_multiplier("music")
+        );
+
+        // Restore over 2000ms (96000 frames).
+        applier.apply_target(&DuckTargetChange {
+            voice: "music".to_string(),
+            target_volume: 1.0,
+            fade_frames: 96000,
+        });
+        applier.get_multiplier("music", 96000);
+        assert!(
+            (applier.peek_multiplier("music") - 1.0).abs() < 0.01,
+            "expected restored to ~1.0, got {}",
+            applier.peek_multiplier("music")
+        );
+    }
+
+    #[test]
+    fn compute_changes_only_emits_on_target_move() {
+        let rules = vec![create_test_rule("narration", vec!["music"], 0.1, 1000)];
+        let mut engine = DuckingEngine::new(rules, 48000);
+
+        // Primary becomes active: "music" moves from 1.0 to 0.1, so one change.
+        let changes = engine.compute_changes("narration", true);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].voice, "music");
+        assert!((changes[0].target_volume - 0.1).abs() < 1e-6);
+
+        // Re-asserting the same activity does not move any target: no changes.
+        let again = engine.compute_changes("narration", true);
+        assert!(
+            again.is_empty(),
+            "expected no changes when targets are unchanged, got {:?}",
+            again
+        );
+
+        // Primary goes inactive: "music" restores to 1.0, so one change again.
+        let restore = engine.compute_changes("narration", false);
+        assert_eq!(restore.len(), 1);
+        assert_eq!(restore[0].voice, "music");
+        assert!((restore[0].target_volume - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn applier_matches_legacy_engine() {
+        // Drive the control-side compute_changes + applier and assert the
+        // multiplier tracks a legacy engine.notify_voice_active + get_multiplier.
+        let rule = create_test_rule("narration", vec!["music"], 0.3, 1000);
+
+        let mut legacy = DuckingEngine::new(vec![rule.clone()], 48000);
+        let mut control = DuckingEngine::new(vec![rule], 48000);
+        let mut applier = DuckingApplier::new();
+
+        // Activate the primary on both paths.
+        legacy.notify_voice_active("narration", true);
+        for change in control.compute_changes("narration", true) {
+            applier.apply_target(&change);
+        }
+
+        // Advance both in identical steps and compare the running multiplier.
+        for _ in 0..5 {
+            let l = legacy.get_multiplier("music", 9600);
+            let a = applier.get_multiplier("music", 9600);
+            assert!(
+                (l - a).abs() < 1e-4,
+                "applier {a} diverged from legacy engine {l}"
+            );
+        }
+
+        // Deactivate and compare through the restore.
+        legacy.notify_voice_active("narration", false);
+        for change in control.compute_changes("narration", false) {
+            applier.apply_target(&change);
+        }
+        for _ in 0..5 {
+            let l = legacy.get_multiplier("music", 9600);
+            let a = applier.get_multiplier("music", 9600);
+            assert!(
+                (l - a).abs() < 1e-4,
+                "applier {a} diverged from legacy engine {l} during restore"
+            );
+        }
     }
 }

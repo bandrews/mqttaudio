@@ -1,8 +1,13 @@
 // ABOUTME: Allocation-counting harness proving the mix path does no heap work per block.
 // ABOUTME: A dedicated test binary with a counting global allocator; arms around mix_audio.
 
+use mqttaudio::audio::ducking::{DuckTargetChange, DuckingApplier};
 use mqttaudio::audio::mixer::{mix_audio, ActiveSample};
 use mqttaudio::audio::test_support::{decoded, sine, SceneBuilder};
+use mqttaudio::rt_engine::{
+    command_channel, drain_commands, graveyard_channel, reap_finished, AudioCallbackState,
+};
+use parking_lot::Mutex;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -133,5 +138,110 @@ fn pitch_mix_path_is_allocation_free_after_warmup() {
     assert_eq!(
         deallocs, 0,
         "pitch mix path freed {deallocs} times across 8 blocks"
+    );
+}
+
+#[test]
+fn callback_step_is_allocation_free_after_warmup() {
+    // The full cpal callback step the engine runs each block — lock the bundled
+    // state, drain pending commands, mix, then reap finished samples into the
+    // graveyard — must do no heap work in steady state (D22a: the lock is
+    // uncontended and allocation-free; the control plane never touches this state).
+    //
+    // Representative scene: a plain sample, a looping sample, and a pitch-corrected
+    // sample, with a ducking applier carrying a target already applied to one voice.
+    let plain = ActiveSample::new(
+        1,
+        "a".to_string(),
+        decoded(sine(440.0, SR, SR as usize, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "a".to_string(),
+    );
+    let looping = ActiveSample::new_with_id(
+        2,
+        "b".to_string(),
+        decoded(sine(330.0, SR, 4800, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "b".to_string(),
+        None,
+        true,
+        0,
+    );
+    let mut pitched = ActiveSample::new(
+        3,
+        "p".to_string(),
+        decoded(sine(220.0, SR, SR as usize, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "p".to_string(),
+    );
+    pitched.enable_pitch_correction();
+    pitched.set_speed(0.7);
+
+    // Duck voice "a" to 0.5 over a long fade so the multiplier keeps advancing
+    // (exercising the applier's per-block fade update) without ever finishing.
+    let mut applier = DuckingApplier::new();
+    applier.apply_target(&DuckTargetChange {
+        voice: "a".to_string(),
+        target_volume: 0.5,
+        fade_frames: SR as usize * 10,
+    });
+
+    let mixer = SceneBuilder::new(2)
+        .sample(plain)
+        .sample(looping)
+        .sample(pitched)
+        .ducking(applier)
+        .build();
+
+    // Bundle the mixer with an (empty) command consumer and graveyard producer
+    // behind one uncontended mutex, exactly as the running engine does.
+    let (_cmd_tx, cmd_rx) = command_channel(1024);
+    let (grave_tx, _grave_rx) = graveyard_channel(1024);
+    let callback_state = Mutex::new(AudioCallbackState {
+        mixer,
+        commands: cmd_rx,
+        graveyard: grave_tx,
+        output_sample_rate: SR,
+    });
+
+    let mut block = vec![0.0f32; BLOCK * 2];
+
+    // One full callback step against the bundled state, mirroring run_mix_callback.
+    let step = |callback_state: &Mutex<AudioCallbackState>, block: &mut [f32]| {
+        let mut guard = callback_state.lock();
+        let acs = &mut *guard;
+        let AudioCallbackState {
+            mixer,
+            commands,
+            graveyard,
+            output_sample_rate,
+        } = acs;
+        drain_commands(commands, mixer, *output_sample_rate, 64);
+        mix_audio(block, mixer);
+        reap_finished(mixer, graveyard);
+    };
+
+    // Warm up off the armed region: sizes the pitch scratch, primes the stretcher,
+    // and grows any lazily-sized buffers so steady-state blocks are alloc-free.
+    for _ in 0..4 {
+        step(&callback_state, &mut block);
+    }
+
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..8 {
+            step(&callback_state, &mut block);
+        }
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "callback step allocated {allocs} times across 8 blocks"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "callback step freed {deallocs} times across 8 blocks"
     );
 }

@@ -558,11 +558,11 @@ pub async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
     };
 
     let (sample_count, input_count, output_channels) = {
-        let mixer = state.mixer_state.lock();
+        let snapshot = state.status.read().unwrap();
         (
-            mixer.active_samples.len(),
-            mixer.live_inputs.len(),
-            mixer.output_channels,
+            snapshot.active_samples,
+            snapshot.inputs.len(),
+            snapshot.output_channels,
         )
     };
     let voice_count = state.voice_manager.lock().voice_count();
@@ -588,42 +588,34 @@ pub async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn handle_samples(State(state): State<AppState>) -> impl IntoResponse {
-    let mixer = state.mixer_state.lock();
+    let snapshot = state.status.read().unwrap();
 
-    let samples: Vec<Value> = mixer
-        .active_samples
+    // The control thread owns this snapshot but not the live playback position,
+    // which the audio thread advances; position-derived fields are reported as 0.
+    let samples: Vec<Value> = snapshot
+        .samples
         .iter()
         .map(|s| {
-            let sample_rate = s.buffer.sample_rate();
-            let position_ms = if sample_rate > 0 {
-                (s.position as u64 * 1000) / sample_rate as u64
-            } else {
-                0
-            };
-            let total_ms = if sample_rate > 0 {
-                (s.buffer.frames() as u64 * 1000) / sample_rate as u64
+            let total_ms = if s.sample_rate > 0 {
+                (s.total_frames as u64 * 1000) / s.sample_rate as u64
             } else {
                 0
             };
             json!({
-                "internal_id": s.id.to_string(),
+                "internal_id": s.internal_id.to_string(),
                 "id": s.sample_id,
                 "voice": s.voice_id,
                 "file": s.file_path,
-                "position": s.position,
-                "position_ms": position_ms,
-                "total_frames": s.buffer.frames(),
+                "position": 0,
+                "position_ms": 0,
+                "total_frames": s.total_frames,
                 "total_ms": total_ms,
-                "sample_rate": sample_rate,
+                "sample_rate": s.sample_rate,
                 "volume": s.volume,
                 "voice_volume": s.voice_volume,
                 "speed": s.speed,
                 "loop_mode": s.loop_mode,
-                "progress_percent": if s.buffer.frames() > 0 {
-                    (s.position as f64 / s.buffer.frames() as f64 * 100.0).round()
-                } else {
-                    0.0
-                }
+                "progress_percent": 0.0
             })
         })
         .collect();
@@ -658,18 +650,17 @@ pub async fn handle_cache_status(State(state): State<AppState>) -> impl IntoResp
 }
 
 pub async fn handle_inputs(State(state): State<AppState>) -> impl IntoResponse {
-    let mixer = state.mixer_state.lock();
+    let snapshot = state.status.read().unwrap();
 
-    let inputs: Vec<Value> = mixer
-        .live_inputs
+    let inputs: Vec<Value> = snapshot
+        .inputs
         .iter()
-        .enumerate()
-        .map(|(idx, input)| {
+        .map(|input| {
             json!({
-                "index": idx,
+                "index": input.index,
                 "voice_id": input.voice_id,
                 "volume": input.volume,
-                "channels": input.input_channels,
+                "channels": input.channels,
                 "muted": input.volume == 0.0
             })
         })

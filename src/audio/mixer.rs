@@ -2,7 +2,7 @@
 // ABOUTME: Runs in audio callback thread with strict real-time constraints.
 
 use crate::audio::bass_management::BassManagement;
-use crate::audio::ducking::DuckingEngine;
+use crate::audio::ducking::DuckingApplier;
 use crate::audio::pitch_correction::PitchCorrector;
 use crate::audio::streaming::SampleBuffer;
 use ringbuf::HeapConsumer;
@@ -532,8 +532,8 @@ pub struct MixerState {
     /// Number of output channels
     pub output_channels: usize,
 
-    /// Ducking engine for automatic voice volume reduction
-    pub ducking_engine: Option<DuckingEngine>,
+    /// Applies pre-resolved ducking targets for automatic voice volume reduction
+    pub ducking_applier: Option<DuckingApplier>,
 
     /// Bass management for LFE extraction and crossover filtering
     pub bass_management: Option<BassManagement>,
@@ -546,7 +546,7 @@ impl MixerState {
             active_samples: Vec::new(),
             live_inputs: Vec::new(),
             output_channels,
-            ducking_engine: None,
+            ducking_applier: None,
             bass_management: None,
         }
     }
@@ -568,8 +568,8 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
     // Mix each active sample into the output
     for sample in &mut state.active_samples {
         // Get ducking multiplier for this sample's voice
-        let ducking_multiplier = if let Some(ref mut engine) = state.ducking_engine {
-            engine.get_multiplier(&sample.voice_id, frames)
+        let ducking_multiplier = if let Some(ref mut applier) = state.ducking_applier {
+            applier.get_multiplier(&sample.voice_id, frames)
         } else {
             1.0 // No ducking
         };
@@ -589,8 +589,8 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
     // Mix each live input into the output
     for input in &mut state.live_inputs {
         // Get ducking multiplier for this input's voice
-        let ducking_multiplier = if let Some(ref mut engine) = state.ducking_engine {
-            engine.get_multiplier(&input.voice_id, frames)
+        let ducking_multiplier = if let Some(ref mut applier) = state.ducking_applier {
+            applier.get_multiplier(&input.voice_id, frames)
         } else {
             1.0 // No ducking
         };

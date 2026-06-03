@@ -3,26 +3,42 @@
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
-use mqttaudio::audio::mixer::{ActiveSample, MixerState};
-use mqttaudio::audio::types::DecodedBuffer;
 use mqttaudio::cache::CacheManager;
-use mqttaudio::http::{create_router, AppState, LogBroadcaster};
+use mqttaudio::http::{create_router, AppState, LogBroadcaster, SampleStatus, StatusSnapshot};
 use mqttaudio::voice::VoiceManager;
 use parking_lot::Mutex;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tower::util::ServiceExt;
+
+/// Build a control-side `SampleStatus` with the static metadata the snapshot
+/// carries. Live position is audio-thread-owned and intentionally absent.
+fn sample_status(
+    internal_id: u64,
+    voice: &str,
+    file: &str,
+    total_frames: usize,
+    sample_rate: u32,
+) -> SampleStatus {
+    SampleStatus {
+        internal_id,
+        voice_id: voice.to_string(),
+        file_path: file.to_string(),
+        total_frames,
+        sample_rate,
+        ..Default::default()
+    }
+}
 
 /// Create a test AppState with mock components.
 fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
     let (cmd_tx, cmd_rx) = mpsc::channel::<String>(100);
 
-    let mixer_state = Arc::new(Mutex::new(MixerState {
-        active_samples: Vec::new(),
-        live_inputs: Vec::new(),
+    let status = Arc::new(RwLock::new(StatusSnapshot {
+        active_samples: 0,
         output_channels: 2,
-        ducking_engine: None,
-        bass_management: None,
+        samples: Vec::new(),
+        inputs: Vec::new(),
     }));
 
     let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));
@@ -32,7 +48,7 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
 
     let state = AppState {
         cmd_tx,
-        mixer_state,
+        status,
         voice_manager,
         cache_manager,
         auth_token: None,
@@ -556,34 +572,24 @@ async fn test_voice_volume_endpoint() {
 }
 
 #[tokio::test]
-async fn test_samples_endpoint_returns_position_ms() {
+async fn test_samples_endpoint_reports_timing_metadata() {
     let (state, _rx) = create_test_state();
 
-    // Create a test buffer: 48000 Hz sample rate, 2 channels, 96000 frames (2 seconds)
-    let sample_rate = 48000u32;
-    let frames = 96000usize; // 2 seconds of audio
-    let channels = 2usize;
-    let data = vec![0.5f32; frames * channels];
-    let buffer = Arc::new(DecodedBuffer::new(data, channels, sample_rate));
-
-    // Create an ActiveSample and set position to 1 second (48000 frames)
-    let position_frames = 48000usize; // 1 second at 48000 Hz
-    let expected_position_ms = 1000u64; // 1 second = 1000ms
-
-    let mut sample = ActiveSample::new(
-        1,
-        "test_voice".to_string(),
-        buffer,
-        1.0,
-        1.0,
-        "/test/audio.wav".to_string(),
-    );
-    sample.position = position_frames;
-
-    // Add sample to mixer state
+    // The control thread records each started sample's static metadata in the
+    // status snapshot. Live playback position is owned by the audio thread and
+    // is not in the snapshot (D20/D22a: the control plane never reads MixerState),
+    // so the position-derived fields are reported as 0 while total_ms / sample_rate
+    // remain truthful from the metadata.
     {
-        let mut mixer = state.mixer_state.lock();
-        mixer.active_samples.push(sample);
+        let mut snapshot = state.status.write().unwrap();
+        snapshot.active_samples = 1;
+        snapshot.samples.push(sample_status(
+            1,
+            "test_voice",
+            "/test/audio.wav",
+            96000, // 2 seconds of audio at 48 kHz
+            48000,
+        ));
     }
 
     let app = create_router(state, false, false);
@@ -609,19 +615,7 @@ async fn test_samples_endpoint_returns_position_ms() {
 
     let sample_json = &samples[0];
 
-    // Verify position_ms is present and correct
-    assert!(
-        sample_json.get("position_ms").is_some(),
-        "position_ms field should be present in response"
-    );
-    let position_ms = sample_json["position_ms"].as_u64().unwrap();
-    assert_eq!(
-        position_ms, expected_position_ms,
-        "position_ms should be {} but was {}",
-        expected_position_ms, position_ms
-    );
-
-    // Also verify other time-related fields are present
+    // total_ms is derived from the snapshot's total_frames + sample_rate.
     assert!(
         sample_json.get("total_ms").is_some(),
         "total_ms field should be present"
@@ -639,40 +633,31 @@ async fn test_samples_endpoint_returns_position_ms() {
     let returned_sample_rate = sample_json["sample_rate"].as_u64().unwrap();
     assert_eq!(returned_sample_rate, 48000, "sample_rate should be 48000");
 
-    // Verify position in frames is also still present
-    assert!(
-        sample_json.get("position").is_some(),
-        "position field (frames) should still be present"
-    );
+    // Live position is audio-thread-owned and not in the control-side snapshot,
+    // so these fields are reported as 0 (documented behavior under D20/D22a).
     let position = sample_json["position"].as_u64().unwrap();
-    assert_eq!(position, 48000, "position should be 48000 frames");
+    assert_eq!(position, 0, "position is not tracked control-side");
+    let position_ms = sample_json["position_ms"].as_u64().unwrap();
+    assert_eq!(position_ms, 0, "position_ms is not tracked control-side");
 }
 
 #[tokio::test]
-async fn test_samples_endpoint_position_ms_handles_zero_sample_rate() {
-    // This test verifies that position_ms handles edge cases gracefully.
-    // When sample_rate is 0 (e.g., still-loading streaming buffer), position_ms should be 0.
+async fn test_samples_endpoint_total_ms_handles_zero_sample_rate() {
+    // total_ms must handle the edge case gracefully: when sample_rate is 0
+    // (e.g. a still-loading streaming buffer recorded in the snapshot), the
+    // handler must not divide by zero and must report total_ms as 0.
     let (state, _rx) = create_test_state();
 
-    // Create a buffer with sample_rate 0 (simulating an edge case)
-    let sample_rate = 0u32;
-    let frames = 1000usize;
-    let channels = 2usize;
-    let data = vec![0.5f32; frames * channels];
-    let buffer = Arc::new(DecodedBuffer::new(data, channels, sample_rate));
-
-    let sample = ActiveSample::new(
-        1,
-        "test_voice".to_string(),
-        buffer,
-        1.0,
-        1.0,
-        "/test/audio.wav".to_string(),
-    );
-
     {
-        let mut mixer = state.mixer_state.lock();
-        mixer.active_samples.push(sample);
+        let mut snapshot = state.status.write().unwrap();
+        snapshot.active_samples = 1;
+        snapshot.samples.push(sample_status(
+            1,
+            "test_voice",
+            "/test/audio.wav",
+            1000, // frames
+            0,    // sample_rate 0 -> divide-by-zero guard
+        ));
     }
 
     let app = create_router(state, false, false);
@@ -695,12 +680,12 @@ async fn test_samples_endpoint_position_ms_handles_zero_sample_rate() {
     let samples = json["samples"].as_array().unwrap();
     assert_eq!(samples.len(), 1);
 
-    // With sample_rate 0, position_ms should be 0 (not cause a divide-by-zero)
+    // With sample_rate 0, total_ms should be 0 (not cause a divide-by-zero).
+    let total_ms = samples[0]["total_ms"].as_u64().unwrap();
+    assert_eq!(total_ms, 0, "total_ms should be 0 when sample_rate is 0");
+    // position_ms remains 0 as well (not tracked control-side).
     let position_ms = samples[0]["position_ms"].as_u64().unwrap();
-    assert_eq!(
-        position_ms, 0,
-        "position_ms should be 0 when sample_rate is 0"
-    );
+    assert_eq!(position_ms, 0, "position_ms should be 0");
 }
 
 #[tokio::test]

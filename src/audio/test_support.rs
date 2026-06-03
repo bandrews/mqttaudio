@@ -2,7 +2,7 @@
 // ABOUTME: Drives mix_audio deterministically and measures the resulting buffer.
 
 use crate::audio::bass_management::BassManagement;
-use crate::audio::ducking::DuckingEngine;
+use crate::audio::ducking::DuckingApplier;
 use crate::audio::mixer::{mix_audio, ActiveSample, LiveInput, MixerState};
 use crate::audio::types::DecodedBuffer;
 use std::sync::Arc;
@@ -37,7 +37,7 @@ pub struct SceneBuilder {
     output_channels: usize,
     samples: Vec<ActiveSample>,
     live_inputs: Vec<LiveInput>,
-    ducking_engine: Option<DuckingEngine>,
+    ducking_applier: Option<DuckingApplier>,
     bass_management: Option<BassManagement>,
 }
 
@@ -47,7 +47,7 @@ impl SceneBuilder {
             output_channels,
             samples: Vec::new(),
             live_inputs: Vec::new(),
-            ducking_engine: None,
+            ducking_applier: None,
             bass_management: None,
         }
     }
@@ -62,8 +62,8 @@ impl SceneBuilder {
         self
     }
 
-    pub fn ducking(mut self, engine: DuckingEngine) -> Self {
-        self.ducking_engine = Some(engine);
+    pub fn ducking(mut self, applier: DuckingApplier) -> Self {
+        self.ducking_applier = Some(applier);
         self
     }
 
@@ -77,7 +77,7 @@ impl SceneBuilder {
             active_samples: self.samples,
             live_inputs: self.live_inputs,
             output_channels: self.output_channels,
-            ducking_engine: self.ducking_engine,
+            ducking_applier: self.ducking_applier,
             bass_management: self.bass_management,
         }
     }

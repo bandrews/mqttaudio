@@ -8,22 +8,57 @@ mod websocket;
 pub use routes::create_router;
 pub use websocket::LogBroadcaster;
 
-use crate::audio::mixer::MixerState;
 use crate::cache::CacheManager;
 use crate::config::HttpConfig;
 use crate::voice::VoiceManager;
 use parking_lot::Mutex;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
+
+/// Per-sample status the control thread knows when a sample is started. Live
+/// playback position is owned by the audio thread and is not reflected here.
+#[derive(Clone, Default)]
+pub struct SampleStatus {
+    pub internal_id: u64,
+    pub sample_id: Option<String>,
+    pub voice_id: String,
+    pub file_path: String,
+    pub total_frames: usize,
+    pub sample_rate: u32,
+    pub volume: f32,
+    pub voice_volume: f32,
+    pub speed: f32,
+    pub loop_mode: bool,
+}
+
+/// Per-input status the control thread knows for a configured live input.
+#[derive(Clone, Default)]
+pub struct InputStatus {
+    pub index: usize,
+    pub voice_id: String,
+    pub volume: f32,
+    pub channels: usize,
+}
+
+/// Control-side view of what is playing, exposed to the HTTP status handlers.
+/// The control thread rebuilds it as it sends commands; the audio thread never
+/// touches it (D20). Live per-sample position is not available control-side.
+#[derive(Clone, Default)]
+pub struct StatusSnapshot {
+    pub active_samples: usize,
+    pub output_channels: usize,
+    pub samples: Vec<SampleStatus>,
+    pub inputs: Vec<InputStatus>,
+}
 
 /// Shared application state passed to all HTTP handlers.
 #[derive(Clone)]
 pub struct AppState {
     /// Channel to send commands (same as MQTT uses)
     pub cmd_tx: mpsc::Sender<String>,
-    /// Read-only access to mixer state for status queries
-    pub mixer_state: Arc<Mutex<MixerState>>,
+    /// Read-only control-side snapshot of what is playing, for status queries
+    pub status: Arc<RwLock<StatusSnapshot>>,
     /// Read-only access to voice manager for status queries
     pub voice_manager: Arc<Mutex<VoiceManager>>,
     /// Read-only access to cache manager for status queries
@@ -59,7 +94,7 @@ pub fn exposure_warning(
 pub async fn start_server(
     config: &HttpConfig,
     cmd_tx: mpsc::Sender<String>,
-    mixer_state: Arc<Mutex<MixerState>>,
+    status: Arc<RwLock<StatusSnapshot>>,
     voice_manager: Arc<Mutex<VoiceManager>>,
     cache_manager: Arc<tokio::sync::Mutex<CacheManager>>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
@@ -67,7 +102,7 @@ pub async fn start_server(
 
     let state = AppState {
         cmd_tx,
-        mixer_state,
+        status,
         voice_manager,
         cache_manager,
         auth_token: config.auth_token.clone(),
