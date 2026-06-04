@@ -153,6 +153,7 @@ Operational telemetry for monitoring. Every field is real — no placeholders.
     "memory_bytes": 1572864,
     "memory_entries": 3,
     "memory_headroom_bytes": 858993459,
+    "memory_cap_bytes": 1073741824,
     "disk_bytes": 0
   },
   "ducking": { "music": 0.1 }
@@ -171,6 +172,7 @@ Operational telemetry for monitoring. Every field is real — no placeholders.
 | `cache.memory_bytes` | integer | Resident decoded-audio bytes in the memory cache |
 | `cache.memory_entries` | integer | Number of decoded buffers resident |
 | `cache.memory_headroom_bytes` | integer / null | Bytes the cache can still accept under the budget (`null` if the budget is unlimited) |
+| `cache.memory_cap_bytes` | integer / null | The resolved hard memory-budget cap in bytes (`null` if the budget is unlimited); `memory_headroom_bytes` is the portion still free |
 | `cache.disk_bytes` | integer | Bytes held in the on-disk cache |
 | `ducking` | object | Map of voice id to its resolved ducking multiplier (`< 1.0` = ducked); voices at full volume are omitted |
 

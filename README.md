@@ -314,6 +314,15 @@ sudo journalctl -u mqttaudio -f
 The daemon exits non-zero when it cannot recover the audio device, so systemd's `Restart=on-failure` brings it
 back. See the comments at the top of the unit for the full install/hardening notes.
 
+The unit also sets `MemoryMax=75%` (with `MemoryAccounting=true`) as an OS-level memory backstop. The daemon
+already auto-sizes its decoded-audio cache to a fraction of available RAM and windows assets that would not fit
+(see [Large files, memory, and streaming](#large-files-memory-and-streaming)), but this hard cgroup limit bounds
+the *whole* process — so even a pathological case can only OOM-kill this one service (which then restarts),
+never the box. Tune it to your hardware (e.g. an absolute `MemoryMax=1500M`). It deliberately omits `MemoryHigh=`,
+whose reclaim throttling can stall the audio thread; the hard ceiling alone is the backstop. If you run the
+daemon outside systemd, apply an equivalent cgroup `memory.max` (or a container `--memory` limit) to get the
+same guarantee.
+
 ### Structured (JSON) logging
 
 For log aggregation, set the log format to JSON. Each record is then emitted as one JSON object per line

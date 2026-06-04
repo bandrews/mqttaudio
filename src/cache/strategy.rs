@@ -32,9 +32,27 @@ pub enum Strategy {
     Windowed,
 }
 
+/// A conservative decoded-size estimate from a file's on-disk byte size, used only as a
+/// fallback when the header carries no frame count (so `frames * channels * 4` is
+/// unavailable). Biased **up** so a large count-less asset still trips the budget/size
+/// checks and windows rather than full-loading into an OOM — the never-OOM guarantee
+/// must not depend on a frame count being present. A lossy codec decodes to many times
+/// its compressed bytes (f32 PCM at the output rate ≈ 10–25× the stored size), while
+/// lossless/PCM expands only modestly (f32 is at most 2× 16-bit PCM); unknown formats
+/// take the conservative (high) factor.
+fn decoded_size_estimate_from_file_size(file_len: u64, extension: Option<&str>) -> u64 {
+    let factor = match extension.map(str::to_ascii_lowercase).as_deref() {
+        Some("wav" | "wave" | "flac" | "aiff" | "aif" | "alac" | "wv") => 2,
+        _ => 25,
+    };
+    file_len.saturating_mul(factor)
+}
+
 /// Probe a local file's header (no packet decode) for a decoded-size estimate at
-/// `target_sample_rate`. Returns `None` if the file or its header could not be read,
-/// or the header carried no frame count.
+/// `target_sample_rate`. Returns `None` if the file or its header could not be read.
+/// When the header carries a frame count the estimate is exact (`frames * channels *
+/// 4`); otherwise it falls back to a conservative size-based estimate so a large
+/// count-less file is still recognized as too big to full-load.
 pub fn probe_local_file(
     path: &str,
     target_sample_rate: u32,
@@ -42,10 +60,10 @@ pub fn probe_local_file(
 ) -> Option<Probe> {
     let file = File::open(path).ok()?;
     let mut hint = Hint::new();
-    if let Some(ext) = std::path::Path::new(path)
+    let extension = std::path::Path::new(path)
         .extension()
-        .and_then(|e| e.to_str())
-    {
+        .and_then(|e| e.to_str());
+    if let Some(ext) = extension {
         hint.with_extension(ext);
     }
     // Constructing the decoder parses the container header (channels, rate, frame
@@ -55,8 +73,15 @@ pub fn probe_local_file(
     let channels = decoder.channels().max(1) as u64;
     // `estimated_frames()` is already scaled to the target (post-resample) rate.
     let est_frames = decoder.estimated_frames();
+    let est_decoded_bytes = match est_frames {
+        Some(f) => Some(f * channels * 4),
+        // No frame count: fall back to a conservative size-based estimate (biased up).
+        None => std::fs::metadata(path)
+            .ok()
+            .map(|m| decoded_size_estimate_from_file_size(m.len(), extension)),
+    };
     Some(Probe {
-        est_decoded_bytes: est_frames.map(|f| f * channels * 4),
+        est_decoded_bytes,
         est_seconds: est_frames.map(|f| f as f64 / target_sample_rate.max(1) as f64),
     })
 }
@@ -287,6 +312,66 @@ mod tests {
                 1
             ),
             Strategy::FullLoad
+        );
+    }
+
+    #[test]
+    fn size_fallback_biases_up_for_lossy_and_unknown() {
+        // Lossy codecs decode to many times their compressed size: bias up so a large
+        // count-less file windows rather than full-loading into an OOM.
+        assert_eq!(
+            decoded_size_estimate_from_file_size(1_000_000, Some("mp3")),
+            25_000_000
+        );
+        assert_eq!(
+            decoded_size_estimate_from_file_size(1_000_000, Some("ogg")),
+            25_000_000
+        );
+        // Case-insensitive, and an unknown/odd extension takes the conservative factor.
+        assert_eq!(
+            decoded_size_estimate_from_file_size(1_000_000, Some("MP3")),
+            25_000_000
+        );
+        assert_eq!(
+            decoded_size_estimate_from_file_size(1_000_000, Some("dat")),
+            25_000_000
+        );
+        assert_eq!(
+            decoded_size_estimate_from_file_size(1_000_000, None),
+            25_000_000
+        );
+    }
+
+    #[test]
+    fn size_fallback_is_modest_for_lossless() {
+        // PCM/lossless expands little (f32 over 16-bit), and these formats almost always
+        // carry a frame count anyway, so the fallback rarely governs them.
+        assert_eq!(
+            decoded_size_estimate_from_file_size(1_000_000, Some("wav")),
+            2_000_000
+        );
+        assert_eq!(
+            decoded_size_estimate_from_file_size(1_000_000, Some("flac")),
+            2_000_000
+        );
+    }
+
+    #[test]
+    fn size_fallback_estimate_can_force_windowed_under_auto() {
+        // A 50 MB count-less lossy file estimates to ~1.25 GB decoded → windowed under
+        // auto (and certainly over a real budget), so it never full-loads to an OOM.
+        let bytes = decoded_size_estimate_from_file_size(50 * 1024 * 1024, Some("mp3"));
+        let p = probe(Some(bytes), None);
+        assert_eq!(
+            decide(
+                LoadMode::Auto,
+                LoadMode::Auto,
+                &p,
+                MAX_BYTES,
+                MAX_SECONDS,
+                HUGE
+            ),
+            Strategy::Windowed
         );
     }
 

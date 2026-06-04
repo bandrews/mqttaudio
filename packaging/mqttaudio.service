@@ -27,6 +27,17 @@ ExecStart=/usr/local/bin/mqttaudio --config /etc/mqttaudio/config.json
 Restart=on-failure
 RestartSec=2
 
+# Memory backstop — the OS-level never-OOM guarantee. The daemon auto-sizes its
+# decoded-audio cache to a fraction of available RAM and windows assets that would not
+# fit, but this hard cgroup limit bounds the *whole* process so even a pathological case
+# can only OOM-kill this one service (which RestartSec above then restarts), never take
+# down the box. 75% of physical RAM leaves room for the cache (<=1 GiB by default) and
+# the rest of the system; tune to your device, or set an absolute value like
+# MemoryMax=1500M. Deliberately no MemoryHigh= — its reclaim throttling can stall the
+# audio thread and cause dropouts; the hard ceiling alone is the backstop.
+MemoryAccounting=true
+MemoryMax=75%
+
 # Run as an unprivileged dedicated user. SupplementaryGroups=audio grants access
 # to the ALSA sound devices (/dev/snd) the audio output stream needs.
 User=mqttaudio

@@ -409,8 +409,13 @@ async fn test_metrics_endpoint_includes_cache_and_budget() {
     assert!(cache["memory_bytes"].is_number());
     assert!(cache["memory_entries"].is_number());
     assert!(cache["disk_bytes"].is_number());
-    // The test cache has an unlimited budget (CacheManager::new), so headroom is null.
+    // The test cache has an unlimited budget (CacheManager::new), so both the cap and
+    // the headroom under it are null.
     assert!(cache["memory_headroom_bytes"].is_null());
+    assert!(
+        cache["memory_cap_bytes"].is_null(),
+        "unlimited budget must report a null cap"
+    );
 }
 
 #[tokio::test]

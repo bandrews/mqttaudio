@@ -10,13 +10,14 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   and loads the URL fully, and `mode=auto` always full-loads (no windowing decision is made). A later sprint
   adds HTTP windowed streaming, where the load decision can probe the source and reuse the same connection
   (avoiding a double GET). The hard memory cap still governs the *cache* of HTTP full-loads.
-- **Local auto-windowing relies on a header frame count (redesign S2 — LOW).** `mode=auto` probes the local
-  file's header (`cache::strategy::probe_local_file`) for a decoded-size estimate. A container that carries
-  no frame count yields no estimate, so the heuristic and budget checks do not trip and the asset full-loads
-  (`src/main.rs` `should_window_local` returns false on `None`). WAV/FLAC carry frame counts; a frame-count-less
-  MP3/OGG that is also very large could then full-load. Mitigate by tagging such assets `mode=stream`, or set
-  a non-`auto` `cache.load_mode`. (Auto-windowing for local files with a known size — the never-OOM guarantee
-  for a 2-hour 5.1 cue under the default `mode=auto` — is fully implemented in S2.)
+- **Local auto-windowing for header-less files (redesign S2 — RESOLVED).** `mode=auto` probes the local file's
+  header (`cache::strategy::probe_local_file`) for a decoded-size estimate. When the container carries a frame
+  count the estimate is exact (`frames * channels * 4`); when it does not (e.g. a frame-count-less VBR MP3/OGG),
+  it now falls back to a conservative size-based estimate (`decoded_size_estimate_from_file_size`, file bytes ×
+  a codec-class factor biased **up**), so a large count-less file still trips the budget/size checks and windows
+  rather than full-loading into an OOM. The estimate is approximate and biased toward windowing, so the only
+  residual is that an unusually large *compressed-but-would-fit* file may window (lose seek/loop/pitch) when a
+  full load would just barely have fit — the safe direction. Covered by `cache::strategy::tests::size_fallback_*`.
 - **Incremental HTTP-to-disk persistence of streamed plays is deferred (redesign S3 — LOW).** An ad-hoc HTTP
   `play` of an uncached URL streams to the *memory* cache only (`cache/mod.rs` `start_streaming_load`), so a
   restart re-downloads it. The blocking precache path (`precache_blocking`, `download_and_cache`) already
@@ -40,10 +41,9 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   (D22a), so these would need the audio thread to publish per-source atomics (ring fill, underrun counter) over
   a side channel into the control-side snapshot — the same plumbing pattern as the xruns `Arc<AtomicU64>`, but
   per voice. Deferred as low value for the disk-focused first client: the never-OOM guarantee is observable
-  today via `memory_headroom_bytes` (→ 0 is the pressure signal) and the windowing logs, and glitch-freeness is
-  gated by the alloc harness + render tests, not a runtime metric. The absolute resolved memory cap is logged
-  once at startup (`CacheManager::with_resolved_cap`) rather than re-exposed on `/metrics`; add a
-  `cache.memory_cap_bytes` gauge alongside the per-source atomics if a dashboard needs the denominator.
+  today via `memory_cap_bytes` and `memory_headroom_bytes` (→ 0 is the pressure signal) and the windowing logs,
+  and glitch-freeness is gated by the alloc harness + render tests, not a runtime metric. (The absolute resolved
+  cap is now surfaced as `cache.memory_cap_bytes`; the remaining gap is purely the per-source atomics.)
 - **`handle_command`'s own "Invalid JSON" 400 branch is unreachable (Sprint 9 F10 — discovered, LOW).**
   `src/http/handlers.rs` `handle_command` extracts `Json(body): Json<Value>` then maps a
   `serde_json::to_string(&body)` failure to `400 + CommandResponse::error("Invalid JSON: ...")`. But by the
@@ -57,14 +57,12 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   `WithRejection` wrapper) — a production change owned by the HTTP-handlers work, out of scope for the
   additive test-gap group. Left as-is and surfaced here.
 
-- **Deployment `Dockerfile` pins `rust:1.83` but the code uses `usize::is_multiple_of` (stable 1.87) (Sprint 8 — discovered, MEDIUM).**
-  `src/audio/streaming.rs` (pre-existing) and now `src/audio/input.rs` (Sprint 8 F6 de-interleave guard) call
-  `usize::is_multiple_of`, which clippy `-D warnings` actively *requires* (lint `manual_is_multiple_of`) on the
-  validate image (`docker/validate.Dockerfile`, `rust:1.95`). The separate **deployment** image
-  (`/Dockerfile`, `rust:1.83`) predates that API and would fail to compile. The validate gate (1.95) is the one
-  that enforces the lint, so Lane A is self-consistent; the deployment Dockerfile is the stale one. Bump
-  `/Dockerfile` to a Rust ≥ 1.87 builder (or add an MSRV pin + `#[allow(clippy::manual_is_multiple_of)]` and use
-  `% n == 0`). Out of scope for the input-RT work (touching the deployment image is Sprint 9 packaging).
+- **Deployment `Dockerfile` Rust version vs `usize::is_multiple_of` (stable 1.87) (Sprint 8 — RESOLVED).**
+  `src/audio/streaming.rs` and `src/audio/input.rs` call `usize::is_multiple_of`, which clippy `-D warnings`
+  *requires* (lint `manual_is_multiple_of`) on the validate image (`docker/validate.Dockerfile`, `rust:1.95`).
+  The deployment image (`/Dockerfile`) previously pinned `rust:1.83`, which predates that API and would fail to
+  compile. It now pins `rust:1.95-bookworm` (matching the validate image), so both images build the same code;
+  this is resolved. Left on record so the version coupling between the two Dockerfiles is documented.
 
 - **Drift control uses a pure-proportional loop, so the ring settles near — not exactly at — half-full (Sprint 8 — LOW, by design).**
   `steer_ratio` (`src/audio/input.rs`) is a P controller on the smoothed ring fill. Holding a steady clock

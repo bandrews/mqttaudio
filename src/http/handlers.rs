@@ -89,7 +89,7 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
 
     // Cache + memory-budget usage: resident decoded bytes, the headroom the auto-window
     // decision sees, and on-disk bytes. `null` headroom means an unlimited budget.
-    let (cache_memory_bytes, cache_memory_entries, cache_headroom, cache_disk_bytes) = {
+    let (cache_memory_bytes, cache_memory_entries, cache_headroom, cache_cap, cache_disk_bytes) = {
         let cache_mgr = state.cache_manager.lock().await;
         let mem = cache_mgr.memory_stats();
         let disk = cache_mgr.disk_stats();
@@ -97,6 +97,7 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
             mem.size_bytes,
             mem.entry_count,
             cache_mgr.memory_headroom(),
+            cache_mgr.memory_cap(),
             disk.size_bytes,
         )
     };
@@ -105,6 +106,8 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
     } else {
         json!(cache_headroom)
     };
+    // The resolved budget cap; null means an unlimited budget (no cap).
+    let cap_json = cache_cap.map(|c| json!(c)).unwrap_or(Value::Null);
 
     let (active_samples, active_inputs, output_channels) = {
         let snapshot = state.status.read().unwrap();
@@ -135,6 +138,7 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
             "memory_bytes": cache_memory_bytes,
             "memory_entries": cache_memory_entries,
             "memory_headroom_bytes": headroom_json,
+            "memory_cap_bytes": cap_json,
             "disk_bytes": cache_disk_bytes,
         },
         "ducking": ducking,

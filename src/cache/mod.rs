@@ -137,6 +137,12 @@ impl CacheManager {
         self.memory_cache.fit_headroom()
     }
 
+    /// The resolved hard memory cap in bytes, or `None` if the budget is unlimited.
+    /// `memory_headroom` is the portion of this cap still free right now.
+    pub fn memory_cap(&self) -> Option<usize> {
+        self.memory_cache.max_size_bytes()
+    }
+
     /// Whether `file_path` is already resident in the memory cache, so a replay can
     /// skip the probe/strategy decision and serve it directly. Does not touch LRU.
     pub fn is_resident(&self, file_path: &str) -> bool {
@@ -663,6 +669,30 @@ mod tests {
         let stats = cache_manager.memory_stats();
         assert_eq!(stats.entry_count, 0);
         assert_eq!(stats.size_bytes, 0);
+    }
+
+    #[test]
+    fn memory_cap_reports_the_resolved_budget() {
+        let temp_dir = TempDir::new().unwrap();
+        let bounded = CacheManager::with_resolved_cap(
+            temp_dir.path().to_path_buf(),
+            ResamplerQuality::Fast,
+            MemoryCap::Bytes(64 * 1024 * 1024),
+            Vec::new(),
+            300,
+        )
+        .unwrap();
+        assert_eq!(bounded.memory_cap(), Some(64 * 1024 * 1024));
+
+        let unlimited = CacheManager::with_resolved_cap(
+            temp_dir.path().to_path_buf(),
+            ResamplerQuality::Fast,
+            MemoryCap::Unlimited,
+            Vec::new(),
+            300,
+        )
+        .unwrap();
+        assert_eq!(unlimited.memory_cap(), None);
     }
 
     #[test]
