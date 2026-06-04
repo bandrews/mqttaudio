@@ -86,6 +86,51 @@ async fn start_test_server(serve_dir: PathBuf) -> (u16, oneshot::Sender<()>) {
     (port, shutdown_tx)
 }
 
+/// Start a server that serves one `/cue.wav` body and counts every request it receives,
+/// so a test can assert a replay hit disk (no extra GET).
+async fn start_counting_server(
+    body: Vec<u8>,
+) -> (
+    u16,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    oneshot::Sender<()>,
+) {
+    use axum::{extract::State, response::IntoResponse, routing::get, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let body = Arc::new(body);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    async fn serve(
+        State((count, body)): State<(Arc<AtomicUsize>, Arc<Vec<u8>>)>,
+    ) -> impl IntoResponse {
+        count.fetch_add(1, Ordering::SeqCst);
+        (
+            [(axum::http::header::CONTENT_TYPE, "audio/wav")],
+            (*body).clone(),
+        )
+    }
+
+    let app = Router::new()
+        .route("/cue.wav", get(serve))
+        .with_state((count.clone(), body));
+
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    (port, count, shutdown_tx)
+}
+
 #[tokio::test]
 async fn test_http_stream_with_streaming_decoder() {
     // Setup: create temp dir and test WAV file
@@ -838,4 +883,139 @@ async fn test_nonexistent_file_error() {
         .await;
 
     assert!(result.is_err(), "Should return error for nonexistent file");
+}
+
+#[tokio::test]
+async fn http_windowed_producer_buffers_a_remote_file_to_eof() {
+    use mqttaudio::audio::streamed_source::spawn_stream_from_source;
+    use mqttaudio::cache::http_stream::open_http_stream;
+    use std::sync::atomic::Ordering;
+
+    // A remote file is windowed through the production path: a bounded reader (O(channel)
+    // compressed bytes, back-pressured) feeds a bounded decoded ring (O(window) samples),
+    // then drained to EOF. This is the never-OOM path for big HTTP cues.
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("cue.wav");
+    generate_test_wav(&wav_path, 1.0); // 1 second
+    let (port, _shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/cue.wav", port);
+
+    // Open headers, then begin the bounded download and run the blocking producer.
+    let open = open_http_stream(&url).await.unwrap();
+    assert!(
+        open.content_length().is_some(),
+        "served WAV must advertise a Content-Length"
+    );
+    let reader = open.into_bounded_reader(None);
+    let window_frames = 4800; // 0.1 s ring — far smaller than the file
+    let mut handles = tokio::task::spawn_blocking(move || {
+        spawn_stream_from_source(reader, url, 48000, ResamplerQuality::Fast, window_frames)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(handles.channels, 2);
+
+    // Drain the bounded ring to EOF on a blocking thread.
+    let (total_frames, done) = tokio::task::spawn_blocking(move || {
+        let mut scratch = vec![0.0f32; 8192];
+        let mut total = 0usize;
+        for _ in 0..100_000 {
+            let n = handles.consumer.pop_slice(&mut scratch);
+            total += n / handles.channels.max(1);
+            if handles.producer_done.load(Ordering::Acquire) && handles.consumer.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        (total, handles.producer_done.load(Ordering::Acquire))
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        done,
+        "remote windowed producer must signal completion at EOF"
+    );
+    // 1 s resampled 44.1k -> 48k is ~48000 frames; allow resampler-latency slack.
+    assert!(
+        (44_000..=50_000).contains(&total_frames),
+        "expected ~48000 frames from the remote stream, got {total_frames}"
+    );
+}
+
+#[tokio::test]
+async fn cacheable_windowed_play_persists_and_replay_hits_disk() {
+    use mqttaudio::cache::http_stream::{open_http_stream, PersistTarget};
+    use mqttaudio::cache::CacheManager;
+    use std::io::Read as _;
+    use std::sync::atomic::Ordering;
+
+    // A WAV served by a request-counting server.
+    let wav_bytes = {
+        let d = TempDir::new().unwrap();
+        let p = d.path().join("src.wav");
+        generate_test_wav(&p, 0.5);
+        std::fs::read(&p).unwrap()
+    };
+    let content_length = wav_bytes.len() as u64;
+    let (port, count, _shutdown) = start_counting_server(wav_bytes).await;
+    let url = format!("http://127.0.0.1:{}/cue.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    // A large revalidation window so a freshly-recorded entry never triggers a
+    // conditional GET on replay (we are asserting zero extra requests).
+    let mut cm = CacheManager::with_options(
+        cache_dir.path().to_path_buf(),
+        ResamplerQuality::Fast,
+        0,
+        Vec::new(),
+        3600,
+    )
+    .unwrap();
+
+    // Tee the cacheable windowed download to disk, exactly as the windowed play does.
+    let (temp_path, final_path) = cm.windowed_persist_paths(&url);
+    let open = open_http_stream(&url).await.unwrap();
+    assert_eq!(open.content_length(), Some(content_length));
+    let content_type = open.content_type().map(|s| s.to_string());
+    let (done_tx, done_rx) = oneshot::channel::<u64>();
+    let reader = open.into_bounded_reader(Some(PersistTarget {
+        temp_path: temp_path.clone(),
+        final_path: final_path.clone(),
+        done: done_tx,
+    }));
+    // Draining the raw bytes to EOF lets the download finalize (rename + done signal).
+    tokio::task::spawn_blocking(move || {
+        let mut reader = reader;
+        let mut buf = [0u8; 4096];
+        while reader.read(&mut buf).map(|n| n > 0).unwrap_or(false) {}
+    })
+    .await
+    .unwrap();
+    let persisted = done_rx.await.expect("a cacheable download must finalize");
+    assert_eq!(persisted, content_length, "the whole file is teed to disk");
+    assert!(final_path.exists(), "final cache file must exist");
+    assert!(!temp_path.exists(), "temp file must be renamed away");
+
+    // Register it; a replay must then serve from disk with no extra GET.
+    cm.record_streamed_download(&url, persisted, None, None, content_type)
+        .unwrap();
+    assert!(cm.is_cached(&url), "URL must be cached after persisting");
+    let gets_after_download = count.load(Ordering::SeqCst);
+    assert_eq!(
+        gets_after_download, 1,
+        "the windowed download is a single GET"
+    );
+
+    let buffer = cm.get_or_load_streaming(&url, 48000).await.unwrap();
+    assert!(
+        buffer.frames() > 0,
+        "replay must decode audio from the disk file"
+    );
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        gets_after_download,
+        "replay must hit disk with zero extra GETs"
+    );
 }

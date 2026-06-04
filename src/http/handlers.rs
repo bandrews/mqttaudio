@@ -87,6 +87,28 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
     let xruns = state.xruns.load(Ordering::Relaxed);
     let voice_count = state.voice_manager.lock().voice_count();
 
+    // Cache + memory-budget usage: resident decoded bytes, the headroom the auto-window
+    // decision sees, and on-disk bytes. `null` headroom means an unlimited budget.
+    let (cache_memory_bytes, cache_memory_entries, cache_headroom, cache_cap, cache_disk_bytes) = {
+        let cache_mgr = state.cache_manager.lock().await;
+        let mem = cache_mgr.memory_stats();
+        let disk = cache_mgr.disk_stats();
+        (
+            mem.size_bytes,
+            mem.entry_count,
+            cache_mgr.memory_headroom(),
+            cache_mgr.memory_cap(),
+            disk.size_bytes,
+        )
+    };
+    let headroom_json = if cache_headroom == usize::MAX {
+        Value::Null
+    } else {
+        json!(cache_headroom)
+    };
+    // The resolved budget cap; null means an unlimited budget (no cap).
+    let cap_json = cache_cap.map(|c| json!(c)).unwrap_or(Value::Null);
+
     let (active_samples, active_inputs, output_channels) = {
         let snapshot = state.status.read().unwrap();
         (
@@ -112,6 +134,13 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
         "active_samples": active_samples,
         "active_inputs": active_inputs,
         "output_channels": output_channels,
+        "cache": {
+            "memory_bytes": cache_memory_bytes,
+            "memory_entries": cache_memory_entries,
+            "memory_headroom_bytes": headroom_json,
+            "memory_cap_bytes": cap_json,
+            "disk_bytes": cache_disk_bytes,
+        },
         "ducking": ducking,
     }))
 }
@@ -462,6 +491,24 @@ pub async fn handle_cache_invalidate(
 ) -> impl IntoResponse {
     let command = json!({
         "command": "cache_invalidate",
+        "message": { "file": params.file }
+    });
+
+    match send_command(&state, &command.to_string()).await {
+        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CommandResponse::error(&e)),
+        ),
+    }
+}
+
+pub async fn handle_cache_reload(
+    State(state): State<AppState>,
+    Json(params): Json<CacheInvalidateParams>,
+) -> impl IntoResponse {
+    let command = json!({
+        "command": "cache_reload",
         "message": { "file": params.file }
     });
 

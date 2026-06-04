@@ -410,6 +410,7 @@ async fn main() {
     let mixer = MixerState {
         active_samples: Vec::with_capacity(audio::mixer::MAX_VOICES),
         live_inputs: Vec::with_capacity(audio::mixer::MAX_LIVE_INPUTS),
+        streamed_sources: Vec::with_capacity(audio::mixer::MAX_STREAMED_SOURCES),
         output_channels,
         ducking_applier,
         bass_management,
@@ -426,6 +427,9 @@ async fn main() {
     // return ring so the callback never frees their heap.
     let (cmd_tx, cmd_rx) = rt_engine::command_channel(1024);
     let (grave_tx, mut grave_rx) = rt_engine::graveyard_channel(1024);
+    // Bounded well above MAX_STREAMED_SOURCES so the callback can always hand a
+    // finished source off for off-RT drop.
+    let (streamed_grave_tx, mut streamed_grave_rx) = rt_engine::streamed_graveyard_channel(256);
     let (cmd_return_tx, mut cmd_return_rx) = rt_engine::command_return_channel(1024);
 
     // Initialize audio inputs from config.
@@ -547,6 +551,7 @@ async fn main() {
         commands: cmd_rx,
         command_returns: cmd_return_tx,
         graveyard: grave_tx,
+        streamed_graveyard: streamed_grave_tx,
         output_sample_rate,
     }));
     let xruns = Arc::new(AtomicU64::new(0));
@@ -557,6 +562,7 @@ async fn main() {
     // snapshot the HTTP handlers read. `active_counts` drives ducking restore;
     // `playing` mirrors the live sample list for status (position excluded).
     let mut active_counts: HashMap<String, usize> = HashMap::new();
+    let mut streamed_voices: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut playing: HashMap<u64, http::SampleStatus> = HashMap::new();
     let status_snapshot = Arc::new(RwLock::new(http::StatusSnapshot {
         active_samples: 0,
@@ -571,9 +577,24 @@ async fn main() {
     // Create cache manager using config
     let cache_dir = config.cache_directory();
     let resampler_quality = config.advanced.resampler_quality;
-    let max_memory_mb = config.cache.max_memory_mb;
+    // Resolve the memory-cache cap from config + a one-shot read of system memory. The
+    // `auto` budget targets a clamped fraction of available RAM so the daemon never
+    // camps all of it; an explicit cap or `unlimited` overrides.
+    let available_memory = detect_available_memory();
+    let memory_cap = config.cache.resolve_memory_cap(available_memory);
     tracing::info!("Cache directory: {}", cache_dir.display());
     tracing::info!("Resampler quality: {:?}", resampler_quality);
+    match available_memory {
+        Some(avail) => tracing::info!(
+            "Memory budget resolved to {:?} ({:.0} MB available at startup)",
+            memory_cap,
+            avail as f64 / (1024.0 * 1024.0)
+        ),
+        None => tracing::info!(
+            "Memory budget resolved to {:?} (system memory not detectable)",
+            memory_cap
+        ),
+    }
 
     if config.security.allowed_directories.is_empty() {
         tracing::warn!(
@@ -592,10 +613,10 @@ async fn main() {
         );
     }
 
-    let cache_manager = match cache::CacheManager::with_options(
+    let cache_manager = match cache::CacheManager::with_resolved_cap(
         cache_dir,
         resampler_quality,
-        max_memory_mb,
+        memory_cap,
         config.security.allowed_directories.clone(),
         config.cache.revalidate_after_seconds,
     ) {
@@ -719,6 +740,10 @@ async fn main() {
     // Periodic reaper: drains finished samples returned by the audio thread,
     // decrements voice activity, and lets the ducking engine restore voices.
     let mut reaper_tick = tokio::time::interval(std::time::Duration::from_millis(20));
+    // Periodic HTTP freshness tick (stale-while-revalidate): refreshes stale remote
+    // cache entries out-of-band so a play never blocks on the network. Idle when
+    // freshness is pinned.
+    let mut freshness_tick = tokio::time::interval(std::time::Duration::from_secs(30));
 
     loop {
         tokio::select! {
@@ -745,6 +770,7 @@ async fn main() {
                             cmd_tx: &mut cmd_tx,
                             ducking_engine: &mut ducking_engine,
                             active_counts: &mut active_counts,
+                            streamed_voices: &mut streamed_voices,
                             playing: &mut playing,
                             snapshot: &status_snapshot,
                             ducking_snapshot: &ducking_snapshot,
@@ -763,16 +789,37 @@ async fn main() {
             _ = reaper_tick.tick() => {
                 reap_finished_samples(
                     &mut grave_rx,
+                    &mut streamed_grave_rx,
                     &mut cmd_return_rx,
                     &mut cmd_tx,
                     ducking_engine.as_mut(),
                     &mut active_counts,
+                    &mut streamed_voices,
                     &mut playing,
                     &status_snapshot,
                     &ducking_snapshot,
                     &input_statuses,
                     output_channels,
                 );
+            }
+            _ = freshness_tick.tick() => {
+                if config.cache.freshness != config::FreshnessMode::Pinned {
+                    // Dev re-checks every tick (zero window); trusting honours the
+                    // configured revalidation window.
+                    let window = if config.cache.freshness == config::FreshnessMode::Dev {
+                        std::time::Duration::ZERO
+                    } else {
+                        std::time::Duration::from_secs(config.cache.revalidate_after_seconds)
+                    };
+                    let n = cache_manager.lock().await.revalidate_stale_http(window).await;
+                    if n > 0 {
+                        tracing::info!(
+                            "Freshness tick refreshed {} stale HTTP cache entr{}",
+                            n,
+                            if n == 1 { "y" } else { "ies" }
+                        );
+                    }
+                }
             }
             _ = shutdown_signal() => {
                 tracing::info!("Shutdown signal received");
@@ -908,18 +955,58 @@ fn notify_voice_activity(
     }
 }
 
-/// Drain the graveyard and the command-return ring, dropping both finished samples
-/// and spent mutation commands off the audio thread, and reconcile control-side
-/// voice activity. When a voice's last sample finishes, the ducking engine computes
-/// restore targets that are sent back to the audio thread. Refreshes the status
-/// snapshot if anything was reaped.
+/// Read the system's available memory in bytes for the auto memory budget, or `None`
+/// if it cannot be determined (the budget then falls back to its bounded ceiling, never
+/// unlimited). A one-shot read at startup; no background polling.
+fn detect_available_memory() -> Option<u64> {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let available = sys.available_memory();
+    (available > 0).then_some(available)
+}
+
+/// Reconcile control-side bookkeeping for one finished voice-bearing entry (a sample
+/// or a streamed source): drop it from the live `playing` map and decrement its
+/// voice's active count; when that count reaches zero, restore the voice through the
+/// shared notify path (which, for a ducking primary, recomputes restore targets sent
+/// back to the audio thread). Returns whether the voice's count reached zero (it is
+/// now fully idle), so the caller can drop it from the streamed-voice set.
+fn reconcile_finished_voice(
+    voice: &str,
+    id: u64,
+    cmd_tx: &mut rt_engine::CommandProducer,
+    ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
+    active_counts: &mut std::collections::HashMap<String, usize>,
+    playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
+    ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
+) -> bool {
+    playing.remove(&id);
+    if let Some(count) = active_counts.get_mut(voice) {
+        *count -= 1;
+        if *count == 0 {
+            active_counts.remove(voice);
+            notify_voice_activity(voice, false, ducking_engine, cmd_tx, ducking_snapshot);
+            return true;
+        }
+    }
+    false
+}
+
+/// Drain the sample and streamed-source graveyards and the command-return ring,
+/// dropping finished voices and spent mutation commands off the audio thread, and
+/// reconcile control-side voice activity. When a voice's last sample or source
+/// finishes, the ducking engine computes restore targets that are sent back to the
+/// audio thread. Refreshes the status snapshot if anything was reaped.
 #[allow(clippy::too_many_arguments)]
 fn reap_finished_samples(
     grave_rx: &mut rt_engine::GraveyardConsumer,
+    streamed_grave_rx: &mut rt_engine::StreamedGraveyardConsumer,
     cmd_return_rx: &mut rt_engine::CommandReturnConsumer,
     cmd_tx: &mut rt_engine::CommandProducer,
     mut ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
     active_counts: &mut std::collections::HashMap<String, usize>,
+    streamed_voices: &mut std::collections::HashSet<String>,
     playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
     snapshot: &std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
     ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
@@ -938,24 +1025,40 @@ fn reap_finished_samples(
         let id = finished.id;
         // Dropping `finished` here is the off-RT free of the sample's buffers.
         drop(finished);
-
-        playing.remove(&id);
-        reaped += 1;
-
-        if let Some(count) = active_counts.get_mut(&voice) {
-            *count -= 1;
-            if *count == 0 {
-                active_counts.remove(&voice);
-                // Voice's last sample finished: restore through the shared notify path.
-                notify_voice_activity(
-                    &voice,
-                    false,
-                    ducking_engine.as_deref_mut(),
-                    cmd_tx,
-                    ducking_snapshot,
-                );
-            }
+        if reconcile_finished_voice(
+            &voice,
+            id,
+            cmd_tx,
+            ducking_engine.as_deref_mut(),
+            active_counts,
+            playing,
+            ducking_snapshot,
+        ) {
+            streamed_voices.remove(&voice);
         }
+        reaped += 1;
+    }
+
+    // Finished streamed sources reconcile the same way. The off-RT drop frees the
+    // source's ring buffer and Arcs here (never in the callback) and, via the
+    // source's Drop, signals its producer thread to stop (a no-op once it has already
+    // exited at EOF).
+    while let Some(finished) = streamed_grave_rx.pop() {
+        let voice = finished.voice_id.clone();
+        let id = finished.id;
+        drop(finished);
+        if reconcile_finished_voice(
+            &voice,
+            id,
+            cmd_tx,
+            ducking_engine.as_deref_mut(),
+            active_counts,
+            playing,
+            ducking_snapshot,
+        ) {
+            streamed_voices.remove(&voice);
+        }
+        reaped += 1;
     }
 
     if reaped > 0 {
@@ -973,6 +1076,9 @@ struct CommandCtx<'a> {
     cmd_tx: &'a mut rt_engine::CommandProducer,
     ducking_engine: &'a mut Option<audio::ducking::DuckingEngine>,
     active_counts: &'a mut std::collections::HashMap<String, usize>,
+    /// Voices that currently have a windowed/streamed source, so the seek/speed gate
+    /// can warn that those commands do not apply to them.
+    streamed_voices: &'a mut std::collections::HashSet<String>,
     playing: &'a mut std::collections::HashMap<u64, http::SampleStatus>,
     snapshot: &'a std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
     ducking_snapshot: &'a std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
@@ -1001,6 +1107,445 @@ impl CommandCtx<'_> {
     }
 }
 
+/// Start a windowed streamed play of a local file: spawn the bounded-ring producer,
+/// gate on a prebuffer for a glitch-free start, then hand a `StreamedSource` to the
+/// audio thread. Streamed voices play forward only — seek/loop-crossfade/reverse/
+/// speed/pitch do not apply (the producer loops by re-opening; the seek/speed command
+/// arms warn for these voices). Bypasses the cache, so it enforces the file allowlist.
+#[allow(clippy::too_many_arguments)]
+async fn handle_stream_play(
+    file: String,
+    id: Option<String>,
+    volume: f32,
+    voice: Option<String>,
+    channel_map: Option<Vec<mqtt::commands::ChannelMapping>>,
+    fade_in: Option<u32>,
+    loop_mode: bool,
+    window_ms: Option<u32>,
+    prebuffer_ms: Option<u32>,
+    ctx: &mut CommandCtx<'_>,
+) {
+    let config = ctx.config;
+    let output_sample_rate = ctx.output_sample_rate;
+
+    // A streamed play bypasses the cache, so enforce the file allowlist here.
+    if !config::Config::is_path_allowed(
+        std::path::Path::new(&file),
+        &config.security.allowed_directories,
+    ) {
+        tracing::error!(
+            "Streamed play of {} rejected: not permitted by allowed_directories",
+            file
+        );
+        return;
+    }
+
+    // Window + prebuffer (per-play override beats config).
+    let window_ms = window_ms.unwrap_or(config.cache.stream_window_ms);
+    let prebuffer_ms = prebuffer_ms.unwrap_or(config.cache.stream_prebuffer_ms);
+    let deadline_ms = config.cache.stream_prebuffer_deadline_ms.max(prebuffer_ms);
+    let rate = output_sample_rate as usize;
+    let window_frames = (window_ms as usize * rate / 1000).max(1);
+    let prebuffer_frames = prebuffer_ms as usize * rate / 1000;
+    let quality = config.advanced.resampler_quality;
+
+    // Open + probe is blocking, so run it off the async runtime; the producer then
+    // streams on its own dedicated thread.
+    let spawn_file = file.clone();
+    let handles = match tokio::task::spawn_blocking(move || {
+        audio::streamed_source::spawn_local_file_stream(
+            spawn_file,
+            output_sample_rate,
+            quality,
+            window_frames,
+            loop_mode,
+        )
+    })
+    .await
+    {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
+            tracing::error!("Failed to start streamed source for {}: {}", file, e);
+            return;
+        }
+        Err(e) => {
+            tracing::error!("Streamed source spawn task failed for {}: {}", file, e);
+            return;
+        }
+    };
+
+    finish_streamed_play(
+        handles,
+        file,
+        id,
+        volume,
+        voice,
+        channel_map,
+        fade_in,
+        loop_mode,
+        prebuffer_frames,
+        deadline_ms,
+        ctx,
+    )
+    .await;
+}
+
+/// Gate a freshly-spawned streamed source on its prebuffer, then build the StreamedSource
+/// and register it (voice activity, ducking, status, AddStreamedSource). Shared by the
+/// local-file and HTTP windowed-play paths.
+#[allow(clippy::too_many_arguments)]
+async fn finish_streamed_play(
+    handles: audio::streamed_source::StreamHandles,
+    file: String,
+    id: Option<String>,
+    volume: f32,
+    voice: Option<String>,
+    channel_map: Option<Vec<mqtt::commands::ChannelMapping>>,
+    fade_in: Option<u32>,
+    loop_mode: bool,
+    prebuffer_frames: usize,
+    deadline_ms: u32,
+    ctx: &mut CommandCtx<'_>,
+) {
+    use std::sync::atomic::Ordering;
+    let config = ctx.config;
+    let output_sample_rate = ctx.output_sample_rate;
+    let voice_id = voice.unwrap_or_else(next_auto_voice_id);
+
+    // Gate on the prebuffer so the first audio is glitch-free, but never wait past the
+    // deadline (start anyway; the underrun fade covers any gap). Polling with a tokio
+    // sleep never blocks a worker thread.
+    let started = tokio::time::Instant::now();
+    let deadline = std::time::Duration::from_millis(deadline_ms as u64);
+    loop {
+        let buffered = handles.frames_buffered.load(Ordering::Acquire);
+        if buffered >= prebuffer_frames || handles.producer_done.load(Ordering::Acquire) {
+            break;
+        }
+        if started.elapsed() >= deadline {
+            tracing::warn!(
+                "Streamed source {} hit the {}ms prebuffer deadline with {}/{} frames; \
+                 starting anyway",
+                file,
+                deadline_ms,
+                buffered,
+                prebuffer_frames
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+
+    // Resolve the internal id and the voice's current volume.
+    let mut voice_mgr = ctx.voice_manager.lock();
+    let internal_id = voice_mgr.add_sample_to_voice(&voice_id);
+    let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
+    drop(voice_mgr);
+
+    // Channel routing: resolve aliases if given, else default 1:1 over decoded channels.
+    let channels = handles.channels;
+    let resolved_map: Vec<(usize, usize)> = match channel_map {
+        Some(map) => {
+            let mut out = Vec::with_capacity(map.len());
+            for m in &map {
+                match (
+                    config.resolve_channel(&m.src),
+                    config.resolve_channel(&m.dest),
+                ) {
+                    (Ok(s), Ok(d)) => out.push((s, d)),
+                    (Err(e), _) | (_, Err(e)) => {
+                        tracing::error!("Failed to resolve channel alias for streamed play: {}", e);
+                        return;
+                    }
+                }
+            }
+            out
+        }
+        None => (0..channels).map(|c| (c, c)).collect(),
+    };
+
+    let mut source = audio::mixer::StreamedSource::new(
+        internal_id,
+        voice_id.clone(),
+        file.clone(),
+        id.clone(),
+        handles.consumer,
+        channels,
+        volume,
+        resolved_map,
+        handles.producer_done,
+        handles.stop_flag,
+    );
+    // Start at the voice's current level (no ramp), like a sample play.
+    source.voice_volume = voice_volume;
+    source.target_voice_volume = voice_volume;
+    if let Some(fade_ms) = fade_in {
+        source.set_fade(audio::mixer::FadeState::fade_in(
+            fade_ms,
+            output_sample_rate,
+        ));
+    }
+
+    let status = http::SampleStatus {
+        internal_id: source.id,
+        sample_id: source.sample_id.clone(),
+        voice_id: voice_id.clone(),
+        file_path: source.file_path.clone(),
+        total_frames: 0, // unbounded / unknown for a stream
+        sample_rate: output_sample_rate,
+        volume: source.volume,
+        voice_volume: source.voice_volume,
+        speed: 1.0,
+        loop_mode,
+    };
+
+    let became_active = !ctx.active_counts.contains_key(&voice_id);
+    if became_active {
+        notify_voice_activity(
+            &voice_id,
+            true,
+            ctx.ducking_engine.as_mut(),
+            ctx.cmd_tx,
+            ctx.ducking_snapshot,
+        );
+    }
+    *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
+    ctx.playing.insert(status.internal_id, status);
+    ctx.streamed_voices.insert(voice_id.clone());
+    ctx.send(rt_engine::AudioCommand::AddStreamedSource(source));
+    ctx.refresh();
+    tracing::info!(
+        "Now streaming {} (voice '{}'); {} active voices",
+        file,
+        voice_id,
+        ctx.playing.len()
+    );
+}
+
+/// For a local file with mode Auto/Full, decide whether to window it instead of fully
+/// loading it. Skips the decision (returns false) when the asset is already resident
+/// (a cache hit serves it directly, full-feature); otherwise probes the header off the
+/// async thread and applies the load-strategy decision against the live memory-budget
+/// headroom, so an over-budget asset is force-windowed (the never-OOM guarantee).
+async fn should_window_local(file: &str, mode: config::LoadMode, ctx: &CommandCtx<'_>) -> bool {
+    let config = ctx.config;
+    let rate = ctx.output_sample_rate;
+
+    let (resident, headroom) = {
+        let cache_mgr = ctx.cache_manager.lock().await;
+        (cache_mgr.is_resident(file), cache_mgr.memory_headroom())
+    };
+    if resident {
+        return false; // already decoded: serve from cache with full features
+    }
+
+    let quality = config.advanced.resampler_quality;
+    let file_owned = file.to_string();
+    let probe = tokio::task::spawn_blocking(move || {
+        cache::strategy::probe_local_file(&file_owned, rate, quality)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let Some(probe) = probe else {
+        return false; // header unreadable: let the full-load path surface the error
+    };
+
+    let strategy = cache::strategy::decide(
+        mode,
+        config.cache.load_mode,
+        &probe,
+        config.cache.full_load_max_bytes,
+        config.cache.full_load_max_seconds,
+        headroom,
+    );
+
+    if strategy == cache::strategy::Strategy::Windowed {
+        match probe.est_decoded_bytes {
+            Some(bytes) => tracing::info!(
+                "Windowing {} (estimated {:.0} MB decoded; cache headroom {:.0} MB)",
+                file,
+                bytes as f64 / (1024.0 * 1024.0),
+                headroom as f64 / (1024.0 * 1024.0)
+            ),
+            None => tracing::info!("Windowing {} per the configured load_mode", file),
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// For an HTTP URL, decide whether to window the play (bounded memory) and, if so, start
+/// a windowed download and register the streamed source. Returns true if it handled the
+/// play; false means the caller should fall back to the full (cache) load — the URL is
+/// already cached, the decision was a full load, or the open failed.
+///
+/// The cache state is read under a brief lock; the network open + decode spawn run
+/// without holding it. Only the windowed branch downloads a body, so a full-load
+/// fallback costs just the response headers. A live stream (no Content-Length) always
+/// windows — it has no finite end to full-load.
+#[allow(clippy::too_many_arguments)]
+async fn try_windowed_http_play(
+    file: &str,
+    id: Option<String>,
+    volume: f32,
+    voice: Option<String>,
+    channel_map: Option<Vec<mqtt::commands::ChannelMapping>>,
+    fade_in: Option<u32>,
+    mode: config::LoadMode,
+    window_ms: Option<u32>,
+    prebuffer_ms: Option<u32>,
+    cacheable: Option<bool>,
+    ctx: &mut CommandCtx<'_>,
+) -> bool {
+    let config = ctx.config;
+    let output_sample_rate = ctx.output_sample_rate;
+
+    // A cached URL serves full-featured from the cache; never window it.
+    let (cached, headroom) = {
+        let cm = ctx.cache_manager.lock().await;
+        (cm.is_cached(file), cm.memory_headroom())
+    };
+    if cached {
+        return false;
+    }
+
+    // Open the response (headers only) to learn the size, then decide.
+    let open = match cache::http_stream::open_http_stream(file).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(
+                "Windowed HTTP open failed for {}: {}; falling back to full load",
+                file,
+                e
+            );
+            return false;
+        }
+    };
+    let content_length = open.content_length();
+    let windowed = content_length.is_none()
+        || cache::strategy::decide(
+            mode,
+            config.cache.load_mode,
+            &cache::strategy::probe_http(content_length, file),
+            config.cache.full_load_max_bytes,
+            config.cache.full_load_max_seconds,
+            headroom,
+        ) == cache::strategy::Strategy::Windowed;
+    if !windowed {
+        return false; // drop `open` → connection closes; caller full-loads
+    }
+
+    // Window + prebuffer (per-play override beats config).
+    let window_ms = window_ms.unwrap_or(config.cache.stream_window_ms);
+    let prebuffer_ms = prebuffer_ms.unwrap_or(config.cache.stream_prebuffer_ms);
+    let deadline_ms = config.cache.stream_prebuffer_deadline_ms.max(prebuffer_ms);
+    let rate = output_sample_rate as usize;
+    let window_frames = (window_ms as usize * rate / 1000).max(1);
+    let prebuffer_frames = prebuffer_ms as usize * rate / 1000;
+    let quality = config.advanced.resampler_quality;
+
+    // A cacheable source (a finite Content-Length, not overridden to live) is teed to
+    // disk while it plays, so the next play of this URL hits disk with no extra request.
+    // A live stream (no Content-Length) or an explicit `cacheable: false` is never
+    // persisted. Registration happens off this path, after the download finalizes.
+    let is_cacheable = content_length.is_some() && cacheable != Some(false);
+    let persist = if is_cacheable {
+        let etag = open.etag().map(|s| s.to_string());
+        let last_modified = open.last_modified().map(|s| s.to_string());
+        let content_type = open.content_type().map(|s| s.to_string());
+        let (temp_path, final_path) = ctx.cache_manager.lock().await.windowed_persist_paths(file);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<u64>();
+        let cache_manager = std::sync::Arc::clone(ctx.cache_manager);
+        let url = file.to_string();
+        tokio::spawn(async move {
+            // Resolves only when the download finalized cleanly (temp renamed into place).
+            if let Ok(file_size) = done_rx.await {
+                let mut guard = cache_manager.lock().await;
+                match guard.record_streamed_download(
+                    &url,
+                    file_size,
+                    etag,
+                    last_modified,
+                    content_type,
+                ) {
+                    Ok(()) => tracing::info!(
+                        "Persisted streamed {} to disk cache ({} bytes)",
+                        url,
+                        file_size
+                    ),
+                    Err(e) => tracing::warn!("Failed to register persisted stream {}: {}", url, e),
+                }
+            }
+        });
+        Some(cache::http_stream::PersistTarget {
+            temp_path,
+            final_path,
+            done: done_tx,
+        })
+    } else {
+        None
+    };
+
+    let reader = open.into_bounded_reader(persist);
+    let label = file.to_string();
+    let handles = match tokio::task::spawn_blocking(move || {
+        audio::streamed_source::spawn_stream_from_source(
+            reader,
+            label,
+            output_sample_rate,
+            quality,
+            window_frames,
+        )
+    })
+    .await
+    {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
+            tracing::error!("Failed to start windowed HTTP source for {}: {}", file, e);
+            return true; // the stream was consumed; do not double-download via full load
+        }
+        Err(e) => {
+            tracing::error!("Windowed HTTP spawn task failed for {}: {}", file, e);
+            return true;
+        }
+    };
+
+    // HTTP windowed plays are forward-only and do not loop.
+    finish_streamed_play(
+        handles,
+        file.to_string(),
+        id,
+        volume,
+        voice,
+        channel_map,
+        fade_in,
+        false,
+        prebuffer_frames,
+        deadline_ms,
+        ctx,
+    )
+    .await;
+    true
+}
+
+/// Whether a selector targets a voice that currently has a windowed/streamed source.
+/// Streamed voices are forward-only, so seek/speed/pitch do not apply. Best-effort:
+/// it matches on the selector's voice (the common case) and is used only to warn — a
+/// stray seek/speed would be a structural no-op on streamed sources anyway, since they
+/// live in a separate voice list the sample-targeted commands never touch.
+fn selector_targets_streamed_voice(
+    selector: &mqtt::commands::SampleSelector,
+    streamed_voices: &std::collections::HashSet<String>,
+) -> bool {
+    selector
+        .voice
+        .as_deref()
+        .is_some_and(|v| streamed_voices.contains(v))
+}
+
 /// Apply a single parsed command to the shared audio state.
 async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<'_>) {
     let cache_manager = ctx.cache_manager;
@@ -1022,11 +1567,66 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             start_position_ms,
             loop_mode,
             crossfade_ms,
+            mode,
+            window_ms,
+            prebuffer_ms,
+            freshness,
+            cacheable,
         } => {
-            // Load file (with streaming support for faster startup)
+            // Windowed streaming gives bounded memory (O(window)) and low time-to-first-
+            // sample for big/long assets. `mode=stream` forces it; `auto`/`full` are
+            // decided from a cheap probe and the live memory budget, which force-windows
+            // an over-budget asset so a full load can never blow the cap (never-OOM).
+            // Local files probe the header; HTTP probes Content-Length on the same
+            // connection, and an unknown-size live stream always windows.
+            let is_http = file.starts_with("http://") || file.starts_with("https://");
+            if is_http {
+                if try_windowed_http_play(
+                    &file,
+                    id.clone(),
+                    volume,
+                    voice.clone(),
+                    channel_map.clone(),
+                    fade_in,
+                    mode,
+                    window_ms,
+                    prebuffer_ms,
+                    cacheable,
+                    ctx,
+                )
+                .await
+                {
+                    return;
+                }
+                // Not windowed (cached, fits the budget, or open failed): fall through to
+                // the full (cache) load below.
+            } else {
+                let go_windowed =
+                    mode == config::LoadMode::Stream || should_window_local(&file, mode, ctx).await;
+                if go_windowed {
+                    handle_stream_play(
+                        file,
+                        id,
+                        volume,
+                        voice,
+                        channel_map,
+                        fade_in,
+                        loop_mode,
+                        window_ms,
+                        prebuffer_ms,
+                        ctx,
+                    )
+                    .await;
+                    return;
+                }
+            }
+
+            // Load file (full in-memory load, with streaming support for faster startup).
+            // A per-play freshness override beats the configured default.
+            let resolved_freshness = freshness.unwrap_or(config.cache.freshness);
             let mut cache_mgr = cache_manager.lock().await;
             let buffer_result = cache_mgr
-                .get_or_load_streaming(&file, output_sample_rate)
+                .get_or_load_streaming_with_freshness(&file, output_sample_rate, resolved_freshness)
                 .await;
             drop(cache_mgr);
 
@@ -1401,6 +2001,22 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 }
             }
         }
+        mqtt::commands::AudioCommand::CacheReload { file } => {
+            // Invalidate then re-precache, so the next play is both fresh and instant —
+            // the explicit refresh path for a content pipeline that just republished
+            // an asset (no per-load freshness cost).
+            let mut cache_mgr = cache_manager.lock().await;
+            if let Err(e) = cache_mgr.invalidate(&file) {
+                tracing::error!("Failed to invalidate {} for reload: {}", file, e);
+            }
+            match cache_mgr
+                .precache_streaming(&file, output_sample_rate)
+                .await
+            {
+                Ok(()) => tracing::info!("Reloaded cache for: {}", file),
+                Err(e) => tracing::error!("Failed to reload {}: {}", file, e),
+            }
+        }
         mqtt::commands::AudioCommand::InputVolume {
             input,
             volume: new_volume,
@@ -1429,6 +2045,11 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         } => {
             if selector.is_empty() {
                 tracing::warn!("Seek command with empty selector - no samples targeted");
+            } else if selector_targets_streamed_voice(&selector, ctx.streamed_voices) {
+                tracing::warn!(
+                    "Seek is not supported for windowed/streamed voices; ignoring (a streamed \
+                     source plays forward only)"
+                );
             } else {
                 // The audio thread matches the selector against the live samples
                 // and converts ms to frames per sample's rate.
@@ -1446,6 +2067,11 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         } => {
             if selector.is_empty() {
                 tracing::warn!("Speed command with empty selector - no samples targeted");
+            } else if selector_targets_streamed_voice(&selector, ctx.streamed_voices) {
+                tracing::warn!(
+                    "Speed/pitch is not supported for windowed/streamed voices; ignoring (a \
+                     streamed source plays forward only)"
+                );
             } else {
                 let mode = if pitch_correction {
                     "pitch-corrected"
@@ -1600,9 +2226,12 @@ mod tests {
         cmd_return_rx: rt_engine::CommandReturnConsumer,
         grave_tx: rt_engine::GraveyardProducer,
         grave_rx: rt_engine::GraveyardConsumer,
+        streamed_grave_tx: rt_engine::StreamedGraveyardProducer,
+        streamed_grave_rx: rt_engine::StreamedGraveyardConsumer,
         mixer: MixerState,
         ducking_engine: Option<DuckingEngine>,
         active_counts: HashMap<String, usize>,
+        streamed_voices: std::collections::HashSet<String>,
         playing: HashMap<u64, http::SampleStatus>,
         snapshot: Arc<RwLock<http::StatusSnapshot>>,
         ducking_snapshot: Arc<RwLock<HashMap<String, f32>>>,
@@ -1633,6 +2262,7 @@ mod tests {
             let (cmd_tx, cmd_rx) = rt_engine::command_channel(1024);
             let (cmd_return_tx, cmd_return_rx) = rt_engine::command_return_channel(1024);
             let (grave_tx, grave_rx) = rt_engine::graveyard_channel(1024);
+            let (streamed_grave_tx, streamed_grave_rx) = rt_engine::streamed_graveyard_channel(256);
             Self {
                 cache_manager: Arc::new(tokio::sync::Mutex::new(cache)),
                 voice_manager: Arc::new(Mutex::new(VoiceManager::new())),
@@ -1642,9 +2272,12 @@ mod tests {
                 cmd_return_rx,
                 grave_tx,
                 grave_rx,
+                streamed_grave_tx,
+                streamed_grave_rx,
                 mixer,
                 ducking_engine,
                 active_counts: HashMap::new(),
+                streamed_voices: std::collections::HashSet::new(),
                 playing: HashMap::new(),
                 snapshot: Arc::new(RwLock::new(http::StatusSnapshot {
                     active_samples: 0,
@@ -1668,6 +2301,7 @@ mod tests {
                 cmd_tx: &mut self.cmd_tx,
                 ducking_engine: &mut self.ducking_engine,
                 active_counts: &mut self.active_counts,
+                streamed_voices: &mut self.streamed_voices,
                 playing: &mut self.playing,
                 snapshot: &self.snapshot,
                 ducking_snapshot: &self.ducking_snapshot,
@@ -1697,10 +2331,12 @@ mod tests {
         fn reap(&mut self) {
             reap_finished_samples(
                 &mut self.grave_rx,
+                &mut self.streamed_grave_rx,
                 &mut self.cmd_return_rx,
                 &mut self.cmd_tx,
                 self.ducking_engine.as_mut(),
                 &mut self.active_counts,
+                &mut self.streamed_voices,
                 &mut self.playing,
                 &self.snapshot,
                 &self.ducking_snapshot,
@@ -1734,6 +2370,31 @@ mod tests {
             start_position_ms: None,
             loop_mode: false,
             crossfade_ms: 0,
+            mode: config::LoadMode::Auto,
+            window_ms: None,
+            prebuffer_ms: None,
+            freshness: None,
+            cacheable: None,
+        }
+    }
+
+    /// A windowed/streamed Play (mode=stream) of the test WAV into `voice`.
+    fn play_stream(voice: Option<&str>) -> AudioCommand {
+        AudioCommand::Play {
+            file: TEST_WAV.to_string(),
+            id: None,
+            volume: 1.0,
+            voice: voice.map(str::to_string),
+            channel_map: None,
+            fade_in: None,
+            start_position_ms: None,
+            loop_mode: false,
+            crossfade_ms: 0,
+            mode: config::LoadMode::Stream,
+            window_ms: Some(200),
+            prebuffer_ms: Some(20),
+            freshness: None,
+            cacheable: None,
         }
     }
 
@@ -1772,6 +2433,111 @@ mod tests {
         assert_ne!(v0, v1, "two no-voice Plays must get distinct voice ids");
     }
 
+    fn seek_voice(voice: &str, position_ms: u64) -> AudioCommand {
+        AudioCommand::Seek {
+            selector: mqtt::commands::SampleSelector {
+                internal_id: None,
+                id: None,
+                file: None,
+                voice: Some(voice.to_string()),
+            },
+            position_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_play_emits_add_streamed_source_and_tracks_the_voice() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_stream(Some("bed"))).await;
+        fixture.drain();
+
+        // The windowed path adds a StreamedSource, not an ActiveSample.
+        assert_eq!(fixture.mixer.streamed_sources.len(), 1);
+        assert!(fixture.mixer.active_samples.is_empty());
+        assert_eq!(fixture.mixer.streamed_sources[0].voice_id, "bed");
+        // The voice is tracked so the seek/speed gate can warn for it.
+        assert!(fixture.streamed_voices.contains("bed"));
+    }
+
+    #[tokio::test]
+    async fn seek_on_a_streamed_voice_is_gated_and_pushes_nothing() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_stream(Some("bed"))).await;
+        fixture.drain(); // consume the AddStreamedSource; the ring is now empty
+
+        // A seek targeting the streamed voice is skipped (the gate warns instead of
+        // pushing a SeekMatching that would be a no-op on a forward-only ring).
+        fixture.run(seek_voice("bed", 1000)).await;
+        assert!(
+            fixture.cmd_rx.pop().is_none(),
+            "seek on a streamed voice must push no command"
+        );
+
+        // A seek on a normal voice still pushes (positive control).
+        fixture.run(seek_voice("other", 1000)).await;
+        assert!(
+            matches!(
+                fixture.cmd_rx.pop(),
+                Some(rt_engine::AudioCommand::SeekMatching { .. })
+            ),
+            "seek on a normal voice must still push SeekMatching"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_windows_a_local_asset_over_the_size_threshold() {
+        let mut fixture = Fixture::new(vec![]);
+        // Make the full-load threshold tiny so the 2 s test WAV exceeds it; mode=auto
+        // must then window it (the producer path) rather than fully decode it.
+        fixture.config.cache.full_load_max_bytes = 1000;
+        fixture.run(play(Some("bed"), 1.0)).await; // mode=auto
+        fixture.drain();
+
+        assert_eq!(
+            fixture.mixer.streamed_sources.len(),
+            1,
+            "an over-threshold asset must auto-window"
+        );
+        assert!(fixture.mixer.active_samples.is_empty());
+        assert!(fixture.streamed_voices.contains("bed"));
+    }
+
+    #[tokio::test]
+    async fn auto_full_loads_a_small_local_asset() {
+        let mut fixture = Fixture::new(vec![]);
+        // Default thresholds: the small test WAV is well under them -> full load.
+        fixture.run(play(Some("sfx"), 1.0)).await;
+        fixture.drain();
+
+        assert_eq!(
+            fixture.mixer.active_samples.len(),
+            1,
+            "a small asset must full-load (random-access, all features)"
+        );
+        assert!(fixture.mixer.streamed_sources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_full_keeps_full_load_even_over_the_size_threshold() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.config.cache.full_load_max_bytes = 1000; // tiny threshold
+                                                         // mode=full overrides the auto size threshold (the budget is unlimited in the
+                                                         // fixture, so nothing forces windowing).
+        let mut cmd = play(Some("v"), 1.0);
+        if let AudioCommand::Play { mode, .. } = &mut cmd {
+            *mode = config::LoadMode::Full;
+        }
+        fixture.run(cmd).await;
+        fixture.drain();
+
+        assert_eq!(
+            fixture.mixer.active_samples.len(),
+            1,
+            "mode=full must full-load regardless of the size threshold"
+        );
+        assert!(fixture.mixer.streamed_sources.is_empty());
+    }
+
     /// A Play of the test WAV with explicit `loop_mode`/`crossfade_ms`, for the
     /// crossfade-without-loop warning (F8).
     fn play_crossfade(loop_mode: bool, crossfade_ms: u32) -> AudioCommand {
@@ -1785,6 +2551,11 @@ mod tests {
             start_position_ms: None,
             loop_mode,
             crossfade_ms,
+            mode: config::LoadMode::Auto,
+            window_ms: None,
+            prebuffer_ms: None,
+            freshness: None,
+            cacheable: None,
         }
     }
 
@@ -2316,6 +3087,88 @@ mod tests {
             .expect("graveyard has room");
     }
 
+    /// Push a finished streamed source for `voice` into the streamed graveyard,
+    /// mirroring the RT thread reaping it, so the control-side reaper can reconcile it.
+    fn finish_streamed_source(fixture: &mut Fixture, voice: &str, id: u64) {
+        use std::sync::atomic::AtomicBool;
+        let (_producer, consumer) = ringbuf::HeapRb::<f32>::new(16).split();
+        let source = audio::mixer::StreamedSource::new(
+            id,
+            voice.to_string(),
+            "stream.wav".to_string(),
+            None,
+            consumer,
+            2,
+            1.0,
+            vec![(0, 0), (1, 1)],
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        fixture
+            .streamed_grave_tx
+            .push(source)
+            .ok()
+            .expect("streamed graveyard has room");
+    }
+
+    #[tokio::test]
+    async fn reaper_reconciles_a_finished_streamed_source() {
+        let mut fixture = Fixture::new(vec![]);
+
+        // A streamed voice is active (as the Play stream branch will register it).
+        fixture.active_counts.insert("bed".to_string(), 1);
+
+        // The RT thread hands a finished streamed source to the streamed graveyard;
+        // the control-side reaper drains it and clears the voice's active count.
+        finish_streamed_source(&mut fixture, "bed", 42);
+        fixture.reap();
+
+        assert!(
+            !fixture.active_counts.contains_key("bed"),
+            "a finished streamed source must clear its voice's active count off-RT"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaper_restores_ducking_when_last_streamed_source_finishes() {
+        // A streamed source acting as a ducking primary must restore the ducked voice
+        // when it finishes, through the same notify path as a sample (the reaper
+        // reconciles samples and streamed sources identically).
+        let rule = DuckingRule {
+            primary_voice: "bed".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0,
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        // Music plays; the streamed "bed" primary becomes active and ducks music.
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+        fixture.active_counts.insert("bed".to_string(), 1);
+        fixture.notify_voice("bed", true);
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            assert!(
+                applier.get_multiplier("music", 1) < 0.2,
+                "music should be ducked while the streamed bed is active"
+            );
+        }
+
+        // The streamed bed finishes: the reaper restores music toward full volume.
+        finish_streamed_source(&mut fixture, "bed", 7);
+        fixture.reap();
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            assert!(
+                (applier.get_multiplier("music", 1) - 1.0).abs() < 1e-6,
+                "music must restore once the streamed bed finishes"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn reaper_restores_ducking_and_clears_voice_when_last_sample_finishes() {
         let rule = DuckingRule {
@@ -2476,6 +3329,7 @@ mod tests {
         match cmd {
             rt_engine::AudioCommand::AddSample(_) => "AddSample",
             rt_engine::AudioCommand::AddLiveInput(_) => "AddLiveInput",
+            rt_engine::AudioCommand::AddStreamedSource(_) => "AddStreamedSource",
             rt_engine::AudioCommand::SetDuckTarget(_) => "SetDuckTarget",
             rt_engine::AudioCommand::FadeOutAll { .. } => "FadeOutAll",
             rt_engine::AudioCommand::FadeOutSamples { .. } => "FadeOutSamples",

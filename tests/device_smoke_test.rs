@@ -5,7 +5,8 @@ use cpal::traits::StreamTrait;
 use mqttaudio::audio::engine::{build_output_stream, find_output_config, find_output_device};
 use mqttaudio::audio::mixer::MixerState;
 use mqttaudio::rt_engine::{
-    command_channel, command_return_channel, graveyard_channel, AudioCallbackState,
+    command_channel, command_return_channel, graveyard_channel, streamed_graveyard_channel,
+    AudioCallbackState,
 };
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -36,11 +37,13 @@ fn default_output_device_opens_and_runs() {
     let (_cmd_tx, cmd_rx) = command_channel(1024);
     let (cmd_return_tx, _cmd_return_rx) = command_return_channel(1024);
     let (grave_tx, _grave_rx) = graveyard_channel(1024);
+    let (streamed_grave_tx, _streamed_grave_rx) = streamed_graveyard_channel(256);
     let callback_state = Arc::new(Mutex::new(AudioCallbackState {
         mixer,
         commands: cmd_rx,
         command_returns: cmd_return_tx,
         graveyard: grave_tx,
+        streamed_graveyard: streamed_grave_tx,
         output_sample_rate,
     }));
     let xruns = Arc::new(AtomicU64::new(0));

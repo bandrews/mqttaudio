@@ -5,6 +5,52 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 
 ## Deferred to a later sprint
 
+- **HTTP windowed streaming (redesign — RESOLVED).** Windowing now applies to `http://`/`https://` as well as
+  local files. An uncached HTTP `play` opens the response headers (`open_http_stream`), and the load decision
+  (`strategy::decide` + `strategy::probe_http` on `Content-Length`, against the live memory budget) routes a
+  big/over-budget/unknown-size URL to a windowed play; a small one falls through to the full (cache) load on the
+  same logic. A windowed HTTP play streams through a forward-only, back-pressured `BoundedHttpReader` (resident
+  memory O(channel) compressed bytes) feeding the decoded window ring (O(window) samples) — so even a multi-hour
+  WAV over HTTP cannot OOM. A live stream (no `Content-Length`) always windows (it has no finite end to
+  full-load). The windowed branch downloads a single request; a full-load fallback costs only the headers.
+  *Remaining piece:* persisting a cacheable windowed download to disk — see the incremental-persist entry below.
+- **Local auto-windowing for header-less files (redesign S2 — RESOLVED).** `mode=auto` probes the local file's
+  header (`cache::strategy::probe_local_file`) for a decoded-size estimate. When the container carries a frame
+  count the estimate is exact (`frames * channels * 4`); when it does not (e.g. a frame-count-less VBR MP3/OGG),
+  it now falls back to a conservative size-based estimate (`decoded_size_estimate_from_file_size`, file bytes ×
+  a codec-class factor biased **up**), so a large count-less file still trips the budget/size checks and windows
+  rather than full-loading into an OOM. The estimate is approximate and biased toward windowing, so the only
+  residual is that an unusually large *compressed-but-would-fit* file may window (lose seek/loop/pitch) when a
+  full load would just barely have fit — the safe direction. Covered by `cache::strategy::tests::size_fallback_*`.
+- **Incremental HTTP-to-disk persistence of windowed plays (redesign — RESOLVED for cacheable windowed plays).**
+  A windowed play of a *cacheable* HTTP URL (one with a `Content-Length`, not overridden `cacheable: false`)
+  now tees its download to a temp file and atomically renames it into the disk cache on completion, registering
+  the entry (`http_stream::PersistTarget`/`PersistSink` → `CacheManager::record_streamed_download`), so a
+  restart/replay hits disk with no extra GET (covered by
+  `streaming_test::cacheable_windowed_play_persists_and_replay_hits_disk`). A live source (no `Content-Length`)
+  or `cacheable: false` is intentionally not persisted. *Still not persisted:* an HTTP play that takes the
+  **full-load** streaming path (`start_streaming_load`, used when the asset is small enough to full-load and is
+  not yet disk-cached) writes only to the memory cache, so a restart re-downloads it — the blocking precache
+  path and `cache_reload` cover the managed case, and this only affects small, ad-hoc, never-precached URLs, so
+  it is left as is.
+- **The seek/speed gate for streamed voices is voice-keyed and best-effort (redesign S1 — LOW).**
+  `selector_targets_streamed_voice` (`src/main.rs`) warns when a Seek/Speed selector names a voice that has a
+  streamed source. A selector that targets a streamed source by `file`/`id` only, or a voice that mixes
+  streamed and full-load sources, may not warn — but the command is a structural no-op on streamed sources
+  regardless (they live in a separate voice list the sample-targeted commands never touch), so this is a UX
+  nicety, not a correctness gap.
+- **Per-streamed-source gauge telemetry is deferred (redesign S4 — LOW).** `/metrics` exposes the cache as
+  whole-system gauges (`cache.memory_bytes`/`memory_entries`/`memory_headroom_bytes`/`disk_bytes`, all real),
+  and the per-play windowing decision and its reason (estimated decoded MB vs. cache headroom MB) are emitted
+  as `tracing::info!` events in `should_window_local` (`src/main.rs`). What is **not** surfaced is
+  *per-streamed-source* runtime state: each windowed voice's ring fill level, its cumulative underrun-frame
+  count, and a live full-vs-windowed-per-voice list on `/status`. The control plane cannot read `MixerState`
+  (D22a), so these would need the audio thread to publish per-source atomics (ring fill, underrun counter) over
+  a side channel into the control-side snapshot — the same plumbing pattern as the xruns `Arc<AtomicU64>`, but
+  per voice. Deferred as low value for the disk-focused first client: the never-OOM guarantee is observable
+  today via `memory_cap_bytes` and `memory_headroom_bytes` (→ 0 is the pressure signal) and the windowing logs,
+  and glitch-freeness is gated by the alloc harness + render tests, not a runtime metric. (The absolute resolved
+  cap is now surfaced as `cache.memory_cap_bytes`; the remaining gap is purely the per-source atomics.)
 - **`handle_command`'s own "Invalid JSON" 400 branch is unreachable (Sprint 9 F10 — discovered, LOW).**
   `src/http/handlers.rs` `handle_command` extracts `Json(body): Json<Value>` then maps a
   `serde_json::to_string(&body)` failure to `400 + CommandResponse::error("Invalid JSON: ...")`. But by the
@@ -18,14 +64,12 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   `WithRejection` wrapper) — a production change owned by the HTTP-handlers work, out of scope for the
   additive test-gap group. Left as-is and surfaced here.
 
-- **Deployment `Dockerfile` pins `rust:1.83` but the code uses `usize::is_multiple_of` (stable 1.87) (Sprint 8 — discovered, MEDIUM).**
-  `src/audio/streaming.rs` (pre-existing) and now `src/audio/input.rs` (Sprint 8 F6 de-interleave guard) call
-  `usize::is_multiple_of`, which clippy `-D warnings` actively *requires* (lint `manual_is_multiple_of`) on the
-  validate image (`docker/validate.Dockerfile`, `rust:1.95`). The separate **deployment** image
-  (`/Dockerfile`, `rust:1.83`) predates that API and would fail to compile. The validate gate (1.95) is the one
-  that enforces the lint, so Lane A is self-consistent; the deployment Dockerfile is the stale one. Bump
-  `/Dockerfile` to a Rust ≥ 1.87 builder (or add an MSRV pin + `#[allow(clippy::manual_is_multiple_of)]` and use
-  `% n == 0`). Out of scope for the input-RT work (touching the deployment image is Sprint 9 packaging).
+- **Deployment `Dockerfile` Rust version vs `usize::is_multiple_of` (stable 1.87) (Sprint 8 — RESOLVED).**
+  `src/audio/streaming.rs` and `src/audio/input.rs` call `usize::is_multiple_of`, which clippy `-D warnings`
+  *requires* (lint `manual_is_multiple_of`) on the validate image (`docker/validate.Dockerfile`, `rust:1.95`).
+  The deployment image (`/Dockerfile`) previously pinned `rust:1.83`, which predates that API and would fail to
+  compile. It now pins `rust:1.95-bookworm` (matching the validate image), so both images build the same code;
+  this is resolved. Left on record so the version coupling between the two Dockerfiles is documented.
 
 - **Drift control uses a pure-proportional loop, so the ring settles near — not exactly at — half-full (Sprint 8 — LOW, by design).**
   `steer_ratio` (`src/audio/input.rs`) is a P controller on the smoothed ring fill. Holding a steady clock

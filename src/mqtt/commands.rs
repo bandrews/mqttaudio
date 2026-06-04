@@ -1,7 +1,7 @@
 // ABOUTME: MQTT command parsing and validation.
 // ABOUTME: Converts JSON messages to internal command types.
 
-use crate::config::ChannelRef;
+use crate::config::{ChannelRef, FreshnessMode, LoadMode};
 use serde::{Deserialize, Serialize};
 
 /// MQTT command envelope supporting both flattened and nested formats.
@@ -140,8 +140,16 @@ pub struct PlayMessage {
     pub loop_mode: Option<bool>, // Loop playback continuously
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crossfade_ms: Option<u32>, // Crossfade duration at loop boundaries (0 = disabled)
-                                   // Future fields for later phases:
-                                   // pub max_play_length: Option<i32>,    // Future
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<LoadMode>, // Load strategy override: auto|full|stream
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_ms: Option<u32>, // Windowed-source ring depth override (streamed plays)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prebuffer_ms: Option<u32>, // Windowed-source prebuffer override (streamed plays)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<FreshnessMode>, // Freshness override: trusting|dev|pinned
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cacheable: Option<bool>, // HTTP windowed plays: persist to disk (true, default) or treat as live (false)
 }
 
 /// Voice stop command parameters
@@ -281,10 +289,15 @@ pub enum AudioCommand {
         volume: f32,
         voice: Option<String>,
         channel_map: Option<Vec<ChannelMapping>>,
-        fade_in: Option<u32>,           // Fade in duration in milliseconds
-        start_position_ms: Option<u64>, // Start playback at this offset
-        loop_mode: bool,                // Loop playback continuously
-        crossfade_ms: u32,              // Crossfade duration at loop boundaries (0 = disabled)
+        fade_in: Option<u32>,             // Fade in duration in milliseconds
+        start_position_ms: Option<u64>,   // Start playback at this offset
+        loop_mode: bool,                  // Loop playback continuously
+        crossfade_ms: u32,                // Crossfade duration at loop boundaries (0 = disabled)
+        mode: LoadMode,                   // Resolved load strategy (auto|full|stream)
+        window_ms: Option<u32>,           // Windowed-source ring depth override
+        prebuffer_ms: Option<u32>,        // Windowed-source prebuffer override
+        freshness: Option<FreshnessMode>, // Freshness override (None => config default)
+        cacheable: Option<bool>, // HTTP windowed: persist to disk (None/true) or treat as live (false)
     },
     StopAll,
     VoiceStop {
@@ -303,6 +316,10 @@ pub enum AudioCommand {
     },
     CacheClear,
     CacheInvalidate {
+        file: String,
+    },
+    /// Invalidate a cached entry and re-precache it, so the next play is fresh+instant.
+    CacheReload {
         file: String,
     },
     InputVolume {
@@ -448,6 +465,11 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 start_position_ms: play_msg.start_position_ms,
                 loop_mode: play_msg.loop_mode.unwrap_or(false),
                 crossfade_ms: play_msg.crossfade_ms.unwrap_or(0),
+                mode: play_msg.mode.unwrap_or_default(),
+                window_ms: play_msg.window_ms,
+                prebuffer_ms: play_msg.prebuffer_ms,
+                freshness: play_msg.freshness,
+                cacheable: play_msg.cacheable,
             })
         }
         "stopall" | "soundStopAll" => Ok(AudioCommand::StopAll),
@@ -503,6 +525,15 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
 
             Ok(AudioCommand::CacheInvalidate {
                 file: invalidate_msg.file,
+            })
+        }
+        "cache_reload" => {
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let reload_msg: CacheInvalidateMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            Ok(AudioCommand::CacheReload {
+                file: reload_msg.file,
             })
         }
         "input_volume" => {
@@ -1234,6 +1265,15 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cache_reload_command() {
+        let json = r#"{"command": "cache_reload", "message": {"file": "/sounds/x.wav"}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::CacheReload { file } => assert_eq!(file, "/sounds/x.wav"),
+            _ => panic!("Expected CacheReload command"),
+        }
+    }
+
+    #[test]
     fn test_parse_cache_invalidate_missing_message() {
         let json = r#"{"command": "cache_invalidate"}"#;
         let result = parse_command(json);
@@ -1525,6 +1565,59 @@ mod tests {
         match cmd {
             AudioCommand::Play { crossfade_ms, .. } => {
                 assert_eq!(crossfade_ms, 0); // Defaults to 0 (disabled)
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_with_stream_mode_and_window() {
+        let json = r#"{"command": "play", "message": {"file": "long.wav", "mode": "stream", "window_ms": 2000, "prebuffer_ms": 100}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play {
+                mode,
+                window_ms,
+                prebuffer_ms,
+                ..
+            } => {
+                assert_eq!(mode, LoadMode::Stream);
+                assert_eq!(window_ms, Some(2000));
+                assert_eq!(prebuffer_ms, Some(100));
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_cacheable_override() {
+        // `cacheable: false` tags an HTTP source live (window, never persist).
+        let json = r#"{"command": "play", "message": {"file": "https://example.com/live.wav", "cacheable": false}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play { cacheable, .. } => assert_eq!(cacheable, Some(false)),
+            _ => panic!("Expected Play command"),
+        }
+        // Omitting it is backward compatible and resolves to None (cacheable default).
+        let json = r#"{"command": "play", "message": {"file": "https://example.com/cue.wav"}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play { cacheable, .. } => assert_eq!(cacheable, None),
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_defaults_mode_to_auto() {
+        // Omitting mode/window/prebuffer is backward compatible and resolves to Auto.
+        let json = r#"{"command": "play", "message": {"file": "sfx.wav"}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play {
+                mode,
+                window_ms,
+                prebuffer_ms,
+                ..
+            } => {
+                assert_eq!(mode, LoadMode::Auto);
+                assert_eq!(window_ms, None);
+                assert_eq!(prebuffer_ms, None);
             }
             _ => panic!("Expected Play command"),
         }

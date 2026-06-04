@@ -5,12 +5,12 @@ use mqttaudio::audio::ducking::{DuckTargetChange, DuckingApplier};
 use mqttaudio::audio::input::{
     convert_input_block, create_ring_buffer, resample_block, ResampleState,
 };
-use mqttaudio::audio::mixer::{mix_audio, ActiveSample, LiveInput};
+use mqttaudio::audio::mixer::{mix_audio, ActiveSample, LiveInput, StreamedSource};
 use mqttaudio::audio::test_support::{decoded, sine, SceneBuilder};
 use mqttaudio::mqtt::commands::SampleSelector;
 use mqttaudio::rt_engine::{
     command_channel, command_return_channel, drain_commands, graveyard_channel, reap_finished,
-    AudioCallbackState, AudioCommand,
+    reap_finished_streamed, streamed_graveyard_channel, AudioCallbackState, AudioCommand,
 };
 use parking_lot::Mutex;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -365,11 +365,13 @@ fn callback_step_is_allocation_free_after_warmup() {
     let (_cmd_tx, cmd_rx) = command_channel(1024);
     let (cmd_return_tx, _cmd_return_rx) = command_return_channel(1024);
     let (grave_tx, _grave_rx) = graveyard_channel(1024);
+    let (streamed_grave_tx, _streamed_grave_rx) = streamed_graveyard_channel(256);
     let callback_state = Mutex::new(AudioCallbackState {
         mixer,
         commands: cmd_rx,
         command_returns: cmd_return_tx,
         graveyard: grave_tx,
+        streamed_graveyard: streamed_grave_tx,
         output_sample_rate: SR,
     });
 
@@ -384,11 +386,13 @@ fn callback_step_is_allocation_free_after_warmup() {
             commands,
             command_returns,
             graveyard,
+            streamed_graveyard,
             output_sample_rate,
         } = acs;
         drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
         mix_audio(block, mixer);
         reap_finished(mixer, graveyard);
+        reap_finished_streamed(mixer, streamed_graveyard);
     };
 
     // Warm up off the armed region: sizes the pitch scratch, primes the stretcher,
@@ -441,11 +445,13 @@ fn draining_mutation_commands_is_free_free() {
     let (mut cmd_tx, cmd_rx) = command_channel(1024);
     let (cmd_return_tx, _cmd_return_rx) = command_return_channel(1024);
     let (grave_tx, _grave_rx) = graveyard_channel(1024);
+    let (streamed_grave_tx, _streamed_grave_rx) = streamed_graveyard_channel(256);
     let callback_state = Mutex::new(AudioCallbackState {
         mixer,
         commands: cmd_rx,
         command_returns: cmd_return_tx,
         graveyard: grave_tx,
+        streamed_graveyard: streamed_grave_tx,
         output_sample_rate: SR,
     });
     let mut block = vec![0.0f32; BLOCK * 2];
@@ -458,11 +464,13 @@ fn draining_mutation_commands_is_free_free() {
             commands,
             command_returns,
             graveyard,
+            streamed_graveyard,
             output_sample_rate,
         } = acs;
         drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
         mix_audio(block, mixer);
         reap_finished(mixer, graveyard);
+        reap_finished_streamed(mixer, streamed_graveyard);
     };
 
     // Warm up off the armed region.
@@ -526,11 +534,13 @@ fn adding_a_sample_into_the_reserved_pool_is_free_free() {
     let (mut cmd_tx, cmd_rx) = command_channel(1024);
     let (cmd_return_tx, _cmd_return_rx) = command_return_channel(1024);
     let (grave_tx, _grave_rx) = graveyard_channel(1024);
+    let (streamed_grave_tx, _streamed_grave_rx) = streamed_graveyard_channel(256);
     let callback_state = Mutex::new(AudioCallbackState {
         mixer,
         commands: cmd_rx,
         command_returns: cmd_return_tx,
         graveyard: grave_tx,
+        streamed_graveyard: streamed_grave_tx,
         output_sample_rate: SR,
     });
     let mut block = vec![0.0f32; BLOCK * 2];
@@ -543,11 +553,13 @@ fn adding_a_sample_into_the_reserved_pool_is_free_free() {
             commands,
             command_returns,
             graveyard,
+            streamed_graveyard,
             output_sample_rate,
         } = acs;
         drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
         mix_audio(block, mixer);
         reap_finished(mixer, graveyard);
+        reap_finished_streamed(mixer, streamed_graveyard);
     };
 
     for _ in 0..4 {
@@ -698,5 +710,86 @@ fn typed_capture_callback_body_is_allocation_free_after_warmup() {
     assert_eq!(
         deallocs, 0,
         "typed capture callback body freed {deallocs} times across 64 blocks"
+    );
+}
+
+#[test]
+fn windowed_source_mix_is_allocation_free_after_warmup() {
+    // A windowed StreamedSource consumes from a ring exactly like a live input. The
+    // armed region must do zero alloc/free on the RT thread across BOTH steady-state
+    // consume AND the 64-frame underrun hold-and-fade, so the ring is seeded with only
+    // a little audio and then left to underrun.
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let mut mixer = SceneBuilder::new(2).build();
+    let (mut producer, consumer) = create_ring_buffer(BLOCK * 2 * 4);
+    let seed = vec![0.3f32; BLOCK * 2]; // ~one block of stereo audio
+    producer.push_slice(&seed);
+    // producer_done stays false so the source never finishes (and is never reaped)
+    // during the test: it keeps mixing — first consuming the seed, then underrun-fading.
+    let source = StreamedSource::new(
+        1,
+        "bed".to_string(),
+        "stream.wav".to_string(),
+        None,
+        consumer,
+        2,
+        1.0,
+        vec![(0, 0), (1, 1)],
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    mixer.streamed_sources.push(source);
+
+    let (_cmd_tx, cmd_rx) = command_channel(1024);
+    let (cmd_return_tx, _cmd_return_rx) = command_return_channel(1024);
+    let (grave_tx, _grave_rx) = graveyard_channel(1024);
+    let (streamed_grave_tx, _streamed_grave_rx) = streamed_graveyard_channel(256);
+    let callback_state = Mutex::new(AudioCallbackState {
+        mixer,
+        commands: cmd_rx,
+        command_returns: cmd_return_tx,
+        graveyard: grave_tx,
+        streamed_graveyard: streamed_grave_tx,
+        output_sample_rate: SR,
+    });
+
+    let mut block = vec![0.0f32; BLOCK * 2];
+    let step = |callback_state: &Mutex<AudioCallbackState>, block: &mut [f32]| {
+        let mut guard = callback_state.lock();
+        let acs = &mut *guard;
+        let AudioCallbackState {
+            mixer,
+            commands,
+            command_returns,
+            graveyard,
+            streamed_graveyard,
+            output_sample_rate,
+        } = acs;
+        drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
+        mix_audio(block, mixer);
+        reap_finished(mixer, graveyard);
+        reap_finished_streamed(mixer, streamed_graveyard);
+    };
+
+    // Warm up off the armed region (one block consumes the seed; later blocks underrun).
+    for _ in 0..4 {
+        step(&callback_state, &mut block);
+    }
+
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..8 {
+            step(&callback_state, &mut block);
+        }
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "streamed-source mix allocated {allocs} times across 8 blocks (incl. underrun)"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "streamed-source mix freed {deallocs} times across 8 blocks (incl. underrun)"
     );
 }

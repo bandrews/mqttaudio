@@ -13,6 +13,7 @@ pub mod mixer;
 pub mod pitch_correction;
 pub mod rebuild;
 pub mod resampler;
+pub mod streamed_source;
 pub mod streaming;
 pub mod streaming_decoder;
 pub mod types;

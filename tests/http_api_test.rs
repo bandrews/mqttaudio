@@ -382,6 +382,43 @@ async fn test_cache_status_endpoint() {
 }
 
 #[tokio::test]
+async fn test_metrics_endpoint_includes_cache_and_budget() {
+    let (state, _rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    // Core telemetry stays present.
+    assert!(json["uptime_seconds"].is_number());
+    assert!(json["xruns"].is_number());
+
+    // Cache + memory-budget usage (the never-OOM observability).
+    let cache = &json["cache"];
+    assert!(cache.is_object(), "metrics must include a cache section");
+    assert!(cache["memory_bytes"].is_number());
+    assert!(cache["memory_entries"].is_number());
+    assert!(cache["disk_bytes"].is_number());
+    // The test cache has an unlimited budget (CacheManager::new), so both the cap and
+    // the headroom under it are null.
+    assert!(cache["memory_headroom_bytes"].is_null());
+    assert!(
+        cache["memory_cap_bytes"].is_null(),
+        "unlimited budget must report a null cap"
+    );
+}
+
+#[tokio::test]
 async fn test_inputs_endpoint() {
     let (state, _rx) = create_test_state();
     let app = create_router(state, false, false);

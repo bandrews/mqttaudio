@@ -215,14 +215,40 @@ pub struct CacheConfig {
     /// List of files to precache on startup
     #[serde(default)]
     pub precache: Vec<String>,
-    /// Maximum memory cache size in megabytes.
-    /// When exceeded, least-recently-used entries are evicted.
-    /// Set to 0 for unlimited (default: 512 MB).
+    /// Simple memory-cache cap in megabytes. `0` (the default) auto-detects a bounded
+    /// cap from system memory at startup; a positive value is an explicit hard cap of
+    /// that many MiB and always wins over the auto default. For an explicit `unlimited`
+    /// or to tune the auto fraction/clamp, set `memory_budget` (it overrides this).
     pub max_memory_mb: u32,
+    /// Advanced memory budget. When present it overrides `max_memory_mb`: a mode of
+    /// `auto` (a clamped fraction of available RAM), `explicit` (a fixed MiB cap), or
+    /// `unlimited` (opt out of the cap entirely — risks OOM on big files).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_budget: Option<MemoryBudget>,
     /// Block startup until all precache files are loaded.
     /// When true (default): App waits for all files to load before accepting commands.
     /// When false: App starts immediately, files load in background (lazy-load).
     pub precache_blocking: bool,
+    /// Window (ring) depth in milliseconds for windowed streamed sources. Bounds the
+    /// resident memory of each streamed voice independently of the asset's length.
+    pub stream_window_ms: u32,
+    /// Milliseconds of audio to prebuffer before a streamed source starts playing, so
+    /// the first audio is glitch-free.
+    pub stream_prebuffer_ms: u32,
+    /// Maximum milliseconds to wait for the prebuffer before starting anyway, so a slow
+    /// source never stalls playback (the underrun fade covers any gap).
+    pub stream_prebuffer_deadline_ms: u32,
+    /// Default load strategy when a Play does not specify one: `auto` (decide from the
+    /// asset's size/duration and the memory budget), `full`, or `stream`.
+    pub load_mode: LoadMode,
+    /// Auto threshold: a local asset whose estimated decoded size exceeds this many
+    /// bytes is windowed rather than fully loaded.
+    pub full_load_max_bytes: u64,
+    /// Auto threshold: a local asset longer than this many seconds is windowed.
+    pub full_load_max_seconds: u32,
+    /// Default freshness policy: `trusting` (serve cache, refresh in the background),
+    /// `dev` (re-check every load), or `pinned` (never auto-check).
+    pub freshness: FreshnessMode,
 }
 
 impl Default for CacheConfig {
@@ -232,8 +258,34 @@ impl Default for CacheConfig {
             directory: "~/.mqttaudio/cache".to_string(),
             revalidate_after_seconds: 300,
             precache: Vec::new(),
-            max_memory_mb: 512,
+            max_memory_mb: 0,
+            memory_budget: None,
             precache_blocking: true,
+            stream_window_ms: 1500,
+            stream_prebuffer_ms: 150,
+            stream_prebuffer_deadline_ms: 300,
+            load_mode: LoadMode::Auto,
+            full_load_max_bytes: 32 * 1024 * 1024,
+            full_load_max_seconds: 60,
+            freshness: FreshnessMode::Trusting,
+        }
+    }
+}
+
+impl CacheConfig {
+    /// Resolve the effective memory cap. `memory_budget` wins when present; otherwise
+    /// the simple `max_memory_mb` knob applies — `0` (the default) auto-detects a
+    /// bounded cap (so the daemon never camps all RAM), a positive value is an explicit
+    /// hard cap. `available_bytes` is the system's available memory (None => the auto
+    /// path falls back to its ceiling, never unlimited).
+    pub fn resolve_memory_cap(&self, available_bytes: Option<u64>) -> MemoryCap {
+        if let Some(budget) = self.memory_budget {
+            return budget.resolve(available_bytes);
+        }
+        if self.max_memory_mb == 0 {
+            MemoryBudget::default_auto().resolve(available_bytes)
+        } else {
+            MemoryCap::Bytes(mib_to_bytes(self.max_memory_mb))
         }
     }
 }
@@ -389,6 +441,129 @@ impl ResamplerQuality {
             ResamplerQuality::Maximum => 256,
         }
     }
+}
+
+/// How a Play chooses between fully loading an asset into memory (full random access:
+/// seek/loop/pitch) and windowed streaming (bounded memory, low time-to-first-sample).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum LoadMode {
+    /// Pick automatically from the asset's estimated size/duration and the memory
+    /// budget (the windowed path is forced when a full load would not fit).
+    #[default]
+    Auto,
+    /// Force a full in-memory load: all features (seek/loop/crossfade/reverse/speed/
+    /// pitch), at the cost of full decode latency and resident memory.
+    Full,
+    /// Force windowed streaming: bounded memory and low latency, but forward playback
+    /// only (no seek/loop-crossfade/reverse/variable-speed/pitch).
+    Stream,
+}
+
+/// Default fraction of available memory the auto budget targets.
+fn default_budget_fraction() -> f32 {
+    0.4
+}
+/// Default floor (MiB) for the auto budget, so small assets still cache on a tiny box.
+fn default_budget_floor_mb() -> u32 {
+    128
+}
+/// Default ceiling (MiB) for the auto budget, so the daemon never camps all RAM.
+fn default_budget_ceiling_mb() -> u32 {
+    1024
+}
+
+/// Convert mebibytes to bytes.
+fn mib_to_bytes(mib: u32) -> usize {
+    (mib as usize) * 1024 * 1024
+}
+
+/// How much memory the decoded-audio cache may use. Resolved once at startup (the
+/// `auto` mode reads system memory) into a [`MemoryCap`].
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum MemoryBudget {
+    /// No cap. Opt-in only: a single large file can then exhaust memory.
+    Unlimited,
+    /// A fixed hard cap of `mb` mebibytes.
+    Explicit { mb: u32 },
+    /// A clamped fraction of *available* system memory: `clamp(available * fraction,
+    /// floor_mb, ceiling_mb)`. The ceiling keeps the daemon from camping all RAM; the
+    /// floor keeps small assets cacheable on a tiny box. If autodetection fails the cap
+    /// falls back to `ceiling_mb` (never unlimited).
+    Auto {
+        #[serde(default = "default_budget_fraction")]
+        fraction: f32,
+        #[serde(default = "default_budget_floor_mb")]
+        floor_mb: u32,
+        #[serde(default = "default_budget_ceiling_mb")]
+        ceiling_mb: u32,
+    },
+}
+
+impl MemoryBudget {
+    /// The default `auto` budget (40% of available, clamped to [128 MiB, 1 GiB]).
+    pub fn default_auto() -> Self {
+        MemoryBudget::Auto {
+            fraction: default_budget_fraction(),
+            floor_mb: default_budget_floor_mb(),
+            ceiling_mb: default_budget_ceiling_mb(),
+        }
+    }
+
+    /// Resolve to a concrete cap. `available_bytes` is the system's available memory
+    /// (None if autodetection failed or was not attempted).
+    pub fn resolve(&self, available_bytes: Option<u64>) -> MemoryCap {
+        match *self {
+            MemoryBudget::Unlimited => MemoryCap::Unlimited,
+            MemoryBudget::Explicit { mb } => MemoryCap::Bytes(mib_to_bytes(mb)),
+            MemoryBudget::Auto {
+                fraction,
+                floor_mb,
+                ceiling_mb,
+            } => {
+                let floor = mib_to_bytes(floor_mb);
+                // Guard a misconfigured ceiling below the floor.
+                let ceiling = mib_to_bytes(ceiling_mb).max(floor);
+                let cap = match available_bytes {
+                    Some(avail) => {
+                        let target = (avail as f64 * fraction.clamp(0.0, 1.0) as f64) as usize;
+                        target.clamp(floor, ceiling)
+                    }
+                    None => ceiling,
+                };
+                MemoryCap::Bytes(cap)
+            }
+        }
+    }
+}
+
+/// A resolved memory-cache cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryCap {
+    /// No cap (the cache may grow without bound).
+    Unlimited,
+    /// A hard cap in bytes.
+    Bytes(usize),
+}
+
+/// How aggressively the cache checks whether an asset changed before serving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum FreshnessMode {
+    /// Serve the cached copy immediately; pick up local changes via a cheap `stat`
+    /// each load, and refresh remote entries in the background once past the
+    /// revalidation window. Never blocks a play on the network. (Default.)
+    #[default]
+    Trusting,
+    /// Check on every load: re-`stat` local files each play and revalidate remote
+    /// entries with no freshness window, so an edited asset is picked up immediately.
+    /// For active development.
+    Dev,
+    /// Never auto-check; changes are picked up only via an explicit reload or restart.
+    Pinned,
 }
 
 /// Advanced configuration settings.
@@ -808,6 +983,22 @@ impl Config {
         // Buffer size must be reasonable
         if self.audio.buffer_size < 64 || self.audio.buffer_size > 8192 {
             errors.push("audio.buffer_size must be between 64 and 8192".to_string());
+        }
+
+        // Streamed-source window and prebuffer must be sane and consistent.
+        if self.cache.stream_window_ms < 100 || self.cache.stream_window_ms > 60000 {
+            errors.push("cache.stream_window_ms must be between 100 and 60000".to_string());
+        }
+        if self.cache.stream_prebuffer_ms > self.cache.stream_window_ms {
+            errors.push(
+                "cache.stream_prebuffer_ms must not exceed cache.stream_window_ms".to_string(),
+            );
+        }
+        if self.cache.stream_prebuffer_deadline_ms < self.cache.stream_prebuffer_ms {
+            errors.push(
+                "cache.stream_prebuffer_deadline_ms must be >= cache.stream_prebuffer_ms"
+                    .to_string(),
+            );
         }
 
         // Channel volumes must be 0.0 to 1.0
@@ -1934,6 +2125,85 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_stream_knob_defaults() {
+        let config = Config::default();
+        assert_eq!(config.cache.stream_window_ms, 1500);
+        assert_eq!(config.cache.stream_prebuffer_ms, 150);
+        assert_eq!(config.cache.stream_prebuffer_deadline_ms, 300);
+    }
+
+    #[test]
+    fn test_cache_stream_knobs_parse_and_are_backward_compatible() {
+        // A config that omits the stream knobs keeps the defaults (backward compat).
+        let legacy: Config =
+            serde_json::from_str(r#"{"mqtt": {"topic": "t"}, "cache": {"max_memory_mb": 256}}"#)
+                .unwrap();
+        assert_eq!(legacy.cache.stream_window_ms, 1500);
+
+        // Explicit values are honoured.
+        let config: Config = serde_json::from_str(
+            r#"{"mqtt": {"topic": "t"}, "cache": {"stream_window_ms": 2000, "stream_prebuffer_ms": 200, "stream_prebuffer_deadline_ms": 400}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.cache.stream_window_ms, 2000);
+        assert_eq!(config.cache.stream_prebuffer_ms, 200);
+        assert_eq!(config.cache.stream_prebuffer_deadline_ms, 400);
+    }
+
+    #[test]
+    fn test_load_mode_serde_lowercase_and_default() {
+        assert_eq!(
+            serde_json::from_str::<LoadMode>("\"auto\"").unwrap(),
+            LoadMode::Auto
+        );
+        assert_eq!(
+            serde_json::from_str::<LoadMode>("\"full\"").unwrap(),
+            LoadMode::Full
+        );
+        assert_eq!(
+            serde_json::from_str::<LoadMode>("\"stream\"").unwrap(),
+            LoadMode::Stream
+        );
+        assert_eq!(LoadMode::default(), LoadMode::Auto);
+    }
+
+    #[test]
+    fn test_freshness_mode_serde_and_default() {
+        assert_eq!(
+            serde_json::from_str::<FreshnessMode>("\"trusting\"").unwrap(),
+            FreshnessMode::Trusting
+        );
+        assert_eq!(
+            serde_json::from_str::<FreshnessMode>("\"dev\"").unwrap(),
+            FreshnessMode::Dev
+        );
+        assert_eq!(
+            serde_json::from_str::<FreshnessMode>("\"pinned\"").unwrap(),
+            FreshnessMode::Pinned
+        );
+        assert_eq!(FreshnessMode::default(), FreshnessMode::Trusting);
+        assert_eq!(Config::default().cache.freshness, FreshnessMode::Trusting);
+    }
+
+    #[test]
+    fn test_validate_rejects_inconsistent_stream_config() {
+        // Prebuffer larger than the window is contradictory.
+        let mut config = Config::default();
+        config.mqtt.topic = Some("t".to_string());
+        config.cache.stream_window_ms = 500;
+        config.cache.stream_prebuffer_ms = 1000;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("stream_prebuffer_ms")));
+
+        // A zero window is rejected.
+        let mut config = Config::default();
+        config.mqtt.topic = Some("t".to_string());
+        config.cache.stream_window_ms = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("stream_window_ms")));
+    }
+
+    #[test]
     fn test_cache_precache_blocking_false() {
         let json = r#"{
             "mqtt": {"topic": "test"},
@@ -1962,7 +2232,8 @@ mod tests {
     #[test]
     fn test_cache_max_memory_mb_default() {
         let config = Config::default();
-        assert_eq!(config.cache.max_memory_mb, 512);
+        // The default is 0, which resolve_memory_cap interprets as auto-detect.
+        assert_eq!(config.cache.max_memory_mb, 0);
     }
 
     #[test]
@@ -1979,7 +2250,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_max_memory_mb_unlimited() {
+    fn test_cache_max_memory_mb_zero_resolves_to_auto() {
         let json = r#"{
             "mqtt": {"topic": "test"},
             "cache": {
@@ -1989,6 +2260,102 @@ mod tests {
 
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.cache.max_memory_mb, 0);
+        // 0 now means auto-detect a bounded cap (not unlimited): with no system reading
+        // it falls back to the auto ceiling, never MemoryCap::Unlimited.
+        assert_eq!(
+            config.cache.resolve_memory_cap(None),
+            MemoryCap::Bytes(1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_resolve_memory_cap_explicit_max_memory_mb_wins() {
+        let mut cfg = CacheConfig {
+            max_memory_mb: 256,
+            ..CacheConfig::default()
+        };
+        cfg.memory_budget = None;
+        assert_eq!(
+            cfg.resolve_memory_cap(Some(8 * 1024 * 1024 * 1024)),
+            MemoryCap::Bytes(256 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_resolve_memory_cap_auto_clamps_to_floor() {
+        // 40% of 100 MiB = 40 MiB, below the 128 MiB floor -> clamp up to the floor.
+        let cfg = CacheConfig::default();
+        assert_eq!(
+            cfg.resolve_memory_cap(Some(100 * 1024 * 1024)),
+            MemoryCap::Bytes(128 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_resolve_memory_cap_auto_clamps_to_ceiling() {
+        // 40% of 100 GiB is far above the 1 GiB ceiling -> clamp down to the ceiling.
+        let cfg = CacheConfig::default();
+        assert_eq!(
+            cfg.resolve_memory_cap(Some(100 * 1024 * 1024 * 1024)),
+            MemoryCap::Bytes(1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_resolve_memory_cap_auto_in_band() {
+        // 40% of 1 GiB ~= 410 MiB, within [128, 1024].
+        let cfg = CacheConfig::default();
+        match cfg.resolve_memory_cap(Some(1024 * 1024 * 1024)) {
+            MemoryCap::Bytes(b) => assert!(
+                b > 380 * 1024 * 1024 && b < 440 * 1024 * 1024,
+                "expected ~410 MiB, got {b} bytes"
+            ),
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_memory_cap_explicit_budget_overrides_max_memory_mb() {
+        let cfg = CacheConfig {
+            max_memory_mb: 256,
+            memory_budget: Some(MemoryBudget::Explicit { mb: 64 }),
+            ..CacheConfig::default()
+        };
+        assert_eq!(
+            cfg.resolve_memory_cap(Some(8 * 1024 * 1024 * 1024)),
+            MemoryCap::Bytes(64 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_resolve_memory_cap_unlimited_is_an_explicit_opt_out() {
+        let cfg = CacheConfig {
+            memory_budget: Some(MemoryBudget::Unlimited),
+            ..CacheConfig::default()
+        };
+        assert_eq!(cfg.resolve_memory_cap(Some(1024)), MemoryCap::Unlimited);
+        // Distinct from the legacy 0 path, which is now auto (bounded), not unlimited.
+        assert_ne!(
+            CacheConfig::default().resolve_memory_cap(None),
+            MemoryCap::Unlimited
+        );
+    }
+
+    #[test]
+    fn test_memory_budget_serde_modes() {
+        assert_eq!(
+            serde_json::from_str::<MemoryBudget>(r#"{"mode":"unlimited"}"#).unwrap(),
+            MemoryBudget::Unlimited
+        );
+        assert_eq!(
+            serde_json::from_str::<MemoryBudget>(r#"{"mode":"explicit","mb":256}"#).unwrap(),
+            MemoryBudget::Explicit { mb: 256 }
+        );
+        // Auto with omitted params uses the defaults.
+        assert_eq!(
+            serde_json::from_str::<MemoryBudget>(r#"{"mode":"auto"}"#).unwrap(),
+            MemoryBudget::default_auto()
+        );
     }
 
     #[test]
@@ -2491,7 +2858,7 @@ mod tests {
     #[test]
     fn test_merge_cli_args_max_cache_mb() {
         let mut config = Config::default();
-        assert_eq!(config.cache.max_memory_mb, 512); // default
+        assert_eq!(config.cache.max_memory_mb, 0); // default (auto-detect)
 
         config.merge_cli_args(
             None,

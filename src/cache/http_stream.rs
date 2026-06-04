@@ -1,11 +1,17 @@
 // ABOUTME: HTTP stream adapter that implements Symphonia's MediaSource trait.
 // ABOUTME: Buffers downloaded bytes to support seeking within the buffered region.
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use symphonia::core::io::MediaSource;
+use tokio::sync::mpsc;
+
+/// How many downloaded chunks may be in flight in a [`BoundedHttpReader`]'s channel
+/// before the download task parks. This bounds the reader's resident memory to roughly
+/// this many reqwest chunks (tens of KB each), independent of the file's total length.
+const WINDOWED_CHUNK_CHANNEL_CAPACITY: usize = 16;
 
 /// Error type for HTTP streaming operations
 #[derive(Debug)]
@@ -318,10 +324,384 @@ pub async fn start_http_stream(url: &str) -> Result<HttpStreamReader, HttpStream
     Ok(reader)
 }
 
+/// Where a cacheable windowed download is teed on disk: bytes are written to `temp_path`
+/// as they arrive and atomically renamed to `final_path` on success, then the byte count
+/// is sent on `done` so the caller can register the cache entry. On failure the temp file
+/// is removed and `done` is dropped (its receiver sees a cancelled channel — no entry).
+pub struct PersistTarget {
+    pub temp_path: std::path::PathBuf,
+    pub final_path: std::path::PathBuf,
+    pub done: tokio::sync::oneshot::Sender<u64>,
+}
+
+/// An opened HTTP response whose headers (status, Content-Length, and cache validators)
+/// have been read but whose body has not been downloaded yet. The caller decides from
+/// `content_length` whether to window the play
+/// ([`into_bounded_reader`](OpenHttpStream::into_bounded_reader), which starts the bounded
+/// download) or to fall back to a full load (drop this, which closes the connection) — so
+/// a windowed play needs only a single request.
+pub struct OpenHttpStream {
+    response: reqwest::Response,
+    content_length: Option<u64>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    content_type: Option<String>,
+}
+
+/// Read a response header as an owned string, if present and valid UTF-8.
+fn header_string(response: &reqwest::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Open an HTTP URL and read its response headers, without downloading the body. Fails
+/// on a connection error or a non-success status.
+pub async fn open_http_stream(url: &str) -> Result<OpenHttpStream, HttpStreamError> {
+    let response = reqwest::get(url)
+        .await
+        .map_err(|e| HttpStreamError::Request(format!("Failed to connect: {}", e)))?;
+    if !response.status().is_success() {
+        return Err(HttpStreamError::Request(format!(
+            "HTTP {} from {}",
+            response.status(),
+            url
+        )));
+    }
+    let content_length = response.content_length();
+    let etag = header_string(&response, "etag");
+    let last_modified = header_string(&response, "last-modified");
+    let content_type = header_string(&response, "content-type");
+    Ok(OpenHttpStream {
+        response,
+        content_length,
+        etag,
+        last_modified,
+        content_type,
+    })
+}
+
+impl OpenHttpStream {
+    /// The body length from the `Content-Length` header, if the server sent one.
+    pub fn content_length(&self) -> Option<u64> {
+        self.content_length
+    }
+
+    /// The `ETag` validator, if present.
+    pub fn etag(&self) -> Option<&str> {
+        self.etag.as_deref()
+    }
+
+    /// The `Last-Modified` validator, if present.
+    pub fn last_modified(&self) -> Option<&str> {
+        self.last_modified.as_deref()
+    }
+
+    /// The `Content-Type`, if present.
+    pub fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+
+    /// Begin downloading into a bounded, forward-only reader, spawning the background
+    /// download task. Resident memory stays O(channel) — the download parks when the
+    /// channel is full and the decoder drains it as it consumes. When `persist` is set,
+    /// the same bytes are teed to disk (temp file + atomic rename on success), so a
+    /// cacheable windowed play also lands in the disk cache for the next replay.
+    pub fn into_bounded_reader(self, persist: Option<PersistTarget>) -> BoundedHttpReader {
+        use futures_util::StreamExt;
+        let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(WINDOWED_CHUNK_CHANNEL_CAPACITY);
+        let content_length = self.content_length;
+        let mut stream = self.response.bytes_stream();
+        tokio::spawn(async move {
+            let mut sink = match persist {
+                Some(p) => match tokio::fs::File::create(&p.temp_path).await {
+                    Ok(file) => Some(PersistSink {
+                        file,
+                        bytes: 0,
+                        target: p,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Cacheable stream: cannot open temp file {}: {}; not persisting",
+                            p.temp_path.display(),
+                            e
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        if let Some(s) = sink.as_mut() {
+                            if !s.write(&chunk).await {
+                                sink = None; // a tee error abandons persistence; playback continues
+                            }
+                        }
+                        // `send` awaits when the channel is full: this back-pressure is
+                        // what bounds memory (the decoder drains it as it consumes).
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            if let Some(s) = sink.take() {
+                                s.abandon().await; // receiver gone: discard the partial tee
+                            }
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("Download error: {}", e))).await;
+                        if let Some(s) = sink.take() {
+                            s.abandon().await;
+                        }
+                        return;
+                    }
+                }
+            }
+            // Stream ended cleanly; dropping `tx` signals EOF to the reader.
+            if let Some(s) = sink.take() {
+                s.finalize().await;
+            }
+        });
+        BoundedHttpReader {
+            rx,
+            current: Bytes::new(),
+            position: 0,
+            content_length,
+            finished: false,
+        }
+    }
+}
+
+/// An in-progress tee of a cacheable download to disk.
+struct PersistSink {
+    file: tokio::fs::File,
+    bytes: u64,
+    target: PersistTarget,
+}
+
+impl PersistSink {
+    /// Write a chunk; returns false (and logs) if the write failed.
+    async fn write(&mut self, chunk: &[u8]) -> bool {
+        use tokio::io::AsyncWriteExt;
+        match self.file.write_all(chunk).await {
+            Ok(()) => {
+                self.bytes += chunk.len() as u64;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Cacheable stream: write to {} failed: {}; not persisting",
+                    self.target.temp_path.display(),
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// On clean EOF: flush, atomically rename temp → final, and report the byte count so
+    /// the caller registers the cache entry.
+    async fn finalize(self) {
+        use tokio::io::AsyncWriteExt;
+        let PersistSink {
+            mut file,
+            bytes,
+            target,
+        } = self;
+        if file.flush().await.is_ok()
+            && file.sync_all().await.is_ok()
+            && tokio::fs::rename(&target.temp_path, &target.final_path)
+                .await
+                .is_ok()
+        {
+            let _ = target.done.send(bytes);
+        } else {
+            tracing::warn!(
+                "Cacheable stream: failed to finalize {}; not persisting",
+                target.final_path.display()
+            );
+            let _ = tokio::fs::remove_file(&target.temp_path).await;
+        }
+    }
+
+    /// On error/cancel: drop the partial temp file (and `done`, so no entry is recorded).
+    async fn abandon(self) {
+        let _ = tokio::fs::remove_file(&self.target.temp_path).await;
+    }
+}
+
+/// A forward-only, bounded-memory adapter over an HTTP download, for windowed streaming.
+/// Unlike [`HttpStreamReader`] (which buffers the whole file in memory to allow seeking),
+/// this holds only a few in-flight chunks: the background download `send`s chunks over a
+/// bounded channel and parks when it is full, so resident memory is O(channel) regardless
+/// of the file's length. It is **not** seekable — a windowed play is forward-only, and the
+/// decoder's own probe buffer covers format sniffing (Symphonia does not seek a source
+/// that reports `is_seekable() == false`). Forward skips are served by discarding bytes.
+pub struct BoundedHttpReader {
+    rx: mpsc::Receiver<Result<Bytes, String>>,
+    current: Bytes,
+    position: u64,
+    content_length: Option<u64>,
+    finished: bool,
+}
+
+impl BoundedHttpReader {
+    /// Block until `current` holds bytes, or the stream ends (EOF) or errors.
+    fn fill(&mut self) -> io::Result<()> {
+        while self.current.is_empty() && !self.finished {
+            match self.rx.blocking_recv() {
+                Some(Ok(chunk)) => self.current = chunk,
+                Some(Err(e)) => {
+                    self.finished = true;
+                    return Err(io::Error::other(e));
+                }
+                None => self.finished = true, // channel closed: EOF
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Read for BoundedHttpReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.fill()?;
+        if self.current.is_empty() {
+            return Ok(0); // EOF
+        }
+        let n = buf.len().min(self.current.len());
+        buf[..n].copy_from_slice(&self.current[..n]);
+        self.current.advance(n);
+        self.position += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for BoundedHttpReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let target = match pos {
+            SeekFrom::Start(p) => p,
+            SeekFrom::Current(n) => {
+                let t = self.position as i64 + n;
+                if t < 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "negative seek"));
+                }
+                t as u64
+            }
+            SeekFrom::End(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "seek from end is not supported on a forward-only stream",
+                ))
+            }
+        };
+        if target < self.position {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "backward seek is not supported on a forward-only stream",
+            ));
+        }
+        // Forward skip: discard bytes until the target (or EOF).
+        let mut remaining = target - self.position;
+        while remaining > 0 {
+            self.fill()?;
+            if self.current.is_empty() {
+                break; // EOF before target
+            }
+            let n = remaining.min(self.current.len() as u64);
+            self.current.advance(n as usize);
+            self.position += n;
+            remaining -= n;
+        }
+        Ok(self.position)
+    }
+}
+
+impl MediaSource for BoundedHttpReader {
+    fn is_seekable(&self) -> bool {
+        false
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.content_length
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
+
+    fn bounded_reader_from(chunks: &[&'static [u8]], len: Option<u64>) -> BoundedHttpReader {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(16);
+        for c in chunks {
+            tx.blocking_send(Ok(Bytes::from_static(c))).unwrap();
+        }
+        drop(tx); // closing the sender signals EOF
+        BoundedHttpReader {
+            rx,
+            current: Bytes::new(),
+            position: 0,
+            content_length: len,
+            finished: false,
+        }
+    }
+
+    #[test]
+    fn bounded_reader_serves_chunks_in_order_then_eof() {
+        let mut reader = bounded_reader_from(&[b"hello ", b"world"], Some(11));
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"hello world");
+        assert_eq!(reader.byte_len(), Some(11));
+        assert!(
+            !reader.is_seekable(),
+            "windowed reader must be forward-only"
+        );
+        // A second read past EOF stays at EOF.
+        let mut buf = [0u8; 4];
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+    }
+
+    #[test]
+    fn bounded_reader_forward_seek_discards_and_rejects_backward() {
+        let mut reader = bounded_reader_from(&[b"0123456789"], Some(10));
+        assert_eq!(reader.seek(SeekFrom::Start(4)).unwrap(), 4);
+        let mut buf = [0u8; 3];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"456");
+        // Backward seeks are unsupported on a forward-only stream.
+        assert!(reader.seek(SeekFrom::Start(0)).is_err());
+        assert!(reader.seek(SeekFrom::End(-1)).is_err());
+    }
+
+    #[test]
+    fn bounded_reader_surfaces_a_download_error() {
+        let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(16);
+        tx.blocking_send(Ok(Bytes::from_static(b"partial")))
+            .unwrap();
+        tx.blocking_send(Err("connection reset".to_string()))
+            .unwrap();
+        drop(tx);
+        let mut reader = BoundedHttpReader {
+            rx,
+            current: Bytes::new(),
+            position: 0,
+            content_length: None,
+            finished: false,
+        };
+        let mut buf = [0u8; 7];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"partial");
+        // The next read surfaces the download error rather than a silent short EOF.
+        let mut more = [0u8; 4];
+        assert!(reader.read(&mut more).is_err());
+    }
 
     #[test]
     fn test_reader_basic_read() {

@@ -216,7 +216,11 @@ fn bench_time_to_first_sample(c: &mut Criterion) {
                         .await
                         .unwrap()
                 });
-                // Time includes full load currently - this is what we want to improve
+                // The full-load path decodes the entire file before the first sample;
+                // its cost grows with the file's length. The windowed path instead
+                // starts after a small prebuffer regardless of length — measured and
+                // bounded by the windowed_time_to_first_sample_is_low_and_precedes_full_decode
+                // test in src/audio/streamed_source.rs.
                 total += start.elapsed();
 
                 // Verify we got data
