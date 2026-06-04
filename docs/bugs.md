@@ -5,11 +5,15 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 
 ## Deferred to a later sprint
 
-- **HTTP windowed streaming is still deferred (redesign S1/S2 — intentional).** Both explicit `mode=stream`
-  and auto-windowing apply to **local files** only. For `http://`/`https://`, `mode=stream` logs a warning
-  and loads the URL fully, and `mode=auto` always full-loads (no windowing decision is made). A later sprint
-  adds HTTP windowed streaming, where the load decision can probe the source and reuse the same connection
-  (avoiding a double GET). The hard memory cap still governs the *cache* of HTTP full-loads.
+- **HTTP windowed streaming (redesign — RESOLVED).** Windowing now applies to `http://`/`https://` as well as
+  local files. An uncached HTTP `play` opens the response headers (`open_http_stream`), and the load decision
+  (`strategy::decide` + `strategy::probe_http` on `Content-Length`, against the live memory budget) routes a
+  big/over-budget/unknown-size URL to a windowed play; a small one falls through to the full (cache) load on the
+  same logic. A windowed HTTP play streams through a forward-only, back-pressured `BoundedHttpReader` (resident
+  memory O(channel) compressed bytes) feeding the decoded window ring (O(window) samples) — so even a multi-hour
+  WAV over HTTP cannot OOM. A live stream (no `Content-Length`) always windows (it has no finite end to
+  full-load). The windowed branch downloads a single request; a full-load fallback costs only the headers.
+  *Remaining piece:* persisting a cacheable windowed download to disk — see the incremental-persist entry below.
 - **Local auto-windowing for header-less files (redesign S2 — RESOLVED).** `mode=auto` probes the local file's
   header (`cache::strategy::probe_local_file`) for a decoded-size estimate. When the container carries a frame
   count the estimate is exact (`frames * channels * 4`); when it does not (e.g. a frame-count-less VBR MP3/OGG),

@@ -1125,7 +1125,6 @@ async fn handle_stream_play(
     prebuffer_ms: Option<u32>,
     ctx: &mut CommandCtx<'_>,
 ) {
-    use std::sync::atomic::Ordering;
     let config = ctx.config;
     let output_sample_rate = ctx.output_sample_rate;
 
@@ -1140,8 +1139,6 @@ async fn handle_stream_play(
         );
         return;
     }
-
-    let voice_id = voice.unwrap_or_else(next_auto_voice_id);
 
     // Window + prebuffer (per-play override beats config).
     let window_ms = window_ms.unwrap_or(config.cache.stream_window_ms);
@@ -1176,6 +1173,44 @@ async fn handle_stream_play(
             return;
         }
     };
+
+    finish_streamed_play(
+        handles,
+        file,
+        id,
+        volume,
+        voice,
+        channel_map,
+        fade_in,
+        loop_mode,
+        prebuffer_frames,
+        deadline_ms,
+        ctx,
+    )
+    .await;
+}
+
+/// Gate a freshly-spawned streamed source on its prebuffer, then build the StreamedSource
+/// and register it (voice activity, ducking, status, AddStreamedSource). Shared by the
+/// local-file and HTTP windowed-play paths.
+#[allow(clippy::too_many_arguments)]
+async fn finish_streamed_play(
+    handles: audio::streamed_source::StreamHandles,
+    file: String,
+    id: Option<String>,
+    volume: f32,
+    voice: Option<String>,
+    channel_map: Option<Vec<mqtt::commands::ChannelMapping>>,
+    fade_in: Option<u32>,
+    loop_mode: bool,
+    prebuffer_frames: usize,
+    deadline_ms: u32,
+    ctx: &mut CommandCtx<'_>,
+) {
+    use std::sync::atomic::Ordering;
+    let config = ctx.config;
+    let output_sample_rate = ctx.output_sample_rate;
+    let voice_id = voice.unwrap_or_else(next_auto_voice_id);
 
     // Gate on the prebuffer so the first audio is glitch-free, but never wait past the
     // deadline (start anyway; the underrun fade covers any gap). Polling with a tokio
@@ -1342,6 +1377,117 @@ async fn should_window_local(file: &str, mode: config::LoadMode, ctx: &CommandCt
     }
 }
 
+/// For an HTTP URL, decide whether to window the play (bounded memory) and, if so, start
+/// a windowed download and register the streamed source. Returns true if it handled the
+/// play; false means the caller should fall back to the full (cache) load — the URL is
+/// already cached, the decision was a full load, or the open failed.
+///
+/// The cache state is read under a brief lock; the network open + decode spawn run
+/// without holding it. Only the windowed branch downloads a body, so a full-load
+/// fallback costs just the response headers. A live stream (no Content-Length) always
+/// windows — it has no finite end to full-load.
+#[allow(clippy::too_many_arguments)]
+async fn try_windowed_http_play(
+    file: &str,
+    id: Option<String>,
+    volume: f32,
+    voice: Option<String>,
+    channel_map: Option<Vec<mqtt::commands::ChannelMapping>>,
+    fade_in: Option<u32>,
+    mode: config::LoadMode,
+    window_ms: Option<u32>,
+    prebuffer_ms: Option<u32>,
+    ctx: &mut CommandCtx<'_>,
+) -> bool {
+    let config = ctx.config;
+    let output_sample_rate = ctx.output_sample_rate;
+
+    // A cached URL serves full-featured from the cache; never window it.
+    let (cached, headroom) = {
+        let cm = ctx.cache_manager.lock().await;
+        (cm.is_cached(file), cm.memory_headroom())
+    };
+    if cached {
+        return false;
+    }
+
+    // Open the response (headers only) to learn the size, then decide.
+    let open = match cache::http_stream::open_http_stream(file).await {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(
+                "Windowed HTTP open failed for {}: {}; falling back to full load",
+                file,
+                e
+            );
+            return false;
+        }
+    };
+    let content_length = open.content_length();
+    let windowed = content_length.is_none()
+        || cache::strategy::decide(
+            mode,
+            config.cache.load_mode,
+            &cache::strategy::probe_http(content_length, file),
+            config.cache.full_load_max_bytes,
+            config.cache.full_load_max_seconds,
+            headroom,
+        ) == cache::strategy::Strategy::Windowed;
+    if !windowed {
+        return false; // drop `open` → connection closes; caller full-loads
+    }
+
+    // Window + prebuffer (per-play override beats config).
+    let window_ms = window_ms.unwrap_or(config.cache.stream_window_ms);
+    let prebuffer_ms = prebuffer_ms.unwrap_or(config.cache.stream_prebuffer_ms);
+    let deadline_ms = config.cache.stream_prebuffer_deadline_ms.max(prebuffer_ms);
+    let rate = output_sample_rate as usize;
+    let window_frames = (window_ms as usize * rate / 1000).max(1);
+    let prebuffer_frames = prebuffer_ms as usize * rate / 1000;
+    let quality = config.advanced.resampler_quality;
+
+    let reader = open.into_bounded_reader();
+    let label = file.to_string();
+    let handles = match tokio::task::spawn_blocking(move || {
+        audio::streamed_source::spawn_stream_from_source(
+            reader,
+            label,
+            output_sample_rate,
+            quality,
+            window_frames,
+        )
+    })
+    .await
+    {
+        Ok(Ok(h)) => h,
+        Ok(Err(e)) => {
+            tracing::error!("Failed to start windowed HTTP source for {}: {}", file, e);
+            return true; // the stream was consumed; do not double-download via full load
+        }
+        Err(e) => {
+            tracing::error!("Windowed HTTP spawn task failed for {}: {}", file, e);
+            return true;
+        }
+    };
+
+    // HTTP windowed plays are forward-only and do not loop.
+    finish_streamed_play(
+        handles,
+        file.to_string(),
+        id,
+        volume,
+        voice,
+        channel_map,
+        fade_in,
+        false,
+        prebuffer_frames,
+        deadline_ms,
+        ctx,
+    )
+    .await;
+    true
+}
+
 /// Whether a selector targets a voice that currently has a windowed/streamed source.
 /// Streamed voices are forward-only, so seek/speed/pitch do not apply. Best-effort:
 /// it matches on the selector's voice (the common case) and is used only to warn — a
@@ -1383,13 +1529,33 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             prebuffer_ms,
             freshness,
         } => {
-            // Windowed streaming applies to local files (HTTP windowed streaming is
-            // deferred to a later sprint). `mode=stream` is explicit; `auto`/`full` are
-            // decided from a cheap header probe and the live memory budget, which
-            // force-windows an over-budget asset so a full load can never blow the cap
-            // (the never-OOM guarantee, O(window) memory, low time-to-first-sample).
+            // Windowed streaming gives bounded memory (O(window)) and low time-to-first-
+            // sample for big/long assets. `mode=stream` forces it; `auto`/`full` are
+            // decided from a cheap probe and the live memory budget, which force-windows
+            // an over-budget asset so a full load can never blow the cap (never-OOM).
+            // Local files probe the header; HTTP probes Content-Length on the same
+            // connection, and an unknown-size live stream always windows.
             let is_http = file.starts_with("http://") || file.starts_with("https://");
-            if !is_http {
+            if is_http {
+                if try_windowed_http_play(
+                    &file,
+                    id.clone(),
+                    volume,
+                    voice.clone(),
+                    channel_map.clone(),
+                    fade_in,
+                    mode,
+                    window_ms,
+                    prebuffer_ms,
+                    ctx,
+                )
+                .await
+                {
+                    return;
+                }
+                // Not windowed (cached, fits the budget, or open failed): fall through to
+                // the full (cache) load below.
+            } else {
                 let go_windowed =
                     mode == config::LoadMode::Stream || should_window_local(&file, mode, ctx).await;
                 if go_windowed {
@@ -1408,11 +1574,6 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     .await;
                     return;
                 }
-            } else if mode == config::LoadMode::Stream {
-                tracing::warn!(
-                    "mode=stream is not yet supported for HTTP ({}); loading fully",
-                    file
-                );
             }
 
             // Load file (full in-memory load, with streaming support for faster startup).

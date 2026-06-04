@@ -839,3 +839,62 @@ async fn test_nonexistent_file_error() {
 
     assert!(result.is_err(), "Should return error for nonexistent file");
 }
+
+#[tokio::test]
+async fn http_windowed_producer_buffers_a_remote_file_to_eof() {
+    use mqttaudio::audio::streamed_source::spawn_stream_from_source;
+    use mqttaudio::cache::http_stream::open_http_stream;
+    use std::sync::atomic::Ordering;
+
+    // A remote file is windowed through the production path: a bounded reader (O(channel)
+    // compressed bytes, back-pressured) feeds a bounded decoded ring (O(window) samples),
+    // then drained to EOF. This is the never-OOM path for big HTTP cues.
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("cue.wav");
+    generate_test_wav(&wav_path, 1.0); // 1 second
+    let (port, _shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/cue.wav", port);
+
+    // Open headers, then begin the bounded download and run the blocking producer.
+    let open = open_http_stream(&url).await.unwrap();
+    assert!(
+        open.content_length().is_some(),
+        "served WAV must advertise a Content-Length"
+    );
+    let reader = open.into_bounded_reader();
+    let window_frames = 4800; // 0.1 s ring — far smaller than the file
+    let mut handles = tokio::task::spawn_blocking(move || {
+        spawn_stream_from_source(reader, url, 48000, ResamplerQuality::Fast, window_frames)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(handles.channels, 2);
+
+    // Drain the bounded ring to EOF on a blocking thread.
+    let (total_frames, done) = tokio::task::spawn_blocking(move || {
+        let mut scratch = vec![0.0f32; 8192];
+        let mut total = 0usize;
+        for _ in 0..100_000 {
+            let n = handles.consumer.pop_slice(&mut scratch);
+            total += n / handles.channels.max(1);
+            if handles.producer_done.load(Ordering::Acquire) && handles.consumer.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        (total, handles.producer_done.load(Ordering::Acquire))
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        done,
+        "remote windowed producer must signal completion at EOF"
+    );
+    // 1 s resampled 44.1k -> 48k is ~48000 frames; allow resampler-latency slack.
+    assert!(
+        (44_000..=50_000).contains(&total_frames),
+        "expected ~48000 frames from the remote stream, got {total_frames}"
+    );
+}

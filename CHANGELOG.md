@@ -9,14 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Windowed streaming for big local files (`mode=stream`, and via the default `mode=auto`).** A `play` of a
-  large or long local file is now played through a bounded ring (a fixed window, default 1.5 s) fed by a
-  background decoder, instead of being fully decoded into memory — so a multi-hour cue costs `O(window)`
-  memory with a low time-to-first-sample. The Play command accepts an optional `mode`
+- **Windowed streaming for big files (`mode=stream`, and via the default `mode=auto`).** A `play` of a large
+  or long file — local **or** `http(s)://` — is now played through a bounded ring (a fixed window, default
+  1.5 s) fed by a background decoder, instead of being fully decoded into memory, so a multi-hour cue costs
+  `O(window)` memory with a low time-to-first-sample. The Play command accepts an optional `mode`
   (`auto`|`full`|`stream`, default `auto`) plus `window_ms`/`prebuffer_ms` overrides;
   `cache.stream_window_ms` / `stream_prebuffer_ms` / `stream_prebuffer_deadline_ms` set the defaults.
   Windowed (streamed) voices play forward only — seek, loop-crossfade, reverse, variable speed, and pitch
-  correction do not apply to them. (HTTP windowed streaming is not yet implemented; HTTP plays full-load.)
+  correction do not apply to them. An uncached HTTP URL is routed by the same size/budget decision (probing
+  `Content-Length`); a live stream with no `Content-Length` always windows. A windowed HTTP play streams
+  through a bounded, back-pressured reader, so even a multi-hour remote WAV cannot OOM the daemon.
 - **Auto memory budget + hard cache cap (never OOM).** The decoded-audio cache now has a hard cap. By default
   it auto-detects a bounded size from available system memory (≈40 %, clamped to [128 MiB, 1 GiB]) so the
   daemon never camps all RAM, and `mode=auto` automatically windows any local asset whose estimated decoded

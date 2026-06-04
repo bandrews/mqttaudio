@@ -86,6 +86,31 @@ pub fn probe_local_file(
     })
 }
 
+/// Build a load-strategy probe for an HTTP source from its `Content-Length`. A known
+/// length estimates decoded bytes via the same biased-up codec-class factor as the local
+/// size fallback; an unknown length (no header, e.g. a live stream) is treated as
+/// effectively unbounded so the decision always windows it — a source whose size cannot
+/// be known can never be safely full-loaded under the never-OOM guarantee.
+pub fn probe_http(content_length: Option<u64>, url: &str) -> Probe {
+    match content_length {
+        Some(len) => {
+            let ext = url
+                .split(['?', '#'])
+                .next()
+                .and_then(|p| std::path::Path::new(p).extension())
+                .and_then(|e| e.to_str());
+            Probe {
+                est_decoded_bytes: Some(decoded_size_estimate_from_file_size(len, ext)),
+                est_seconds: None,
+            }
+        }
+        None => Probe {
+            est_decoded_bytes: Some(u64::MAX),
+            est_seconds: None,
+        },
+    }
+}
+
 /// Decide full-load vs windowed for a local asset.
 ///
 /// Precedence: a non-`Auto` `per_play` mode wins; else a non-`Auto` `config_mode`;
@@ -367,6 +392,79 @@ mod tests {
                 LoadMode::Auto,
                 LoadMode::Auto,
                 &p,
+                MAX_BYTES,
+                MAX_SECONDS,
+                HUGE
+            ),
+            Strategy::Windowed
+        );
+    }
+
+    #[test]
+    fn probe_http_unknown_length_estimates_unbounded() {
+        // No Content-Length (live stream): the estimate is unbounded. Under auto/stream
+        // it windows on the size heuristic; under an explicit full with a finite budget
+        // the budget override windows it. (A live source is additionally force-windowed
+        // by the caller regardless of mode, since it has no finite end to full-load.)
+        let p = probe_http(None, "http://example.com/live");
+        assert_eq!(p.est_decoded_bytes, Some(u64::MAX));
+        assert_eq!(
+            decide(
+                LoadMode::Auto,
+                LoadMode::Auto,
+                &p,
+                MAX_BYTES,
+                MAX_SECONDS,
+                HUGE
+            ),
+            Strategy::Windowed
+        );
+        assert_eq!(
+            decide(
+                LoadMode::Stream,
+                LoadMode::Auto,
+                &p,
+                MAX_BYTES,
+                MAX_SECONDS,
+                HUGE
+            ),
+            Strategy::Windowed
+        );
+        let finite_headroom = 512 * 1024 * 1024;
+        assert_eq!(
+            decide(
+                LoadMode::Full,
+                LoadMode::Auto,
+                &p,
+                MAX_BYTES,
+                MAX_SECONDS,
+                finite_headroom
+            ),
+            Strategy::Windowed
+        );
+    }
+
+    #[test]
+    fn probe_http_known_length_estimates_and_decides() {
+        // A small known file full-loads under auto; a large one windows.
+        let small = probe_http(Some(500_000), "http://example.com/sfx.mp3"); // ~12.5 MB est
+        assert_eq!(
+            decide(
+                LoadMode::Auto,
+                LoadMode::Auto,
+                &small,
+                MAX_BYTES,
+                MAX_SECONDS,
+                HUGE
+            ),
+            Strategy::FullLoad
+        );
+        let big = probe_http(Some(50 * 1024 * 1024), "http://example.com/cue.mp3?sig=x"); // huge
+        assert_eq!(
+            decide(
+                LoadMode::Auto,
+                LoadMode::Auto,
+                &big,
                 MAX_BYTES,
                 MAX_SECONDS,
                 HUGE

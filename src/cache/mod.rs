@@ -149,6 +149,12 @@ impl CacheManager {
         self.memory_cache.contains(file_path)
     }
 
+    /// Whether `file_path` is cached in memory or on disk. A cached URL is served
+    /// full-featured from the cache rather than windowed.
+    pub fn is_cached(&self, file_path: &str) -> bool {
+        self.memory_cache.contains(file_path) || self.disk_cache.is_cached(file_path)
+    }
+
     /// Create a new cache manager with specified resampler quality and no memory limit.
     pub fn with_quality(
         cache_dir: PathBuf,
