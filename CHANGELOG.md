@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correction do not apply to them. An uncached HTTP URL is routed by the same size/budget decision (probing
   `Content-Length`); a live stream with no `Content-Length` always windows. A windowed HTTP play streams
   through a bounded, back-pressured reader, so even a multi-hour remote WAV cannot OOM the daemon.
+- **Cacheable HTTP windowed plays persist to disk.** A windowed play of a cacheable HTTP URL (one with a
+  `Content-Length`) tees its download to the disk cache as it plays, so the next play of that URL hits disk
+  with no extra request. A live source (no `Content-Length`) or an explicit per-play `"cacheable": false`
+  windows without persisting. This is incremental (the bytes are written as they stream, not after a full
+  download), so it does not delay time-to-first-sample.
 - **Auto memory budget + hard cache cap (never OOM).** The decoded-audio cache now has a hard cap. By default
   it auto-detects a bounded size from available system memory (≈40 %, clamped to [128 MiB, 1 GiB]) so the
   daemon never camps all RAM, and `mode=auto` automatically windows any local asset whose estimated decoded

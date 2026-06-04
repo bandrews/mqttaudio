@@ -148,6 +148,8 @@ pub struct PlayMessage {
     pub prebuffer_ms: Option<u32>, // Windowed-source prebuffer override (streamed plays)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freshness: Option<FreshnessMode>, // Freshness override: trusting|dev|pinned
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cacheable: Option<bool>, // HTTP windowed plays: persist to disk (true, default) or treat as live (false)
 }
 
 /// Voice stop command parameters
@@ -295,6 +297,7 @@ pub enum AudioCommand {
         window_ms: Option<u32>,           // Windowed-source ring depth override
         prebuffer_ms: Option<u32>,        // Windowed-source prebuffer override
         freshness: Option<FreshnessMode>, // Freshness override (None => config default)
+        cacheable: Option<bool>, // HTTP windowed: persist to disk (None/true) or treat as live (false)
     },
     StopAll,
     VoiceStop {
@@ -466,6 +469,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 window_ms: play_msg.window_ms,
                 prebuffer_ms: play_msg.prebuffer_ms,
                 freshness: play_msg.freshness,
+                cacheable: play_msg.cacheable,
             })
         }
         "stopall" | "soundStopAll" => Ok(AudioCommand::StopAll),
@@ -1580,6 +1584,22 @@ mod tests {
                 assert_eq!(window_ms, Some(2000));
                 assert_eq!(prebuffer_ms, Some(100));
             }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_cacheable_override() {
+        // `cacheable: false` tags an HTTP source live (window, never persist).
+        let json = r#"{"command": "play", "message": {"file": "https://example.com/live.wav", "cacheable": false}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play { cacheable, .. } => assert_eq!(cacheable, Some(false)),
+            _ => panic!("Expected Play command"),
+        }
+        // Omitting it is backward compatible and resolves to None (cacheable default).
+        let json = r#"{"command": "play", "message": {"file": "https://example.com/cue.wav"}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play { cacheable, .. } => assert_eq!(cacheable, None),
             _ => panic!("Expected Play command"),
         }
     }

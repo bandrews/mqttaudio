@@ -1397,6 +1397,7 @@ async fn try_windowed_http_play(
     mode: config::LoadMode,
     window_ms: Option<u32>,
     prebuffer_ms: Option<u32>,
+    cacheable: Option<bool>,
     ctx: &mut CommandCtx<'_>,
 ) -> bool {
     let config = ctx.config;
@@ -1446,7 +1447,49 @@ async fn try_windowed_http_play(
     let prebuffer_frames = prebuffer_ms as usize * rate / 1000;
     let quality = config.advanced.resampler_quality;
 
-    let reader = open.into_bounded_reader();
+    // A cacheable source (a finite Content-Length, not overridden to live) is teed to
+    // disk while it plays, so the next play of this URL hits disk with no extra request.
+    // A live stream (no Content-Length) or an explicit `cacheable: false` is never
+    // persisted. Registration happens off this path, after the download finalizes.
+    let is_cacheable = content_length.is_some() && cacheable != Some(false);
+    let persist = if is_cacheable {
+        let etag = open.etag().map(|s| s.to_string());
+        let last_modified = open.last_modified().map(|s| s.to_string());
+        let content_type = open.content_type().map(|s| s.to_string());
+        let (temp_path, final_path) = ctx.cache_manager.lock().await.windowed_persist_paths(file);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<u64>();
+        let cache_manager = std::sync::Arc::clone(ctx.cache_manager);
+        let url = file.to_string();
+        tokio::spawn(async move {
+            // Resolves only when the download finalized cleanly (temp renamed into place).
+            if let Ok(file_size) = done_rx.await {
+                let mut guard = cache_manager.lock().await;
+                match guard.record_streamed_download(
+                    &url,
+                    file_size,
+                    etag,
+                    last_modified,
+                    content_type,
+                ) {
+                    Ok(()) => tracing::info!(
+                        "Persisted streamed {} to disk cache ({} bytes)",
+                        url,
+                        file_size
+                    ),
+                    Err(e) => tracing::warn!("Failed to register persisted stream {}: {}", url, e),
+                }
+            }
+        });
+        Some(cache::http_stream::PersistTarget {
+            temp_path,
+            final_path,
+            done: done_tx,
+        })
+    } else {
+        None
+    };
+
+    let reader = open.into_bounded_reader(persist);
     let label = file.to_string();
     let handles = match tokio::task::spawn_blocking(move || {
         audio::streamed_source::spawn_stream_from_source(
@@ -1528,6 +1571,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             window_ms,
             prebuffer_ms,
             freshness,
+            cacheable,
         } => {
             // Windowed streaming gives bounded memory (O(window)) and low time-to-first-
             // sample for big/long assets. `mode=stream` forces it; `auto`/`full` are
@@ -1547,6 +1591,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     mode,
                     window_ms,
                     prebuffer_ms,
+                    cacheable,
                     ctx,
                 )
                 .await
@@ -2329,6 +2374,7 @@ mod tests {
             window_ms: None,
             prebuffer_ms: None,
             freshness: None,
+            cacheable: None,
         }
     }
 
@@ -2348,6 +2394,7 @@ mod tests {
             window_ms: Some(200),
             prebuffer_ms: Some(20),
             freshness: None,
+            cacheable: None,
         }
     }
 
@@ -2508,6 +2555,7 @@ mod tests {
             window_ms: None,
             prebuffer_ms: None,
             freshness: None,
+            cacheable: None,
         }
     }
 

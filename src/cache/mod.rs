@@ -155,6 +155,26 @@ impl CacheManager {
         self.memory_cache.contains(file_path) || self.disk_cache.is_cached(file_path)
     }
 
+    /// Temp + final disk paths for teeing a cacheable windowed download (see
+    /// [`DiskCache::windowed_persist_paths`]).
+    pub fn windowed_persist_paths(&self, url: &str) -> (PathBuf, PathBuf) {
+        self.disk_cache.windowed_persist_paths(url)
+    }
+
+    /// Register a windowed download that was teed to disk as a cache entry, so a later
+    /// play of `url` hits disk with no extra request.
+    pub fn record_streamed_download(
+        &mut self,
+        url: &str,
+        file_size: u64,
+        etag: Option<String>,
+        last_modified: Option<String>,
+        content_type: Option<String>,
+    ) -> Result<(), CacheError> {
+        self.disk_cache
+            .record_streamed_download(url, file_size, etag, last_modified, content_type)
+    }
+
     /// Create a new cache manager with specified resampler quality and no memory limit.
     pub fn with_quality(
         cache_dir: PathBuf,

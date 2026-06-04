@@ -324,14 +324,37 @@ pub async fn start_http_stream(url: &str) -> Result<HttpStreamReader, HttpStream
     Ok(reader)
 }
 
-/// An opened HTTP response whose headers (status, Content-Length) have been read but
-/// whose body has not been downloaded yet. The caller decides from `content_length`
-/// whether to window the play ([`into_bounded_reader`](OpenHttpStream::into_bounded_reader),
-/// which starts the bounded download) or to fall back to a full load (drop this, which
-/// closes the connection) — so a windowed play needs only a single request.
+/// Where a cacheable windowed download is teed on disk: bytes are written to `temp_path`
+/// as they arrive and atomically renamed to `final_path` on success, then the byte count
+/// is sent on `done` so the caller can register the cache entry. On failure the temp file
+/// is removed and `done` is dropped (its receiver sees a cancelled channel — no entry).
+pub struct PersistTarget {
+    pub temp_path: std::path::PathBuf,
+    pub final_path: std::path::PathBuf,
+    pub done: tokio::sync::oneshot::Sender<u64>,
+}
+
+/// An opened HTTP response whose headers (status, Content-Length, and cache validators)
+/// have been read but whose body has not been downloaded yet. The caller decides from
+/// `content_length` whether to window the play
+/// ([`into_bounded_reader`](OpenHttpStream::into_bounded_reader), which starts the bounded
+/// download) or to fall back to a full load (drop this, which closes the connection) — so
+/// a windowed play needs only a single request.
 pub struct OpenHttpStream {
     response: reqwest::Response,
     content_length: Option<u64>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    content_type: Option<String>,
+}
+
+/// Read a response header as an owned string, if present and valid UTF-8.
+fn header_string(response: &reqwest::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 /// Open an HTTP URL and read its response headers, without downloading the body. Fails
@@ -348,9 +371,15 @@ pub async fn open_http_stream(url: &str) -> Result<OpenHttpStream, HttpStreamErr
         )));
     }
     let content_length = response.content_length();
+    let etag = header_string(&response, "etag");
+    let last_modified = header_string(&response, "last-modified");
+    let content_type = header_string(&response, "content-type");
     Ok(OpenHttpStream {
         response,
         content_length,
+        etag,
+        last_modified,
+        content_type,
     })
 }
 
@@ -360,28 +389,81 @@ impl OpenHttpStream {
         self.content_length
     }
 
+    /// The `ETag` validator, if present.
+    pub fn etag(&self) -> Option<&str> {
+        self.etag.as_deref()
+    }
+
+    /// The `Last-Modified` validator, if present.
+    pub fn last_modified(&self) -> Option<&str> {
+        self.last_modified.as_deref()
+    }
+
+    /// The `Content-Type`, if present.
+    pub fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+
     /// Begin downloading into a bounded, forward-only reader, spawning the background
     /// download task. Resident memory stays O(channel) — the download parks when the
-    /// channel is full and the decoder drains it as it consumes.
-    pub fn into_bounded_reader(self) -> BoundedHttpReader {
+    /// channel is full and the decoder drains it as it consumes. When `persist` is set,
+    /// the same bytes are teed to disk (temp file + atomic rename on success), so a
+    /// cacheable windowed play also lands in the disk cache for the next replay.
+    pub fn into_bounded_reader(self, persist: Option<PersistTarget>) -> BoundedHttpReader {
         use futures_util::StreamExt;
         let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(WINDOWED_CHUNK_CHANNEL_CAPACITY);
         let content_length = self.content_length;
         let mut stream = self.response.bytes_stream();
         tokio::spawn(async move {
+            let mut sink = match persist {
+                Some(p) => match tokio::fs::File::create(&p.temp_path).await {
+                    Ok(file) => Some(PersistSink {
+                        file,
+                        bytes: 0,
+                        target: p,
+                    }),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Cacheable stream: cannot open temp file {}: {}; not persisting",
+                            p.temp_path.display(),
+                            e
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+
             while let Some(chunk_result) = stream.next().await {
-                let is_err = chunk_result.is_err();
-                let msg = chunk_result.map_err(|e| format!("Download error: {}", e));
-                // `send` awaits when the channel is full: this back-pressure is what
-                // bounds memory (the decoder drains the channel as it consumes).
-                if tx.send(msg).await.is_err() {
-                    return; // receiver gone (playback stopped): stop downloading
-                }
-                if is_err {
-                    return;
+                match chunk_result {
+                    Ok(chunk) => {
+                        if let Some(s) = sink.as_mut() {
+                            if !s.write(&chunk).await {
+                                sink = None; // a tee error abandons persistence; playback continues
+                            }
+                        }
+                        // `send` awaits when the channel is full: this back-pressure is
+                        // what bounds memory (the decoder drains it as it consumes).
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            if let Some(s) = sink.take() {
+                                s.abandon().await; // receiver gone: discard the partial tee
+                            }
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("Download error: {}", e))).await;
+                        if let Some(s) = sink.take() {
+                            s.abandon().await;
+                        }
+                        return;
+                    }
                 }
             }
-            // Stream ended; dropping `tx` here signals EOF to the reader.
+            // Stream ended cleanly; dropping `tx` signals EOF to the reader.
+            if let Some(s) = sink.take() {
+                s.finalize().await;
+            }
         });
         BoundedHttpReader {
             rx,
@@ -390,6 +472,64 @@ impl OpenHttpStream {
             content_length,
             finished: false,
         }
+    }
+}
+
+/// An in-progress tee of a cacheable download to disk.
+struct PersistSink {
+    file: tokio::fs::File,
+    bytes: u64,
+    target: PersistTarget,
+}
+
+impl PersistSink {
+    /// Write a chunk; returns false (and logs) if the write failed.
+    async fn write(&mut self, chunk: &[u8]) -> bool {
+        use tokio::io::AsyncWriteExt;
+        match self.file.write_all(chunk).await {
+            Ok(()) => {
+                self.bytes += chunk.len() as u64;
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Cacheable stream: write to {} failed: {}; not persisting",
+                    self.target.temp_path.display(),
+                    e
+                );
+                false
+            }
+        }
+    }
+
+    /// On clean EOF: flush, atomically rename temp → final, and report the byte count so
+    /// the caller registers the cache entry.
+    async fn finalize(self) {
+        use tokio::io::AsyncWriteExt;
+        let PersistSink {
+            mut file,
+            bytes,
+            target,
+        } = self;
+        if file.flush().await.is_ok()
+            && file.sync_all().await.is_ok()
+            && tokio::fs::rename(&target.temp_path, &target.final_path)
+                .await
+                .is_ok()
+        {
+            let _ = target.done.send(bytes);
+        } else {
+            tracing::warn!(
+                "Cacheable stream: failed to finalize {}; not persisting",
+                target.final_path.display()
+            );
+            let _ = tokio::fs::remove_file(&target.temp_path).await;
+        }
+    }
+
+    /// On error/cancel: drop the partial temp file (and `done`, so no entry is recorded).
+    async fn abandon(self) {
+        let _ = tokio::fs::remove_file(&self.target.temp_path).await;
     }
 }
 

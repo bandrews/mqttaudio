@@ -199,7 +199,14 @@ seek/loop/pitch SFX and 2-hour beds that must never OOM.
 - **D48 · Runtime memory-pressure monitoring deferred.** Static cap + startup autodetect only; recommend OS
   `cgroup`/systemd `MemoryMax` for the daemon. `detect_available_memory()` / `with_resolved_cap` seams are left
   for a future controller. *Why:* owner flagged the dynamic-shrinking test burden as not worth it now (YAGNI).
-- **D49 · HTTP windowed streaming + incremental disk persist deferred.** The first client is disk-focused;
-  windowed HTTP playback and tee-to-disk-on-stream are scoped out and recorded in `docs/bugs.md` with the
-  reuse points (`http_stream.rs` buffered bytes → atomic rename to `cache_filename_for_url`). *Why:* YAGNI for
-  the first client; the seams exist when a streaming-HTTP client appears.
+- **D49 · HTTP windowed streaming + incremental disk persist (initially deferred, now IMPLEMENTED).** Originally
+  scoped out as YAGNI for the disk-focused first client. *New evidence:* the existing `HttpStreamReader` buffers
+  the whole file in memory to support seeking, so the never-OOM guarantee did **not** hold for a big HTTP source
+  (a 2-hour WAV over HTTP stayed fully resident). Owner chose to close it properly. Implemented: a forward-only,
+  back-pressured `BoundedHttpReader` (a bounded mpsc channel between the async download and the sync decoder)
+  windows any HTTP source in `O(channel)` memory; `open_http_stream` + `strategy::probe_http`/`decide` route a
+  big/over-budget/unknown-size URL to windowed on a single request; and a *cacheable* (finite-length) windowed
+  download is teed to a temp file and atomically renamed into the disk cache on completion
+  (`PersistTarget`/`PersistSink` → `record_streamed_download`), so a replay hits disk with no extra GET. A live
+  source (no `Content-Length`) or a per-play `cacheable: false` windows without persisting. The remaining
+  unpersisted case is the small-asset HTTP *full-load* streaming path (noted in `docs/bugs.md`).

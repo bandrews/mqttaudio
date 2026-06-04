@@ -337,6 +337,42 @@ impl DiskCache {
         Ok(cache_path)
     }
 
+    /// Paths for teeing a cacheable windowed download to disk: a unique temp file (so
+    /// concurrent downloads of the same URL never share a temp) and the final cache path
+    /// it is atomically renamed to. The final path is what `is_cached`/`get_entry`
+    /// resolve for this URL, so a later `record_streamed_download` makes it a cache hit.
+    pub fn windowed_persist_paths(&self, url: &str) -> (PathBuf, PathBuf) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let cache_filename = Self::cache_filename_for_url(url);
+        let files = self.cache_dir.join("files");
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = files.join(format!("{}.{}.streaming.tmp", cache_filename, seq));
+        let final_path = files.join(&cache_filename);
+        (temp, final_path)
+    }
+
+    /// Register a windowed download that was teed to disk (the file is already at its
+    /// final path) as a cache entry, so a later play hits disk with no extra request.
+    pub fn record_streamed_download(
+        &mut self,
+        url: &str,
+        file_size: u64,
+        etag: Option<String>,
+        last_modified: Option<String>,
+        content_type: Option<String>,
+    ) -> Result<(), CacheError> {
+        let entry = CacheEntry {
+            local_file: Self::cache_filename_for_url(url),
+            etag,
+            last_modified,
+            last_validated: chrono::Utc::now().to_rfc3339(),
+            file_size,
+            content_type,
+        };
+        self.put_entry(url.to_string(), entry);
+        self.save_metadata()
+    }
+
     /// All URLs currently in the disk cache metadata.
     pub fn cached_urls(&self) -> Vec<String> {
         self.metadata.entries.keys().cloned().collect()

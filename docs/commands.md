@@ -52,6 +52,7 @@ Play an audio file.
 | `window_ms` | integer | config | Windowed-source ring depth override (streamed plays) |
 | `prebuffer_ms` | integer | config | Windowed-source prebuffer override (streamed plays) |
 | `freshness` | string | config | Cache freshness override: `trusting`, `dev`, or `pinned` |
+| `cacheable` | boolean | `true` | HTTP windowed plays only: `true` (default) tees the download to the disk cache so a replay hits disk; `false` treats the source as live (window, never persist). A URL with no `Content-Length` is always live |
 
 **Channel Mapping:**
 

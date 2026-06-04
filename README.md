@@ -211,7 +211,9 @@ mqttaudio keeps memory bounded automatically, so a long cue — even a 2-hour 5.
   `cache.load_mode`, `cache.full_load_max_bytes`, `cache.full_load_max_seconds`, and `cache.stream_window_ms`.
   Windowing applies to both local files and `http(s)://` URLs: an uncached HTTP URL is windowed by the same
   size/budget decision (a live stream with no `Content-Length` always windows), streaming through a bounded,
-  back-pressured reader so even a multi-hour remote cue stays within `O(window)` memory.
+  back-pressured reader so even a multi-hour remote cue stays within `O(window)` memory. A windowed HTTP URL
+  that is cacheable (has a `Content-Length`) is also teed to the disk cache as it plays, so a replay hits disk
+  with no extra download; pass `"cacheable": false` on the play to treat a URL as live (window, never persist).
 - **Memory budget (never camps all RAM).** The decoded-audio cache has a hard cap. By default it auto-detects
   a bounded size — about 40 % of *available* RAM, clamped to `[128 MiB, 1 GiB]` — so it is safe on a 2 GB
   Raspberry Pi without starving other processes. Override with `cache.memory_budget`:

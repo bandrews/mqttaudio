@@ -22,14 +22,17 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   rather than full-loading into an OOM. The estimate is approximate and biased toward windowing, so the only
   residual is that an unusually large *compressed-but-would-fit* file may window (lose seek/loop/pitch) when a
   full load would just barely have fit — the safe direction. Covered by `cache::strategy::tests::size_fallback_*`.
-- **Incremental HTTP-to-disk persistence of streamed plays is deferred (redesign S3 — LOW).** An ad-hoc HTTP
-  `play` of an uncached URL streams to the *memory* cache only (`cache/mod.rs` `start_streaming_load`), so a
-  restart re-downloads it. The blocking precache path (`precache_blocking`, `download_and_cache`) already
-  persists HTTP assets to disk, and `cache_reload` re-warms an entry, so this only affects URLs that are
-  played ad-hoc and never precached. The S3 freshness work added stale-while-revalidate for HTTP entries that
-  *are* disk-cached (the freshness tick + `revalidate_stale_http`); teeing raw bytes from the streaming
-  download to disk (so an ad-hoc streamed play also persists) is the remaining piece, deferred as low value
-  for the disk-focused first client.
+- **Incremental HTTP-to-disk persistence of windowed plays (redesign — RESOLVED for cacheable windowed plays).**
+  A windowed play of a *cacheable* HTTP URL (one with a `Content-Length`, not overridden `cacheable: false`)
+  now tees its download to a temp file and atomically renames it into the disk cache on completion, registering
+  the entry (`http_stream::PersistTarget`/`PersistSink` → `CacheManager::record_streamed_download`), so a
+  restart/replay hits disk with no extra GET (covered by
+  `streaming_test::cacheable_windowed_play_persists_and_replay_hits_disk`). A live source (no `Content-Length`)
+  or `cacheable: false` is intentionally not persisted. *Still not persisted:* an HTTP play that takes the
+  **full-load** streaming path (`start_streaming_load`, used when the asset is small enough to full-load and is
+  not yet disk-cached) writes only to the memory cache, so a restart re-downloads it — the blocking precache
+  path and `cache_reload` cover the managed case, and this only affects small, ad-hoc, never-precached URLs, so
+  it is left as is.
 - **The seek/speed gate for streamed voices is voice-keyed and best-effort (redesign S1 — LOW).**
   `selector_targets_streamed_voice` (`src/main.rs`) warns when a Seek/Speed selector names a voice that has a
   streamed source. A selector that targets a streamed source by `file`/`id` only, or a voice that mixes
