@@ -81,7 +81,7 @@ If you cannot honestly check every box for a sprint, leave it `In progress` or `
 
 | # | Sprint | Status | Depends on | File |
 |---|--------|--------|-----------|------|
-| 0 | Foundations, API contract & CI harness | Not started | — | [sprint-00](sprint-00-foundations-and-api-contract.md) |
+| 0 | Foundations, API contract & CI harness | Done | — | [sprint-00](sprint-00-foundations-and-api-contract.md) |
 | 1 | Deployment: reverse-proxy sidecar & connectivity | Not started | 0 | [sprint-01](sprint-01-deployment-and-connectivity.md) |
 | 2 | Live monitoring dashboard (poll-based) | Not started | 0, 1 | [sprint-02](sprint-02-live-monitoring-dashboard.md) |
 | 3 | Command test-bench & cue launcher | Not started | 0 | [sprint-03](sprint-03-command-test-bench.md) |
@@ -102,11 +102,11 @@ Tick a box only when genuinely verified. `[A]` = CI/headless, `[B]` = real brows
 cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates (backend-touching sprints).
 
 ### Sprint 0 — Foundations, API contract & CI harness
-- [ ] `webui/` scaffolds and builds: Vite + React + TS + MUI; `pnpm build`, `tsc --noEmit`, and eslint (warnings-as-errors) all pass in CI `[A]`
-- [ ] A swappable `DaemonConnection` transport interface exists with a browser/proxy implementation; "a connection" (base URL + optional token) is a first-class entity (multi-instance-ready, per DW2) `[A]`
-- [ ] A typed API client covers every runtime command + read endpoint from `API-CONTRACT.md`, encoding the transport quirks (`loop`/`loop_mode`, `time`/`time_ms`, `internal_id` as string, `/command` for the full play surface); unit tests assert the emitted JSON shapes `[A]`
-- [ ] Connection bootstrap reads `/health` + `/version`, detects open vs `require_auth`, and surfaces an optional Bearer-token field; a component test covers the auth-required path `[A]`
-- [ ] CI runs Vitest + React Testing Library and a Playwright headless smoke against a fixture/mock backend, green `[A]`
+- [x] `webui/` scaffolds and builds: Vite + React + TS + MUI; `pnpm build`, `tsc --noEmit`, and eslint (warnings-as-errors) all pass in CI `[A]`
+- [x] A swappable `DaemonConnection` transport interface exists with a browser/proxy implementation; "a connection" (base URL + optional token) is a first-class entity (multi-instance-ready, per DW2) `[A]`
+- [x] A typed API client covers every runtime command + read endpoint from `API-CONTRACT.md`, encoding the transport quirks (`loop`/`loop_mode`, `time`/`time_ms`, `internal_id` as string, `/command` for the full play surface); unit tests assert the emitted JSON shapes `[A]`
+- [x] Connection bootstrap reads `/health` + `/version`, detects open vs `require_auth`, and surfaces an optional Bearer-token field; a component test covers the auth-required path `[A]`
+- [x] CI runs Vitest + React Testing Library and a Playwright headless smoke against a fixture/mock backend, green `[A]`
 
 ### Sprint 1 — Deployment: reverse-proxy sidecar & connectivity
 - [ ] A reverse-proxy sidecar config (Caddy or nginx) serves the built SPA and proxies `/api/*` + `/ws` to the daemon, injecting the Bearer header server-side; documented and runnable (DW1) `[A]`
