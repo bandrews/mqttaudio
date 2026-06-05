@@ -82,7 +82,7 @@ struct Args {
     #[arg(long)]
     http_port: Option<u16>,
 
-    /// Maximum memory cache size in MB (0 = unlimited)
+    /// Override the memory cache cap in MiB (0 = auto-detect a bounded cap)
     #[arg(long)]
     max_cache_mb: Option<u32>,
 }

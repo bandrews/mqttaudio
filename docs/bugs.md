@@ -228,6 +228,14 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   adding it would be an unverified change to the twin path. Pick it up if reverse looped crossfades are
   exercised in earnest.
 
+- **Dead config field `audio.channel_names` (web-UI doc reconciliation, out of scope, LOW).** `channel_names`
+  is declared, deserialized, and unit-tested in `src/config.rs` (around `config.rs:84`) but is never read by
+  the audio path — only `channel_aliases` (name → index) is used for routing/resolution and per-channel
+  calibration. It is undocumented and appears to be a vestigial parallel to `channel_aliases`. Discovered while
+  auditing the docs against the code for the web control app. Cleanup (remove the field, or wire it to
+  something real and document it) is a future task; left untouched here to avoid an unscoped serde/behavior
+  change.
+
 ## Implementation notes
 
 - **Auto voice-id format: `_auto_<millis>_<n>` shipped, reconciling DECISIONS.md D24 vs D41/Sprint-9 F5.**

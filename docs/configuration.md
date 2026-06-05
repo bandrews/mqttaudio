@@ -9,23 +9,30 @@ mqttaudio [OPTIONS]
 
 OPTIONS:
   -c, --config <FILE>          Load configuration from JSON file
-  -s, --server <HOST>          MQTT server hostname [default: localhost]
-  -p, --port <PORT>            MQTT server port [default: 1883]
+  -s, --server <HOST>          MQTT server hostname (config default: localhost)
+  -p, --port <PORT>            MQTT server port (config default: 1883)
   -t, --topic <TOPIC>          MQTT topic to subscribe to
   --mqtt-username <USER>       MQTT broker username for authentication
   --mqtt-password <PASS>       MQTT broker password for authentication
   -d, --device <NAME>          Audio output device name
-  -r, --sample-rate <RATE>     Output sample rate [default: 48000]
-  -n, --channels <COUNT>       Number of output channels [default: auto-detect]
+  -r, --sample-rate <RATE>     Output sample rate (config default: 48000)
+  -n, --channels <COUNT>       Number of output channels (config default: auto-detect)
   --lfe-channel <INDEX>        LFE (subwoofer) channel index for bass management
-  --crossover-frequency <HZ>   Crossover frequency for bass management [default: 80]
+  --crossover-frequency <HZ>   Crossover frequency for bass management (config default: 80)
   --log-topic <TOPIC>          MQTT topic to publish log messages to
+  --http-port <PORT>           Enable the HTTP REST/WebSocket server on this port
+  --max-cache-mb <MB>          Override the memory cache cap in MiB (0 = auto-detect a bounded cap)
   -v, --verbose                Enable verbose logging (debug level)
   --list-devices               List available audio output devices and exit
   --list-inputs                List available audio input devices and exit
   --help                       Print help information
   --version                    Print version information
 ```
+
+The value-taking flags are optional overrides: when omitted they fall back to the config file, and the
+"config default" shown is the built-in value applied when neither the flag nor the config sets it. These are
+config-level defaults, not clap defaults, so `--help` does not display them. `--max-cache-mb 0` (and leaving
+`cache.max_memory_mb` at `0`) selects an auto-detected **bounded** cap — not an unlimited cache.
 
 ## Configuration File
 

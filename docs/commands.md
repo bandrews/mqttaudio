@@ -141,12 +141,13 @@ Stop specific samples.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
 | `id` | string | — | Stop sample with this ID |
 | `file` | string | — | Stop all samples playing this file |
 | `voice` | string | — | Stop all samples in this voice |
 | `fade_out_ms` | integer | 0 | Fade-out duration (milliseconds) |
 
-At least one of `id`, `file`, or `voice` is required. Multiple selectors use OR logic.
+At least one of `internal_id`, `id`, `file`, or `voice` is required. Multiple selectors use OR logic (a sample matches if any one criterion matches). An empty selector matches nothing and is silently a no-op.
 
 ### seek
 
@@ -162,6 +163,7 @@ Jump to a position in a playing sample.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target all samples playing this file |
 | `voice` | string | — | Target all samples in this voice |
@@ -182,6 +184,7 @@ Change playback speed.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target samples playing this file |
 | `voice` | string | — | Target samples in this voice |
@@ -206,6 +209,7 @@ Adjust volume of specific samples.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target samples playing this file |
 | `voice` | string | — | Target samples in this voice |
@@ -494,4 +498,16 @@ For backward compatibility, commands also accept parameters wrapped in a `messag
 }
 ```
 
-This format is equivalent to the flattened format shown throughout this document. When both formats are present in the same message, the `message` object takes precedence.
+This format is equivalent to the flattened format shown throughout this document. When both formats are present in the same message, the `message` object takes precedence (its contents replace the flattened keys wholesale rather than merging).
+
+### Legacy command names
+
+Three commands also accept a legacy alias for their `command` value:
+
+| Canonical | Legacy alias |
+|-----------|--------------|
+| `play` | `soundPlay` |
+| `stopall` | `soundStopAll` |
+| `precache` | `soundPrecache` |
+
+These aliases are accepted only for those three commands; every other command uses its canonical name. Command names are matched case-sensitively.
