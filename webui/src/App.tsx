@@ -17,7 +17,7 @@ import type { Connection } from './api/connection';
 import type { BootstrapResult } from './api/bootstrap';
 import { ClientProvider } from './state/QueryProvider';
 import { Connect } from './components/Connect';
-import { LogConsole } from './features/logs/LogConsole';
+import { Dashboard } from './features/dashboard/Dashboard';
 
 interface Session {
   client: DaemonClient;
@@ -68,15 +68,8 @@ function ConnectedView({ session, onDisconnect }: { session: Session; onDisconne
           </Stack>
         </Toolbar>
       </AppBar>
-      <Container sx={{ py: 4 }}>
-        <Stack spacing={2}>
-          <Typography variant="body2" color="text.secondary">
-            Connected to <strong>{result.service ?? 'mqttaudio'}</strong>
-            {version ? ` ${version.name} ${version.version}` : ''}. Monitoring &amp; control surfaces
-            are added in later sprints.
-          </Typography>
-          <LogConsole />
-        </Stack>
+      <Container maxWidth="xl" sx={{ py: 3 }}>
+        <Dashboard />
       </Container>
     </Box>
   );

@@ -83,7 +83,7 @@ If you cannot honestly check every box for a sprint, leave it `In progress` or `
 |---|--------|--------|-----------|------|
 | 0 | Foundations, API contract & CI harness | Done | — | [sprint-00](sprint-00-foundations-and-api-contract.md) |
 | 1 | Deployment: reverse-proxy sidecar & connectivity | Done | 0 | [sprint-01](sprint-01-deployment-and-connectivity.md) |
-| 2 | Live monitoring dashboard (poll-based) | Not started | 0, 1 | [sprint-02](sprint-02-live-monitoring-dashboard.md) |
+| 2 | Live monitoring dashboard (poll-based) | Done | 0, 1 | [sprint-02](sprint-02-live-monitoring-dashboard.md) |
 | 3 | Command test-bench & cue launcher | Not started | 0 | [sprint-03](sprint-03-command-test-bench.md) |
 | 4 | Channel-map matrix mixer | Not started | 0, 3 | [sprint-04](sprint-04-channel-map-matrix-mixer.md) |
 | 5 | Transport, speed & windowed gating | Not started | 0, 2 | [sprint-05](sprint-05-transport-speed-and-windowed-gating.md) |
@@ -116,12 +116,12 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [x] Against a real daemon behind the sidecar, the SPA connects, streams logs, and survives a daemon restart with backoff/reconnect `[B]` — *automated against a real spawned daemon (`pnpm test:e2e:laneb`): connect + welcome frame (real version) + restart→backoff-reconnect verified. Real log **lines** don't arrive because the daemon never installs `WebSocketLogLayer` into tracing (welcome-frame-only `/ws`) — a daemon-side gap recorded in `docs/bugs.md` (Sprint W1), out of scope for the frontend-only sprint per DW1.*
 
 ### Sprint 2 — Live monitoring dashboard (poll-based)
-- [ ] A persistent health header shows active samples/voices/inputs, output channels, uptime, a clip badge, and a stream-error badge (labeled "stream errors / rebuilds", not "buffer xruns") from `/status` + `/metrics` `[A]`
-- [ ] A cache memory-budget gauge renders resident bytes vs cap with headroom from `/metrics` (`null` cap → "unlimited") `[A]`
-- [ ] A now-playing board lists active samples from `/status/samples`; progress is shown as "live position unavailable" pending telemetry (Sprint 6), not faked `[A]`
-- [ ] Voices rack (`/status/voices`, volume + `ducking_multiplier` with a "ducked" indicator) and inputs rack (`/status/inputs`, volume + `muted`) render from live data `[A]`
-- [ ] Clip/stream-error rates are computed client-side by diffing successive `/metrics` polls (cumulative counters are not shown as instantaneous) `[A]`
-- [ ] Against a real daemon, the dashboard reflects live plays/stops/duck changes within the poll interval `[B]`
+- [x] A persistent health header shows active samples/voices/inputs, output channels, uptime, a clip badge, and a stream-error badge (labeled "stream errors / rebuilds", not "buffer xruns") from `/status` + `/metrics` `[A]`
+- [x] A cache memory-budget gauge renders resident bytes vs cap with headroom from `/metrics` (`null` cap → "unlimited") `[A]`
+- [x] A now-playing board lists active samples from `/status/samples`; progress is shown as "live position unavailable" pending telemetry (Sprint 6), not faked `[A]`
+- [x] Voices rack (`/status/voices`, volume + `ducking_multiplier` with a "ducked" indicator) and inputs rack (`/status/inputs`, volume + `muted`) render from live data `[A]`
+- [x] Clip/stream-error rates are computed client-side by diffing successive `/metrics` polls (cumulative counters are not shown as instantaneous) `[A]`
+- [x] Against a real daemon, the dashboard reflects live plays/stops/duck changes within the poll interval `[B]` — *`pnpm test:e2e:laneb`: a real looping play appears on the now-playing board within the poll interval and clears on stopall.*
 
 ### Sprint 3 — Command test-bench & cue launcher
 - [ ] Every runtime command (play, stop, stopall, volume, seek, speed, voice_*, input_*, cache_*, precache) has a form that emits correct JSON, with client-side validation mirroring the code (volume 0-1, speed ranges, lowercase enums) `[A]`
