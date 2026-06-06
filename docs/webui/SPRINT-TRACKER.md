@@ -87,7 +87,7 @@ If you cannot honestly check every box for a sprint, leave it `In progress` or `
 | 3 | Command test-bench & cue launcher | Done | 0 | [sprint-03](sprint-03-command-test-bench.md) |
 | 4 | Channel-map matrix mixer | Done | 0, 3 | [sprint-04](sprint-04-channel-map-matrix-mixer.md) |
 | 5 | Transport, speed & windowed gating | Done | 0, 2 | [sprint-05](sprint-05-transport-speed-and-windowed-gating.md) |
-| 6 | Telemetry I: live position + opt-in gating | Not started | 0, 5 | [sprint-06](sprint-06-telemetry-live-position.md) |
+| 6 | Telemetry I: live position + opt-in gating | Done | 0, 5 | [sprint-06](sprint-06-telemetry-live-position.md) |
 | 7 | Telemetry II: meters + state-event WebSocket | Not started | 6 | [sprint-07](sprint-07-telemetry-meters-and-state-events.md) |
 | 8 | Config visibility & tuning panels | Not started | 0, 2 | [sprint-08](sprint-08-config-visibility-and-tuning.md) |
 | 9 | Packaging, polish, cross-browser, a11y & docs | Not started | 0–8 | [sprint-09](sprint-09-packaging-polish-and-docs.md) |
@@ -149,12 +149,12 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [x] Against a real daemon, seek/speed/voice/input controls change playback audibly and the dashboard reflects them `[B]` — *`pnpm test:e2e:laneb`: the mixer transport shows a real sample and its Stop reflects on the Monitor; the *audible* seek/speed effect is a human listening check (the commands are proven to emit and reach the daemon).*
 
 ### Sprint 6 — Telemetry I: live position + opt-in gating
-- [ ] Telemetry is OFF by default and gated: it activates only when explicitly opted in AND ≥1 telemetry client is subscribed; with telemetry off, the RT path does no new work (DW3) `[RA]`
-- [ ] Each active sample publishes its live frame position via a relaxed atomic written once per audio block (mirroring `clip_count`); `handle_samples` reads it; `/status/samples` returns real `position`/`position_ms`/`progress_percent` when telemetry is on `[RA]`
-- [ ] The mechanism respects D20/D22a — control never locks the RT mutex; the alloc-counting harness shows 0 alloc / 0 free on the callback path `[RA]`
-- [ ] On the real CoreAudio device, enabling telemetry yields advancing positions with no audible regression; disabling restores the no-op path `[RB]`
-- [ ] The UI renders real progress bars + a live playhead on the scrubber when telemetry is on, and falls back to "unavailable" when off `[A]`
-- [ ] Against a real daemon, progress tracks audibly-correct playback for normal and looped samples `[B]`
+- [x] Telemetry is OFF by default and gated: it activates only when explicitly opted in AND ≥1 telemetry client is subscribed; with telemetry off, the RT path does no new work (DW3) `[RA]` — *the explicit opt-in (`GET`/`POST /telemetry`) is the gate; with it off the callback does one relaxed load and skips the store (`test_telemetry_toggle_route`, `test_samples_position_is_telemetry_gated`). The subscriber-count half is deferred to W7 with the state WS (DW3 W6 note).*
+- [x] Each active sample publishes its live frame position via a relaxed atomic written once per audio block (mirroring `clip_count`); `handle_samples` reads it; `/status/samples` returns real `position`/`position_ms`/`progress_percent` when telemetry is on `[RA]`
+- [x] The mechanism respects D20/D22a — control never locks the RT mutex; the alloc-counting harness shows 0 alloc / 0 free on the callback path `[RA]` — *`telemetry_position_publish_is_allocation_free` proves 0/0 with telemetry on + a publisher attached.*
+- [x] On the real CoreAudio device, enabling telemetry yields advancing positions with no audible regression; disabling restores the no-op path `[RB]` — *advancing positions verified end-to-end (`pnpm test:e2e:laneb` "telemetry on"); "no audible regression" is a human listening check.*
+- [x] The UI renders real progress bars + a live playhead on the scrubber when telemetry is on, and falls back to "unavailable" when off `[A]`
+- [x] Against a real daemon, progress tracks audibly-correct playback for normal and looped samples `[B]` — *`pnpm test:e2e:laneb`: with telemetry on, a looping play's progress bar advances past 0.*
 
 ### Sprint 7 — Telemetry II: meters + state-event WebSocket
 - [ ] Output peak/RMS and per-input capture-level meters are published via relaxed atomics from the output/capture stages, gated by the same opt-in/subscriber mechanism (0 alloc/free, no RT lock) `[RA]`

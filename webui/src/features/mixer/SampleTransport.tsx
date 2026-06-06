@@ -19,6 +19,7 @@ import Typography from '@mui/material/Typography';
 import type { SampleInfo } from '../../api/contract';
 import type { DaemonClient } from '../../api/client';
 import { useClient } from '../../state/clientContext';
+import { useTelemetry } from '../../state/queries';
 import { formatDuration } from '../../utils/format';
 import { isWindowed } from './windowed';
 
@@ -74,22 +75,37 @@ function SpeedControl({ sample, disabled }: { sample: SampleInfo; disabled: bool
   );
 }
 
-function SeekControl({ sample, disabled }: { sample: SampleInfo; disabled: boolean }) {
+function SeekControl({
+  sample,
+  disabled,
+  telemetryOn,
+}: {
+  sample: SampleInfo;
+  disabled: boolean;
+  telemetryOn: boolean;
+}) {
   const client = useClient();
-  const [pos, setPos] = useState(0);
+  // While dragging, the thumb follows the user; otherwise it follows the live
+  // playhead when telemetry is on (Sprint W6), or sits at 0 (set-only) when off.
+  const [drag, setDrag] = useState<number | null>(null);
+  const live = telemetryOn ? sample.position_ms : 0;
+  const value = drag ?? live;
   return (
     <Stack direction="row" spacing={1} alignItems="center">
       <Typography variant="caption" sx={{ width: 90 }}>
-        seek {formatDuration(pos)}
+        {telemetryOn ? 'pos' : 'seek'} {formatDuration(value)}
       </Typography>
       <Slider
         size="small"
         min={0}
         max={sample.total_ms || 1}
-        value={pos}
+        value={value}
         disabled={disabled}
-        onChange={(_e, v) => setPos(v as number)}
-        onChangeCommitted={(_e, v) => client?.seek({ internal_id: sample.internal_id, position_ms: v as number })}
+        onChange={(_e, v) => setDrag(v as number)}
+        onChangeCommitted={(_e, v) => {
+          client?.seek({ internal_id: sample.internal_id, position_ms: v as number });
+          setDrag(null);
+        }}
         aria-label={`seek ${sample.internal_id}`}
       />
       <Typography variant="caption" color="text.secondary">/ {formatDuration(sample.total_ms)}</Typography>
@@ -99,6 +115,7 @@ function SeekControl({ sample, disabled }: { sample: SampleInfo; disabled: boole
 
 export function SampleTransport({ sample }: { sample: SampleInfo }) {
   const client: DaemonClient | null = useClient();
+  const telemetryOn = useTelemetry().data?.enabled ?? false;
   const windowed = isWindowed(sample);
 
   return (
@@ -120,7 +137,7 @@ export function SampleTransport({ sample }: { sample: SampleInfo }) {
         </Typography>
       ) : (
         <Box>
-          <SeekControl sample={sample} disabled={false} />
+          <SeekControl sample={sample} disabled={false} telemetryOn={telemetryOn} />
           <SpeedControl sample={sample} disabled={false} />
         </Box>
       )}

@@ -131,10 +131,17 @@ export interface SampleInfo {
   speed: number;
   loop_mode: boolean;
   progress_percent: number;
+  /** Windowed/streamed (forward-only). Present from Sprint W6; absent on older daemons. */
+  windowed?: boolean;
 }
 
 export interface SamplesResponse {
   samples: SampleInfo[];
+}
+
+/** Telemetry opt-in state (Sprint W6). */
+export interface TelemetryInfo {
+  enabled: boolean;
 }
 
 export interface VoiceInfo {

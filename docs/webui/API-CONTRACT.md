@@ -108,7 +108,8 @@ numeric string (`"3"` → index 3), or an alias string resolved against `audio.c
 | `/health` | `{status,service,version}` — liveness only; slow poll / connection-loss probe. |
 | `/version` | `{name,version,git_sha?}` — fetch once. |
 | `/status` | counts (`active_samples/inputs/voices`, `output_channels`), `clip_count`, `xruns`, cache mem/disk `{entries,size_bytes}`, `status`,`version`. Poll 1–2 s. |
-| `/status/samples` | per-sample `internal_id,id,voice,file,total_frames,total_ms,sample_rate,volume,voice_volume,speed,loop_mode`. **`position`/`position_ms`/`progress_percent` are hard-coded `0`** (`handlers.rs:721-730`) until telemetry (§7). Poll 1–2 s. |
+| `/status/samples` | per-sample `internal_id,id,voice,file,total_frames,total_ms,sample_rate,volume,voice_volume,speed,loop_mode,windowed`. `position`/`position_ms`/`progress_percent` are real **when telemetry is enabled** (Sprint W6, `GET/POST /telemetry`), else `0`. Poll 1–2 s. |
+| `/telemetry` | `{enabled}` (Sprint W6). `GET` reads the opt-in flag; `POST {"enabled":bool}` sets it. Off by default. |
 | `/status/voices` | per-voice `id,sample_count,volume,ducking_multiplier` (1.0 = not ducked). Poll 1–2 s. |
 | `/status/inputs` | per-input `index,voice_id,volume,channels,muted` (`muted = volume==0.0`). Poll 1–2 s. |
 | `/status/cache` | memory/disk `{entries,size_bytes,size_mb}`. Poll 2–5 s. |
@@ -130,8 +131,9 @@ connects same-origin; bypassing the proxy forces `?token=` in the WS URL (DW9).
 These do **not** exist yet; the sprints add them. The client should feature-detect (try/fallback), per DW3/DW6.
 
 - **`GET /config`** (Sprint W8, DW11): read-only running config, secrets redacted.
-- **Live sample position** (Sprint W6, DW12): real `position`/`position_ms`/`progress_percent` on
-  `/status/samples` and over the state channel, **only when telemetry is opted-in + subscribed** (DW3).
+- **Live sample position** — *landed in Sprint W6.* Real `position`/`position_ms`/`progress_percent` on
+  `/status/samples` when telemetry is opted-in via `GET/POST /telemetry` (DW3); `0` when off. The over-the-WS
+  delivery (tick frames) is still Sprint W7.
 - **Meters** (Sprint W7): output peak/RMS + per-input capture level atomics, exposed via the state channel
   (and/or `/status/meters`).
 - **State-event WebSocket channel** (Sprint W7, DW12): a second channel of typed events

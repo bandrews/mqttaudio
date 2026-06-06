@@ -157,3 +157,29 @@ test('the mixer transport shows a real sample and its Stop control clears it', a
   await page.getByRole('tab', { name: 'Monitor' }).click();
   await expect(page.getByText(/no samples playing/i)).toBeVisible({ timeout: 6_000 });
 });
+
+test('telemetry on: live progress advances against a real daemon (Sprint W6)', async ({ page }) => {
+  daemon = await startDaemon();
+
+  await page.goto('/');
+  await page.getByRole('button', { name: /connect/i }).click();
+  await expect(page.getByText('Log stream')).toBeVisible({ timeout: 20_000 });
+
+  // Opt in to telemetry, then play a looping file. (The switch is controlled by
+  // the /telemetry query, so click rather than check.)
+  await page.getByRole('checkbox', { name: 'telemetry' }).click();
+  await page.request.post('/api/command', {
+    data: { command: 'play', message: { file: WAV, voice: 'beep', loop: true } },
+  });
+
+  await page.getByRole('tab', { name: 'Monitor' }).click();
+  // A real progress bar appears and its value advances past 0 as the daemon
+  // publishes live position (this is the gated W6 telemetry working end-to-end).
+  const bar = page.getByLabel(/^progress /);
+  await expect(bar).toBeVisible({ timeout: 8_000 });
+  await expect
+    .poll(async () => Number(await bar.getAttribute('aria-valuenow')), { timeout: 8_000 })
+    .toBeGreaterThan(0);
+
+  await page.request.post('/api/command', { data: { command: 'stopall' } });
+});

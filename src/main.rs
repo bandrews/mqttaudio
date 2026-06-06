@@ -407,6 +407,12 @@ async fn main() {
     // limiter acts; HTTP `/status` reads it. Created once and cloned into both sides.
     let clip_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
+    // Opt-in telemetry gate (Sprint W6, DW3). Off by default. Shared between the RT
+    // `MixerState` (which gates its per-sample position store on it) and the HTTP
+    // `AppState` (POST /telemetry flips it). The control thread never locks the RT.
+    let telemetry_enabled =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let mixer = MixerState {
         active_samples: Vec::with_capacity(audio::mixer::MAX_VOICES),
         live_inputs: Vec::with_capacity(audio::mixer::MAX_LIVE_INPUTS),
@@ -418,6 +424,7 @@ async fn main() {
         output_ceiling: audio::mixer::db_to_linear(config.audio.output_ceiling_db),
         master_gain: config.audio.master_gain,
         clip_count: clip_count.clone(),
+        telemetry_enabled: telemetry_enabled.clone(),
     };
 
     // Control->audio command ring, audio->reaper graveyard ring, and audio->reaper
@@ -700,6 +707,7 @@ async fn main() {
             xruns.clone(),
             start_time,
             ducking_snapshot.clone(),
+            telemetry_enabled.clone(),
         )
         .await
         {
@@ -1297,6 +1305,9 @@ async fn finish_streamed_play(
         voice_volume: source.voice_volume,
         speed: 1.0,
         loop_mode,
+        // Streamed/windowed sources are forward-only (no seek/speed/reverse).
+        windowed: true,
+        position: None,
     };
 
     let became_active = !ctx.active_counts.contains_key(&voice_id);
@@ -1813,8 +1824,18 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                         tracing::debug!("Applied {}ms fade in to voice '{}'", fade_ms, voice_id);
                     }
 
+                    // Live-position publisher (Sprint W6, DW12): one atomic, shared
+                    // between the RT sample (which stores into it each block when
+                    // telemetry is on) and the control-side status (which the handler
+                    // reads). Constructed off-RT and moved in with the sample, so the
+                    // callback never allocates it.
+                    let position = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                        sample.position,
+                    ));
+                    sample.position_publisher = Some(position.clone());
+
                     // Record the control-side status before the sample is moved
-                    // into the command (live position stays audio-thread-owned).
+                    // into the command. Full-load samples are seekable (not windowed).
                     let status = http::SampleStatus {
                         internal_id: sample.id,
                         sample_id: sample.sample_id.clone(),
@@ -1826,6 +1847,8 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                         voice_volume: sample.voice_volume,
                         speed: sample.speed,
                         loop_mode: sample.loop_mode,
+                        windowed: false,
+                        position: Some(position),
                     };
 
                     // Voice became active: compute and forward ducking targets

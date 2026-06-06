@@ -8,7 +8,7 @@ use crate::audio::streaming::SampleBuffer;
 use crate::audio::types::DecodedBuffer;
 use crate::config::{DEFAULT_MASTER_GAIN, DEFAULT_OUTPUT_CEILING_DB};
 use ringbuf::HeapConsumer;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Fade state for audio samples
@@ -187,6 +187,14 @@ pub struct ActiveSample {
     pitch_crossfade_remaining: usize,
     pitch_crossfade_total: usize,
     pitch_crossfade_direct_pos: f64,
+
+    /// Optional live-position publisher (Sprint W6 telemetry, DW3/DW12). When set
+    /// and telemetry is enabled, the callback stores `position` into this atomic
+    /// once per block — a single relaxed store, no alloc/lock — so the control
+    /// thread can read live playback position without touching the mixer (D22a).
+    /// The atomic is constructed off-RT and moved in with the sample, never
+    /// allocated on the audio thread.
+    pub position_publisher: Option<Arc<AtomicUsize>>,
 }
 
 impl ActiveSample {
@@ -236,6 +244,7 @@ impl ActiveSample {
             pitch_crossfade_remaining: 0,
             pitch_crossfade_total: 0,
             pitch_crossfade_direct_pos: 0.0,
+            position_publisher: None,
         }
     }
 
@@ -282,6 +291,7 @@ impl ActiveSample {
             pitch_crossfade_remaining: 0,
             pitch_crossfade_total: 0,
             pitch_crossfade_direct_pos: 0.0,
+            position_publisher: None,
         }
     }
 
@@ -325,6 +335,7 @@ impl ActiveSample {
             pitch_crossfade_remaining: 0,
             pitch_crossfade_total: 0,
             pitch_crossfade_direct_pos: 0.0,
+            position_publisher: None,
         }
     }
 
@@ -1044,6 +1055,13 @@ pub struct MixerState {
     /// Count of samples that exceeded the ceiling and were limited. Incremented on
     /// the audio thread (lock-free), read by `/status`.
     pub clip_count: Arc<AtomicU64>,
+
+    /// Opt-in telemetry gate (Sprint W6, DW3). Off by default. When set, the
+    /// callback publishes each sample's live position into its `position_publisher`
+    /// atomic (one relaxed store per sample per block); when clear it does no new
+    /// work beyond a single relaxed load. The control thread shares this Arc and
+    /// flips it (POST /telemetry); it never locks the RT state (D22a).
+    pub telemetry_enabled: Arc<AtomicBool>,
 }
 
 impl MixerState {
@@ -1068,6 +1086,7 @@ impl MixerState {
             output_ceiling: db_to_linear(DEFAULT_OUTPUT_CEILING_DB),
             master_gain: DEFAULT_MASTER_GAIN,
             clip_count: Arc::new(AtomicU64::new(0)),
+            telemetry_enabled: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -1096,6 +1115,10 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
     let ducking = state.ducking_applier.as_ref();
     let output_channels = state.output_channels;
 
+    // Opt-in telemetry gate (Sprint W6, DW3): read once per block. When clear, the
+    // per-sample position store below is skipped — no new RT work beyond this load.
+    let publish_positions = state.telemetry_enabled.load(Ordering::Relaxed);
+
     // Mix each active sample into the output
     for sample in &mut state.active_samples {
         // This voice's duck multipliers at the buffer's start and end (D1); the mix
@@ -1110,6 +1133,15 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
         // skip the generic speed-based advance for it to avoid double-counting.
         if !position_advanced {
             sample.advance_position(frames);
+        }
+
+        // Publish the post-advance live position (DW12): a single relaxed store into
+        // a pre-allocated atomic moved in with the sample — no alloc, no lock. The
+        // control thread reads it without ever touching the mixer (D22a).
+        if publish_positions {
+            if let Some(ref publisher) = sample.position_publisher {
+                publisher.store(sample.position, Ordering::Relaxed);
+            }
         }
     }
 

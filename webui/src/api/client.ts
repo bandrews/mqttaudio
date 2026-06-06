@@ -23,6 +23,7 @@ import type {
   SpeedParams,
   StatusInfo,
   StopParams,
+  TelemetryInfo,
   VersionInfo,
   VoiceFadeOutParams,
   VoiceStopParams,
@@ -180,6 +181,16 @@ export class DaemonClient {
 
   statusInputs(): Promise<InputsResponse> {
     return this.conn.get<InputsResponse>('/status/inputs');
+  }
+
+  /** Read the telemetry opt-in state (Sprint W6). */
+  telemetry(): Promise<TelemetryInfo> {
+    return this.conn.get<TelemetryInfo>('/telemetry');
+  }
+
+  /** Opt in/out of live telemetry (Sprint W6, DW3). */
+  setTelemetry(enabled: boolean): Promise<TelemetryInfo> {
+    return this.conn.post<TelemetryInfo>('/telemetry', { enabled });
   }
 
   // ---- Transport + lifecycle ----

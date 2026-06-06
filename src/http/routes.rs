@@ -105,7 +105,12 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         .route("/status/cache", get(handlers::handle_cache_status))
         .route("/status/inputs", get(handlers::handle_inputs))
         .route("/version", get(handlers::handle_version))
-        .route("/metrics", get(handlers::handle_metrics));
+        .route("/metrics", get(handlers::handle_metrics))
+        // Telemetry opt-in (Sprint W6, DW3): GET reads the flag, POST sets it.
+        .route(
+            "/telemetry",
+            get(handlers::handle_telemetry_get).post(handlers::handle_telemetry_set),
+        );
 
     // Health check (no auth)
     let health_route = Router::new().route("/health", get(handlers::handle_health));

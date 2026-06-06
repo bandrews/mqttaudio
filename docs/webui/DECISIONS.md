@@ -42,6 +42,14 @@ monotonic** across this file (the web program's namespace; distinct from the bac
   "may impact performance", so it must not run unless someone is actively watching. *Behavior change* (new
   control + endpoints) — changelog it. *Partner decision.* See DW12 for the mechanism.
 
+  - **DW3 · W6 implementation note (landed).** The opt-in surface is `GET/POST /telemetry` (`{enabled: bool}`),
+    a single shared `AtomicBool` flipped by the SPA's Telemetry switch — not the per-read "transient subscriber"
+    TTL the W6 brief sketched. The RT gate is this flag: with telemetry off the callback does one relaxed load
+    and skips the per-sample position store (0-alloc/0-free both ways, proven by `tests/alloc_harness.rs`). The
+    **subscriber-count** half of the gate ("≥1 client subscribed") is only meaningful once the state-event
+    WebSocket exists, so it is **deferred to Sprint W7** (per the W6 F1 note); for the poll-based W6 path the
+    explicit opt-in flag is the gate. Recorded here per the override rule.
+
 - **DW4 · Frontend stack.** Vite + React + TypeScript + Material UI (MUI). Server state via a query/cache layer
   (TanStack Query) over the typed API client; light view-local state via Zustand or React Context (no Redux).
   Tests: Vitest + React Testing Library (unit/component) and Playwright (E2E). Package manager: pnpm. *Why:*

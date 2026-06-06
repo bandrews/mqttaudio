@@ -5,11 +5,13 @@
 
 import Box from '@mui/material/Box';
 import Chip from '@mui/material/Chip';
+import LinearProgress from '@mui/material/LinearProgress';
 import Paper from '@mui/material/Paper';
 import Stack from '@mui/material/Stack';
 import Typography from '@mui/material/Typography';
-import { useStatusSamples } from '../../state/queries';
+import { useStatusSamples, useTelemetry } from '../../state/queries';
 import { formatDuration } from '../../utils/format';
+import { isWindowed } from '../mixer/windowed';
 import type { SampleInfo } from '../../api/contract';
 
 function basename(path: string): string {
@@ -17,7 +19,9 @@ function basename(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
-function SampleRow({ sample }: { sample: SampleInfo }) {
+function SampleRow({ sample, telemetryOn }: { sample: SampleInfo; telemetryOn: boolean }) {
+  const windowed = isWindowed(sample);
+  const showProgress = telemetryOn && !windowed && sample.total_ms > 0;
   return (
     <Paper variant="outlined" sx={{ p: 1.5 }}>
       <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
@@ -28,19 +32,35 @@ function SampleRow({ sample }: { sample: SampleInfo }) {
         <Chip size="small" variant="outlined" label={`vol ${sample.volume.toFixed(2)}`} />
         {sample.speed !== 1 && <Chip size="small" variant="outlined" label={`${sample.speed}×`} />}
         {sample.loop_mode && <Chip size="small" color="info" variant="outlined" label="loop" />}
+        {windowed && <Chip size="small" color="warning" label="streamed" />}
         <Typography variant="caption" color="text.secondary">
           {formatDuration(sample.total_ms)}
         </Typography>
       </Stack>
-      <Typography variant="caption" color="text.secondary">
-        live position unavailable (enable telemetry — Sprint W6)
-      </Typography>
+      {showProgress ? (
+        <Box mt={0.5}>
+          <LinearProgress
+            variant="determinate"
+            value={Math.min(100, sample.progress_percent)}
+            sx={{ height: 6, borderRadius: 1 }}
+            aria-label={`progress ${sample.internal_id}`}
+          />
+          <Typography variant="caption" color="text.secondary">
+            {formatDuration(sample.position_ms)} / {formatDuration(sample.total_ms)}
+          </Typography>
+        </Box>
+      ) : (
+        <Typography variant="caption" color="text.secondary">
+          {windowed ? 'streamed (forward-only)' : 'live position unavailable (enable Telemetry)'}
+        </Typography>
+      )}
     </Paper>
   );
 }
 
 export function NowPlayingBoard() {
   const { data } = useStatusSamples();
+  const telemetryOn = useTelemetry().data?.enabled ?? false;
   const samples = data?.samples ?? [];
 
   return (
@@ -55,7 +75,7 @@ export function NowPlayingBoard() {
       ) : (
         <Stack spacing={1} aria-label="active samples">
           {samples.map((s) => (
-            <SampleRow key={s.internal_id} sample={s} />
+            <SampleRow key={s.internal_id} sample={s} telemetryOn={telemetryOn} />
           ))}
         </Stack>
       )}

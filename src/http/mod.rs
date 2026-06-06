@@ -14,7 +14,7 @@ use crate::voice::VoiceManager;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -33,6 +33,15 @@ pub struct SampleStatus {
     pub voice_volume: f32,
     pub speed: f32,
     pub loop_mode: bool,
+    /// Windowed/streamed (forward-only) sample (Sprint W6 F4). The transport UI
+    /// gates seek/speed/reverse off this instead of inferring from total_frames.
+    pub windowed: bool,
+    /// Live-position publisher shared with the RT `ActiveSample` (Sprint W6, DW12).
+    /// When telemetry is enabled the audio thread stores the current frame position
+    /// here; the status handler reads it. `None` for streamed sources and when the
+    /// sample was started without a publisher. The Arc is cloned into the status
+    /// snapshot, so reading it never touches the mixer (D22a).
+    pub position: Option<Arc<AtomicUsize>>,
 }
 
 /// Per-input status the control thread knows for a configured live input.
@@ -86,6 +95,11 @@ pub struct AppState {
     pub require_auth: bool,
     /// Log broadcaster for WebSocket clients
     pub log_broadcaster: Arc<LogBroadcaster>,
+    /// Opt-in telemetry gate (Sprint W6, DW3). Off by default. Shared with the RT
+    /// `MixerState`; `POST /telemetry` flips it. When set, the audio thread
+    /// publishes live positions and the status handler reports them; when clear,
+    /// `/status/samples` reports `0` as before and the RT does no new work.
+    pub telemetry_enabled: Arc<AtomicBool>,
 }
 
 /// Return a warning when the HTTP control API is exposed on a non-loopback
@@ -119,6 +133,7 @@ pub async fn start_server(
     xruns: Arc<AtomicU64>,
     start_time: Instant,
     ducking: Arc<RwLock<HashMap<String, f32>>>,
+    telemetry_enabled: Arc<AtomicBool>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
 
@@ -134,6 +149,7 @@ pub async fn start_server(
         auth_token: config.auth_token.clone(),
         require_auth: config.require_auth,
         log_broadcaster: log_broadcaster.clone(),
+        telemetry_enabled,
     };
 
     let app = create_router(state, config.cors_permissive, config.websocket_enabled);

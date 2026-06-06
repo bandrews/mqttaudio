@@ -5,6 +5,9 @@
 
 import type { SampleInfo } from '../../api/contract';
 
-export function isWindowed(sample: Pick<SampleInfo, 'total_frames'>): boolean {
+export function isWindowed(sample: Pick<SampleInfo, 'total_frames' | 'windowed'>): boolean {
+  // Prefer the real flag (Sprint W6 F4); fall back to the total_frames heuristic
+  // for older daemons that don't send it.
+  if (typeof sample.windowed === 'boolean') return sample.windowed;
   return sample.total_frames === 0;
 }

@@ -23,6 +23,7 @@ import { Dashboard } from './features/dashboard/Dashboard';
 import { CommandConsole } from './features/console/CommandConsole';
 import { MatrixMixer } from './features/matrix/MatrixMixer';
 import { MixerView } from './features/mixer/MixerView';
+import { TelemetrySwitch } from './features/telemetry/TelemetrySwitch';
 
 interface Session {
   client: DaemonClient;
@@ -62,6 +63,7 @@ function ConnectedView({ session, onDisconnect }: { session: Session; onDisconne
             mqttaudio
           </Typography>
           <Stack direction="row" spacing={1} alignItems="center">
+            <TelemetrySwitch />
             <Chip size="small" color="success" label={`connected: ${connection.label}`} />
             {version && (
               <Chip

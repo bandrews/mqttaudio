@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Opt-in live-position telemetry (`GET`/`POST /telemetry`).** Off by default. When enabled, the audio thread
+  publishes each playing sample's live frame position into a pre-allocated atomic once per block (a single
+  relaxed store — no allocation, no lock, RT-safe), and `GET /status/samples` then reports real `position`,
+  `position_ms`, and `progress_percent` instead of `0`. With telemetry off the callback does no new work and
+  those fields stay `0` exactly as before, so nothing changes for existing clients. `POST /telemetry`
+  (`{"enabled": true|false}`) flips it; `GET /telemetry` reads it. Added for the web control app's live
+  progress bars; it is opt-in because it adds a little real-time work. `/status/samples` also gains a
+  `windowed` boolean (a streamed/forward-only sample) so a UI can gate seek/speed/reverse reliably.
 - **Windowed streaming for big files (`mode=stream`, and via the default `mode=auto`).** A `play` of a large
   or long file — local **or** `http(s)://` — is now played through a bounded ring (a fixed window, default
   1.5 s) fed by a background decoder, instead of being fully decoded into memory, so a multi-hour cue costs

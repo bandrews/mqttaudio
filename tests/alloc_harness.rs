@@ -115,6 +115,45 @@ fn mix_path_is_allocation_free_after_warmup() {
 }
 
 #[test]
+fn telemetry_position_publish_is_allocation_free() {
+    // Sprint W6 (DW3/DW12): with telemetry ON and a position publisher attached,
+    // the callback stores each sample's live position into a pre-allocated atomic
+    // once per block. The atomic is created off-RT (here, before the armed region);
+    // the store itself must be 0 alloc / 0 free.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let plain = ActiveSample::new(
+        1,
+        "a".to_string(),
+        decoded(sine(440.0, SR, SR as usize, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "a".to_string(),
+    );
+    let mut state = SceneBuilder::new(2).sample(plain).build();
+    state.telemetry_enabled.store(true, Ordering::Relaxed);
+    let pos = Arc::new(AtomicUsize::new(0));
+    state.active_samples[0].position_publisher = Some(pos.clone());
+
+    let mut block = vec![0.0f32; BLOCK * 2];
+    mix_audio(&mut block, &mut state); // warm up off the armed region
+
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..8 {
+            mix_audio(&mut block, &mut state);
+        }
+    });
+
+    assert_eq!(allocs, 0, "telemetry position publish allocated {allocs} times");
+    assert_eq!(deallocs, 0, "telemetry position publish freed {deallocs} times");
+    assert!(
+        pos.load(Ordering::Relaxed) > 0,
+        "the published position should have advanced"
+    );
+}
+
+#[test]
 fn live_input_underrun_mix_is_allocation_free_after_warmup() {
     // F3: the graceful-underrun fade in mix_live_input_into_output runs on the RT
     // thread (inside mix_audio). It holds the last frame and fades it to silence

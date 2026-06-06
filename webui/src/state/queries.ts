@@ -56,6 +56,10 @@ export function cacheQueryOptions(client: DaemonClient): Options<Awaited<ReturnT
   return { queryKey: ['status', 'cache'], queryFn: () => client.statusCache(), refetchInterval: POLL.cache };
 }
 
+export function telemetryQueryOptions(client: DaemonClient): Options<Awaited<ReturnType<DaemonClient['telemetry']>>> {
+  return { queryKey: ['telemetry'], queryFn: () => client.telemetry(), refetchInterval: POLL.cache };
+}
+
 function useClientQuery<T>(factory: (client: DaemonClient) => Options<T>) {
   const client = useClient();
   // The factory needs a non-null client; when there is none, disable the query
@@ -74,3 +78,4 @@ export const useStatusSamples = () => useClientQuery(samplesQueryOptions);
 export const useStatusVoices = () => useClientQuery(voicesQueryOptions);
 export const useStatusInputs = () => useClientQuery(inputsQueryOptions);
 export const useStatusCache = () => useClientQuery(cacheQueryOptions);
+export const useTelemetry = () => useClientQuery(telemetryQueryOptions);

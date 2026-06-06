@@ -9,7 +9,7 @@ use mqttaudio::http::{
 };
 use mqttaudio::voice::VoiceManager;
 use parking_lot::Mutex;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tower::util::ServiceExt;
@@ -61,6 +61,7 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         auth_token: None,
         require_auth: false,
         log_broadcaster: Arc::new(LogBroadcaster::new()),
+        telemetry_enabled: Arc::new(AtomicBool::new(false)),
     };
 
     (state, cmd_rx)
@@ -701,6 +702,100 @@ async fn test_samples_endpoint_reports_timing_metadata() {
     assert_eq!(position, 0, "position is not tracked control-side");
     let position_ms = sample_json["position_ms"].as_u64().unwrap();
     assert_eq!(position_ms, 0, "position_ms is not tracked control-side");
+}
+
+// Sprint W6: live position is gated by the opt-in telemetry flag (DW3). The audio
+// thread publishes into a per-sample atomic; the handler reports it only when
+// telemetry is on. With telemetry off the fields stay 0 (the pre-W6 behavior).
+async fn get_samples_json(app: axum::Router) -> serde_json::Value {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/status/samples")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+async fn test_samples_position_is_telemetry_gated() {
+    let (state, _rx) = create_test_state();
+    let flag = state.telemetry_enabled.clone();
+
+    // A full-load sample with a live-position publisher at 1.0s in (48000 frames of
+    // a 10s / 480000-frame buffer), and a streamed source (windowed, no publisher).
+    let pos = Arc::new(AtomicUsize::new(48_000));
+    {
+        let mut snapshot = state.status.write().unwrap();
+        let mut full = sample_status(1, "music", "/a.wav", 480_000, 48_000);
+        full.position = Some(pos.clone());
+        full.windowed = false;
+        snapshot.samples.push(full);
+        let mut streamed = sample_status(2, "stream", "/b.wav", 0, 48_000);
+        streamed.windowed = true;
+        streamed.position = None;
+        snapshot.samples.push(streamed);
+    }
+
+    let app = create_router(state, false, false);
+
+    // Telemetry OFF (default): position is 0 even though the atomic holds 48000.
+    flag.store(false, Ordering::Relaxed);
+    let json = get_samples_json(app.clone()).await;
+    let samples = json["samples"].as_array().unwrap();
+    assert_eq!(samples[0]["position"].as_u64().unwrap(), 0);
+    assert_eq!(samples[0]["position_ms"].as_u64().unwrap(), 0);
+    assert_eq!(samples[0]["progress_percent"].as_f64().unwrap(), 0.0);
+    assert_eq!(samples[0]["windowed"], serde_json::json!(false));
+    assert_eq!(samples[1]["windowed"], serde_json::json!(true));
+
+    // Telemetry ON: the live position is reported (48000 frames = 1000ms = 10%).
+    flag.store(true, Ordering::Relaxed);
+    let json = get_samples_json(app.clone()).await;
+    let samples = json["samples"].as_array().unwrap();
+    assert_eq!(samples[0]["position"].as_u64().unwrap(), 48_000);
+    assert_eq!(samples[0]["position_ms"].as_u64().unwrap(), 1000);
+    assert_eq!(samples[0]["progress_percent"].as_f64().unwrap(), 10.0);
+    // The streamed sample has no publisher, so it stays at 0 even with telemetry on.
+    assert_eq!(samples[1]["position"].as_u64().unwrap(), 0);
+
+    // The audio thread advancing the atomic is reflected on the next read.
+    pos.store(96_000, Ordering::Relaxed);
+    let json = get_samples_json(app).await;
+    assert_eq!(json["samples"][0]["position_ms"].as_u64().unwrap(), 2000);
+}
+
+#[tokio::test]
+async fn test_telemetry_toggle_route() {
+    let (state, _rx) = create_test_state();
+    let flag = state.telemetry_enabled.clone();
+    let app = create_router(state, false, false);
+
+    // GET reports the default (off).
+    let get = Request::builder()
+        .method(Method::GET)
+        .uri("/telemetry")
+        .body(Body::empty())
+        .unwrap();
+    let body = axum::body::to_bytes(app.clone().oneshot(get).await.unwrap().into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["enabled"], serde_json::json!(false));
+
+    // POST enables it; the shared flag flips.
+    let post = Request::builder()
+        .method(Method::POST)
+        .uri("/telemetry")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"enabled":true}"#))
+        .unwrap();
+    let response = app.oneshot(post).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(flag.load(Ordering::Relaxed), "POST /telemetry should set the flag");
 }
 
 #[tokio::test]

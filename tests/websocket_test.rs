@@ -6,7 +6,7 @@ use mqttaudio::cache::CacheManager;
 use mqttaudio::http::{create_router, AppState, LogBroadcaster, StatusSnapshot};
 use mqttaudio::voice::VoiceManager;
 use parking_lot::Mutex;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -42,6 +42,7 @@ fn build_state() -> (AppState, mpsc::Receiver<String>, Arc<LogBroadcaster>) {
         auth_token: None,
         require_auth: false,
         log_broadcaster: log_broadcaster.clone(),
+        telemetry_enabled: Arc::new(AtomicBool::new(false)),
     };
 
     (state, cmd_rx, log_broadcaster)
