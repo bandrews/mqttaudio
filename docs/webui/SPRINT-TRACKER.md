@@ -91,8 +91,14 @@ If you cannot honestly check every box for a sprint, leave it `In progress` or `
 | 7 | Telemetry II: meters + state-event WebSocket | Not started | 6 | [sprint-07](sprint-07-telemetry-meters-and-state-events.md) |
 | 8 | Config visibility & tuning panels | Not started | 0, 2 | [sprint-08](sprint-08-config-visibility-and-tuning.md) |
 | 9 | Packaging, polish, cross-browser, a11y & docs | Not started | 0–8 | [sprint-09](sprint-09-packaging-polish-and-docs.md) |
+| 10 | **Bonus (daemon):** CPAL upgrade & device-detection fix | Not started | — | [sprint-10](sprint-10-cpal-upgrade.md) |
 
 Status values: `Not started` · `In progress` · `Blocked` · `Done`.
+
+> **Sprint 10 is a bonus, daemon-only sprint** bundled into this branch for convenience (partner request):
+> bump `cpal` to the latest release to resolve a discovered device-detection bug. It has **no web-app
+> dependency** and runs entirely on the **Rust lanes** (`[RA]`/`[RB]`); it can be done at any point. It is not
+> required for the web program's Final gates, but should be green before the branch merges.
 
 ---
 
@@ -170,6 +176,12 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [ ] Keyboard navigation and screen-reader labels pass an automated a11y check (axe) in CI `[A]`
 - [ ] `docs/webui/` gains a README + getting-started (run the sidecar, point it at a daemon, optional token), linked from the main `README.md` `[A]`
 - [ ] Cross-browser (Safari/Firefox/Edge) + manual a11y/visual QA pass recorded in `MANUAL-VERIFICATION.md` `[C]`
+
+### Sprint 10 — Bonus (daemon): CPAL upgrade & device-detection fix
+- [ ] `cpal` bumped to the latest release in `Cargo.toml`/`Cargo.lock`; the daemon builds warning-free with `-D warnings` and clippy is clean across the cpal API changes `[RA]`
+- [ ] The discovered device-detection bug is reproduced (a failing/asserting test or a documented repro), root-caused, and fixed against the new cpal; a regression test or `--list-devices`/`--list-inputs` assertion covers it `[RA]`
+- [ ] The existing audio test suite + the alloc-counting harness stay green on the new cpal; any cpal API/behavior change is reflected in `docs/architecture.md`/`CHANGELOG.md` `[RA]`
+- [ ] On the real CoreAudio device, `--list-devices`/`--list-inputs` enumerate correctly and a play opens the device and runs clean on the new cpal `[RB]`
 
 ---
 
