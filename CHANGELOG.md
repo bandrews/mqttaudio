@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   meters:{output:[…]}}`) over a new `/ws/state` WebSocket — **only while telemetry is on and at least one client
   is connected**, so it costs nothing otherwise. `GET /status/meters` is a poll fallback. Added for the web
   app's live meters and smoother position updates.
+- **Read-only `GET /config`.** Returns the running configuration as JSON with secrets redacted
+  (`http.auth_token` and `mqtt.password` are nulled out). Config is read once at startup, so this is a startup
+  snapshot. Added so the web app can show current values and generate restart-required config snippets for
+  tuning (the daemon has no hot-reload).
 - **Windowed streaming for big files (`mode=stream`, and via the default `mode=auto`).** A `play` of a large
   or long file — local **or** `http(s)://` — is now played through a bounded ring (a fixed window, default
   1.5 s) fed by a background decoder, instead of being fully decoded into memory, so a multi-hour cue costs

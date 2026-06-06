@@ -23,6 +23,7 @@ import { Dashboard } from './features/dashboard/Dashboard';
 import { CommandConsole } from './features/console/CommandConsole';
 import { MatrixMixer } from './features/matrix/MatrixMixer';
 import { MixerView } from './features/mixer/MixerView';
+import { ConfigView } from './features/config/ConfigView';
 import { TelemetrySwitch } from './features/telemetry/TelemetrySwitch';
 
 interface Session {
@@ -49,7 +50,7 @@ export function App() {
   );
 }
 
-type View = 'monitor' | 'mixer' | 'console' | 'matrix';
+type View = 'monitor' | 'mixer' | 'console' | 'matrix' | 'config';
 
 function ConnectedView({ session, onDisconnect }: { session: Session; onDisconnect: () => void }) {
   const { result, connection } = session;
@@ -82,6 +83,7 @@ function ConnectedView({ session, onDisconnect }: { session: Session; onDisconne
           <Tab value="mixer" label="Mixer" />
           <Tab value="console" label="Console" />
           <Tab value="matrix" label="Matrix" />
+          <Tab value="config" label="Config" />
         </Tabs>
       </AppBar>
       <Container maxWidth="xl" sx={{ py: 3 }}>
@@ -89,6 +91,7 @@ function ConnectedView({ session, onDisconnect }: { session: Session; onDisconne
         {view === 'mixer' && <MixerView />}
         {view === 'console' && <CommandConsole />}
         {view === 'matrix' && <MatrixMixer />}
+        {view === 'config' && <ConfigView />}
       </Container>
     </Box>
   );

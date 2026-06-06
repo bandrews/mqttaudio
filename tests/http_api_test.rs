@@ -64,6 +64,7 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         telemetry_enabled: Arc::new(AtomicBool::new(false)),
         output_meters: Arc::new(Vec::new()),
         state_broadcaster: Arc::new(LogBroadcaster::new()),
+        config_json: Arc::new(serde_json::json!({})),
     };
 
     (state, cmd_rx)
@@ -798,6 +799,35 @@ async fn test_telemetry_toggle_route() {
     let response = app.oneshot(post).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert!(flag.load(Ordering::Relaxed), "POST /telemetry should set the flag");
+}
+
+#[test]
+fn redact_config_json_nulls_secrets_and_keeps_the_rest() {
+    let input = serde_json::json!({
+        "http": { "auth_token": "supersecret", "port": 8080 },
+        "mqtt": { "password": "pw", "server": "localhost" },
+        "audio": { "sample_rate": 48000 },
+    });
+    let out = mqttaudio::http::redact_config_json(input);
+    assert!(out["http"]["auth_token"].is_null(), "auth_token must be redacted");
+    assert!(out["mqtt"]["password"].is_null(), "mqtt password must be redacted");
+    // Non-secret fields are preserved verbatim.
+    assert_eq!(out["http"]["port"], 8080);
+    assert_eq!(out["mqtt"]["server"], "localhost");
+    assert_eq!(out["audio"]["sample_rate"], 48000);
+}
+
+#[tokio::test]
+async fn test_config_endpoint_returns_snapshot() {
+    let (state, _rx) = create_test_state();
+    let app = create_router(state, false, false);
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/config")
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

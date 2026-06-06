@@ -844,6 +844,13 @@ pub async fn handle_meters(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({ "output": output }))
 }
 
+/// Read-only running config (Sprint W8, DW11), secrets redacted. Config is read
+/// once at startup, so this is a startup snapshot. The web app shows current
+/// values and emits restart-required config snippets (config has no hot-reload).
+pub async fn handle_config(State(state): State<AppState>) -> impl IntoResponse {
+    Json((*state.config_json).clone())
+}
+
 /// Current telemetry-enable state.
 pub async fn handle_telemetry_get(State(state): State<AppState>) -> impl IntoResponse {
     let enabled = state

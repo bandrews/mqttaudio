@@ -149,6 +149,10 @@ export interface MetersInfo {
   output: number[];
 }
 
+/** The running daemon config (Sprint W8), secrets redacted. Loosely typed — it
+ * mirrors the config.json schema and the UI reads sections by key. */
+export type ConfigInfo = Record<string, unknown>;
+
 /** A throttled tick frame from the `/ws/state` channel (Sprint W7). */
 export interface TickFrame {
   type: 'tick';

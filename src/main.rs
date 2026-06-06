@@ -421,6 +421,13 @@ async fn main() {
             .collect(),
     );
 
+    // Snapshot the running config as redacted JSON for the read-only `GET /config`
+    // (Sprint W8, DW11). Config is read once at startup (DW8), so a startup snapshot
+    // is accurate. Secrets (http.auth_token, mqtt.password) are nulled out.
+    let config_json = std::sync::Arc::new(http::redact_config_json(
+        serde_json::to_value(&config).unwrap_or_else(|_| serde_json::json!({})),
+    ));
+
     let mixer = MixerState {
         active_samples: Vec::with_capacity(audio::mixer::MAX_VOICES),
         live_inputs: Vec::with_capacity(audio::mixer::MAX_LIVE_INPUTS),
@@ -718,6 +725,7 @@ async fn main() {
             ducking_snapshot.clone(),
             telemetry_enabled.clone(),
             output_meters.clone(),
+            config_json.clone(),
         )
         .await
         {

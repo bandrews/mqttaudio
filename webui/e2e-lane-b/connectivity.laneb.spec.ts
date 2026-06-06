@@ -158,6 +158,20 @@ test('the mixer transport shows a real sample and its Stop control clears it', a
   await expect(page.getByText(/no samples playing/i)).toBeVisible({ timeout: 6_000 });
 });
 
+test('the config tab shows the real running config and emits a snippet (Sprint W8)', async ({ page }) => {
+  daemon = await startDaemon();
+
+  await page.goto('/');
+  await page.getByRole('button', { name: /connect/i }).click();
+  await expect(page.getByText('Log stream')).toBeVisible({ timeout: 20_000 });
+
+  await page.getByRole('tab', { name: 'Config' }).click();
+  // GET /config round-trips through the proxy to the real daemon and is shown.
+  await expect(page.getByLabel('running config')).toContainText('audio', { timeout: 8_000 });
+  // The output-stage editor produces a restart-required snippet.
+  await expect(page.getByLabel('audio output stage snippet')).toContainText('master_gain');
+});
+
 test('telemetry on: output meters move with signal over /ws/state (Sprint W7)', async ({ page }) => {
   daemon = await startDaemon();
 

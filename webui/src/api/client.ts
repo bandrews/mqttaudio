@@ -11,6 +11,7 @@ export type ConnectionState = 'connecting' | 'live' | 'offline' | 'unauthorized'
 import type {
   CommandResponse,
   CacheStatus,
+  ConfigInfo,
   FileParam,
   HealthInfo,
   InputMuteParams,
@@ -197,6 +198,11 @@ export class DaemonClient {
   /** Per-output-channel peak meters poll fallback (Sprint W7). */
   meters(): Promise<MetersInfo> {
     return this.conn.get<MetersInfo>('/status/meters');
+  }
+
+  /** Read-only running config, secrets redacted (Sprint W8). */
+  config(): Promise<ConfigInfo> {
+    return this.conn.get<ConfigInfo>('/config');
   }
 
   /** Subscribe to the typed state-event channel (`/ws/state`, Sprint W7). */

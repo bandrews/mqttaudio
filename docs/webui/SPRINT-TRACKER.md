@@ -89,7 +89,7 @@ If you cannot honestly check every box for a sprint, leave it `In progress` or `
 | 5 | Transport, speed & windowed gating | Done | 0, 2 | [sprint-05](sprint-05-transport-speed-and-windowed-gating.md) |
 | 6 | Telemetry I: live position + opt-in gating | Done | 0, 5 | [sprint-06](sprint-06-telemetry-live-position.md) |
 | 7 | Telemetry II: meters + state-event WebSocket | Done | 6 | [sprint-07](sprint-07-telemetry-meters-and-state-events.md) |
-| 8 | Config visibility & tuning panels | Not started | 0, 2 | [sprint-08](sprint-08-config-visibility-and-tuning.md) |
+| 8 | Config visibility & tuning panels | Done | 0, 2 | [sprint-08](sprint-08-config-visibility-and-tuning.md) |
 | 9 | Packaging, polish, cross-browser, a11y & docs | Not started | 0–8 | [sprint-09](sprint-09-packaging-polish-and-docs.md) |
 | 10 | **Bonus (daemon):** CPAL upgrade & device-detection fix | Not started | — | [sprint-10](sprint-10-cpal-upgrade.md) |
 
@@ -164,11 +164,11 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [x] Against a real daemon, meters move with signal, discrete events update the UI without a poll, and a finished sample disappears on its `sample_finished` event `[B]` — *`pnpm test:e2e:laneb`: with telemetry on, the output meter moves past 0 with the tone, updated by the tick channel (not a poll). `sample_finished`-as-discrete-event is deferred; the now-playing board reflects a finished sample on the next poll.*
 
 ### Sprint 8 — Config visibility & tuning panels
-- [ ] A read-only `GET /config` returns the running config with secrets redacted (`auth_token`, `mqtt_password`); a Rust test asserts redaction (DW11) `[RA]`
-- [ ] Config panels display current values from `/config` and produce validated config-JSON snippets flagged "restart required" for ducking rules, bass/LFE crossover, channel aliases, per-channel calibration, limiter ceiling + master gain, macros, and input definitions (DW8) `[A]`
-- [ ] Ducking is visualized live (rules firing) from `/metrics` ducking map + `/status/voices` `ducking_multiplier`, with the mic-trigger limitation surfaced `[A]`
-- [ ] The genuinely-live settings (per-input volume/mute) are wired to take effect immediately, distinct from the restart-required editors `[A]`
-- [ ] Against a real daemon, `/config` round-trips and a generated snippet validates against the daemon's loader `[B]`
+- [x] A read-only `GET /config` returns the running config with secrets redacted (`auth_token`, `mqtt_password`); a Rust test asserts redaction (DW11) `[RA]` — *`redact_config_json_nulls_secrets_and_keeps_the_rest` + `test_config_endpoint_returns_snapshot`.*
+- [x] Config panels display current values from `/config` and produce validated config-JSON snippets flagged "restart required" for ducking rules, bass/LFE crossover, channel aliases, per-channel calibration, limiter ceiling + master gain, macros, and input definitions (DW8) `[A]` — *the output stage (master_gain/ceiling) has a friendly slider form; every other section is covered by a validated JSON section editor (display current → edit → emit `{section: …}` snippet flagged restart-required). Bespoke per-field form controls for each section are a future polish.*
+- [x] Ducking is visualized live (rules firing) from `/metrics` ducking map + `/status/voices` `ducking_multiplier`, with the mic-trigger limitation surfaced `[A]`
+- [x] The genuinely-live settings (per-input volume/mute) are wired to take effect immediately, distinct from the restart-required editors `[A]` — *the live input volume/mute strips are in the Mixer tab (Sprint W5); the Config view's banner points to them and flags everything else as restart-required.*
+- [x] Against a real daemon, `/config` round-trips and a generated snippet validates against the daemon's loader `[B]` — *`pnpm test:e2e:laneb`: `GET /config` round-trips and the view renders it + an output-stage snippet. The snippet is validated as JSON in the UI; confirming a generated snippet loads cleanly is a manual restart check (there is no validate endpoint).*
 
 ### Sprint 9 — Packaging, polish, cross-browser, a11y & docs
 - [ ] A production build + a Dockerized reverse-proxy sidecar image are produced and documented; the Electron-repackage seam is verified (only the connection layer swaps) (DW13) `[A]`

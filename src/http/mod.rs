@@ -107,6 +107,27 @@ pub struct AppState {
     /// tick timer publishes here only when telemetry is on AND ≥1 client is
     /// subscribed (DW3).
     pub state_broadcaster: Arc<LogBroadcaster>,
+    /// The running config as redacted JSON (Sprint W8, DW11), for read-only
+    /// `GET /config`. Config is read once at startup (DW8), so this is a startup
+    /// snapshot; secrets (auth_token, mqtt password) are nulled out.
+    pub config_json: Arc<serde_json::Value>,
+}
+
+/// Redact secrets from a serialized config for `GET /config` (DW11):
+/// `http.auth_token` and `mqtt.password` become `null`. Pure, for the startup
+/// snapshot and tests.
+pub fn redact_config_json(mut value: serde_json::Value) -> serde_json::Value {
+    if let Some(http) = value.get_mut("http").and_then(|h| h.as_object_mut()) {
+        if http.contains_key("auth_token") {
+            http.insert("auth_token".to_string(), serde_json::Value::Null);
+        }
+    }
+    if let Some(mqtt) = value.get_mut("mqtt").and_then(|m| m.as_object_mut()) {
+        if mqtt.contains_key("password") {
+            mqtt.insert("password".to_string(), serde_json::Value::Null);
+        }
+    }
+    value
 }
 
 /// Return a warning when the HTTP control API is exposed on a non-loopback
@@ -142,6 +163,7 @@ pub async fn start_server(
     ducking: Arc<RwLock<HashMap<String, f32>>>,
     telemetry_enabled: Arc<AtomicBool>,
     output_meters: Arc<Vec<AtomicU32>>,
+    config_json: Arc<serde_json::Value>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let state_broadcaster = Arc::new(LogBroadcaster::new());
@@ -168,6 +190,7 @@ pub async fn start_server(
         telemetry_enabled,
         output_meters,
         state_broadcaster: state_broadcaster.clone(),
+        config_json,
     };
 
     // State-event tick timer (~15 Hz, DW12): only does work when telemetry is on AND

@@ -56,6 +56,11 @@ export function cacheQueryOptions(client: DaemonClient): Options<Awaited<ReturnT
   return { queryKey: ['status', 'cache'], queryFn: () => client.statusCache(), refetchInterval: POLL.cache };
 }
 
+export function configQueryOptions(client: DaemonClient): Options<Awaited<ReturnType<DaemonClient['config']>>> {
+  // Config is read once at startup (DW8), so fetch once and do not poll.
+  return { queryKey: ['config'], queryFn: () => client.config(), staleTime: Infinity, refetchInterval: false };
+}
+
 export function telemetryQueryOptions(client: DaemonClient): Options<Awaited<ReturnType<DaemonClient['telemetry']>>> {
   return { queryKey: ['telemetry'], queryFn: () => client.telemetry(), refetchInterval: POLL.cache };
 }
@@ -79,3 +84,4 @@ export const useStatusVoices = () => useClientQuery(voicesQueryOptions);
 export const useStatusInputs = () => useClientQuery(inputsQueryOptions);
 export const useStatusCache = () => useClientQuery(cacheQueryOptions);
 export const useTelemetry = () => useClientQuery(telemetryQueryOptions);
+export const useConfig = () => useClientQuery(configQueryOptions);

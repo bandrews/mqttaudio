@@ -108,6 +108,8 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         .route("/metrics", get(handlers::handle_metrics))
         // Per-output-channel peak meters poll fallback (Sprint W7).
         .route("/status/meters", get(handlers::handle_meters))
+        // Read-only running config, secrets redacted (Sprint W8, DW11).
+        .route("/config", get(handlers::handle_config))
         // Telemetry opt-in (Sprint W6, DW3): GET reads the flag, POST sets it.
         .route(
             "/telemetry",
