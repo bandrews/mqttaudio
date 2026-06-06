@@ -29,7 +29,10 @@ function defaultMakeTransport(connection: Connection): DaemonConnection {
 }
 
 export function Connect({ onConnected, makeTransport = defaultMakeTransport }: ConnectProps) {
-  const [baseUrl, setBaseUrl] = useState('http://localhost:8080');
+  // Default to the same-origin proxy path (DW1): behind the sidecar the SPA uses
+  // /api and the proxy injects auth. A direct daemon URL (http://host:8080) also
+  // works for dev-without-proxy and then a token is sent from the browser.
+  const [baseUrl, setBaseUrl] = useState('/api');
   const [token, setToken] = useState('');
   const [authRequired, setAuthRequired] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -80,6 +83,7 @@ export function Connect({ onConnected, makeTransport = defaultMakeTransport }: C
             onChange={(e) => setBaseUrl(e.target.value)}
             fullWidth
             autoFocus
+            helperText="Behind the sidecar use /api (same-origin); or a direct http://host:port"
             inputProps={{ 'aria-label': 'Daemon URL' }}
           />
           {authRequired && (

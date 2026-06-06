@@ -121,4 +121,21 @@ describe('ProxyBrowserConnection (the only fetch/WebSocket module)', () => {
     sub.close();
     expect(ws.closed).toBe(true);
   });
+
+  it('a relative (proxy) base URL resolves the socket same-origin against the page', () => {
+    const urls: string[] = [];
+    class FakeWS {
+      constructor(public url: string) {
+        urls.push(url);
+      }
+      close() {}
+    }
+    vi.stubGlobal('WebSocket', FakeWS as unknown as typeof WebSocket);
+    // Proxy deployment (DW1): REST under /api, but the socket is same-origin /ws.
+    const conn = new ProxyBrowserConnection({ id: 'x', label: 'x', baseUrl: '/api' });
+    conn.subscribe('/ws', { onMessage: () => {} });
+    expect(urls[0]).toMatch(/^wss?:\/\/[^/]+\/ws$/);
+    expect(urls[0]).not.toContain('/api');
+    expect(urls[0]).not.toContain('token=');
+  });
 });

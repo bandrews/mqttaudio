@@ -236,6 +236,20 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   something real and document it) is a future task; left untouched here to avoid an unscoped serde/behavior
   change.
 
+- **`/ws` never streams log lines — `WebSocketLogLayer` is not installed in the tracing subscriber (Sprint W1,
+  daemon gap, MEDIUM).** `start_server` creates a `LogBroadcaster` (`src/http/mod.rs:123`) and `handle_socket`
+  forwards whatever it broadcasts (`src/http/websocket.rs:57-103`), but the only producer of real frames,
+  `WebSocketLogLayer::on_event` (`src/http/websocket.rs:144-169`), is `#[allow(dead_code)]` and referenced only
+  by unit tests — it is **never added to the `tracing_subscriber` registry in `main.rs`**. So a `/ws` client
+  receives the `{type:"connected"}` welcome frame and then nothing; the daemon's tracing output goes only to
+  stdout/the MQTT log layer, never to the socket. Verified live: a running daemon logs `Processing command:
+  StopAll` to stdout but emits no `{type:"log"}` frame. Impact: the web app's log console (Sprint W1) correctly
+  renders connection state + the welcome (daemon version), but shows no log lines against a real daemon until
+  this is wired. Fix (a daemon-side follow-up, out of scope for the frontend-only Sprint W1 per DW1): create the
+  `LogBroadcaster` in `main.rs` before logging init, add `WebSocketLogLayer::new(broadcaster)` to the subscriber
+  registry, and pass the same broadcaster into `start_server`. `docs/http-api.md` documents `/ws` log streaming
+  as if it works, so it should be corrected or the layer wired. Discovered during Sprint W1 Lane B.
+
 ## Implementation notes
 
 - **Auto voice-id format: `_auto_<millis>_<n>` shipped, reconciling DECISIONS.md D24 vs D41/Sprint-9 F5.**

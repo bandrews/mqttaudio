@@ -4,7 +4,10 @@
 // `time_ms`). The client validates and WARNS — it never silently clamps or
 // fabricates a selector.
 
-import type { DaemonConnection } from './connection';
+import { HttpError, type DaemonConnection, type Subscription, type SubscriptionHandlers } from './connection';
+
+/** Connection lifecycle states surfaced to the UI (Sprint W1, F4). */
+export type ConnectionState = 'connecting' | 'live' | 'offline' | 'unauthorized';
 import type {
   CommandResponse,
   CacheStatus,
@@ -177,5 +180,29 @@ export class DaemonClient {
 
   statusInputs(): Promise<InputsResponse> {
     return this.conn.get<InputsResponse>('/status/inputs');
+  }
+
+  // ---- Transport + lifecycle ----
+
+  /** Subscribe to a daemon WebSocket (e.g. the /ws log stream). */
+  subscribe(path: string, handlers: SubscriptionHandlers): Subscription {
+    return this.conn.subscribe(path, handlers);
+  }
+
+  /**
+   * Re-probe a gated endpoint (/version) to classify the connection: `live` on
+   * 200, `unauthorized` on 401 (auth required/failed — do not blind-retry),
+   * `offline` on a network/other failure (retry with backoff).
+   */
+  async probeConnection(): Promise<Exclude<ConnectionState, 'connecting'>> {
+    try {
+      await this.conn.get('/version');
+      return 'live';
+    } catch (err) {
+      if (err instanceof HttpError && err.status === 401) {
+        return 'unauthorized';
+      }
+      return 'offline';
+    }
   }
 }

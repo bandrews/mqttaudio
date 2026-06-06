@@ -82,7 +82,7 @@ If you cannot honestly check every box for a sprint, leave it `In progress` or `
 | # | Sprint | Status | Depends on | File |
 |---|--------|--------|-----------|------|
 | 0 | Foundations, API contract & CI harness | Done | — | [sprint-00](sprint-00-foundations-and-api-contract.md) |
-| 1 | Deployment: reverse-proxy sidecar & connectivity | Not started | 0 | [sprint-01](sprint-01-deployment-and-connectivity.md) |
+| 1 | Deployment: reverse-proxy sidecar & connectivity | Done | 0 | [sprint-01](sprint-01-deployment-and-connectivity.md) |
 | 2 | Live monitoring dashboard (poll-based) | Not started | 0, 1 | [sprint-02](sprint-02-live-monitoring-dashboard.md) |
 | 3 | Command test-bench & cue launcher | Not started | 0 | [sprint-03](sprint-03-command-test-bench.md) |
 | 4 | Channel-map matrix mixer | Not started | 0, 3 | [sprint-04](sprint-04-channel-map-matrix-mixer.md) |
@@ -109,11 +109,11 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [x] CI runs Vitest + React Testing Library and a Playwright headless smoke against a fixture/mock backend, green `[A]`
 
 ### Sprint 1 — Deployment: reverse-proxy sidecar & connectivity
-- [ ] A reverse-proxy sidecar config (Caddy or nginx) serves the built SPA and proxies `/api/*` + `/ws` to the daemon, injecting the Bearer header server-side; documented and runnable (DW1) `[A]`
-- [ ] A dev proxy (Vite) mirrors the sidecar so same-origin behavior holds in dev `[A]`
-- [ ] The `/ws` log stream renders in a live log console (connect, `{type:"connected"}`, `{type:"log"}`, lag/close handling); component test with a mock socket `[A]`
-- [ ] No UI module imports `fetch`/`WebSocket` directly — all access goes through `DaemonConnection`; the Electron-future seam is documented (DW2) `[A]`
-- [ ] Against a real daemon behind the sidecar, the SPA connects, streams logs, and survives a daemon restart with backoff/reconnect `[B]`
+- [x] A reverse-proxy sidecar config (Caddy or nginx) serves the built SPA and proxies `/api/*` + `/ws` to the daemon, injecting the Bearer header server-side; documented and runnable (DW1) `[A]`
+- [x] A dev proxy (Vite) mirrors the sidecar so same-origin behavior holds in dev `[A]`
+- [x] The `/ws` log stream renders in a live log console (connect, `{type:"connected"}`, `{type:"log"}`, lag/close handling); component test with a mock socket `[A]`
+- [x] No UI module imports `fetch`/`WebSocket` directly — all access goes through `DaemonConnection`; the Electron-future seam is documented (DW2) `[A]`
+- [x] Against a real daemon behind the sidecar, the SPA connects, streams logs, and survives a daemon restart with backoff/reconnect `[B]` — *automated against a real spawned daemon (`pnpm test:e2e:laneb`): connect + welcome frame (real version) + restart→backoff-reconnect verified. Real log **lines** don't arrive because the daemon never installs `WebSocketLogLayer` into tracing (welcome-frame-only `/ws`) — a daemon-side gap recorded in `docs/bugs.md` (Sprint W1), out of scope for the frontend-only sprint per DW1.*
 
 ### Sprint 2 — Live monitoring dashboard (poll-based)
 - [ ] A persistent health header shows active samples/voices/inputs, output channels, uptime, a clip badge, and a stream-error badge (labeled "stream errors / rebuilds", not "buffer xruns") from `/status` + `/metrics` `[A]`

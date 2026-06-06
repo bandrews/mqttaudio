@@ -57,8 +57,30 @@ export class ProxyBrowserConnection implements DaemonConnection {
     return (text ? JSON.parse(text) : undefined) as T;
   }
 
+  /**
+   * Resolve the WebSocket URL. A direct (absolute) base URL builds ws(s):// from
+   * the daemon host (with ?token= for a direct token, DW9). A relative base URL
+   * means the proxy deployment (DW1): the socket is same-origin against the page,
+   * independent of the REST /api prefix, and the proxy injects auth — no token in
+   * the URL.
+   */
+  private wsUrl(path: string): string {
+    const base = this.connection.baseUrl;
+    if (/^https?:\/\//i.test(base)) {
+      return toWebSocketUrl(base, path, this.connection.token);
+    }
+    const loc = window.location;
+    const proto = loc.protocol === 'https:' ? 'wss' : 'ws';
+    const suffix = path.startsWith('/') ? path : `/${path}`;
+    let url = `${proto}://${loc.host}${suffix}`;
+    if (this.connection.token) {
+      url += `${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(this.connection.token)}`;
+    }
+    return url;
+  }
+
   subscribe(path: string, handlers: SubscriptionHandlers): Subscription {
-    const url = toWebSocketUrl(this.connection.baseUrl, path, this.connection.token);
+    const url = this.wsUrl(path);
     const ws = new WebSocket(url);
     ws.onopen = () => handlers.onOpen?.();
     ws.onmessage = (event: MessageEvent) => {
