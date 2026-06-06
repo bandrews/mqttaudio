@@ -250,6 +250,13 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   registry, and pass the same broadcaster into `start_server`. `docs/http-api.md` documents `/ws` log streaming
   as if it works, so it should be corrected or the layer wired. Discovered during Sprint W1 Lane B.
 
+- **No per-sample `windowed` flag on `/status/samples` (Sprint W5 F3, daemon gap, LOW).** The transport UI must
+  gate seek/speed/reverse for windowed/streamed (forward-only) voices, but `/status/samples` carries no
+  is-windowed flag. The web app INFERS windowed from `total_frames === 0` (streamed plays construct their status
+  with `total_frames: 0`, `main.rs:1294`), in `webui/src/features/mixer/windowed.ts`. This is a heuristic; a
+  full-load sample with an unknown length could in principle also report 0. Sprint W6 F4 closes this by adding a
+  real `windowed` field to `SampleStatus`/`/status/samples`, at which point the web helper switches to the flag.
+
 ## Implementation notes
 
 - **Auto voice-id format: `_auto_<millis>_<n>` shipped, reconciling DECISIONS.md D24 vs D41/Sprint-9 F5.**

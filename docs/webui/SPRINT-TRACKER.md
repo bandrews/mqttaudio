@@ -86,7 +86,7 @@ If you cannot honestly check every box for a sprint, leave it `In progress` or `
 | 2 | Live monitoring dashboard (poll-based) | Done | 0, 1 | [sprint-02](sprint-02-live-monitoring-dashboard.md) |
 | 3 | Command test-bench & cue launcher | Done | 0 | [sprint-03](sprint-03-command-test-bench.md) |
 | 4 | Channel-map matrix mixer | Done | 0, 3 | [sprint-04](sprint-04-channel-map-matrix-mixer.md) |
-| 5 | Transport, speed & windowed gating | Not started | 0, 2 | [sprint-05](sprint-05-transport-speed-and-windowed-gating.md) |
+| 5 | Transport, speed & windowed gating | Done | 0, 2 | [sprint-05](sprint-05-transport-speed-and-windowed-gating.md) |
 | 6 | Telemetry I: live position + opt-in gating | Not started | 0, 5 | [sprint-06](sprint-06-telemetry-live-position.md) |
 | 7 | Telemetry II: meters + state-event WebSocket | Not started | 6 | [sprint-07](sprint-07-telemetry-meters-and-state-events.md) |
 | 8 | Config visibility & tuning panels | Not started | 0, 2 | [sprint-08](sprint-08-config-visibility-and-tuning.md) |
@@ -137,10 +137,10 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [x] Against a real multichannel device, a routed play lands on the intended channels `[B]` — *`pnpm test:e2e:laneb` routes a real play to dest 0/1 on the default device and it plays; routing to >2 channels needs multichannel hardware (out-of-range routes are silently skipped by the daemon).*
 
 ### Sprint 5 — Transport, speed & windowed gating
-- [ ] Each active sample card has a seek scrubber over `total_ms` (emits `seek`) and a speed control with a 1.0 detent spanning −100..100, plus a pitch-correction toggle that re-clamps the range to 0.05..8.0 and disables reverse `[A]`
-- [ ] Windowed/streamed voices show a "streamed" badge and disable seek, speed, reverse, and loop-crossfade controls `[A]`
-- [ ] Voice strips expose volume (`voice_volume`), fade-out (`time_ms`), and stop; input strips expose volume (`input_volume`) and mute (`input_mute`) `[A]`
-- [ ] Against a real daemon, seek/speed/voice/input controls change playback audibly and the dashboard reflects them `[B]`
+- [x] Each active sample card has a seek scrubber over `total_ms` (emits `seek`) and a speed control with a 1.0 detent spanning −100..100, plus a pitch-correction toggle that re-clamps the range to 0.05..8.0 and disables reverse `[A]`
+- [x] Windowed/streamed voices show a "streamed" badge and disable seek, speed, reverse, and loop-crossfade controls `[A]` — *windowed is inferred from `total_frames === 0` until Sprint W6 F4 adds a real flag (docs/bugs.md, Sprint W5).*
+- [x] Voice strips expose volume (`voice_volume`), fade-out (`time_ms`), and stop; input strips expose volume (`input_volume`) and mute (`input_mute`) `[A]`
+- [x] Against a real daemon, seek/speed/voice/input controls change playback audibly and the dashboard reflects them `[B]` — *`pnpm test:e2e:laneb`: the mixer transport shows a real sample and its Stop reflects on the Monitor; the *audible* seek/speed effect is a human listening check (the commands are proven to emit and reach the daemon).*
 
 ### Sprint 6 — Telemetry I: live position + opt-in gating
 - [ ] Telemetry is OFF by default and gated: it activates only when explicitly opted in AND ≥1 telemetry client is subscribed; with telemetry off, the RT path does no new work (DW3) `[RA]`

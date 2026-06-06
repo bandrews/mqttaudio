@@ -135,3 +135,25 @@ test('the matrix mixer routes a real play (dest 0/1 on the default device)', asy
 
   await page.request.post('/api/command', { data: { command: 'stopall' } });
 });
+
+test('the mixer transport shows a real sample and its Stop control clears it', async ({ page }) => {
+  daemon = await startDaemon();
+
+  await page.goto('/');
+  await page.getByRole('button', { name: /connect/i }).click();
+  await expect(page.getByText('Log stream')).toBeVisible({ timeout: 20_000 });
+
+  await page.request.post('/api/command', {
+    data: { command: 'play', message: { file: WAV, voice: 'beep', loop: true } },
+  });
+
+  // The mixer transport reflects the real sample with seek + speed controls.
+  await page.getByRole('tab', { name: 'Mixer' }).click();
+  await expect(page.getByText('test_beep_5s.wav')).toBeVisible({ timeout: 6_000 });
+  await expect(page.getByLabel(/^seek /)).toBeVisible();
+
+  // Stop it from the transport card; the monitor clears.
+  await page.getByRole('button', { name: 'Stop' }).first().click();
+  await page.getByRole('tab', { name: 'Monitor' }).click();
+  await expect(page.getByText(/no samples playing/i)).toBeVisible({ timeout: 6_000 });
+});

@@ -22,6 +22,7 @@ import { Connect } from './components/Connect';
 import { Dashboard } from './features/dashboard/Dashboard';
 import { CommandConsole } from './features/console/CommandConsole';
 import { MatrixMixer } from './features/matrix/MatrixMixer';
+import { MixerView } from './features/mixer/MixerView';
 
 interface Session {
   client: DaemonClient;
@@ -47,7 +48,7 @@ export function App() {
   );
 }
 
-type View = 'monitor' | 'console' | 'matrix';
+type View = 'monitor' | 'mixer' | 'console' | 'matrix';
 
 function ConnectedView({ session, onDisconnect }: { session: Session; onDisconnect: () => void }) {
   const { result, connection } = session;
@@ -76,12 +77,14 @@ function ConnectedView({ session, onDisconnect }: { session: Session; onDisconne
         </Toolbar>
         <Tabs value={view} onChange={(_e, v: View) => setView(v)} sx={{ px: 2 }}>
           <Tab value="monitor" label="Monitor" />
+          <Tab value="mixer" label="Mixer" />
           <Tab value="console" label="Console" />
           <Tab value="matrix" label="Matrix" />
         </Tabs>
       </AppBar>
       <Container maxWidth="xl" sx={{ py: 3 }}>
         {view === 'monitor' && <Dashboard />}
+        {view === 'mixer' && <MixerView />}
         {view === 'console' && <CommandConsole />}
         {view === 'matrix' && <MatrixMixer />}
       </Container>
