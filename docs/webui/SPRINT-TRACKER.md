@@ -85,7 +85,7 @@ If you cannot honestly check every box for a sprint, leave it `In progress` or `
 | 1 | Deployment: reverse-proxy sidecar & connectivity | Done | 0 | [sprint-01](sprint-01-deployment-and-connectivity.md) |
 | 2 | Live monitoring dashboard (poll-based) | Done | 0, 1 | [sprint-02](sprint-02-live-monitoring-dashboard.md) |
 | 3 | Command test-bench & cue launcher | Done | 0 | [sprint-03](sprint-03-command-test-bench.md) |
-| 4 | Channel-map matrix mixer | Not started | 0, 3 | [sprint-04](sprint-04-channel-map-matrix-mixer.md) |
+| 4 | Channel-map matrix mixer | Done | 0, 3 | [sprint-04](sprint-04-channel-map-matrix-mixer.md) |
 | 5 | Transport, speed & windowed gating | Not started | 0, 2 | [sprint-05](sprint-05-transport-speed-and-windowed-gating.md) |
 | 6 | Telemetry I: live position + opt-in gating | Not started | 0, 5 | [sprint-06](sprint-06-telemetry-live-position.md) |
 | 7 | Telemetry II: meters + state-event WebSocket | Not started | 6 | [sprint-07](sprint-07-telemetry-meters-and-state-events.md) |
@@ -131,10 +131,10 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [x] Against a real daemon, representative commands from each family take effect and are reflected on the dashboard `[B]` — *`pnpm test:e2e:laneb`: the cue launcher plays a real file (shown on the Monitor) and the console Stop All clears it.*
 
 ### Sprint 4 — Channel-map matrix mixer
-- [ ] A src×dest matrix grid sized from `output_channels` (`/status`) lets the user toggle routes and set a per-route `gain`; channel aliases label destination columns `[A]`
-- [ ] Destinations with multiple summed sources carry a clip-risk badge; one-to-many fan-out and partial routing are supported `[A]`
-- [ ] The matrix emits a play via `/command` (not typed `/play`) and surfaces the caveats: per-route gain is ignored on `mode:stream`, and an unknown alias silently aborts the play `[A]`
-- [ ] Against a real multichannel device, a routed play lands on the intended channels `[B]`
+- [x] A src×dest matrix grid sized from `output_channels` (`/status`) lets the user toggle routes and set a per-route `gain`; channel aliases label destination columns `[A]`
+- [x] Destinations with multiple summed sources carry a clip-risk badge; one-to-many fan-out and partial routing are supported `[A]`
+- [x] The matrix emits a play via `/command` (not typed `/play`) and surfaces the caveats: per-route gain is ignored on `mode:stream`, and an unknown alias silently aborts the play `[A]`
+- [x] Against a real multichannel device, a routed play lands on the intended channels `[B]` — *`pnpm test:e2e:laneb` routes a real play to dest 0/1 on the default device and it plays; routing to >2 channels needs multichannel hardware (out-of-range routes are silently skipped by the daemon).*
 
 ### Sprint 5 — Transport, speed & windowed gating
 - [ ] Each active sample card has a seek scrubber over `total_ms` (emits `seek`) and a speed control with a 1.0 detent spanning −100..100, plus a pitch-correction toggle that re-clamps the range to 0.05..8.0 and disables reverse `[A]`

@@ -113,3 +113,25 @@ test('the console cue launcher plays a real file and Stop All clears it', async 
   await page.getByRole('tab', { name: 'Monitor' }).click();
   await expect(page.getByText(/no samples playing/i)).toBeVisible({ timeout: 6_000 });
 });
+
+test('the matrix mixer routes a real play (dest 0/1 on the default device)', async ({ page }) => {
+  daemon = await startDaemon();
+
+  await page.goto('/');
+  await page.getByRole('button', { name: /connect/i }).click();
+  await expect(page.getByText('Log stream')).toBeVisible({ timeout: 20_000 });
+
+  await page.getByRole('tab', { name: 'Matrix' }).click();
+  await page.getByLabel('matrix file').fill(WAV);
+  // Route to the first two output channels (valid on any >= 2ch device; routing
+  // to higher channels needs multichannel hardware — out-of-range routes are
+  // silently skipped by the daemon).
+  await page.getByLabel('route 0 to 0').check();
+  await page.getByLabel('route 1 to 1').check();
+  await page.getByRole('button', { name: 'Play routed' }).click();
+
+  await page.getByRole('tab', { name: 'Monitor' }).click();
+  await expect(page.getByText('test_beep_5s.wav')).toBeVisible({ timeout: 6_000 });
+
+  await page.request.post('/api/command', { data: { command: 'stopall' } });
+});
