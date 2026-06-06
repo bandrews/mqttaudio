@@ -33,7 +33,15 @@ engines in ways a single headless Chromium run cannot reveal.
 
 **Expected:** visual + interaction parity across all four engines; no console errors; no broken controls.
 
-**Result:** _(record PASS/FAIL + browser + notes + date)_
+**Result:** **PARTIAL — Chrome PASS; Safari/Firefox/Edge + mobile PENDING (human).** Chrome 2026-06-05
+(real browser, driven against the live daemon behind the Vite dev proxy): the connect screen, the full
+dashboard (health header, now-playing, output meters, voices/inputs racks, cache table, log-stream welcome
+frame), and all five tabs (Monitor / Mixer / Console / Matrix / Config) render without layout breakage; a real
+looping play + the Telemetry toggle drove live now-playing / meters / voice / cache updates; **dark and light
+themes** both render with good contrast; the layout **collapses cleanly to a single column at tablet width
+(834 px)** with no overflow. **No console errors** — only benign Vite HMR (`[vite] connected`) + the React
+DevTools dev-mode notice. Remaining for a human: rendering/interaction parity on **Safari, Firefox, Edge**, and
+one mobile browser (only Chrome can be driven from this environment).
 
 ---
 
@@ -50,7 +58,13 @@ experience.
 
 **Expected:** full keyboard operability; meaningful announcements; no focus traps.
 
-**Result:** _(record PASS/FAIL + AT used + notes + date)_
+**Result:** **PARTIAL — Chrome keyboard PASS; screen-reader PENDING (human).** Chrome 2026-06-05: Tab
+traversal reaches the header controls in a sensible order, and the **Telemetry switch surfaces its
+descriptive tooltip on keyboard focus** (not hover-only) — evidence the control is keyboard-focusable and
+self-describing. The automated **axe** check (`e2e/a11y.spec.ts`, Lane A CI) reports no serious/critical
+violations on the connect screen + connected dashboard. Remaining for a human: an actual screen-reader
+(VoiceOver / NVDA) walk-through to confirm spoken labels and that live regions (clip / stream-error badge,
+"ducked" indicator) announce on change — a sensory judgment no automation can stand in for.
 
 ---
 
@@ -69,7 +83,14 @@ unaffected with telemetry on?" is a judgment a human must make. Lane B proves it
 **Expected:** progress and meters update smoothly at ~15–20 Hz with no visible stutter; audio is unaffected
 whether telemetry is on or off; toggling off cleanly stops the live updates and the UI falls back to polling.
 
-**Result:** _(record PASS/FAIL + notes + date)_
+**Result:** **PARTIAL — Chrome visual PASS; "audio unaffected" listening judgment PENDING (human).** Chrome
+2026-06-05 against a live daemon with a real looping play: enabling Telemetry made the **output meters (ch 0 /
+ch 1) move with the tone** over `/ws/state`, and the now-playing progress bar + the Mixer seek playhead
+**advanced live** through the loop; updates looked smooth with no visible stutter. Toggling Telemetry off
+stopped the live updates (the off-state "Enable Telemetry…" fallback returns). Remaining for a human: a
+sustained ~2-minute watch with several overlapping/variable-speed plays to judge sub-perceptual jank, and an
+**ears-on confirmation that opting in does not audibly degrade playback** (the alloc harness already proves the
+RT path stays 0-alloc/0-free, but "sounds identical" is a human call).
 
 ---
 

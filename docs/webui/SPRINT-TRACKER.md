@@ -175,7 +175,7 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [x] Theming (light/dark) and a responsive layout work down to a tablet width; component tests cover the theme switch `[A]` — *light/dark toggle (`ColorModeToggle`, tested); MUI responsive breakpoints throughout.*
 - [x] Keyboard navigation and screen-reader labels pass an automated a11y check (axe) in CI `[A]` — *`e2e/a11y.spec.ts` (axe, no serious/critical violations on the connect screen + connected dashboard), run by `pnpm test:e2e` in CI.*
 - [x] `docs/webui/` gains a README + getting-started (run the sidecar, point it at a daemon, optional token), linked from the main `README.md` `[A]`
-- [ ] Cross-browser (Safari/Firefox/Edge) + manual a11y/visual QA pass recorded in `MANUAL-VERIFICATION.md` `[C]` — *the human pass (V-1/V-2/V-3); the only box reserved for a person, per the program.*
+- [ ] Cross-browser (Safari/Firefox/Edge) + manual a11y/visual QA pass recorded in `MANUAL-VERIFICATION.md` `[C]` — *partial: the **Chrome** half of V-1/V-2/V-3 was driven against the live daemon this session (real-browser render of all 5 tabs + connect; live play/telemetry meters+playhead; dark/light themes; tablet-width responsive; keyboard focus + focus tooltip; **no console errors**) and recorded. Still reserved for a human: **Safari/Firefox/Edge** engine parity and a real **screen-reader** (VoiceOver/NVDA) + ears-on "audio unaffected" judgment — these need other engines / assistive tech / human senses this environment can't drive.*
 
 ### Sprint 10 — Bonus (daemon): CPAL upgrade & device-detection fix
 - [x] `cpal` bumped to the latest release in `Cargo.toml`/`Cargo.lock`; the daemon builds warning-free with `-D warnings` and clippy is clean across the cpal API changes `[RA]` — *`cpal 0.15`→`0.17` (`Cargo.toml`/`Cargo.lock`); `cargo build --release` + `cargo clippy --all-targets -- -D warnings` clean across the API migration (`SampleRate` → `u32`, `Device::name()` → `Device::description()`).*
@@ -190,11 +190,14 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [x] All sprints 0–9 are `Done` — every `[A]`/`[B]`/`[RA]`/`[RB]` box is genuinely checked and green. The only
   boxes allowed to remain unchecked are the `[C]` cross-browser/manual items, run once at the end. _(Sprint 10,
   the daemon-only cpal bonus, is also `Done`.)_
-- [ ] `MANUAL-VERIFICATION.md` has been run (cross-browser + a11y + visual QA) with results recorded. _**Human-
-  reserved Lane C** (V-1/V-2/V-3): Safari/Firefox/Edge parity, a screen-reader walk-through, and live-telemetry
-  visual smoothness need a person on real browsers/AT — they cannot be run in this headless/Chromium-only env.
-  The automated half is already green (Playwright chromium incl. axe a11y in CI; the 8-flow live-daemon Lane B
-  suite). This is the single box the program reserves for a human; run it before a public release._
+- [ ] `MANUAL-VERIFICATION.md` has been run (cross-browser + a11y + visual QA) with results recorded. _**Partly
+  run.** The **Chrome** half of V-1/V-2/V-3 was driven against the live daemon this session and the results are
+  recorded inline (real-browser render of all five tabs, live telemetry meters + playhead, dark/light themes,
+  tablet-width responsive, keyboard focus, **no console errors**). The genuinely **human-reserved remainder** —
+  **Safari/Firefox/Edge** engine parity and a real **screen-reader (VoiceOver/NVDA)** + ears-on "audio
+  unaffected" pass — needs other engines / assistive tech / human senses this environment can't drive; run it
+  before a public release. (Automated baseline already green: Playwright chromium + axe a11y in CI; the 8-flow
+  live-daemon Lane B suite.)_
 - [x] `README.md` / `CHANGELOG.md` updated for user-visible items (the new web app; the DW3 telemetry opt-in;
   the DW11 `GET /config` endpoint). _(`README.md` §Web UI; `CHANGELOG.md` Added: telemetry, meters/`/ws/state`,
   `GET /config`, windowing; Changed: cpal `0.17`.)_
