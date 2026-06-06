@@ -54,3 +54,29 @@ If this file has open entries when the program finishes, surface them in the fin
   migration, warning-free `-D warnings` + clippy, full audio suite + alloc harness green, real-device
   enumeration + open-and-run + name round-trip verified, docs updated.
 - **Status:** Open
+
+### [Sprint 9 / Lane C] Residual human-sensory QA before public release
+- **Blocked item:** The Sprint 9 `[C]` box + Final-gate "MANUAL-VERIFICATION.md has been run" — specifically the
+  three checks that require human senses / assistive tech, after everything automatable was done.
+- **Why it needs a human:** (1) a real **screen-reader (VoiceOver / NVDA)** walk-through to confirm controls are
+  *spoken* with meaningful labels and that live regions (clip / stream-error badge, "ducked" indicator) announce
+  on change; (2) an **ears-on listen** confirming that opting into telemetry does not audibly degrade playback;
+  (3) a visual spot-check in the actual **Safari / Edge desktop apps** + a mobile browser. None of these can be
+  produced by automation — they are sensory judgments and (for the real desktop apps) software this environment
+  can't drive.
+- **What I tried / shipped instead:** Took Lane C as far as automation genuinely reaches. Cross-engine parity is
+  automated-green — `pnpm test:e2e:crossbrowser` runs the fixture-backed specs + axe a11y across **Chromium
+  (Blink/Edge), WebKit (Safari engine), and Firefox (Gecko)**, 12/12 (real engines, not emulation), so axe
+  already proves controls have accessible names/roles, valid ARIA, and adequate contrast on every engine. Drove
+  the SPA in real **Chrome** against the live daemon (all five tabs, live telemetry meters + playhead, dark/light
+  themes, tablet-width responsive, keyboard focus + focus tooltip, **no console errors**). The alloc-counting
+  harness proves the telemetry RT path is 0-alloc / 0-free (the objective proxy for "audio unaffected"). All
+  recorded inline in `MANUAL-VERIFICATION.md` (V-1/V-2/V-3).
+- **Options for the human:** (A, recommended) Run the three sensory checks once before a public release using the
+  steps in `MANUAL-VERIFICATION.md` (the env spins up with `mqttaudio --http-port 8099` + `VITE_DAEMON_TARGET=…
+  pnpm dev`), and tick the `[C]` box. (B) Accept the automated cross-engine + axe + Chrome-live coverage as
+  sufficient for internal use and defer the sensory pass to release time.
+- **Proceeded without it:** The entire web program (Sprints 0–10) is implemented, tested, and committed/pushed on
+  `webui`; every `[A]`/`[B]`/`[RA]`/`[RB]` box is green and cross-engine parity is automated. Only these
+  human-sensory checks remain.
+- **Status:** Open
