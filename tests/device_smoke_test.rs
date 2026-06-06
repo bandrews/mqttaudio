@@ -27,7 +27,7 @@ fn default_output_device_opens_and_runs() {
     let output_config =
         find_output_config(&device, None, Some(48000), 512).expect("an output config");
     let channels = output_config.stream_config.channels as usize;
-    let output_sample_rate = output_config.stream_config.sample_rate.0;
+    let output_sample_rate = output_config.stream_config.sample_rate;
 
     let mixer = MixerState::new(channels);
 
@@ -99,4 +99,88 @@ fn default_input_device_opens_and_captures() {
     let captured = consumer.len();
     eprintln!("input smoke: captured {captured} samples in 300ms (informational)");
     drop(active);
+}
+
+/// Device-detection round-trip on the real CoreAudio host (Sprint 10, cpal 0.17).
+/// Enumerate the default OUTPUT device's reported name, then re-select the device
+/// *by that name* through `find_output_device`. This guards the name-based
+/// detection path the cpal-0.17 migration moved onto `Device::description()`: the
+/// name enumeration reports must round-trip back to a device, or selecting the
+/// configured `audio.device` by name would silently fail to detect a present
+/// device. A bare `--list-devices` only proves enumeration; this proves the
+/// enumerate → select-by-name path that real configs exercise.
+#[test]
+#[ignore] // Lane B only (real device): `cargo test -- --ignored` with MQTTAUDIO_DEVICE_TESTS=1
+fn output_device_detection_round_trips_by_name() {
+    if std::env::var("MQTTAUDIO_DEVICE_TESTS").is_err() {
+        eprintln!("skipping: set MQTTAUDIO_DEVICE_TESTS=1 to run real-device smoke tests");
+        return;
+    }
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = cpal::default_host();
+    let default = host
+        .default_output_device()
+        .expect("a default output device");
+    let name = default
+        .description()
+        .map(|d| d.name().to_string())
+        .expect("the default output device reports a name");
+    assert!(
+        !name.is_empty(),
+        "an enumerated output device name must be non-empty"
+    );
+
+    let reselected =
+        find_output_device(Some(&name)).expect("the enumerated name must round-trip to a device");
+    let reselected_name = reselected
+        .description()
+        .map(|d| d.name().to_string())
+        .expect("the re-selected output device reports a name");
+    assert_eq!(
+        reselected_name, name,
+        "selecting by the enumerated name must resolve to that same device"
+    );
+}
+
+/// Device-detection round-trip on the real CoreAudio host for INPUT devices
+/// (Sprint 10, cpal 0.17). Same guard as the output round-trip, over the
+/// `get_input_device` name-matching path used by the live-input feature.
+#[test]
+#[ignore] // Lane B only (real device): `cargo test -- --ignored` with MQTTAUDIO_DEVICE_TESTS=1
+fn input_device_detection_round_trips_by_name() {
+    if std::env::var("MQTTAUDIO_DEVICE_TESTS").is_err() {
+        eprintln!("skipping: set MQTTAUDIO_DEVICE_TESTS=1 to run real-device smoke tests");
+        return;
+    }
+    use cpal::traits::{DeviceTrait, HostTrait};
+    use mqttaudio::audio::input::get_input_device;
+
+    let host = cpal::default_host();
+    let default = match host.default_input_device() {
+        Some(d) => d,
+        None => {
+            eprintln!("skipping: no default input device on this host");
+            return;
+        }
+    };
+    let name = default
+        .description()
+        .map(|d| d.name().to_string())
+        .expect("the default input device reports a name");
+    assert!(
+        !name.is_empty(),
+        "an enumerated input device name must be non-empty"
+    );
+
+    let reselected =
+        get_input_device(Some(&name)).expect("the enumerated name must round-trip to a device");
+    let reselected_name = reselected
+        .description()
+        .map(|d| d.name().to_string())
+        .expect("the re-selected input device reports a name");
+    assert_eq!(
+        reselected_name, name,
+        "selecting by the enumerated name must resolve to that same input device"
+    );
 }

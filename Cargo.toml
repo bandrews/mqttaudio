@@ -8,7 +8,7 @@ license = "MIT"
 
 [dependencies]
 # Audio I/O
-cpal = "0.15"
+cpal = "0.17"
 
 # Audio decoding
 symphonia = { version = "0.5", features = ["all"] }

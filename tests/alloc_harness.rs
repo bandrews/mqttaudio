@@ -145,8 +145,14 @@ fn telemetry_position_publish_is_allocation_free() {
         }
     });
 
-    assert_eq!(allocs, 0, "telemetry position publish allocated {allocs} times");
-    assert_eq!(deallocs, 0, "telemetry position publish freed {deallocs} times");
+    assert_eq!(
+        allocs, 0,
+        "telemetry position publish allocated {allocs} times"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "telemetry position publish freed {deallocs} times"
+    );
     assert!(
         pos.load(Ordering::Relaxed) > 0,
         "the published position should have advanced"

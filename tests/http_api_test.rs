@@ -783,9 +783,12 @@ async fn test_telemetry_toggle_route() {
         .uri("/telemetry")
         .body(Body::empty())
         .unwrap();
-    let body = axum::body::to_bytes(app.clone().oneshot(get).await.unwrap().into_body(), usize::MAX)
-        .await
-        .unwrap();
+    let body = axum::body::to_bytes(
+        app.clone().oneshot(get).await.unwrap().into_body(),
+        usize::MAX,
+    )
+    .await
+    .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["enabled"], serde_json::json!(false));
 
@@ -798,7 +801,10 @@ async fn test_telemetry_toggle_route() {
         .unwrap();
     let response = app.oneshot(post).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert!(flag.load(Ordering::Relaxed), "POST /telemetry should set the flag");
+    assert!(
+        flag.load(Ordering::Relaxed),
+        "POST /telemetry should set the flag"
+    );
 }
 
 #[test]
@@ -809,8 +815,14 @@ fn redact_config_json_nulls_secrets_and_keeps_the_rest() {
         "audio": { "sample_rate": 48000 },
     });
     let out = mqttaudio::http::redact_config_json(input);
-    assert!(out["http"]["auth_token"].is_null(), "auth_token must be redacted");
-    assert!(out["mqtt"]["password"].is_null(), "mqtt password must be redacted");
+    assert!(
+        out["http"]["auth_token"].is_null(),
+        "auth_token must be redacted"
+    );
+    assert!(
+        out["mqtt"]["password"].is_null(),
+        "mqtt password must be redacted"
+    );
     // Non-secret fields are preserved verbatim.
     assert_eq!(out["http"]["port"], 8080);
     assert_eq!(out["mqtt"]["server"], "localhost");

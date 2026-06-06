@@ -303,7 +303,10 @@ async fn main() {
         }
     };
 
-    let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+    let device_name = device
+        .description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|_| "Unknown".to_string());
     let output_config = match audio::engine::find_output_config(
         &device,
         config.audio.channels,
@@ -327,7 +330,7 @@ async fn main() {
 
     let stream_config = output_config.stream_config;
     let sample_format = output_config.sample_format;
-    let output_sample_rate = stream_config.sample_rate.0;
+    let output_sample_rate = stream_config.sample_rate;
     let output_channels = stream_config.channels as usize;
 
     tracing::info!("Audio device: {}", device_name);
@@ -410,8 +413,7 @@ async fn main() {
     // Opt-in telemetry gate (Sprint W6, DW3). Off by default. Shared between the RT
     // `MixerState` (which gates its per-sample position store on it) and the HTTP
     // `AppState` (POST /telemetry flips it). The control thread never locks the RT.
-    let telemetry_enabled =
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let telemetry_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Per-output-channel peak meters (Sprint W7), shared between the RT mixer (which
     // stores into them when telemetry is on) and the HTTP state-event tick timer.
@@ -1847,9 +1849,8 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     // telemetry is on) and the control-side status (which the handler
                     // reads). Constructed off-RT and moved in with the sample, so the
                     // callback never allocates it.
-                    let position = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
-                        sample.position,
-                    ));
+                    let position =
+                        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(sample.position));
                     sample.position_publisher = Some(position.clone());
 
                     // Record the control-side status before the sample is moved

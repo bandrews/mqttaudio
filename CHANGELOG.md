@@ -96,6 +96,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`cpal` upgraded from `0.15` to `0.17`.** Brings the current cross-platform audio I/O layer (including the
+  CoreAudio device backend) and adopts cpal's reworked device-identity API: device names are now read through
+  `Device::description()` (the `Device::name()` call used through `0.15` is deprecated), and `SupportedStreamConfig`
+  exposes the sample rate as a plain `u32`. No change to the device-selection policy, the lock-free RT callback,
+  or the audio output: the bump is API adaptation plus the newer backend. Device enumeration and name-based
+  selection (`audio.device`) are covered by real-device round-trip tests (`tests/device_smoke_test.rs`,
+  `[RB]`-gated), and the RT callback remains 0-allocation / 0-free (alloc harness green).
 - **`cache.max_memory_mb: 0` now means auto-detect a bounded cap, not unlimited.** Previously `0` (and the
   former `512` default) meant an unlimited cache, which could OOM the box on a big file. `0` is the new
   default and resolves to the auto memory budget. A positive `max_memory_mb` is still an explicit hard cap

@@ -248,7 +248,7 @@ Two-tier caching:
 
 | Crate | Purpose |
 |-------|---------|
-| cpal | Cross-platform audio I/O |
+| cpal | Cross-platform audio I/O (`0.17`; device names via `Device::description()`) |
 | symphonia | Audio decoding |
 | rubato | Sample rate conversion |
 | rumqttc | MQTT client |

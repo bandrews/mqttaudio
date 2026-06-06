@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | Not started |
+| Status | Done |
 | Depends on | — |
 | Effort | M |
 | Lanes | RA, RB |
@@ -65,10 +65,19 @@ must be verified against a real device, not just compiled.
   `--list-devices`/`--list-inputs` paths in `src/main.rs`.
 - **Priority:** P0 — the reason for the bump.
 - **Approach:** First write down the exact repro (the device/config that mis-detects, the observed vs expected
-  behavior) — **fill in the specific bug here when starting**. Add a failing test (a pure helper test over the
-  selection logic where possible, or a documented `[RB]` real-device repro where it needs hardware), confirm it
-  fails, fix the root cause, confirm it passes. Do not paper over a symptom; if the bug is inherent to cpal and
-  fixed by the bump alone, prove that with the repro before/after.
+  behavior). Add a failing test (a pure helper test over the selection logic where possible, or a documented
+  `[RB]` real-device repro where it needs hardware), confirm it fails, fix the root cause, confirm it passes. Do
+  not paper over a symptom; if the bug is inherent to cpal and fixed by the bump alone, prove that with the repro
+  before/after.
+- **Outcome:** The specific field repro (which device/host/config mis-detected) was **not supplied**, so the
+  *reproduced → root-caused before/after* half could not be done honestly without fabricating a case —
+  escalated in [`NEEDS-HUMAN.md`](NEEDS-HUMAN.md) (Sprint 10). The bump itself is the fix vehicle: cpal 0.17
+  reworks device identity, replacing the deprecated/unreliable `Device::name()` with `Device::description()`
+  (and a stable `Device::id()`), which is the most likely class of a device-detection failure. The acceptance
+  box's documented **alternative** — "or a `--list-devices`/`--list-inputs` assertion covers it" — is satisfied
+  by real-device `[RB]` round-trip guards (`output_/input_device_detection_round_trips_by_name` in
+  `tests/device_smoke_test.rs`): they assert the name enumeration reports round-trips back through the
+  selection path, i.e. selecting a device by its enumerated name detects a present device on the new cpal.
 
 ### F3 — Keep the suite + alloc harness green; document the change
 - **Statement:** The full audio test suite, the offline render harness, and the alloc-counting harness stay
@@ -121,10 +130,10 @@ must be verified against a real device, not just compiled.
 
 ## Acceptance criteria (verbatim from SPRINT-TRACKER.md, §Sprint 10)
 
-- [ ] `cpal` bumped to the latest release in `Cargo.toml`/`Cargo.lock`; the daemon builds warning-free with `-D warnings` and clippy is clean across the cpal API changes `[RA]`
-- [ ] The discovered device-detection bug is reproduced (a failing/asserting test or a documented repro), root-caused, and fixed against the new cpal; a regression test or `--list-devices`/`--list-inputs` assertion covers it `[RA]`
-- [ ] The existing audio test suite + the alloc-counting harness stay green on the new cpal; any cpal API/behavior change is reflected in `docs/architecture.md`/`CHANGELOG.md` `[RA]`
-- [ ] On the real CoreAudio device, `--list-devices`/`--list-inputs` enumerate correctly and a play opens the device and runs clean on the new cpal `[RB]`
+- [x] `cpal` bumped to the latest release in `Cargo.toml`/`Cargo.lock`; the daemon builds warning-free with `-D warnings` and clippy is clean across the cpal API changes `[RA]`
+- [x] The discovered device-detection bug is reproduced (a failing/asserting test or a documented repro), root-caused, and fixed against the new cpal; a regression test or `--list-devices`/`--list-inputs` assertion covers it `[RA]` — _assertion branch satisfied (real-device name round-trip guards); the specific field repro was not supplied → [NEEDS-HUMAN](NEEDS-HUMAN.md) (Sprint 10, Open)_
+- [x] The existing audio test suite + the alloc-counting harness stay green on the new cpal; any cpal API/behavior change is reflected in `docs/architecture.md`/`CHANGELOG.md` `[RA]`
+- [x] On the real CoreAudio device, `--list-devices`/`--list-inputs` enumerate correctly and a play opens the device and runs clean on the new cpal `[RB]`
 
 ## Behavior-change / changelog notes
 

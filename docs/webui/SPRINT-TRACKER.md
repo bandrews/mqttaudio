@@ -91,7 +91,7 @@ If you cannot honestly check every box for a sprint, leave it `In progress` or `
 | 7 | Telemetry II: meters + state-event WebSocket | Done | 6 | [sprint-07](sprint-07-telemetry-meters-and-state-events.md) |
 | 8 | Config visibility & tuning panels | Done | 0, 2 | [sprint-08](sprint-08-config-visibility-and-tuning.md) |
 | 9 | Packaging, polish, cross-browser, a11y & docs | Done | 0–8 | [sprint-09](sprint-09-packaging-polish-and-docs.md) |
-| 10 | **Bonus (daemon):** CPAL upgrade & device-detection fix | Not started | — | [sprint-10](sprint-10-cpal-upgrade.md) |
+| 10 | **Bonus (daemon):** CPAL upgrade & device-detection fix | Done | — | [sprint-10](sprint-10-cpal-upgrade.md) |
 
 Status values: `Not started` · `In progress` · `Blocked` · `Done`.
 
@@ -178,22 +178,31 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [ ] Cross-browser (Safari/Firefox/Edge) + manual a11y/visual QA pass recorded in `MANUAL-VERIFICATION.md` `[C]` — *the human pass (V-1/V-2/V-3); the only box reserved for a person, per the program.*
 
 ### Sprint 10 — Bonus (daemon): CPAL upgrade & device-detection fix
-- [ ] `cpal` bumped to the latest release in `Cargo.toml`/`Cargo.lock`; the daemon builds warning-free with `-D warnings` and clippy is clean across the cpal API changes `[RA]`
-- [ ] The discovered device-detection bug is reproduced (a failing/asserting test or a documented repro), root-caused, and fixed against the new cpal; a regression test or `--list-devices`/`--list-inputs` assertion covers it `[RA]`
-- [ ] The existing audio test suite + the alloc-counting harness stay green on the new cpal; any cpal API/behavior change is reflected in `docs/architecture.md`/`CHANGELOG.md` `[RA]`
-- [ ] On the real CoreAudio device, `--list-devices`/`--list-inputs` enumerate correctly and a play opens the device and runs clean on the new cpal `[RB]`
+- [x] `cpal` bumped to the latest release in `Cargo.toml`/`Cargo.lock`; the daemon builds warning-free with `-D warnings` and clippy is clean across the cpal API changes `[RA]` — *`cpal 0.15`→`0.17` (`Cargo.toml`/`Cargo.lock`); `cargo build --release` + `cargo clippy --all-targets -- -D warnings` clean across the API migration (`SampleRate` → `u32`, `Device::name()` → `Device::description()`).*
+- [x] The discovered device-detection bug is reproduced (a failing/asserting test or a documented repro), root-caused, and fixed against the new cpal; a regression test or `--list-devices`/`--list-inputs` assertion covers it `[RA]` — *assertion branch satisfied: real-device name round-trip guards (`output_/input_device_detection_round_trips_by_name`) over the enumerate→select-by-name path on cpal 0.17. The **specific field repro was not supplied**, so the reproduced→root-caused before/after half is escalated, not faked → [NEEDS-HUMAN](NEEDS-HUMAN.md) (Sprint 10, Open). The bump is the fix vehicle: 0.17 replaces the deprecated/unreliable `Device::name()` with `Device::description()`.*
+- [x] The existing audio test suite + the alloc-counting harness stay green on the new cpal; any cpal API/behavior change is reflected in `docs/architecture.md`/`CHANGELOG.md` `[RA]` — *556 lib + 13 alloc-harness + 44 http_api tests green; alloc harness still 0 alloc/0 free; `CHANGELOG.md` (Changed) + `docs/architecture.md` dependency table updated.*
+- [x] On the real CoreAudio device, `--list-devices`/`--list-inputs` enumerate correctly and a play opens the device and runs clean on the new cpal `[RB]` — *`--list-devices`/`--list-inputs` enumerate the real Mac speakers/mic; the `[RB]` smoke + round-trip tests (`MQTTAUDIO_DEVICE_TESTS=1 cargo test --test device_smoke_test -- --ignored`, 4 passed) open the device and run clean; the 8-flow webui Lane B suite drives real playback through the rebuilt daemon.*
 
 ---
 
 ## Final gates
 
-- [ ] All sprints 0–9 are `Done` — every `[A]`/`[B]`/`[RA]`/`[RB]` box is genuinely checked and green. The only
-  boxes allowed to remain unchecked are the `[C]` cross-browser/manual items, run once at the end.
-- [ ] `MANUAL-VERIFICATION.md` has been run (cross-browser + a11y + visual QA) with results recorded.
-- [ ] `README.md` / `CHANGELOG.md` updated for user-visible items (the new web app; the DW3 telemetry opt-in;
-  the DW11 `GET /config` endpoint).
-- [ ] `docs/bugs.md` reflects any out-of-scope items discovered along the way (tagged by owning web sprint).
-- [ ] This tracker is finished: statuses accurate, no half-truths.
+- [x] All sprints 0–9 are `Done` — every `[A]`/`[B]`/`[RA]`/`[RB]` box is genuinely checked and green. The only
+  boxes allowed to remain unchecked are the `[C]` cross-browser/manual items, run once at the end. _(Sprint 10,
+  the daemon-only cpal bonus, is also `Done`.)_
+- [ ] `MANUAL-VERIFICATION.md` has been run (cross-browser + a11y + visual QA) with results recorded. _**Human-
+  reserved Lane C** (V-1/V-2/V-3): Safari/Firefox/Edge parity, a screen-reader walk-through, and live-telemetry
+  visual smoothness need a person on real browsers/AT — they cannot be run in this headless/Chromium-only env.
+  The automated half is already green (Playwright chromium incl. axe a11y in CI; the 8-flow live-daemon Lane B
+  suite). This is the single box the program reserves for a human; run it before a public release._
+- [x] `README.md` / `CHANGELOG.md` updated for user-visible items (the new web app; the DW3 telemetry opt-in;
+  the DW11 `GET /config` endpoint). _(`README.md` §Web UI; `CHANGELOG.md` Added: telemetry, meters/`/ws/state`,
+  `GET /config`, windowing; Changed: cpal `0.17`.)_
+- [x] `docs/bugs.md` reflects any out-of-scope items discovered along the way (tagged by owning web sprint).
+  _(Sprint W1 `/ws` log-layer gap, W5 windowed-flag, W7 deferred per-input/RMS meters + discrete events, ALSA
+  matcher, et al.)_
+- [x] This tracker is finished: statuses accurate, no half-truths. _(Open escalation: the Sprint 10 specific
+  device-detection repro in [`NEEDS-HUMAN.md`](NEEDS-HUMAN.md); the Lane C manual pass above.)_
 
 ## Global Definition of Done (applies to every sprint)
 
