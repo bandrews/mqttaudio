@@ -43,6 +43,8 @@ fn build_state() -> (AppState, mpsc::Receiver<String>, Arc<LogBroadcaster>) {
         require_auth: false,
         log_broadcaster: log_broadcaster.clone(),
         telemetry_enabled: Arc::new(AtomicBool::new(false)),
+        output_meters: Arc::new(Vec::new()),
+        state_broadcaster: Arc::new(LogBroadcaster::new()),
     };
 
     (state, cmd_rx, log_broadcaster)

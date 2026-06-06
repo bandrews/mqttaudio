@@ -8,7 +8,7 @@ use crate::audio::streaming::SampleBuffer;
 use crate::audio::types::DecodedBuffer;
 use crate::config::{DEFAULT_MASTER_GAIN, DEFAULT_OUTPUT_CEILING_DB};
 use ringbuf::HeapConsumer;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Fade state for audio samples
@@ -1062,6 +1062,12 @@ pub struct MixerState {
     /// work beyond a single relaxed load. The control thread shares this Arc and
     /// flips it (POST /telemetry); it never locks the RT state (D22a).
     pub telemetry_enabled: Arc<AtomicBool>,
+
+    /// Per-output-channel peak meters (Sprint W7), length `output_channels`. When
+    /// telemetry is on, the callback stores each channel's post-limiter peak (as
+    /// f32 bits) once per block — relaxed, alloc-free. The control thread reads them
+    /// for the state-event tick. Empty disables metering.
+    pub output_meters: Arc<Vec<AtomicU32>>,
 }
 
 impl MixerState {
@@ -1087,6 +1093,7 @@ impl MixerState {
             master_gain: DEFAULT_MASTER_GAIN,
             clip_count: Arc::new(AtomicU64::new(0)),
             telemetry_enabled: Arc::new(AtomicBool::new(false)),
+            output_meters: Arc::new((0..output_channels).map(|_| AtomicU32::new(0)).collect()),
         }
     }
 }
@@ -1179,6 +1186,10 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
     let ceiling = state.output_ceiling;
     let channel_gains = &state.channel_gains;
     let mut clip_events: u64 = 0;
+    // Per-channel output peak for the meters (Sprint W7), tracked during the limiter
+    // pass on a fixed-size stack array (no alloc) and published below if telemetry on.
+    const MAX_METER_CHANNELS: usize = 64;
+    let mut peaks = [0.0f32; MAX_METER_CHANNELS];
     for frame in output.chunks_exact_mut(channels) {
         for (ch, s) in frame.iter_mut().enumerate() {
             // `channel_gains` is sized to `output_channels` at construction, so this
@@ -1194,10 +1205,25 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
                 clip_events += 1;
             }
             *s = soft_limit(gained, ceiling).clamp(-ceiling, ceiling);
+            if ch < MAX_METER_CHANNELS {
+                let a = s.abs();
+                if a > peaks[ch] {
+                    peaks[ch] = a;
+                }
+            }
         }
     }
     if clip_events > 0 {
         state.clip_count.fetch_add(clip_events, Ordering::Relaxed);
+    }
+    // Publish per-channel output peaks (gated; relaxed alloc-free stores, mirroring
+    // the position publish). The control thread reads these for the state tick.
+    if publish_positions {
+        let meters = &state.output_meters;
+        let n = channels.min(meters.len()).min(MAX_METER_CHANNELS);
+        for (ch, slot) in meters.iter().take(n).enumerate() {
+            slot.store(peaks[ch].to_bits(), Ordering::Relaxed);
+        }
     }
 }
 

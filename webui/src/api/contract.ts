@@ -144,6 +144,18 @@ export interface TelemetryInfo {
   enabled: boolean;
 }
 
+/** Per-output-channel peak meters (Sprint W7). Linear amplitudes. */
+export interface MetersInfo {
+  output: number[];
+}
+
+/** A throttled tick frame from the `/ws/state` channel (Sprint W7). */
+export interface TickFrame {
+  type: 'tick';
+  samples: { internal_id: string; position_ms: number; progress_percent: number }[];
+  meters: { output: number[] };
+}
+
 export interface VoiceInfo {
   id: string;
   sample_count: number;

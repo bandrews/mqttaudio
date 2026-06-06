@@ -827,6 +827,23 @@ pub struct TelemetryParams {
     enabled: bool,
 }
 
+/// Per-output-channel peak meters (Sprint W7), a poll fallback for the `/ws/state`
+/// tick channel. Linear amplitudes; all zero when telemetry is off.
+pub async fn handle_meters(State(state): State<AppState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+    let telemetry = state.telemetry_enabled.load(Ordering::Relaxed);
+    let output: Vec<f32> = if telemetry {
+        state
+            .output_meters
+            .iter()
+            .map(|m| f32::from_bits(m.load(Ordering::Relaxed)))
+            .collect()
+    } else {
+        vec![0.0; state.output_meters.len()]
+    };
+    Json(json!({ "output": output }))
+}
+
 /// Current telemetry-enable state.
 pub async fn handle_telemetry_get(State(state): State<AppState>) -> impl IntoResponse {
     let enabled = state

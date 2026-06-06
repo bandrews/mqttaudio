@@ -21,8 +21,9 @@
 		}
 	}
 
-	# WebSocket stream (/ws). Caddy upgrades WebSockets automatically.
-	handle /ws {
+	# WebSocket streams: /ws (logs) and /ws/state (state events, Sprint W7). Caddy
+	# upgrades WebSockets automatically. The `/ws*` matcher covers both.
+	handle /ws* {
 		reverse_proxy {$DAEMON_HOST:127.0.0.1:8080} {
 			header_up Authorization "Bearer {$DAEMON_TOKEN}"
 		}

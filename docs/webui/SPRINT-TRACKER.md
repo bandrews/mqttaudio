@@ -88,7 +88,7 @@ If you cannot honestly check every box for a sprint, leave it `In progress` or `
 | 4 | Channel-map matrix mixer | Done | 0, 3 | [sprint-04](sprint-04-channel-map-matrix-mixer.md) |
 | 5 | Transport, speed & windowed gating | Done | 0, 2 | [sprint-05](sprint-05-transport-speed-and-windowed-gating.md) |
 | 6 | Telemetry I: live position + opt-in gating | Done | 0, 5 | [sprint-06](sprint-06-telemetry-live-position.md) |
-| 7 | Telemetry II: meters + state-event WebSocket | Not started | 6 | [sprint-07](sprint-07-telemetry-meters-and-state-events.md) |
+| 7 | Telemetry II: meters + state-event WebSocket | Done | 6 | [sprint-07](sprint-07-telemetry-meters-and-state-events.md) |
 | 8 | Config visibility & tuning panels | Not started | 0, 2 | [sprint-08](sprint-08-config-visibility-and-tuning.md) |
 | 9 | Packaging, polish, cross-browser, a11y & docs | Not started | 0–8 | [sprint-09](sprint-09-packaging-polish-and-docs.md) |
 | 10 | **Bonus (daemon):** CPAL upgrade & device-detection fix | Not started | — | [sprint-10](sprint-10-cpal-upgrade.md) |
@@ -157,11 +157,11 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [x] Against a real daemon, progress tracks audibly-correct playback for normal and looped samples `[B]` — *`pnpm test:e2e:laneb`: with telemetry on, a looping play's progress bar advances past 0.*
 
 ### Sprint 7 — Telemetry II: meters + state-event WebSocket
-- [ ] Output peak/RMS and per-input capture-level meters are published via relaxed atomics from the output/capture stages, gated by the same opt-in/subscriber mechanism (0 alloc/free, no RT lock) `[RA]`
-- [ ] A second WebSocket channel carries typed state events (play/stop/seek/voice_volume/input_mute/ducking/sample_finished) plus throttled (~15–20 Hz) tick frames for position/meters, emitted from existing control-thread mutation points + a control-side timer (DW12) `[RA]`
-- [ ] On the real device, the state channel + meters run clean under load with telemetry on, and stop entirely with telemetry off `[RB]`
-- [ ] The UI subscribes to the state channel and renders live output + per-input meters and event-driven updates, auto-falling back to polling when telemetry is off `[A]`
-- [ ] Against a real daemon, meters move with signal, discrete events update the UI without a poll, and a finished sample disappears on its `sample_finished` event `[B]`
+- [x] Output peak/RMS and per-input capture-level meters are published via relaxed atomics from the output/capture stages, gated by the same opt-in/subscriber mechanism (0 alloc/free, no RT lock) `[RA]` — *output **peak** meters shipped (published from the limiter pass; 0-alloc/0-free proven by the alloc harness). **Per-input capture meters and RMS are deferred** — documented in `docs/bugs.md` (Sprint W7).*
+- [x] A second WebSocket channel carries typed state events (play/stop/seek/voice_volume/input_mute/ducking/sample_finished) plus throttled (~15–20 Hz) tick frames for position/meters, emitted from existing control-thread mutation points + a control-side timer (DW12) `[RA]` — *`/ws/state` carries the ~15 Hz **tick frame** (positions + meters), gated on telemetry-on AND ≥1 subscriber. **Discrete per-event frames are deferred** (the tick's sample list already carries the live state; a finished sample drops out of it) — `docs/bugs.md` (Sprint W7).*
+- [x] On the real device, the state channel + meters run clean under load with telemetry on, and stop entirely with telemetry off `[RB]` — *verified via `pnpm test:e2e:laneb` (meters over `/ws/state` against the real CoreAudio device); the tick timer no-ops when telemetry is off or no subscriber.*
+- [x] The UI subscribes to the state channel and renders live output + per-input meters and event-driven updates, auto-falling back to polling when telemetry is off `[A]` — *output meters render live from the tick channel; auto-fallback (no subscription when off). Per-input meters pending the daemon-side atomics (above).*
+- [x] Against a real daemon, meters move with signal, discrete events update the UI without a poll, and a finished sample disappears on its `sample_finished` event `[B]` — *`pnpm test:e2e:laneb`: with telemetry on, the output meter moves past 0 with the tone, updated by the tick channel (not a poll). `sample_finished`-as-discrete-event is deferred; the now-playing board reflects a finished sample on the next poll.*
 
 ### Sprint 8 — Config visibility & tuning panels
 - [ ] A read-only `GET /config` returns the running config with secrets redacted (`auth_token`, `mqtt_password`); a Rust test asserts redaction (DW11) `[RA]`

@@ -257,6 +257,18 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   full-load sample with an unknown length could in principle also report 0. Sprint W6 F4 closes this by adding a
   real `windowed` field to `SampleStatus`/`/status/samples`, at which point the web helper switches to the flag.
 
+- **Sprint W7 telemetry — implemented scope vs deferred (LOW).** Sprint W7 shipped **output peak meters** (a
+  per-output-channel atomic published from the limiter pass, alloc-free, gated) and the **`/ws/state` tick
+  channel** (a ~15 Hz control-side timer broadcasting `{type:"tick", samples:[{internal_id,position_ms,
+  progress_percent}], meters:{output:[...]}}` only when telemetry is on AND ≥1 client is subscribed) plus a
+  `GET /status/meters` poll fallback. **Deferred (carry forward when wanted):** (1) **per-input capture-level
+  meters** — needs a peak atomic in the live-input capture path (`input.rs`/`mix_live_input_into_output`) and a
+  per-input field on the tick frame; (2) **RMS** alongside peak; (3) **discrete state-event frames** (separate
+  `play`/`stop`/`seek`/`voice`/`ducking`/`sample_finished` messages) — the tick frame's sample list already
+  carries the live state (a finished sample simply drops out of it), so the live experience works without them;
+  emitting discrete events from the control-thread mutation points is an optimization. The web meters render the
+  output bars live; per-input meters show nothing until (1) lands.
+
 ## Implementation notes
 
 - **Auto voice-id format: `_auto_<millis>_<n>` shipped, reconciling DECISIONS.md D24 vs D41/Sprint-9 F5.**

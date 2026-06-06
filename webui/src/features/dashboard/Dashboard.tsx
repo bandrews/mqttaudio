@@ -11,6 +11,7 @@ import { VoicesRack } from './VoicesRack';
 import { InputsRack } from './InputsRack';
 import { CacheTable } from './CacheTable';
 import { LogConsole } from '../logs/LogConsole';
+import { Meters } from '../telemetry/Meters';
 
 export function Dashboard() {
   return (
@@ -28,6 +29,7 @@ export function Dashboard() {
           <LogConsole />
         </Stack>
         <Stack spacing={2}>
+          <Meters />
           <VoicesRack />
           <InputsRack />
           <CacheTable />

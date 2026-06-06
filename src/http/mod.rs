@@ -14,7 +14,7 @@ use crate::voice::VoiceManager;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -100,6 +100,13 @@ pub struct AppState {
     /// publishes live positions and the status handler reports them; when clear,
     /// `/status/samples` reports `0` as before and the RT does no new work.
     pub telemetry_enabled: Arc<AtomicBool>,
+    /// Per-output-channel peak meters (Sprint W7), shared with the RT `MixerState`.
+    /// Read by the state-event tick timer (as f32 bits).
+    pub output_meters: Arc<Vec<AtomicU32>>,
+    /// Broadcaster for the `/ws/state` typed state-event channel (Sprint W7). The
+    /// tick timer publishes here only when telemetry is on AND ≥1 client is
+    /// subscribed (DW3).
+    pub state_broadcaster: Arc<LogBroadcaster>,
 }
 
 /// Return a warning when the HTTP control API is exposed on a non-loopback
@@ -134,8 +141,17 @@ pub async fn start_server(
     start_time: Instant,
     ducking: Arc<RwLock<HashMap<String, f32>>>,
     telemetry_enabled: Arc<AtomicBool>,
+    output_meters: Arc<Vec<AtomicU32>>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
+    let state_broadcaster = Arc::new(LogBroadcaster::new());
+
+    // Clones for the state-event tick timer (Sprint W7), taken before `status` etc.
+    // are moved into AppState.
+    let tick_telemetry = telemetry_enabled.clone();
+    let tick_status = status.clone();
+    let tick_meters = output_meters.clone();
+    let tick_broadcaster = state_broadcaster.clone();
 
     let state = AppState {
         cmd_tx,
@@ -150,7 +166,57 @@ pub async fn start_server(
         require_auth: config.require_auth,
         log_broadcaster: log_broadcaster.clone(),
         telemetry_enabled,
+        output_meters,
+        state_broadcaster: state_broadcaster.clone(),
     };
+
+    // State-event tick timer (~15 Hz, DW12): only does work when telemetry is on AND
+    // a client is subscribed (DW3). Reads the RT-published position + meter atomics
+    // (never the mixer, D22a) and broadcasts a compact tick frame.
+    tokio::spawn(async move {
+        use std::sync::atomic::Ordering;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(66));
+        loop {
+            ticker.tick().await;
+            if !tick_telemetry.load(Ordering::Relaxed) || tick_broadcaster.receiver_count() == 0 {
+                continue;
+            }
+            let samples: Vec<serde_json::Value> = {
+                let snap = tick_status.read().unwrap();
+                snap.samples
+                    .iter()
+                    .map(|s| {
+                        let position = s.position.as_ref().map_or(0, |p| p.load(Ordering::Relaxed));
+                        let position_ms = if s.sample_rate > 0 {
+                            (position as u64 * 1000) / s.sample_rate as u64
+                        } else {
+                            0
+                        };
+                        let progress = if s.total_frames > 0 {
+                            (position as f64 / s.total_frames as f64 * 100.0).min(100.0)
+                        } else {
+                            0.0
+                        };
+                        serde_json::json!({
+                            "internal_id": s.internal_id.to_string(),
+                            "position_ms": position_ms,
+                            "progress_percent": progress,
+                        })
+                    })
+                    .collect()
+            };
+            let output: Vec<f32> = tick_meters
+                .iter()
+                .map(|m| f32::from_bits(m.load(Ordering::Relaxed)))
+                .collect();
+            let frame = serde_json::json!({
+                "type": "tick",
+                "samples": samples,
+                "meters": { "output": output },
+            });
+            tick_broadcaster.broadcast(frame.to_string());
+        }
+    });
 
     let app = create_router(state, config.cors_permissive, config.websocket_enabled);
 

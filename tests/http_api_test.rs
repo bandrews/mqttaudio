@@ -62,6 +62,8 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         require_auth: false,
         log_broadcaster: Arc::new(LogBroadcaster::new()),
         telemetry_enabled: Arc::new(AtomicBool::new(false)),
+        output_meters: Arc::new(Vec::new()),
+        state_broadcaster: Arc::new(LogBroadcaster::new()),
     };
 
     (state, cmd_rx)

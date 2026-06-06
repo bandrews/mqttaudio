@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`{"enabled": true|false}`) flips it; `GET /telemetry` reads it. Added for the web control app's live
   progress bars; it is opt-in because it adds a little real-time work. `/status/samples` also gains a
   `windowed` boolean (a streamed/forward-only sample) so a UI can gate seek/speed/reverse reliably.
+- **Live output meters + state-event channel (`/ws/state`, `GET /status/meters`).** Also opt-in (the same
+  `/telemetry` gate). When enabled, the audio thread publishes per-output-channel peak levels into atomics (a
+  relaxed store per block in the limiter pass — no allocation, no lock), and a ~15 Hz control-side timer
+  broadcasts a compact tick frame (`{type:"tick", samples:[{internal_id,position_ms,progress_percent}],
+  meters:{output:[…]}}`) over a new `/ws/state` WebSocket — **only while telemetry is on and at least one client
+  is connected**, so it costs nothing otherwise. `GET /status/meters` is a poll fallback. Added for the web
+  app's live meters and smoother position updates.
 - **Windowed streaming for big files (`mode=stream`, and via the default `mode=auto`).** A `play` of a large
   or long file — local **or** `http(s)://` — is now played through a bounded ring (a fixed window, default
   1.5 s) fed by a background decoder, instead of being fully decoded into memory, so a multi-hour cue costs

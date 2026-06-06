@@ -158,6 +158,30 @@ test('the mixer transport shows a real sample and its Stop control clears it', a
   await expect(page.getByText(/no samples playing/i)).toBeVisible({ timeout: 6_000 });
 });
 
+test('telemetry on: output meters move with signal over /ws/state (Sprint W7)', async ({ page }) => {
+  daemon = await startDaemon();
+
+  await page.goto('/');
+  await page.getByRole('button', { name: /connect/i }).click();
+  await expect(page.getByText('Log stream')).toBeVisible({ timeout: 20_000 });
+
+  await page.getByRole('checkbox', { name: 'telemetry' }).click();
+  await page.request.post('/api/command', {
+    data: { command: 'play', message: { file: WAV, voice: 'beep', loop: true } },
+  });
+
+  await page.getByRole('tab', { name: 'Monitor' }).click();
+  // The output meter (driven by the /ws/state tick channel) moves past 0 with the
+  // tone playing — the W7 state channel + meters working end-to-end.
+  const meter = page.getByLabel('output meter 0');
+  await expect(meter).toBeVisible({ timeout: 8_000 });
+  await expect
+    .poll(async () => Number(await meter.getAttribute('aria-valuenow')), { timeout: 8_000 })
+    .toBeGreaterThan(0);
+
+  await page.request.post('/api/command', { data: { command: 'stopall' } });
+});
+
 test('telemetry on: live progress advances against a real daemon (Sprint W6)', async ({ page }) => {
   daemon = await startDaemon();
 

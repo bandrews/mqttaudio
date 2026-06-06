@@ -16,6 +16,7 @@ import type {
   InputMuteParams,
   InputVolumeParams,
   InputsResponse,
+  MetersInfo,
   MetricsInfo,
   PlayParams,
   SamplesResponse,
@@ -191,6 +192,16 @@ export class DaemonClient {
   /** Opt in/out of live telemetry (Sprint W6, DW3). */
   setTelemetry(enabled: boolean): Promise<TelemetryInfo> {
     return this.conn.post<TelemetryInfo>('/telemetry', { enabled });
+  }
+
+  /** Per-output-channel peak meters poll fallback (Sprint W7). */
+  meters(): Promise<MetersInfo> {
+    return this.conn.get<MetersInfo>('/status/meters');
+  }
+
+  /** Subscribe to the typed state-event channel (`/ws/state`, Sprint W7). */
+  subscribeState(handlers: SubscriptionHandlers): Subscription {
+    return this.conn.subscribe('/ws/state', handlers);
   }
 
   // ---- Transport + lifecycle ----

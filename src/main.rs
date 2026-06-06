@@ -413,6 +413,14 @@ async fn main() {
     let telemetry_enabled =
         std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+    // Per-output-channel peak meters (Sprint W7), shared between the RT mixer (which
+    // stores into them when telemetry is on) and the HTTP state-event tick timer.
+    let output_meters: std::sync::Arc<Vec<std::sync::atomic::AtomicU32>> = std::sync::Arc::new(
+        (0..output_channels)
+            .map(|_| std::sync::atomic::AtomicU32::new(0))
+            .collect(),
+    );
+
     let mixer = MixerState {
         active_samples: Vec::with_capacity(audio::mixer::MAX_VOICES),
         live_inputs: Vec::with_capacity(audio::mixer::MAX_LIVE_INPUTS),
@@ -425,6 +433,7 @@ async fn main() {
         master_gain: config.audio.master_gain,
         clip_count: clip_count.clone(),
         telemetry_enabled: telemetry_enabled.clone(),
+        output_meters: output_meters.clone(),
     };
 
     // Control->audio command ring, audio->reaper graveyard ring, and audio->reaper
@@ -708,6 +717,7 @@ async fn main() {
             start_time,
             ducking_snapshot.clone(),
             telemetry_enabled.clone(),
+            output_meters.clone(),
         )
         .await
         {
