@@ -68,14 +68,19 @@ cd webui
 pnpm typecheck          # tsc --noEmit
 pnpm lint               # eslint, warnings are errors
 pnpm test               # Vitest + React Testing Library
-pnpm test:e2e           # Playwright headless (mocked backend) + axe a11y
+pnpm test:e2e           # Playwright headless (mocked backend) + axe a11y — Chromium (Lane A)
+pnpm test:e2e:crossbrowser  # the same specs + axe across Chromium, WebKit (Safari) & Firefox (Gecko)
 pnpm test:e2e:laneb     # Lane B: spawns a real daemon, drives the SPA through the dev proxy
 pnpm build              # type-check + production build to webui/dist
 ```
 
+`test:e2e:crossbrowser` needs the extra engines once: `pnpm exec playwright install webkit firefox`.
+
 CI (`.github/workflows/webui-ci.yml`) runs the Lane A gate (build, typecheck, lint, unit/component, Playwright
-headless incl. a11y). Lane B (real browser + live daemon) runs locally on a machine with an audio device;
-cross-browser and manual a11y/visual QA are tracked in [`MANUAL-VERIFICATION.md`](MANUAL-VERIFICATION.md).
+headless incl. a11y) on Chromium. Lane B (real browser + live daemon) runs locally on a machine with an audio
+device. Cross-engine rendering/interaction/a11y parity (WebKit + Gecko) is covered by `test:e2e:crossbrowser`;
+the residual human pass — a real screen-reader walk-through and an ears-on "audio unaffected" listen — is
+tracked in [`MANUAL-VERIFICATION.md`](MANUAL-VERIFICATION.md).
 
 ## Electron (future)
 

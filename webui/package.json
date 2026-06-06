@@ -14,7 +14,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
-    "test:e2e:laneb": "playwright test --config=playwright.laneb.config.ts"
+    "test:e2e:laneb": "playwright test --config=playwright.laneb.config.ts",
+    "test:e2e:crossbrowser": "playwright test --config=playwright.crossbrowser.config.ts"
   },
   "dependencies": {
     "@emotion/react": "^11.13.3",
