@@ -84,7 +84,7 @@ If you cannot honestly check every box for a sprint, leave it `In progress` or `
 | 0 | Foundations, API contract & CI harness | Done | — | [sprint-00](sprint-00-foundations-and-api-contract.md) |
 | 1 | Deployment: reverse-proxy sidecar & connectivity | Done | 0 | [sprint-01](sprint-01-deployment-and-connectivity.md) |
 | 2 | Live monitoring dashboard (poll-based) | Done | 0, 1 | [sprint-02](sprint-02-live-monitoring-dashboard.md) |
-| 3 | Command test-bench & cue launcher | Not started | 0 | [sprint-03](sprint-03-command-test-bench.md) |
+| 3 | Command test-bench & cue launcher | Done | 0 | [sprint-03](sprint-03-command-test-bench.md) |
 | 4 | Channel-map matrix mixer | Not started | 0, 3 | [sprint-04](sprint-04-channel-map-matrix-mixer.md) |
 | 5 | Transport, speed & windowed gating | Not started | 0, 2 | [sprint-05](sprint-05-transport-speed-and-windowed-gating.md) |
 | 6 | Telemetry I: live position + opt-in gating | Not started | 0, 5 | [sprint-06](sprint-06-telemetry-live-position.md) |
@@ -124,11 +124,11 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [x] Against a real daemon, the dashboard reflects live plays/stops/duck changes within the poll interval `[B]` — *`pnpm test:e2e:laneb`: a real looping play appears on the now-playing board within the poll interval and clears on stopall.*
 
 ### Sprint 3 — Command test-bench & cue launcher
-- [ ] Every runtime command (play, stop, stopall, volume, seek, speed, voice_*, input_*, cache_*, precache) has a form that emits correct JSON, with client-side validation mirroring the code (volume 0-1, speed ranges, lowercase enums) `[A]`
-- [ ] The selector model (`internal_id`/`id`/`file`/`voice`, OR-logic) is exposed with an explicit warning when no selector is set (silent no-op) `[A]`
-- [ ] A raw `/command` editor exposes the full play surface (`channel_map`, `mode`, `window_ms`, `prebuffer_ms`, `freshness`, `cacheable`, `crossfade_ms`) that typed `/play` omits (DW10) `[A]`
-- [ ] A cue launcher composes file + options into a play, with a live JSON preview reflecting macro + explicit-field precedence `[A]`
-- [ ] Against a real daemon, representative commands from each family take effect and are reflected on the dashboard `[B]`
+- [x] Every runtime command (play, stop, stopall, volume, seek, speed, voice_*, input_*, cache_*, precache) has a form that emits correct JSON, with client-side validation mirroring the code (volume 0-1, speed ranges, lowercase enums) `[A]`
+- [x] The selector model (`internal_id`/`id`/`file`/`voice`, OR-logic) is exposed with an explicit warning when no selector is set (silent no-op) `[A]`
+- [x] A raw `/command` editor exposes the full play surface (`channel_map`, `mode`, `window_ms`, `prebuffer_ms`, `freshness`, `cacheable`, `crossfade_ms`) that typed `/play` omits (DW10) `[A]`
+- [x] A cue launcher composes file + options into a play, with a live JSON preview reflecting macro + explicit-field precedence `[A]`
+- [x] Against a real daemon, representative commands from each family take effect and are reflected on the dashboard `[B]` — *`pnpm test:e2e:laneb`: the cue launcher plays a real file (shown on the Monitor) and the console Stop All clears it.*
 
 ### Sprint 4 — Channel-map matrix mixer
 - [ ] A src×dest matrix grid sized from `output_channels` (`/status`) lets the user toggle routes and set a per-route `gain`; channel aliases label destination columns `[A]`

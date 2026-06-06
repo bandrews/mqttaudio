@@ -89,3 +89,27 @@ test('dashboard reflects a real play and stop within the poll interval', async (
   await page.request.post('/api/command', { data: { command: 'stopall' } });
   await expect(page.getByText(/no samples playing/i)).toBeVisible({ timeout: 6_000 });
 });
+
+test('the console cue launcher plays a real file and Stop All clears it', async ({ page }) => {
+  daemon = await startDaemon();
+
+  await page.goto('/');
+  await page.getByRole('button', { name: /connect/i }).click();
+  await expect(page.getByText('Log stream')).toBeVisible({ timeout: 20_000 });
+
+  // Drive the cue launcher in the Console tab.
+  await page.getByRole('tab', { name: 'Console' }).click();
+  await page.getByLabel('file', { exact: true }).first().fill(WAV);
+  await page.getByLabel('loop').check();
+  await page.getByRole('button', { name: 'Play' }).click();
+
+  // The Monitor tab reflects the real play.
+  await page.getByRole('tab', { name: 'Monitor' }).click();
+  await expect(page.getByText('test_beep_5s.wav')).toBeVisible({ timeout: 6_000 });
+
+  // Stop All from the console clears it.
+  await page.getByRole('tab', { name: 'Console' }).click();
+  await page.getByRole('button', { name: 'Stop all' }).click();
+  await page.getByRole('tab', { name: 'Monitor' }).click();
+  await expect(page.getByText(/no samples playing/i)).toBeVisible({ timeout: 6_000 });
+});

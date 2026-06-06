@@ -10,6 +10,8 @@ import Button from '@mui/material/Button';
 import Chip from '@mui/material/Chip';
 import Container from '@mui/material/Container';
 import Stack from '@mui/material/Stack';
+import Tab from '@mui/material/Tab';
+import Tabs from '@mui/material/Tabs';
 import Toolbar from '@mui/material/Toolbar';
 import Typography from '@mui/material/Typography';
 import { DaemonClient } from './api/client';
@@ -18,6 +20,7 @@ import type { BootstrapResult } from './api/bootstrap';
 import { ClientProvider } from './state/QueryProvider';
 import { Connect } from './components/Connect';
 import { Dashboard } from './features/dashboard/Dashboard';
+import { CommandConsole } from './features/console/CommandConsole';
 
 interface Session {
   client: DaemonClient;
@@ -43,9 +46,12 @@ export function App() {
   );
 }
 
+type View = 'monitor' | 'console';
+
 function ConnectedView({ session, onDisconnect }: { session: Session; onDisconnect: () => void }) {
   const { result, connection } = session;
   const version = result.version;
+  const [view, setView] = useState<View>('monitor');
   return (
     <Box>
       <AppBar position="static" color="default" elevation={1}>
@@ -67,9 +73,13 @@ function ConnectedView({ session, onDisconnect }: { session: Session; onDisconne
             </Button>
           </Stack>
         </Toolbar>
+        <Tabs value={view} onChange={(_e, v: View) => setView(v)} sx={{ px: 2 }}>
+          <Tab value="monitor" label="Monitor" />
+          <Tab value="console" label="Console" />
+        </Tabs>
       </AppBar>
       <Container maxWidth="xl" sx={{ py: 3 }}>
-        <Dashboard />
+        {view === 'monitor' ? <Dashboard /> : <CommandConsole />}
       </Container>
     </Box>
   );
