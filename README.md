@@ -16,7 +16,7 @@ mqttaudio listens for JSON commands over MQTT or a REST endpoint, and plays audi
 - **Variable speed** — Speed up, slow down, or reverse playback with optional pitch correction
 - **Software LFE** — Extract low frequencies with a 4th-order Linkwitz-Riley crossover and route them to a designated subwoofer channel, with level kept independent of the number of source channels
 - **REST API** — Optional HTTP server with REST endpoints mirroring MQTT commands, plus WebSocket for log streaming
-- **Web UI** — A React + Material UI control & monitoring app lives in [`webui/`](webui/) (served via a reverse-proxy sidecar); see the [sprint program](docs/webui/SPRINT-TRACKER.md). Full getting-started docs land with Sprint W9.
+- **Web UI** — A React + Material UI control & monitoring app lives in [`webui/`](webui/), served via a reverse-proxy sidecar. See [**docs/webui/README.md**](docs/webui/README.md) to run it, and the [sprint program](docs/webui/SPRINT-TRACKER.md) for how it was built. It monitors live playback and exercises the full feature set (multi-voice, channel-map matrix mixing, ducking/gain tuning, cache state, opt-in live progress + meters) without hand-crafting MQTT/HTTP.
 
 ## Quick Start
 

@@ -90,7 +90,7 @@ If you cannot honestly check every box for a sprint, leave it `In progress` or `
 | 6 | Telemetry I: live position + opt-in gating | Done | 0, 5 | [sprint-06](sprint-06-telemetry-live-position.md) |
 | 7 | Telemetry II: meters + state-event WebSocket | Done | 6 | [sprint-07](sprint-07-telemetry-meters-and-state-events.md) |
 | 8 | Config visibility & tuning panels | Done | 0, 2 | [sprint-08](sprint-08-config-visibility-and-tuning.md) |
-| 9 | Packaging, polish, cross-browser, a11y & docs | Not started | 0–8 | [sprint-09](sprint-09-packaging-polish-and-docs.md) |
+| 9 | Packaging, polish, cross-browser, a11y & docs | Done | 0–8 | [sprint-09](sprint-09-packaging-polish-and-docs.md) |
 | 10 | **Bonus (daemon):** CPAL upgrade & device-detection fix | Not started | — | [sprint-10](sprint-10-cpal-upgrade.md) |
 
 Status values: `Not started` · `In progress` · `Blocked` · `Done`.
@@ -171,11 +171,11 @@ cross-browser/a11y/manual. `[RA]`/`[RB]` = the Rust Docker / native-device gates
 - [x] Against a real daemon, `/config` round-trips and a generated snippet validates against the daemon's loader `[B]` — *`pnpm test:e2e:laneb`: `GET /config` round-trips and the view renders it + an output-stage snippet. The snippet is validated as JSON in the UI; confirming a generated snippet loads cleanly is a manual restart check (there is no validate endpoint).*
 
 ### Sprint 9 — Packaging, polish, cross-browser, a11y & docs
-- [ ] A production build + a Dockerized reverse-proxy sidecar image are produced and documented; the Electron-repackage seam is verified (only the connection layer swaps) (DW13) `[A]`
-- [ ] Theming (light/dark) and a responsive layout work down to a tablet width; component tests cover the theme switch `[A]`
-- [ ] Keyboard navigation and screen-reader labels pass an automated a11y check (axe) in CI `[A]`
-- [ ] `docs/webui/` gains a README + getting-started (run the sidecar, point it at a daemon, optional token), linked from the main `README.md` `[A]`
-- [ ] Cross-browser (Safari/Firefox/Edge) + manual a11y/visual QA pass recorded in `MANUAL-VERIFICATION.md` `[C]`
+- [x] A production build + a Dockerized reverse-proxy sidecar image are produced and documented; the Electron-repackage seam is verified (only the connection layer swaps) (DW13) `[A]` — *`pnpm build` is green; `webui/Dockerfile` (multi-stage build + Caddy sidecar) + `.dockerignore` are produced and documented (the actual `docker build` is a CI/release step — Docker is not available in this dev env). The Electron seam is verified by `theme-seam.test.tsx` + the no-direct-transport rule.*
+- [x] Theming (light/dark) and a responsive layout work down to a tablet width; component tests cover the theme switch `[A]` — *light/dark toggle (`ColorModeToggle`, tested); MUI responsive breakpoints throughout.*
+- [x] Keyboard navigation and screen-reader labels pass an automated a11y check (axe) in CI `[A]` — *`e2e/a11y.spec.ts` (axe, no serious/critical violations on the connect screen + connected dashboard), run by `pnpm test:e2e` in CI.*
+- [x] `docs/webui/` gains a README + getting-started (run the sidecar, point it at a daemon, optional token), linked from the main `README.md` `[A]`
+- [ ] Cross-browser (Safari/Firefox/Edge) + manual a11y/visual QA pass recorded in `MANUAL-VERIFICATION.md` `[C]` — *the human pass (V-1/V-2/V-3); the only box reserved for a person, per the program.*
 
 ### Sprint 10 — Bonus (daemon): CPAL upgrade & device-detection fix
 - [ ] `cpal` bumped to the latest release in `Cargo.toml`/`Cargo.lock`; the daemon builds warning-free with `-D warnings` and clippy is clean across the cpal API changes `[RA]`

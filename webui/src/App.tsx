@@ -25,6 +25,7 @@ import { MatrixMixer } from './features/matrix/MatrixMixer';
 import { MixerView } from './features/mixer/MixerView';
 import { ConfigView } from './features/config/ConfigView';
 import { TelemetrySwitch } from './features/telemetry/TelemetrySwitch';
+import { ColorModeToggle } from './features/theme/ColorModeToggle';
 
 interface Session {
   client: DaemonClient;
@@ -64,6 +65,7 @@ function ConnectedView({ session, onDisconnect }: { session: Session; onDisconne
             mqttaudio
           </Typography>
           <Stack direction="row" spacing={1} alignItems="center">
+            <ColorModeToggle />
             <TelemetrySwitch />
             <Chip size="small" color="success" label={`connected: ${connection.label}`} />
             {version && (
