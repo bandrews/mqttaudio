@@ -239,6 +239,16 @@ daemon-side plumbing, never front-end work.
   a `start_position` beyond the loaded edge **gates** on `frames_loaded` with the prebuffer
   gate's deadline-then-start shape. *Why:* this is the owner's reported cold-start problem, and
   the fix is wiring three paths onto the one that already works — no new machinery.
+  *Implementation amendments (Sprint 12, evidence-driven per the override protocol):* (1) the
+  Play command carries no pitch parameter, so the "pitch exception" was vacuous — pitch arrives
+  only via later Speed commands, which no-op on `Streaming`-variant buffers even after the fill
+  completes. To preserve full feature parity, the reaper **upgrades** a cold play to its
+  promoted Complete buffer once the decode finishes (`AudioCommand::UpgradeSampleBuffer`: an
+  RT-side `mem::swap` of identical PCM, the displaced buffer dropped off-RT via the husk), so
+  pitch/seek/loop-crossfade regain full-decode semantics within roughly the decode time of the
+  start. (2) The decoder is constructed **synchronously** (a header parse, microseconds for
+  local files) before the buffer is returned, so the channel count and total-frames estimate
+  are correct immediately — `/status` and the crossfade-length warning depend on them.
 - **D52 · Invalidation abandons in-flight loads; the revalidation tick is already safe.**
   `invalidate`/`cache_reload` must mark the matching `active_loads` entry abandoned: completion
   skips promotion and the entry no longer joins new plays. The background
@@ -256,10 +266,16 @@ daemon-side plumbing, never front-end work.
   `(canonical_path, mtime, size)` → `Probe` (capped ~256 entries). *Why:* windowed plays never
   enter the memory cache, so today every replay of a large file re-pays a ~5–20 ms header
   parse.
-- **D55 · The HTTP header open overlaps local setup.** Start `open_http_stream` as a task at
-  the top of the HTTP play path; await it only where the windowing decision needs its result.
-  D49's single-request property is preserved (the opened response *is* the download). *Why:*
-  100–300 ms of network latency currently serializes ahead of independent work.
+- **D55 · The HTTP header open overlaps local setup — SUPERSEDED by reuse (Sprint 12,
+  evidence-driven).** Implementation found the premise hollow: the "local setup" available to
+  overlap totals microseconds, so overlapping buys nothing. The real serialized cost was that a
+  small uncached HTTP asset paid **two GETs** — the windowing probe opened the response, then
+  `windowed=false` dropped the connection and the full-load path re-fetched. Amended decision:
+  when the probe decides full-load, **reuse the already-open response** for a progressive
+  full-load decode (`start_streaming_load_from_reader` over the bounded reader) — one request
+  total, a full RTT+TTFB saved — and tee a cacheable download to the disk cache during playback
+  (also closing the documented HTTP-full-load-never-persists gap). D49's single-request
+  property now holds for *every* uncached HTTP play shape.
 - **D56 · The pitch corrector's lifecycle is control-side.** `SetSpeedMatching` ships a
   pre-built corrector (with its pre-sized tail buffer); the RT side moves it in on enable and
   returns any displaced corrector via the command-return/graveyard ring for off-RT drop. The

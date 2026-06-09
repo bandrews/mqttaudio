@@ -28,26 +28,28 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   the entry (`http_stream::PersistTarget`/`PersistSink` → `CacheManager::record_streamed_download`), so a
   restart/replay hits disk with no extra GET (covered by
   `streaming_test::cacheable_windowed_play_persists_and_replay_hits_disk`). A live source (no `Content-Length`)
-  or `cacheable: false` is intentionally not persisted. *Still not persisted:* an HTTP play that takes the
-  **full-load** streaming path (`start_streaming_load`, used when the asset is small enough to full-load and is
-  not yet disk-cached) writes only to the memory cache, so a restart re-downloads it — the blocking precache
-  path and `cache_reload` cover the managed case, and this only affects small, ad-hoc, never-precached URLs, so
-  it is left as is.
+  or `cacheable: false` is intentionally not persisted. *Update (Sprint 12, D55):* a small uncached HTTP **play**
+  now full-loads over the probe's reused response and tees a cacheable download to disk
+  (`start_streaming_load_from_reader`), closing the main re-download case. The remaining unpersisted case is the
+  direct cache-API full-load streaming path (`start_streaming_load`, e.g. `precache` of an uncached URL in
+  non-blocking mode), which still writes only to the memory cache — narrow and managed, left as is.
 - **Cold local and disk-cached-HTTP full-loads block on a complete decode before any sound (Sprint 10
-  evaluation — HIGH, owned by Sprint 12 F1, D51).** `get_or_load_streaming_with_freshness`
-  (`src/cache/mod.rs:296-301` local, `:252-274` disk-cached HTTP) awaits a one-shot `decode_file` of the
-  entire file, so cold first-start latency scales with file length — only uncached HTTP returns the
-  progressive `SampleBuffer::Streaming` immediately (`start_streaming_load`, `:312-366`), despite the doc
-  comment at `:210-213` promising immediate playback for all paths. This is the owner-reported cold-start
-  problem. Fix: unify onto the streaming-load machinery
-  (`docs/sprints/sprint-12-first-start-latency.md`).
-- **`invalidate`/`cache_reload` does not abandon in-flight streaming loads (Sprint 10 trace — MEDIUM, owned
-  by Sprint 12 F2, D52).** `invalidate` (`src/cache/mod.rs:605-611`) clears the memory and disk caches but
-  not `active_loads`; a concurrent streaming load of the same URL survives, later promotes **stale** content
-  into the freshly invalidated memory cache (`cleanup_completed_loads`, `:462-492`), and concurrent plays
-  join the stale stream (`:244-246`). The related suspicion about the background `revalidate_stale_http`
-  tick was **refuted** — it only touches URLs both disk-cached and memory-resident (`:624`), which an active
-  load can never be.
+  evaluation — RESOLVED in Sprint 12, D51).** All three cold full-load paths now return a progressive
+  `SampleBuffer::Streaming` immediately (`start_file_streaming_decode` in `src/cache/mod.rs`; the decoder is
+  constructed synchronously so channels and the total estimate are right from the start), with
+  stat-at-load-start freshness, a generation-guarded promotion, a `start_position` gate, and a
+  reaper-driven upgrade of the playing voice to the promoted Complete buffer (the `UpgradeSampleBuffer`
+  command) so seek/loop-crossfade/pitch regain full-decode semantics once the load finishes. Measured: a
+  cold 300 s WAV is playable in ~0.2 ms vs ~210 ms before (x86). See
+  `docs/sprints/sprint-12-first-start-latency.md` and the CHANGELOG.
+- **`invalidate`/`cache_reload` does not abandon in-flight streaming loads (Sprint 10 trace — RESOLVED in
+  Sprint 12, D52).** `invalidate` now removes the matching `active_loads` entry: completion no longer
+  promotes stale content and new plays no longer join the abandoned stream (the playing voice keeps its own
+  Arc and finishes normally). Discovered and fixed in the same pass: an **errored** streaming load used to
+  linger in `active_loads` forever, so replays of a failed URL silently joined the dead buffer —
+  `cleanup_completed_loads` now drops errored loads (without promotion) so replays retry fresh. The related
+  suspicion about the background `revalidate_stale_http` tick was **refuted** — it only touches URLs both
+  disk-cached and memory-resident, which an active load can never be.
 - **Streaming-buffer promotion copies the whole buffer (Sprint 10 observation — LOW, not scheduled).**
   `cleanup_completed_loads` promotes via `guard.data().to_vec()` (`src/cache/mod.rs:483`), a transient 2×
   memory spike bounded by `full_load_max_bytes` (≤ ~64 MiB total at the 32 MiB default). Acceptable today;
@@ -249,7 +251,9 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   different PCM for the same source (the `matches_full_decode` test tolerates the diff); it is not an
   audible glitch. Sprint 4's promotion (F2) means a streamed URL resolves to the one-shot path on replay,
   so the divergence only affects the first, still-streaming play. Left for Sprint 9 cleanup — do not
-  rewrite the resampler for this.
+  rewrite the resampler for this. *Scope note (Sprint 12, D51):* with all cold full-loads now progressive,
+  every cold play of a rate-converted file takes the chunked path and its promoted cache entry keeps that
+  PCM; the divergence remains tolerance-tested (`matches_full_decode`) and inaudible.
 
 - **Reverse-loop crossfade still replays the overlapped tail (Sprint 6 F6, out of scope).** The F6
   overlap-on-wrap fix is forward-only, matching the sprint's F6 statement and its forward transient-loop

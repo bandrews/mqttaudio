@@ -73,6 +73,16 @@ pub enum AudioCommand {
         selector: SampleSelector,
         volume: f32,
     },
+    /// Swap the buffer of the sample with internal id `id` for the Complete
+    /// version promoted from its finished progressive load (D51), restoring the
+    /// full random-access feature set (pitch correction needs slice access) to a
+    /// cold-played voice. The PCM is identical, so the playback position carries
+    /// over exactly. The displaced streaming buffer rides back in the spent husk
+    /// for off-RT drop.
+    UpgradeSampleBuffer {
+        id: u64,
+        buffer: crate::audio::streaming::SampleBuffer,
+    },
 }
 
 /// The producer half of the control->audio command ring (held by the control thread).
@@ -120,6 +130,11 @@ pub fn apply_command(state: &mut MixerState, cmd: AudioCommand, output_sample_ra
         AudioCommand::AddStreamedSource(source) => {
             state.streamed_sources.push(source);
         }
+        AudioCommand::UpgradeSampleBuffer { id, buffer } => {
+            if let Some(sample) = state.active_samples.iter_mut().find(|s| s.id == id) {
+                sample.buffer = buffer;
+            }
+        }
         other => apply_mutation(state, &other, output_sample_rate),
     }
 }
@@ -142,7 +157,8 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
         // Handled by move in `drain_commands`/`apply_command`, never by reference.
         AudioCommand::AddSample(_)
         | AudioCommand::AddLiveInput(_)
-        | AudioCommand::AddStreamedSource(_) => {}
+        | AudioCommand::AddStreamedSource(_)
+        | AudioCommand::UpgradeSampleBuffer { .. } => {}
         AudioCommand::SetDuckTarget(change) => {
             if let Some(ref mut applier) = state.ducking_applier {
                 applier.apply_target(change);
@@ -275,6 +291,14 @@ pub fn drain_commands(
             }
             Some(AudioCommand::AddStreamedSource(source)) => {
                 state.streamed_sources.push(source);
+            }
+            Some(AudioCommand::UpgradeSampleBuffer { id, mut buffer }) => {
+                // Swap in place (no alloc/free); a missing id means the sample
+                // finished first — the unused buffer still rides the husk out.
+                if let Some(sample) = state.active_samples.iter_mut().find(|s| s.id == id) {
+                    std::mem::swap(&mut sample.buffer, &mut buffer);
+                }
+                let _ = returns.push(AudioCommand::UpgradeSampleBuffer { id, buffer });
             }
             Some(cmd) => {
                 apply_mutation(state, &cmd, output_sample_rate);

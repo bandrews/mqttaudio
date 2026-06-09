@@ -261,8 +261,9 @@ fn bench_probe_local_file(c: &mut Criterion) {
 }
 
 /// Benchmark a windowed play's prebuffer-ready time: producer spawn + ring fill to
-/// the default 100ms prebuffer, polled at the control loop's 5ms quantum (Sprint 11
-/// baseline; Sprint 12 replaces the poll with an event-driven gate).
+/// the default 100ms prebuffer through the control loop's gate. Sprint 11 measured
+/// the 5ms-poll gate at ~5.16ms; Sprint 12 (D53) made the gate event-driven, so this
+/// now measures producer spin-up + actual fill time.
 fn bench_windowed_prebuffer_ready(c: &mut Criterion) {
     use std::sync::atomic::Ordering;
 
@@ -279,6 +280,8 @@ fn bench_windowed_prebuffer_ready(c: &mut Criterion) {
     const PREBUFFER_FRAMES: usize = 48000 / 10; // 100ms at 48k (config default)
     const WINDOW_FRAMES: usize = 48000 / 2; // 500ms window (config default)
 
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
     group.bench_function("300s_wav_100ms_prebuffer", |b| {
         b.iter_custom(|iters| {
             let mut total = Duration::ZERO;
@@ -292,14 +295,56 @@ fn bench_windowed_prebuffer_ready(c: &mut Criterion) {
                     false,
                 )
                 .unwrap();
-                // The control loop's gate: poll frames_buffered every 5ms.
-                while handles.frames_buffered.load(Ordering::Acquire) < PREBUFFER_FRAMES
-                    && !handles.producer_done.load(Ordering::Acquire)
-                {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+                // The control loop's gate (event-driven, D53).
+                rt.block_on(handles.wait_prebuffer(PREBUFFER_FRAMES, Duration::from_secs(5)));
                 total += start.elapsed();
                 handles.stop_flag.store(true, Ordering::Release);
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
+/// Time until a cold local play has a PLAYABLE buffer (D51): the progressive
+/// load returns a streaming buffer immediately, so this no longer scales with
+/// file length (contrast `cold_load_file`, which measures the legacy blocking
+/// full-decode API).
+fn bench_cold_streaming_playable(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cold_streaming_playable");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(5));
+
+    let temp_dir = TempDir::new().unwrap();
+    let cache_dir = temp_dir.path().join("cache");
+    let file_path = temp_dir.path().join("playable_300s.wav");
+    generate_wav_file(&file_path, 300, 48000, 2);
+    let path = file_path.to_str().unwrap().to_string();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    group.bench_function("300s_file_cold", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let mut cache_mgr = rt.block_on(async {
+                    mqttaudio::cache::CacheManager::new(cache_dir.clone()).unwrap()
+                });
+                let _ = cache_mgr.clear_all();
+
+                let start = Instant::now();
+                let buffer = rt
+                    .block_on(async { cache_mgr.get_or_load_streaming(&path, 48000).await })
+                    .unwrap();
+                total += start.elapsed();
+
+                // Drain the background decode outside the timed region so decode
+                // tasks do not pile up across iterations.
+                while !buffer.is_complete() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
             total
         });
@@ -455,6 +500,7 @@ criterion_group!(
     bench_time_to_first_sample,
     bench_probe_local_file,
     bench_windowed_prebuffer_ready,
+    bench_cold_streaming_playable,
     bench_memory_usage,
     bench_resampling,
 );

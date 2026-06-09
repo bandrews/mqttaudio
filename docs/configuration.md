@@ -325,6 +325,34 @@ The `precache_blocking` option controls startup behavior:
 
 **Note:** The MQTT `precache` command always operates in non-blocking mode, regardless of this setting. It queues the file for loading and returns immediately.
 
+#### Tuning first-start latency
+
+Cold-play latency (command received → first audible sample) is dominated by a few
+knobs. Measured shapes (x86 reference machine; Pi-class hardware is several times
+slower, but the *shapes* hold — see `docs/sprints/sprint-12-first-start-latency.md`
+for the measured tables):
+
+- **Warm plays** (memory-cache hit) are effectively instant (~150 ns to a playable
+  buffer) — `precache` anything that must fire on a cue.
+- **Cold full-load plays** return a playable buffer in well under a millisecond and
+  fill in the background; audio begins as soon as the first decoded chunk lands
+  (typically a few ms for local files). This no longer scales with file length.
+- **Windowed plays** start after `stream_prebuffer_ms` of audio is buffered, gated
+  event-driven (no polling quantum). Lowering it starts sound sooner at higher
+  underrun risk on slow storage/networks; `stream_prebuffer_deadline_ms` bounds the
+  worst case (playback starts anyway at the deadline, with the underrun fade
+  covering any gap). On a stable LAN, `stream_prebuffer_ms: 50` with a `150` ms
+  deadline is a reasonable aggressive setting; keep the defaults for internet
+  sources.
+- **Uncached HTTP plays** pay one request (the windowing probe's connection is
+  reused for the download); latency is network-dominated. Cacheable downloads are
+  teed to the disk cache during playback, so the replay needs no network.
+- **`audio.buffer_size`** sets the callback period — the floor on every start
+  (~10.7 ms at 512 frames / 48 kHz). Smaller buffers cut latency at higher xrun
+  risk on constrained hardware.
+- `GET /metrics` reports `latency.play_to_first_mix_ns{last,max}` so these effects
+  can be measured on the target hardware.
+
 ### bass_management
 
 LFE/subwoofer routing.

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Cold plays start instantly (Sprint 12, D51).** Local files and disk-cached HTTP downloads in
+  full-load mode now decode progressively, exactly as uncached HTTP always did: the play returns a
+  playable buffer immediately (measured ~0.2 ms for a 5-minute WAV that previously waited ~210 ms —
+  and on Pi-class hardware, seconds — for the whole decode) and audio begins with the first decoded
+  chunk. Once the decode finishes, the playing voice is upgraded in place to the fully-loaded buffer,
+  so seek/loop-crossfade/pitch behave exactly as before from that point on. Observable differences:
+  pitch correction enabled in the first moments of a cold play (before its decode finishes) is
+  deferred until the upgrade (it was previously available immediately, after the long blocking wait);
+  a `start_position` deep into a cold file waits (bounded by `stream_prebuffer_deadline_ms`) for the
+  decode to reach it; `/status/samples` reports the header's total-frames estimate for a still-loading
+  play. The cold play's cached PCM comes from the chunked resampling path (an inaudible,
+  tolerance-tested divergence from the one-shot path, already shipping for uncached HTTP).
+- **One request per uncached HTTP play (Sprint 12, D55).** When the windowing probe decides a small
+  uncached HTTP asset should full-load, the already-open response is decoded directly instead of being
+  dropped and re-fetched — saving a full round-trip — and a cacheable download is teed to the disk
+  cache during playback (previously the HTTP full-load path never persisted, so a restart re-downloaded).
+- **The windowed prebuffer gate is event-driven (Sprint 12, D53).** The producer wakes the gate the
+  moment the threshold is crossed; the ~5 ms polling quantum is gone (measured prebuffer-ready time
+  fell from ~5.2 ms to ~0.2 ms plus actual fill). Deadline semantics are unchanged.
+- **`cache_reload`/invalidation now abandons in-flight loads (Sprint 12, D52).** Previously a
+  streaming load racing an invalidation could re-promote stale content into the cache and new plays
+  could join the stale stream. Errored streaming loads are likewise dropped instead of lingering
+  (replays of a failed URL retry instead of silently joining a dead buffer).
+
 ### Added
 
 - **First-start play-latency telemetry (Sprint 11, D50).** Every play now measures the time from its command

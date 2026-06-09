@@ -41,9 +41,45 @@ pub struct StreamHandles {
     /// Set by the control side to ask the producer to stop early; the producer exits
     /// within one park and sets `producer_done`.
     pub stop_flag: Arc<AtomicBool>,
-    /// Total frames pushed so far (monotonic). The control side polls this to start
+    /// Total frames pushed so far (monotonic). The control side reads this to start
     /// playback once a prebuffer has accumulated, without blocking a thread.
     pub frames_buffered: Arc<AtomicUsize>,
+    /// Signalled by the producer after every ring push and on finish, so the
+    /// prebuffer gate wakes the moment data lands instead of polling (D53).
+    pub data_notify: Arc<tokio::sync::Notify>,
+}
+
+impl StreamHandles {
+    /// Wait until at least `prebuffer_frames` frames are buffered or the producer
+    /// is done (a short file may finish below the threshold — nothing more to wait
+    /// for), woken by the producer's data notifications; give up at `deadline` and
+    /// start anyway. Returns `true` when the gate released because the prebuffer
+    /// filled or the producer finished, `false` when the deadline hit first.
+    /// Event-driven (D53): the release instant is the producer's, with no polling
+    /// quantum.
+    pub async fn wait_prebuffer(
+        &self,
+        prebuffer_frames: usize,
+        deadline: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + deadline;
+        loop {
+            // Register interest BEFORE checking, so a producer update that lands
+            // between the check and the await still wakes the gate (notify_waiters
+            // only wakes already-registered waiters).
+            let notified = self.data_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.frames_buffered.load(Ordering::Acquire) >= prebuffer_frames
+                || self.producer_done.load(Ordering::Acquire)
+            {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return false;
+            }
+        }
+    }
 }
 
 /// Open a streaming decoder over a local file, resampling to `target_sample_rate`.
@@ -89,10 +125,12 @@ pub fn spawn_local_file_stream(
     let stop_flag = Arc::new(AtomicBool::new(false));
     let producer_done = Arc::new(AtomicBool::new(false));
     let frames_buffered = Arc::new(AtomicUsize::new(0));
+    let data_notify = Arc::new(tokio::sync::Notify::new());
 
     let thread_stop = Arc::clone(&stop_flag);
     let thread_done = Arc::clone(&producer_done);
     let thread_buffered = Arc::clone(&frames_buffered);
+    let thread_notify = Arc::clone(&data_notify);
     std::thread::Builder::new()
         .name("streamed-decode".to_string())
         .spawn(move || {
@@ -107,6 +145,7 @@ pub fn spawn_local_file_stream(
                 thread_stop,
                 thread_done,
                 thread_buffered,
+                thread_notify,
             );
         })
         .map_err(StreamingDecodeError::Io)?;
@@ -117,6 +156,7 @@ pub fn spawn_local_file_stream(
         producer_done,
         stop_flag,
         frames_buffered,
+        data_notify,
     })
 }
 
@@ -158,10 +198,12 @@ pub fn spawn_stream_from_source<R: MediaSource + 'static>(
     let stop_flag = Arc::new(AtomicBool::new(false));
     let producer_done = Arc::new(AtomicBool::new(false));
     let frames_buffered = Arc::new(AtomicUsize::new(0));
+    let data_notify = Arc::new(tokio::sync::Notify::new());
 
     let thread_stop = Arc::clone(&stop_flag);
     let thread_done = Arc::clone(&producer_done);
     let thread_buffered = Arc::clone(&frames_buffered);
+    let thread_notify = Arc::clone(&data_notify);
     std::thread::Builder::new()
         .name("streamed-decode".to_string())
         .spawn(move || {
@@ -171,9 +213,11 @@ pub fn spawn_stream_from_source<R: MediaSource + 'static>(
                 &mut producer,
                 &thread_stop,
                 &thread_buffered,
+                &thread_notify,
                 &source_label,
             );
             thread_done.store(true, Ordering::Release);
+            thread_notify.notify_waiters();
         })
         .map_err(StreamingDecodeError::Io)?;
 
@@ -183,6 +227,7 @@ pub fn spawn_stream_from_source<R: MediaSource + 'static>(
         producer_done,
         stop_flag,
         frames_buffered,
+        data_notify,
     })
 }
 
@@ -204,6 +249,7 @@ fn pump_decoder_into_ring(
     producer: &mut HeapProducer<f32>,
     stop_flag: &AtomicBool,
     frames_buffered: &AtomicUsize,
+    data_notify: &tokio::sync::Notify,
     source_label: &str,
 ) -> PumpOutcome {
     for chunk in decoder {
@@ -234,6 +280,8 @@ fn pump_decoder_into_ring(
             // The ring capacity and every pushed chunk are multiples of the channel
             // count, so `n` is too and this is an exact frame count.
             frames_buffered.fetch_add(n / channels, Ordering::Release);
+            // Wake the prebuffer gate the moment data lands (D53).
+            data_notify.notify_waiters();
         }
     }
     PumpOutcome::Eof
@@ -254,6 +302,7 @@ fn run_producer(
     stop_flag: Arc<AtomicBool>,
     producer_done: Arc<AtomicBool>,
     frames_buffered: Arc<AtomicUsize>,
+    data_notify: Arc<tokio::sync::Notify>,
 ) {
     let mut next = Some(initial);
     loop {
@@ -274,6 +323,7 @@ fn run_producer(
             &mut producer,
             &stop_flag,
             &frames_buffered,
+            &data_notify,
             &path,
         ) {
             PumpOutcome::Halted => break,
@@ -288,6 +338,7 @@ fn run_producer(
     }
 
     producer_done.store(true, Ordering::Release);
+    data_notify.notify_waiters();
 }
 
 #[cfg(test)]

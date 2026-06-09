@@ -236,7 +236,7 @@ owner's priority; 14 last (lowest risk, and its resampler re-pins follow 12's te
 |---|--------|--------|-----------|------|
 | 10 | Performance & RT-hardening program plan | Done | 0–9 | [sprint-10](sprint-10-perf-program-plan.md) |
 | 11 | Latency instrumentation & baselines | Done | 10 | [sprint-11](sprint-11-latency-instrumentation.md) |
-| 12 | First-start latency | Not started | 11 | [sprint-12](sprint-12-first-start-latency.md) |
+| 12 | First-start latency | Done | 11 | [sprint-12](sprint-12-first-start-latency.md) |
 | 13 | RT-path hardening | Not started | 11 (soft: after 12) | [sprint-13](sprint-13-rt-path-hardening.md) |
 | 14 | Quality & correctness backlog | Not started | 11 (soft: after 13) | [sprint-14](sprint-14-quality-and-correctness.md) |
 
@@ -256,13 +256,13 @@ owner's priority; 14 last (lowest risk, and its resampler re-pins follow 12's te
 - [ ] Real-device sanity: cached play shows sub-50 ms first-mix latency on `/metrics` `[B]` — partner's pass
 
 ### Sprint 12 — First-start latency
-- [ ] Cold local and disk-cached-HTTP full-loads return a progressive buffer immediately and are audible before decode completes; pitch-corrected plays keep the full decode; promotion, freshness (stat-at-start), and the generation guard are test-covered `[A]`
-- [ ] `invalidate`/`cache_reload` abandons in-flight streaming loads (no stale promotion, no stale joins) `[A]`
-- [ ] Windowed prebuffer gate is event-driven with deadline semantics preserved (paused-time tests) `[A]`
-- [ ] Probe results cached by (path, mtime, size); warm windowed replay skips the header parse `[A]`
-- [ ] HTTP header open overlaps local setup on a single request (stub-server test) `[A]`
-- [ ] Before/after table recorded against Sprint 11 baselines; cold-start time no longer scales with file length `[A]`
-- [ ] Long cold local file audibly starts near-instantly on the real device `[B]`
+- [x] Cold local and disk-cached-HTTP full-loads return a progressive buffer immediately and are audible before decode completes; promotion, freshness (stat-at-start), and the generation guard are test-covered `[A]` — the "pitch exception" became the stronger `UpgradeSampleBuffer` mechanism (D51 amendment; plays carry no pitch parameter)
+- [x] `invalidate`/`cache_reload` abandons in-flight streaming loads (no stale promotion, no stale joins); errored loads dropped too (found in passing) `[A]`
+- [x] Windowed prebuffer gate is event-driven with deadline semantics preserved (paused-time tests) `[A]`
+- [x] Probe results cached by (path, mtime, size); warm windowed replay skips the header parse `[A]`
+- [x] Uncached HTTP full-load reuses the probe's request — one GET, counted by a stub-server test — and persists cacheable downloads (D55 amendment: reuse supersedes the hollow "overlap") `[A]`
+- [x] Before/after table recorded against Sprint 11 baselines; cold-start playable time is ~223 µs for a 300 s file (was ~211 ms, ∝ length) `[A]`
+- [ ] Long cold local file audibly starts near-instantly on the real device `[B]` — partner's pass
 
 ### Sprint 13 — RT-path hardening
 - [ ] First duck of a never-seen voice is 0 alloc / 0 free on the callback (warm-up crutch removed from the harness) `[A]`

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | Not started |
+| Status | Done (Lane A via documented host approximation — see tracker note; Lane B pending partner) |
 | Depends on | 11 |
 | Effort | L |
 | Lanes | A (Docker) + B (native macOS) |
@@ -223,11 +223,39 @@ All citations re-verified against the current tree during Sprint 10.
 
    | Scenario | Sprint 11 baseline | After Sprint 12 |
    |---|---|---|
-   | Warm memory-cache hit | _from S11_ | _measure_ |
-   | Cold local full-load → playable | _from S11_ | _must be ≈ constant, not ∝ length_ |
-   | Cold disk-cached HTTP → playable | _from S11_ | _same_ |
-   | `probe_local_file` warm replay | _from S11_ | _≈ 0 (cache hit)_ |
-   | Windowed prebuffer-ready | _from S11_ | _poll quantization gone_ |
+   | Warm memory-cache hit | ~148 ns | ~148 ns (unchanged) |
+   | Cold local full-load → playable (300 s WAV) | ~211 ms (∝ length: 2.9 ms @ 5 s … 211 ms @ 300 s) | **~223 µs, constant in length** (`cold_streaming_playable/300s_file_cold`) |
+   | Cold disk-cached HTTP → playable | ≈ full decode (same blocking path) | same progressive path as local (variant-asserted by `disk_cached_http_full_load_returns_a_progressive_buffer`) |
+   | `probe_local_file` warm replay | ~4.4 µs per play | one stat syscall (probe cache hit, D54) |
+   | Windowed prebuffer-ready (100 ms prebuffer) | ~5.16 ms (5 ms poll quantum dominated) | **~224 µs** (event gate, D53) |
+
+   Measured 2026-06-09, Lane-A-approximation host (x86, rust 1.94.1). The audible start of a
+   cold play additionally waits for the first decoded chunk (a few ms for local files) plus the
+   callback period — measured live by the Sprint 11 `/metrics` first-mix probe, whose
+   "first *audible* mix" definition makes it honest for progressive plays.
+
+### Implementation deviations (recorded honestly, per the override protocol)
+
+- **D55 was superseded by request reuse.** The header-open "overlap" premise was hollow (the
+  local work to overlap totals microseconds). Implemented instead: `windowed=false` reuses the
+  probe's open response for a progressive full load on a single request
+  (`CacheManager::start_streaming_load_from_reader`), teeing cacheable downloads to the disk
+  cache — which also closed the documented HTTP-full-load-never-persists gap. Recorded in
+  DECISIONS.md (D55 amendment).
+- **The D51 "pitch exception" was vacuous and became the upgrade mechanism.** Play commands
+  carry no pitch parameter; pitch arrives via later Speed commands, which no-op on
+  `Streaming`-variant buffers forever (the variant never changes after fill). Implemented:
+  `AudioCommand::UpgradeSampleBuffer` + a reaper upgrade pass swaps the playing sample onto the
+  promoted Complete buffer (identical PCM, RT-side `mem::swap`, displaced buffer dropped
+  off-RT), restoring full-decode semantics within ~decode-time of a cold start. Recorded in
+  DECISIONS.md (D51 amendment).
+- **F4 probe-cache evidence note:** Sprint 11 measured the probe at ~4.4 µs on page-cached fast
+  storage — far below the 5–20 ms estimate. The cache was built anyway (D54 locked; the win is
+  real on SD-card-class storage and the implementation is ~40 lines), but its priority claim is
+  corrected here.
+- **Fixed in passing:** errored streaming loads used to linger in `active_loads` forever, so a
+  replay of a failed URL silently joined the dead buffer; `cleanup_completed_loads` now drops
+  them (test-locked). Logged in `docs/bugs.md` alongside the invalidate-race closure.
 
 ## Files to create / touch
 

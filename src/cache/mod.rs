@@ -18,6 +18,42 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use symphonia::core::probe::Hint;
 
+/// Identity of an on-disk source captured when a streaming load starts and
+/// re-checked at promotion (D51): a load whose file changed underneath it (an
+/// edit, or a revalidation swapping the cached download) is dropped instead of
+/// being published as fresh.
+#[derive(Clone, Debug)]
+pub struct LoadGeneration {
+    path: PathBuf,
+    mtime: Option<std::time::SystemTime>,
+    size: u64,
+}
+
+impl LoadGeneration {
+    /// Capture the source file's identity at load start. Best-effort: an
+    /// unreadable file records nothing (no generation check at promotion).
+    fn capture(path: &std::path::Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            path: path.to_path_buf(),
+            mtime: meta.modified().ok(),
+            size: meta.len(),
+        })
+    }
+
+    /// Whether the source file is still the one this load decoded. A vanished
+    /// file reads as stale (do not publish content with no source).
+    fn still_current(&self) -> bool {
+        match std::fs::metadata(&self.path) {
+            Ok(meta) => {
+                meta.len() == self.size
+                    && (self.mtime.is_none() || meta.modified().ok() == self.mtime)
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 /// Tracks an active streaming load operation
 #[derive(Clone)]
 pub struct ActiveLoad {
@@ -26,6 +62,9 @@ pub struct ActiveLoad {
     /// URL/path being loaded
     #[allow(dead_code)] // Used for logging in cleanup_completed_loads
     pub path: String,
+    /// Source-file identity at load start, re-checked at promotion (D51). `None`
+    /// for sources with no stable on-disk identity (a live network download).
+    pub generation: Option<LoadGeneration>,
 }
 
 /// Unified cache manager coordinating memory and disk caches
@@ -42,7 +81,26 @@ pub struct CacheManager {
     /// mtime + size recorded when a local file was decoded, so a later load can cheaply
     /// detect an edit and re-decode (path -> (mtime, size)).
     local_stats: HashMap<String, (std::time::SystemTime, u64)>,
+    /// Bounded cache of local-file header probes keyed by path, valid for one
+    /// (mtime, size) identity (D54). Windowed plays never enter the memory cache,
+    /// so every replay of a large file would otherwise re-pay the header
+    /// open+parse on the play path.
+    probe_cache: HashMap<String, CachedProbe>,
+    /// Insertion order for the probe cache's FIFO bound.
+    probe_cache_order: std::collections::VecDeque<String>,
 }
+
+/// A header probe plus the file identity it was taken from (D54).
+#[derive(Clone)]
+struct CachedProbe {
+    mtime: Option<std::time::SystemTime>,
+    size: u64,
+    probe: strategy::Probe,
+}
+
+/// The probe cache keeps at most this many entries (FIFO eviction). Each entry is
+/// a few dozen bytes; the bound only guards against unbounded path churn.
+const PROBE_CACHE_CAP: usize = 256;
 
 impl CacheManager {
     /// Create a new cache manager with specified resampler quality and memory limit.
@@ -99,6 +157,8 @@ impl CacheManager {
             allowed_directories,
             revalidate_after_seconds,
             local_stats: HashMap::new(),
+            probe_cache: HashMap::new(),
+            probe_cache_order: std::collections::VecDeque::new(),
         })
     }
 
@@ -248,7 +308,9 @@ impl CacheManager {
 
         // For HTTP URLs, use streaming approach
         if file_path.starts_with("http://") || file_path.starts_with("https://") {
-            // Check disk cache first - if cached, load from disk (fast)
+            // Check disk cache first - if cached, decode the cached file
+            // progressively (D51): playback starts at once, the decode fills the
+            // buffer in the background, and promotion publishes it when done.
             if self.disk_cache.is_cached(file_path) {
                 tracing::debug!("Disk cache hit for: {}", file_path);
                 let _ = self
@@ -260,18 +322,9 @@ impl CacheManager {
                     .await;
                 let entry = self.disk_cache.get_entry(file_path).unwrap();
                 let local_path = self.disk_cache.get_cached_file_path(entry);
-
-                let path = local_path.to_string_lossy().into_owned();
-                let quality = self.resampler_quality;
-                let buffer = tokio::task::spawn_blocking(move || {
-                    decoder::decode_file(&path, Some(target_sample_rate), quality)
-                })
-                .await??;
-
-                let arc_buffer = Arc::new(buffer);
-                self.memory_cache
-                    .put(file_path.to_string(), arc_buffer.clone());
-                return Ok(SampleBuffer::Complete(arc_buffer));
+                return self
+                    .start_file_streaming_decode(file_path, local_path, target_sample_rate)
+                    .await;
             }
 
             // Start streaming download
@@ -281,7 +334,8 @@ impl CacheManager {
                 .await;
         }
 
-        // Local file - load from disk (could stream later for very large files)
+        // Local file: decode progressively (D51) — return a streaming buffer at
+        // once, fill it in the background, and let promotion publish it when done.
         tracing::debug!("Loading local file: {}", file_path);
         if !crate::config::Config::is_path_allowed(
             std::path::Path::new(file_path),
@@ -293,19 +347,66 @@ impl CacheManager {
             )
             .into());
         }
-        let path = file_path.to_string();
-        let quality = self.resampler_quality;
-        let buffer = tokio::task::spawn_blocking(move || {
-            decoder::decode_file(&path, Some(target_sample_rate), quality)
-        })
-        .await??;
-
-        let arc_buffer = Arc::new(buffer);
-        self.memory_cache
-            .put(file_path.to_string(), arc_buffer.clone());
-        // Remember the file's mtime+size so a later load can detect an edit (freshness).
+        // Remember the file's mtime+size BEFORE the decode (freshness): an edit
+        // that lands mid-decode then mismatches this stat and the next play
+        // re-decodes — the safe direction.
         self.record_local_stat(file_path);
-        Ok(SampleBuffer::Complete(arc_buffer))
+        self.start_file_streaming_decode(file_path, PathBuf::from(file_path), target_sample_rate)
+            .await
+    }
+
+    /// Start a progressive decode of the file at `source_path`, registered in
+    /// `active_loads` under `key` (the play's path or URL — for a disk-cached HTTP
+    /// entry the two differ). The decoder is constructed here (a header parse), so
+    /// the returned buffer carries the correct channel count and total-frames
+    /// estimate immediately; the packet decode then runs on a blocking task while
+    /// playback proceeds (D51). The load's generation is captured for the
+    /// promotion guard.
+    async fn start_file_streaming_decode(
+        &mut self,
+        key: &str,
+        source_path: PathBuf,
+        target_sample_rate: u32,
+    ) -> Result<SampleBuffer, Box<dyn std::error::Error + Send + Sync>> {
+        let quality = self.resampler_quality;
+        let open_path = source_path.clone();
+        let decoder = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(&open_path)
+                .map_err(crate::audio::streaming_decoder::StreamingDecodeError::Io)?;
+            let mut hint = Hint::new();
+            if let Some(ext) = open_path.extension().and_then(|e| e.to_str()) {
+                hint.with_extension(ext);
+            }
+            StreamingDecoder::new(file, Some(&hint), Some(target_sample_rate), quality)
+        })
+        .await?
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        let channels = decoder.channels().max(1);
+        let estimated = decoder.estimated_frames().map(|f| f as usize);
+        let streaming_buffer = Arc::new(RwLock::new(StreamingBuffer::new(
+            channels,
+            target_sample_rate,
+            estimated,
+        )));
+
+        self.active_loads.insert(
+            key.to_string(),
+            ActiveLoad {
+                buffer: Arc::clone(&streaming_buffer),
+                path: key.to_string(),
+                generation: LoadGeneration::capture(&source_path),
+            },
+        );
+
+        tracing::info!("Starting progressive load for: {}", key);
+        let pump_buffer = Arc::clone(&streaming_buffer);
+        let label = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            Self::pump_streaming_decode(decoder, target_sample_rate, pump_buffer, label);
+        });
+
+        Ok(SampleBuffer::Streaming(streaming_buffer))
     }
 
     /// Start a streaming load for an HTTP URL
@@ -338,6 +439,7 @@ impl CacheManager {
         let active_load = ActiveLoad {
             buffer: Arc::clone(&streaming_buffer),
             path: url.to_string(),
+            generation: None,
         };
         self.active_loads.insert(url.to_string(), active_load);
 
@@ -366,9 +468,69 @@ impl CacheManager {
         Ok(SampleBuffer::Streaming(streaming_buffer))
     }
 
+    /// Start a progressive full-load decode over an already-open HTTP body (D55):
+    /// the windowing probe's response is reused, so a small uncached HTTP asset
+    /// costs ONE request instead of a probe GET plus a load GET. Registered as an
+    /// active load keyed by `url`, so completion promotes to the memory cache
+    /// exactly like any other streaming load.
+    pub fn start_streaming_load_from_reader<R>(
+        &mut self,
+        url: &str,
+        reader: R,
+        target_sample_rate: u32,
+        estimated_frames: Option<usize>,
+    ) -> SampleBuffer
+    where
+        R: symphonia::core::io::MediaSource + Send + 'static,
+    {
+        let streaming_buffer = Arc::new(RwLock::new(StreamingBuffer::new(
+            2, // Default, corrected by the decoder once the header is parsed
+            target_sample_rate,
+            estimated_frames,
+        )));
+
+        self.active_loads.insert(
+            url.to_string(),
+            ActiveLoad {
+                buffer: Arc::clone(&streaming_buffer),
+                path: url.to_string(),
+                generation: None,
+            },
+        );
+
+        let mut hint = Hint::new();
+        let path_part = url.split(['?', '#']).next().unwrap_or(url);
+        if let Some(ext) = std::path::Path::new(path_part)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
+            hint.with_extension(ext);
+        }
+
+        tracing::info!(
+            "Starting full-load streaming decode (reused request) for: {}",
+            url
+        );
+        let buffer_clone = Arc::clone(&streaming_buffer);
+        let quality = self.resampler_quality;
+        let url_clone = url.to_string();
+        tokio::task::spawn_blocking(move || {
+            Self::decode_streaming(
+                reader,
+                hint,
+                target_sample_rate,
+                quality,
+                buffer_clone,
+                url_clone,
+            );
+        });
+
+        SampleBuffer::Streaming(streaming_buffer)
+    }
+
     /// Background decode task - runs in spawn_blocking
-    fn decode_streaming(
-        reader: http_stream::HttpStreamReader,
+    fn decode_streaming<R: symphonia::core::io::MediaSource + 'static>(
+        reader: R,
         hint: Hint,
         target_sample_rate: u32,
         quality: ResamplerQuality,
@@ -388,10 +550,14 @@ impl CacheManager {
                 }
             };
 
-        // Update buffer with actual channel count
+        // Update buffer with the actual channel count and, when the header knows
+        // it, a real total-frames estimate (better than the Content-Length guess).
         let channels = decoder.channels();
         if let Ok(mut guard) = buffer.write() {
             guard.channels = channels;
+            if let Some(est) = decoder.estimated_frames() {
+                guard.total_frames = Some(est as usize);
+            }
         }
 
         tracing::debug!(
@@ -399,6 +565,21 @@ impl CacheManager {
             channels,
             target_sample_rate
         );
+
+        Self::pump_streaming_decode(decoder, target_sample_rate, buffer, url);
+    }
+
+    /// Drain a constructed decoder into `buffer` chunk by chunk, marking it
+    /// complete (or errored) at the end. The shared tail of every progressive
+    /// load — HTTP downloads and on-disk files alike (D51). Runs on a blocking
+    /// task.
+    fn pump_streaming_decode(
+        decoder: StreamingDecoder,
+        target_sample_rate: u32,
+        buffer: Arc<RwLock<StreamingBuffer>>,
+        label: String,
+    ) {
+        let channels = decoder.channels();
 
         // Decode chunks and append to buffer
         let mut total_samples = 0;
@@ -411,7 +592,7 @@ impl CacheManager {
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Decode error for {}: {}", url, e);
+                    tracing::error!("Decode error for {}: {}", label, e);
                     if let Ok(mut guard) = buffer.write() {
                         guard.mark_error(format!("Decode error: {}", e));
                     }
@@ -428,7 +609,7 @@ impl CacheManager {
         let frames = total_samples / channels.max(1);
         tracing::info!(
             "Streaming decode complete for {}: {} frames ({:.2}s)",
-            url,
+            label,
             frames,
             frames as f64 / target_sample_rate as f64
         );
@@ -458,14 +639,16 @@ impl CacheManager {
         None
     }
 
-    /// Clean up completed loads and promote to memory cache
+    /// Clean up completed loads and promote to memory cache. Errored loads are
+    /// removed too (without promotion), so a later play retries fresh instead of
+    /// joining a dead buffer.
     pub fn cleanup_completed_loads(&mut self) {
         let completed: Vec<String> = self
             .active_loads
             .iter()
             .filter_map(|(path, active)| {
                 if let Ok(guard) = active.buffer.read() {
-                    if guard.is_complete() {
+                    if guard.is_complete() || guard.has_error() {
                         return Some(path.clone());
                     }
                 }
@@ -475,6 +658,25 @@ impl CacheManager {
 
         for path in completed {
             if let Some(active) = self.active_loads.remove(&path) {
+                // An errored load is dropped without promotion; removing it lets
+                // the next play of this key start fresh.
+                if let Ok(guard) = active.buffer.read() {
+                    if guard.has_error() {
+                        tracing::warn!("Dropping errored streaming load for {}", path);
+                        continue;
+                    }
+                }
+                // Generation guard (D51): never publish a load whose source file
+                // changed underneath it — the next play decodes fresh instead.
+                if let Some(generation) = &active.generation {
+                    if !generation.still_current() {
+                        tracing::info!(
+                            "Skipping stale promotion for {} (source changed during load)",
+                            path
+                        );
+                        continue;
+                    }
+                }
                 // Try to promote to memory cache as DecodedBuffer
                 if let Ok(guard) = active.buffer.read() {
                     if guard.is_complete() {
@@ -601,10 +803,17 @@ impl CacheManager {
         Ok(())
     }
 
-    /// Invalidate a specific file from both caches
+    /// Invalidate a specific file from both caches. An in-flight streaming load of
+    /// the same key is abandoned (D52): it is removed from `active_loads`, so its
+    /// completion never promotes the now-stale content and no new play joins it —
+    /// any voice already playing the old buffer keeps its own Arc and finishes
+    /// normally.
     pub fn invalidate(&mut self, file_path: &str) -> Result<(), CacheError> {
         self.memory_cache.remove(file_path);
         self.local_stats.remove(file_path);
+        if self.active_loads.remove(file_path).is_some() {
+            tracing::info!("Abandoned in-flight streaming load for: {}", file_path);
+        }
         self.disk_cache.remove_entry(file_path)?;
         tracing::info!("Invalidated cache for: {}", file_path);
         Ok(())
@@ -643,6 +852,58 @@ impl CacheManager {
     /// Flush the disk-cache metadata to disk (called on graceful shutdown).
     pub fn flush_metadata(&self) -> Result<(), CacheError> {
         self.disk_cache.save_metadata()
+    }
+
+    /// Whether `key` is resident in the memory cache (status/test introspection).
+    /// Exercised by the lib's integration tests; the binary reads the cache only
+    /// through `get_cached`, so it is dead in the bin target.
+    #[allow(dead_code)]
+    pub fn is_in_memory_cache(&self, key: &str) -> bool {
+        self.memory_cache.contains(key)
+    }
+
+    /// Fetch a memory-cached decoded buffer (refreshing its LRU slot) without
+    /// triggering any load. The reaper's buffer-upgrade pass (D51) uses this to
+    /// hand a finished cold play its promoted Complete buffer.
+    pub fn get_cached(&mut self, key: &str) -> Option<Arc<DecodedBuffer>> {
+        self.memory_cache.get(key)
+    }
+
+    /// Look up a cached header probe for `path`, valid only while the file's
+    /// mtime+size match the identity it was taken from (D54). One stat syscall;
+    /// any edit to the file misses naturally.
+    pub fn cached_probe(&self, path: &str) -> Option<strategy::Probe> {
+        let cached = self.probe_cache.get(path)?;
+        let meta = std::fs::metadata(path).ok()?;
+        if meta.len() == cached.size && meta.modified().ok() == cached.mtime {
+            Some(cached.probe)
+        } else {
+            None
+        }
+    }
+
+    /// Store a header probe for `path` under its current mtime+size identity
+    /// (D54), bounded by FIFO eviction.
+    pub fn store_probe(&mut self, path: &str, probe: strategy::Probe) {
+        let Ok(meta) = std::fs::metadata(path) else {
+            return;
+        };
+        if !self.probe_cache.contains_key(path) {
+            if self.probe_cache_order.len() >= PROBE_CACHE_CAP {
+                if let Some(evicted) = self.probe_cache_order.pop_front() {
+                    self.probe_cache.remove(&evicted);
+                }
+            }
+            self.probe_cache_order.push_back(path.to_string());
+        }
+        self.probe_cache.insert(
+            path.to_string(),
+            CachedProbe {
+                mtime: meta.modified().ok(),
+                size: meta.len(),
+                probe,
+            },
+        );
     }
 
     /// Get memory cache statistics
@@ -800,6 +1061,7 @@ mod tests {
             ActiveLoad {
                 buffer: Arc::new(RwLock::new(sb)),
                 path: url.to_string(),
+                generation: None,
             },
         );
 
@@ -825,6 +1087,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn errored_streaming_load_is_dropped_and_not_promoted() {
+        // An errored load must not linger in active_loads (a later play would
+        // join the dead buffer forever) and must never promote.
+        let cache_dir = TempDir::new().unwrap();
+        let mut cm =
+            CacheManager::with_quality(cache_dir.path().to_path_buf(), ResamplerQuality::Fast)
+                .unwrap();
+        let url = "http://example.com/broken.wav";
+
+        let mut sb = StreamingBuffer::new(2, 48000, None);
+        sb.mark_error("decoder blew up".to_string());
+        cm.active_loads.insert(
+            url.to_string(),
+            ActiveLoad {
+                buffer: Arc::new(RwLock::new(sb)),
+                path: url.to_string(),
+                generation: None,
+            },
+        );
+
+        cm.cleanup_completed_loads();
+        assert!(
+            cm.active_loads.is_empty(),
+            "an errored load must be removed so a replay starts fresh"
+        );
+        assert!(
+            !cm.is_in_memory_cache(url),
+            "an errored load must never be promoted"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_cache_hits_until_the_file_changes() {
+        // D54: a stored probe serves repeat plays without re-opening the file's
+        // header, and any change to the file (size/mtime) invalidates it.
+        if !wavs_present() {
+            eprintln!("skipping: test WAVs not found");
+            return;
+        }
+        let work = TempDir::new().unwrap();
+        let asset = work.path().join("probe.wav");
+        std::fs::copy(SHORT_WAV, &asset).unwrap();
+        let asset_str = asset.to_string_lossy().into_owned();
+
+        let cache_dir = TempDir::new().unwrap();
+        let mut cm =
+            CacheManager::with_quality(cache_dir.path().to_path_buf(), ResamplerQuality::Fast)
+                .unwrap();
+
+        assert!(
+            cm.cached_probe(&asset_str).is_none(),
+            "no probe cached before the first store"
+        );
+        let probe = strategy::probe_local_file(&asset_str, 48000, ResamplerQuality::Fast).unwrap();
+        cm.store_probe(&asset_str, probe);
+        assert_eq!(
+            cm.cached_probe(&asset_str),
+            Some(probe),
+            "the stored probe is served while the file is unchanged"
+        );
+
+        // The file changes (different length => different size): the entry no
+        // longer matches and the lookup misses.
+        std::fs::copy(LONG_WAV, &asset).unwrap();
+        assert!(
+            cm.cached_probe(&asset_str).is_none(),
+            "a changed file must invalidate its cached probe"
+        );
+    }
+
+    /// Wait for a progressive load to finish (D51: local loads return Streaming
+    /// and fill in the background).
+    async fn wait_complete(buffer: &SampleBuffer) {
+        let mut attempts = 0;
+        while !buffer.is_complete() && attempts < 500 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            attempts += 1;
+        }
+        assert!(buffer.is_complete(), "background decode must finish");
+    }
+
+    #[tokio::test]
     async fn local_freshness_reloads_a_changed_file_in_trusting_but_not_pinned() {
         if !wavs_present() {
             eprintln!("skipping: test WAVs not found");
@@ -840,11 +1184,14 @@ mod tests {
             CacheManager::with_quality(cache_dir.path().to_path_buf(), ResamplerQuality::Fast)
                 .unwrap();
 
-        // First load: the ~2 s clip; its mtime+size are recorded.
+        // First load: the ~2 s clip; its mtime+size are recorded. The load is
+        // progressive (D51): wait for it and promote it to the memory cache.
         let b1 = cm
             .get_or_load_streaming_with_freshness(&asset_str, 48000, FreshnessMode::Trusting)
             .await
             .unwrap();
+        wait_complete(&b1).await;
+        cm.cleanup_completed_loads();
         let frames1 = b1.frames();
         assert!(
             (80_000..=110_000).contains(&frames1),
@@ -870,6 +1217,7 @@ mod tests {
             .get_or_load_streaming_with_freshness(&asset_str, 48000, FreshnessMode::Trusting)
             .await
             .unwrap();
+        wait_complete(&b2).await;
         assert!(
             b2.frames() > frames1 + 50_000,
             "trusting must reload the changed (longer) file, got {} vs {}",
@@ -894,16 +1242,25 @@ mod tests {
             CacheManager::with_quality(cache_dir.path().to_path_buf(), ResamplerQuality::Fast)
                 .unwrap();
 
+        // The first (progressive, D51) load completes and is promoted.
         let b1 = cm
             .get_or_load_streaming_with_freshness(&asset_str, 48000, FreshnessMode::Trusting)
             .await
             .unwrap();
-        // No change on disk: the second load returns the SAME cached Arc (not a redecode).
+        wait_complete(&b1).await;
+        cm.cleanup_completed_loads();
+
+        // No change on disk: subsequent loads serve the SAME cached Arc (not a
+        // redecode).
         let b2 = cm
             .get_or_load_streaming_with_freshness(&asset_str, 48000, FreshnessMode::Trusting)
             .await
             .unwrap();
-        match (b1, b2) {
+        let b3 = cm
+            .get_or_load_streaming_with_freshness(&asset_str, 48000, FreshnessMode::Trusting)
+            .await
+            .unwrap();
+        match (b2, b3) {
             (SampleBuffer::Complete(a), SampleBuffer::Complete(b)) => {
                 assert!(
                     Arc::ptr_eq(&a, &b),
@@ -930,11 +1287,9 @@ mod tests {
             CacheManager::with_quality(cache_dir.path().to_path_buf(), ResamplerQuality::Fast)
                 .unwrap();
 
-        let frames1 = cm
-            .get_or_load_streaming(&asset_str, 48000)
-            .await
-            .unwrap()
-            .frames();
+        let b1 = cm.get_or_load_streaming(&asset_str, 48000).await.unwrap();
+        wait_complete(&b1).await;
+        let frames1 = b1.frames();
 
         // Republish a longer asset, then run the cache_reload mechanism (invalidate +
         // precache), as a content pipeline would after publishing.
@@ -942,11 +1297,9 @@ mod tests {
         cm.invalidate(&asset_str).unwrap();
         cm.precache_streaming(&asset_str, 48000).await.unwrap();
 
-        let frames2 = cm
-            .get_or_load_streaming(&asset_str, 48000)
-            .await
-            .unwrap()
-            .frames();
+        let b2 = cm.get_or_load_streaming(&asset_str, 48000).await.unwrap();
+        wait_complete(&b2).await;
+        let frames2 = b2.frames();
         assert!(
             frames2 > frames1 + 50_000,
             "reload must serve the republished (longer) file, got {frames2} vs {frames1}"
