@@ -158,26 +158,33 @@ async fn main() {
         _ => tracing::Level::INFO,
     };
 
-    // Initialize logging: a console fmt layer (text or JSON per logging.format)
-    // plus, when an MQTT log topic is configured, a composable MQTT publish layer.
-    // Both sinks live in one registry so the format choice applies regardless of
-    // whether MQTT logging is on (F13/D40).
+    // Initialize logging: a console fmt layer (text or JSON per logging.format),
+    // the WebSocket log layer (D62 — created BEFORE logging init and shared with
+    // the HTTP server so /ws clients stream live log lines), plus, when an MQTT
+    // log topic is configured, a composable MQTT publish layer. All sinks live in
+    // one registry so the format choice applies regardless (F13/D40).
+    let log_broadcaster = std::sync::Arc::new(http::LogBroadcaster::new());
     let mqtt_log_receiver = {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
 
         let fmt_layer = build_fmt_layer(&config.logging.format, log_level, std::io::stdout);
+        let ws_layer = http::WebSocketLogLayer::new(log_broadcaster.clone());
 
         if config.logging.mqtt_topic.is_some() {
             let (sender, receiver) = mqtt::logger::create_log_channel(100);
             let mqtt_layer = mqtt::logger::MqttLogLayer::new(sender, log_level);
             tracing_subscriber::registry()
                 .with(fmt_layer)
+                .with(ws_layer)
                 .with(mqtt_layer)
                 .init();
             Some(receiver)
         } else {
-            tracing_subscriber::registry().with(fmt_layer).init();
+            tracing_subscriber::registry()
+                .with(fmt_layer)
+                .with(ws_layer)
+                .init();
             None
         }
     };
@@ -767,6 +774,7 @@ async fn main() {
             config_json.clone(),
             latency_stats.clone(),
             input_telemetry.clone(),
+            log_broadcaster.clone(),
         )
         .await
         {

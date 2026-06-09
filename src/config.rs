@@ -81,8 +81,6 @@ pub struct AudioConfig {
     pub channels: Option<usize>,
     pub buffer_size: u32,
     #[serde(default)]
-    pub channel_names: HashMap<String, String>,
-    #[serde(default)]
     pub channel_volumes: HashMap<String, f32>,
     /// Maps alias names to channel numbers (e.g., "front_left" -> 0)
     #[serde(default)]
@@ -197,7 +195,6 @@ impl Default for AudioConfig {
             sample_rate: 48000,
             channels: None,
             buffer_size: 512,
-            channel_names: HashMap::new(),
             channel_volumes: HashMap::new(),
             channel_aliases: HashMap::new(),
             output_ceiling_db: DEFAULT_OUTPUT_CEILING_DB,
@@ -1312,8 +1309,8 @@ mod tests {
                 "sample_rate": 96000,
                 "buffer_size": 1024,
                 "channel_names": {
-                    "0": "front_left",
-                    "1": "front_right"
+                    "_comment": "removed field (D60): old configs carrying it must still parse",
+                    "0": "front_left"
                 },
                 "channel_volumes": {
                     "front_left": 0.9,
@@ -1348,10 +1345,6 @@ mod tests {
         assert_eq!(config.audio.device, Some("USB Audio".to_string()));
         assert_eq!(config.audio.sample_rate, 96000);
         assert_eq!(config.audio.buffer_size, 1024);
-        assert_eq!(
-            config.audio.channel_names.get("0"),
-            Some(&"front_left".to_string())
-        );
         assert_eq!(config.audio.channel_volumes.get("front_left"), Some(&0.9));
 
         assert!(!config.cache.enabled);
@@ -3020,5 +3013,20 @@ mod tests {
         assert!(json.contains("macros"));
         assert!(json.contains("test_macro"));
         assert!(json.contains("0.5"));
+    }
+
+    #[test]
+    fn removed_channel_names_key_still_parses() {
+        // D60: `audio.channel_names` was removed (it was never read); configs
+        // that still carry the key must keep parsing — serde tolerates unknown
+        // keys because no config struct opts into deny_unknown_fields.
+        let json = r#"{
+            "audio": {
+                "channel_names": { "0": "front_left" },
+                "channel_aliases": { "front_left": 0 }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).expect("old configs must keep parsing");
+        assert_eq!(config.audio.channel_aliases.get("front_left"), Some(&0));
     }
 }

@@ -85,9 +85,10 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   `tests/http_api_test.rs::test_command_non_json_body_returns_400` locks the *actual* behavior (400 +
   plaintext). Making the body a `CommandResponse` would mean adding a custom `JsonRejection` handler (or a
   `WithRejection` wrapper) — a production change owned by the HTTP-handlers work, out of scope for the
-  additive test-gap group. Left as-is and surfaced here. **Decided 2026-06-09: owner approved the
-  `CommandResponse` body as daemon plumbing — D61, owned by Sprint 14 F3**
-  (`docs/sprints/sprint-14-quality-and-correctness.md`).
+  additive test-gap group. **RESOLVED in Sprint 14 F3 (D61, owner-approved):** `handle_command` now extracts
+  `Result<Json<Value>, JsonRejection>` and answers a non-JSON body with 400 + the `CommandResponse` JSON
+  shape; the unreachable internal branch is gone; `test_command_non_json_body_returns_400` locks the new
+  contract; `docs/webui/API-CONTRACT.md` updated.
 
 - **Deployment `Dockerfile` Rust version vs `usize::is_multiple_of` (stable 1.87) (Sprint 8 — RESOLVED).**
   `src/audio/streaming.rs` and `src/audio/input.rs` call `usize::is_multiple_of`, which clippy `-D warnings`
@@ -138,8 +139,13 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   negligible — the table is precomputed) would change decoded PCM for every resampled file with no test
   pinning the result, so it was left as-is. `Fast` is intentionally not transparent; revisit with Sprint 9
   cleanup if transparency matters. The D27 cubic work above is the *playback-speed* interpolator, a separate
-  code path. **Decided 2026-06-09: owner approved the switch to `Cubic` — D59, owned by Sprint 14 F1**
-  (`docs/sprints/sprint-14-quality-and-correctness.md`).
+  code path. **CLOSED in Sprint 14 F1 as "stay Linear" (D59 overridden on measurement, per the Charter's
+  evidence rule):** a least-squares tone-residual probe at the daemon's actual presets (sinc_len ≥ 64,
+  oversampling ≥ 64, 15 kHz tone, 44.1k→48k) measured Linear and Cubic identical to ~0.015% of an already
+  ≈-60 dB residual — the floor is the sinc filter, not the table interpolation, so the switch would change
+  every rate-converted file's PCM for no measurable benefit and no pinnable test. The measured quality floor
+  is now pinned by `resampler::tests::fast_preset_off_tone_residual_stays_below_minus_50_dbfs`, so R1 stops
+  haunting this file either way.
 
 - **Voice pool is a soft reserve, not a hard cap (Sprint 5, D17/D18 — RESOLVED in Sprint 13 F2,
   owner-approved 2026-06-09).** The D18 over-cap policy is implemented: the graveyard producer is threaded
@@ -266,8 +272,9 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   calibration. It is undocumented and appears to be a vestigial parallel to `channel_aliases`. Discovered while
   auditing the docs against the code for the web control app. Cleanup (remove the field, or wire it to
   something real and document it) is a future task; left untouched here to avoid an unscoped serde/behavior
-  change. **Decided 2026-06-09: remove the field — D60, owned by Sprint 14 F2**
-  (`docs/sprints/sprint-14-quality-and-correctness.md`).
+  change. **RESOLVED in Sprint 14 F2 (D60, owner-approved):** the field, its default, and its assertions are
+  removed; configs still carrying the key keep parsing (no struct opts into `deny_unknown_fields`), locked by
+  `config::tests::removed_channel_names_key_still_parses`.
 
 - **`/ws` never streams log lines — `WebSocketLogLayer` is not installed in the tracing subscriber (Sprint W1,
   daemon gap, MEDIUM).** `start_server` creates a `LogBroadcaster` (`src/http/mod.rs:123`) and `handle_socket`
@@ -282,8 +289,10 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   `LogBroadcaster` in `main.rs` before logging init, add `WebSocketLogLayer::new(broadcaster)` to the subscriber
   registry, and pass the same broadcaster into `start_server`. `docs/http-api.md` documents `/ws` log streaming
   as if it works, so it should be corrected or the layer wired. Discovered during Sprint W1 Lane B.
-  **Decided 2026-06-09: wire the layer (daemon plumbing) — D62, owned by Sprint 14 F4**
-  (`docs/sprints/sprint-14-quality-and-correctness.md`).
+  **RESOLVED in Sprint 14 F4 (D62, owner-approved):** `main` now creates the `LogBroadcaster` before logging
+  init, installs `WebSocketLogLayer` in the registry alongside the fmt/MQTT layers, and passes the same
+  broadcaster into `start_server` — `/ws` clients stream real `{type:"log"}` frames
+  (`websocket_test::ws_streams_live_tracing_log_lines_through_the_layer`); `docs/http-api.md` is now true.
 
 - **No per-sample `windowed` flag on `/status/samples` (Sprint W5 F3 — RESOLVED, entry was stale).**
   Sprint W6 F4 shipped the real flag: verified 2026-06-09, `/status/samples` emits `"windowed": s.windowed`

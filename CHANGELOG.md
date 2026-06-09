@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`/ws` now actually streams the daemon's log lines (Sprint 14, D62).** The WebSocket log layer existed
+  but was never installed in the tracing subscriber, so `/ws` clients got the welcome frame and then silence.
+  It is now wired in `main` alongside the console/MQTT layers; every log line arrives as a
+  `{"type":"log","message":…}` frame, as `docs/http-api.md` always claimed.
+- **`/command` rejects non-JSON bodies with `CommandResponse` JSON (Sprint 14, D61).** A body the JSON
+  extractor cannot parse now returns `400 {"success":false,"error":"Invalid JSON: …"}` instead of axum's
+  plaintext rejection, so every `/command` error parses the same way. Clients that special-cased the
+  plaintext body must read the JSON shape.
+- **Removed the dead `audio.channel_names` config field (Sprint 14, D60).** It was deserialized and never
+  read (channel routing uses `channel_aliases`). Old configs carrying the key still parse — unknown keys are
+  tolerated.
+- **Resampler interpolation stays `Linear` — R1 closed by measurement (Sprint 14, D59 overridden on
+  evidence).** At the daemon's quality presets, Linear and Cubic sinc-table interpolation measure identical
+  to ~0.015% of an already ≈-60 dB residual, so the planned switch was dropped rather than changing every
+  rate-converted file's PCM for no measurable benefit. The measured quality floor is now pinned by a test.
+
 - **The audio and capture threads no longer log or allocate on any steady-state path (Sprint 13).**
   Remaining real-time residuals are closed: ducking states are pre-populated at startup so the FIRST duck of
   a voice is allocation-free; pitch correction is built control-side and shipped to the audio thread inside

@@ -294,11 +294,17 @@ daemon-side plumbing, never front-end work.
   cap on `Unknown`. The `resize` fallback stays, **counted** (`scratch_regrows` on `/metrics`)
   so a pathological device is visible instead of silently reallocating. *Why:* closes the
   mid-run regrow edge without trusting every backend's buffer-size honesty.
-- **D59 · Resampler sinc interpolation: `Linear` → `Cubic`** in both `resampler.rs` and
-  `chunked_resampler.rs` (closes R1, owner-approved 2026-06-09 — an audible-output change:
-  decoded PCM changes for every rate-converted file). Re-pin tolerance tests; record the bench
-  delta; escalate per the Charter if decode cost regresses >10% rather than shipping. *Why:*
-  quality up at precomputed-table cost; the item has lingered undecided since Sprint 6.
+- **D59 · Resampler sinc interpolation: `Linear` → `Cubic` — OVERRIDDEN in Sprint 14 (stay
+  `Linear`), per this document's evidence rule.** Implementation measured the two interpolation
+  types at the daemon's actual presets (sinc_len ≥ 64, oversampling ≥ 64; 15 kHz tone,
+  44.1k→48k, least-squares tone-residual metric): identical to ~0.015% of an already ≈-60 dB
+  residual — the error floor is the sinc filter itself, so the premise ("quality up at
+  negligible cost") does not hold and no test could pin a difference. The switch would have
+  changed every rate-converted file's PCM for no measurable benefit. R1 is closed as "stay
+  Linear" with the measured floor pinned by
+  `resampler::tests::fast_preset_off_tone_residual_stays_below_minus_50_dbfs`. Anyone wanting
+  more rate-conversion quality should raise `resampler_quality` (the sinc/oversampling
+  presets), which is the lever that actually moves the floor.
 - **D60 · Remove `audio.channel_names`.** The field is declared, deserialized, and tested but
   never read; only `channel_aliases` is real. Serde tolerates the key in existing configs
   (locked by a test). Changelog. *Why:* dead config surface misleads config authors.

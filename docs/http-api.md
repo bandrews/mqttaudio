@@ -291,7 +291,11 @@ Returns memory and disk cache totals (the `size_mb` fields are not present in th
 
 ## WebSocket Log Streaming
 
-Connect to `/ws` for real-time log streaming:
+Connect to `/ws` for real-time log streaming. The first frame is
+`{"type":"connected", "message":…, "version":…}`; every subsequent daemon log
+line arrives as `{"type":"log", "message":…}`, where `message` is the formatted
+line (timestamp, level, target, text — the tracing subscriber feeds the socket;
+daemon Sprint 14, D62).
 
 ```javascript
 const ws = new WebSocket('ws://localhost:8080/ws');

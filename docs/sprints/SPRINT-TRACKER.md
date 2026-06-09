@@ -238,7 +238,7 @@ owner's priority; 14 last (lowest risk, and its resampler re-pins follow 12's te
 | 11 | Latency instrumentation & baselines | Done | 10 | [sprint-11](sprint-11-latency-instrumentation.md) |
 | 12 | First-start latency | Done | 11 | [sprint-12](sprint-12-first-start-latency.md) |
 | 13 | RT-path hardening | Done | 11 (soft: after 12) | [sprint-13](sprint-13-rt-path-hardening.md) |
-| 14 | Quality & correctness backlog | Not started | 11 (soft: after 13) | [sprint-14](sprint-14-quality-and-correctness.md) |
+| 14 | Quality & correctness backlog | Done | 11 (soft: after 13) | [sprint-14](sprint-14-quality-and-correctness.md) |
 
 ## Acceptance criteria
 
@@ -274,9 +274,9 @@ owner's priority; 14 last (lowest risk, and its resampler re-pins follow 12's te
 - [ ] Real-device smoke: pitch toggle + over-cap burst with zero xruns `[B]` — partner's pass (MANUAL-VERIFICATION note appended)
 
 ### Sprint 14 — Quality & correctness backlog
-- [ ] `/ws` streams real `{type:"log"}` frames from the live tracing subscriber (integration-tested); `docs/http-api.md` is true `[A]`
-- [ ] `/command` 400 rejections return the `CommandResponse` JSON shape; contract test updated; API-CONTRACT.md updated `[A]`
-- [ ] Resampler sinc interpolation is `Cubic` in both constructions; quality test passes that `Linear` fails; tolerance tests re-pinned; bench delta recorded `[A]`
-- [ ] `audio.channel_names` removed; configs containing it still parse (locked by test); changelog'd `[A]`
-- [ ] `docs/bugs.md` sweep complete: program-resolved entries closed with citations, retained items intact `[A]`
-- [ ] Live `/ws` log lines observed against a running daemon `[B]`
+- [x] `/ws` streams real `{type:"log"}` frames from the live tracing subscriber (integration-tested); `docs/http-api.md` is true `[A]`
+- [x] `/command` 400 rejections return the `CommandResponse` JSON shape; contract test updated; API-CONTRACT.md updated `[A]`
+- [x] R1 closed: D59 overridden on measurement (stay `Linear` — Linear/Cubic identical to ~0.015% at our presets; no pinnable difference exists); the measured quality floor is pinned by a new resampler test; recorded in DECISIONS.md/bugs.md/sprint-14 `[A]`
+- [x] `audio.channel_names` removed; configs containing it still parse (locked by test); changelog'd `[A]`
+- [x] `docs/bugs.md` sweep complete: program-resolved entries closed with citations, retained items intact `[A]`
+- [ ] Live `/ws` log lines observed against a running daemon `[B]` — partner's pass

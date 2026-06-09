@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | Not started |
+| Status | Done (Lane A via documented host approximation — see tracker note; Lane B pending partner) |
 | Depends on | 11 (metrics surface); soft-ordered after 13 (documents its counters); independent of 12 except shared test re-pins |
 | Effort | M |
 | Lanes | A (Docker) primarily; B (regression run) |
@@ -132,6 +132,18 @@ All citations re-verified against the current tree during Sprint 10.
   (C++ harness caveat, chunked-resample divergence with its Sprint-12-widened scope note,
   speed>1 aliasing, PI drift, LFE bus, reverse-loop crossfade, ALSA matcher, module refactor)
   with their reasons intact.
+
+## Implementation deviations (recorded honestly, per the override protocol)
+
+- **F1 closed R1 as "stay Linear" — D59 overridden on measurement.** The TDD plan required a quality
+  test that Linear fails and Cubic passes; no such property exists at the daemon's presets. A
+  least-squares tone-residual probe (15 kHz, 44.1k→48k, Fast preset and above) measured the two
+  interpolation types identical to ~0.015% of an already ≈-60 dB residual: the error floor is the sinc
+  filter (`sinc_len`/`oversampling_factor` — the existing `resampler_quality` presets), not the table
+  interpolation. Shipping Cubic would have changed every rate-converted file's PCM for no measurable
+  benefit, with no pinnable test — exactly what the Charter's evidence rule exists for. Instead the
+  measured floor is pinned (`resampler::tests::fast_preset_off_tone_residual_stays_below_minus_50_dbfs`),
+  R1 is closed in `docs/bugs.md` with the measurement, and D59 carries the override note.
 
 ## Caveats (refuted / over-stated — do not chase ghosts)
 

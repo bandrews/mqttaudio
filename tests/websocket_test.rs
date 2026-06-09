@@ -142,3 +142,50 @@ async fn test_websocket_route_absent_when_disabled() {
         "/ws must not be reachable when websocket_enabled is false"
     );
 }
+
+#[tokio::test]
+async fn ws_streams_live_tracing_log_lines_through_the_layer() {
+    // Sprint 14 F4 (D62): with WebSocketLogLayer installed in the tracing
+    // subscriber — as main.rs now wires it — a /ws client receives real
+    // {type:"log"} frames for tracing events. This was the documented behavior
+    // that was never wired (the layer existed but was not in the registry).
+    use mqttaudio::http::WebSocketLogLayer;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    let (state, _cmd_rx, broadcaster) = build_state();
+    let app = create_router(state, false, true);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let url = format!("ws://{addr}/ws");
+    let (mut ws, _resp) = connect_async(&url).await.expect("failed to connect to /ws");
+    let welcome = next_text(&mut ws).await;
+    assert!(welcome.contains("connected"), "welcome first: {welcome}");
+
+    // The daemon's wiring: the SAME broadcaster the server serves /ws from,
+    // installed as a tracing layer.
+    let subscriber =
+        tracing_subscriber::registry().with(WebSocketLogLayer::new(broadcaster.clone()));
+    let dispatch = tracing::Dispatch::new(subscriber);
+    {
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::info!("log line for the websocket client");
+    }
+
+    let frame_raw = next_text(&mut ws).await;
+    let frame: serde_json::Value =
+        serde_json::from_str(&frame_raw).expect("log frame must be JSON");
+    assert_eq!(frame["type"], "log", "expected a log frame, got {frame}");
+    assert!(
+        frame["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("log line for the websocket client")),
+        "the tracing event's message must reach the client, got {frame}"
+    );
+
+    let _ = ws.close(None).await;
+}

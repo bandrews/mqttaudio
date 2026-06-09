@@ -206,6 +206,12 @@ mqttaudio keeps memory bounded automatically, so a long cue — even a 2-hour 5.
   thresholds **or would not fit the memory budget**, plays it through a bounded **window** (a fixed ring,
   default 1.5 s) fed by a background decoder — `O(window)` memory and a low time-to-first-sample — instead of
   fully decoding it. Small assets (SFX, voiceovers) still fully load, with all features.
+- **Cold plays start instantly.** A full-load play of a file that is not yet decoded (local, disk-cached, or
+  remote) returns a playable buffer immediately and decodes in the background — first sound no longer waits
+  for the whole file. Once the decode finishes the voice is upgraded in place, so seek/loop-crossfade/pitch
+  behave exactly as a fully-loaded play from then on. Warm plays (memory cache) remain effectively instant;
+  `GET /metrics` reports the measured play-to-first-mix latency (see
+  [docs/configuration.md](docs/configuration.md) for tuning).
 - **Windowed voices play forward only.** Seek, loop-crossfade, reverse, variable speed, and pitch correction
   do not apply to a windowed (streamed) voice. Force a full load with `"mode": "full"` on the `play` (it still
   cannot exceed the memory cap), or force windowing with `"mode": "stream"`. Tune the defaults with

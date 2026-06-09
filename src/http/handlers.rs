@@ -188,20 +188,29 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
 // =============================================================================
 
 /// Handle any command by accepting raw JSON.
-/// Accepts the same JSON format as MQTT messages.
+/// Accepts the same JSON format as MQTT messages. A body the `Json` extractor
+/// rejects (not JSON at all) is answered with 400 and the daemon's own
+/// `CommandResponse` shape (D61), so every `/command` error parses the same way
+/// for clients — never axum's plaintext rejection.
 pub async fn handle_command(
     State(state): State<AppState>,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let command_json = match serde_json::to_string(&body) {
+    let Json(body) = match body {
         Ok(json) => json,
-        Err(e) => {
+        Err(rejection) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(CommandResponse::error(&format!("Invalid JSON: {}", e))),
+                Json(CommandResponse::error(&format!(
+                    "Invalid JSON: {}",
+                    rejection.body_text()
+                ))),
             );
         }
     };
+
+    // An already-parsed `Value` always re-serializes.
+    let command_json = body.to_string();
 
     match send_command(&state, &command_json).await {
         Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),

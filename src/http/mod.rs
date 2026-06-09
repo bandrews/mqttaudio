@@ -6,7 +6,7 @@ mod routes;
 mod websocket;
 
 pub use routes::create_router;
-pub use websocket::LogBroadcaster;
+pub use websocket::{LogBroadcaster, WebSocketLogLayer};
 
 use crate::cache::CacheManager;
 use crate::config::HttpConfig;
@@ -237,8 +237,8 @@ pub async fn start_server(
     config_json: Arc<serde_json::Value>,
     latency: Arc<PlayLatencyStats>,
     input_telemetry: Arc<Vec<(String, Arc<crate::audio::input::InputTelemetry>)>>,
+    log_broadcaster: Arc<LogBroadcaster>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
-    let log_broadcaster = Arc::new(LogBroadcaster::new());
     let state_broadcaster = Arc::new(LogBroadcaster::new());
 
     // Clones for the state-event tick timer (Sprint W7), taken before `status` etc.

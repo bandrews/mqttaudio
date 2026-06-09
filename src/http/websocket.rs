@@ -177,16 +177,17 @@ async fn handle_state_socket(socket: WebSocket, broadcaster: Arc<LogBroadcaster>
     send_task.abort();
 }
 
-/// A tracing layer that sends log messages to the WebSocket broadcaster.
-/// This integrates with the existing tracing infrastructure.
+/// A tracing layer that sends log messages to the WebSocket broadcaster, so
+/// `/ws` clients stream the daemon's live log lines (D62). `main` installs it in
+/// the tracing registry alongside the fmt/MQTT layers, sharing the broadcaster
+/// the HTTP server serves `/ws` from. The layer must never emit tracing events
+/// itself while broadcasting (it would recurse into the subscriber).
 pub struct WebSocketLogLayer {
     broadcaster: Arc<LogBroadcaster>,
 }
 
 impl WebSocketLogLayer {
-    /// Create a new WebSocket log layer for tracing integration.
-    /// Note: This is designed for future integration with tracing-subscriber.
-    #[allow(dead_code)]
+    /// Create the layer over the broadcaster `/ws` clients subscribe to.
     pub fn new(broadcaster: Arc<LogBroadcaster>) -> Self {
         Self { broadcaster }
     }

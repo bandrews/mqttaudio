@@ -958,11 +958,9 @@ async fn test_command_non_json_body_returns_400() {
     let app = create_router(state, false, false);
 
     // A body that is not valid JSON, sent with the JSON content type, is
-    // rejected by axum's `Json<Value>` extractor with 400 before the handler
-    // runs. The rejection body is axum's plaintext parse error, NOT a
-    // `CommandResponse` — `handle_command`'s own invalid-JSON branch is
-    // unreachable because re-serializing an already-parsed `Value` cannot fail
-    // (see docs/bugs.md: surfaced dead error branch).
+    // rejected with 400 whose body is the daemon's own `CommandResponse` JSON
+    // shape (Sprint 14, D61) — not axum's plaintext rejection — so every error
+    // a client sees from /command parses the same way.
     let request = Request::builder()
         .method(Method::POST)
         .uri("/command")
@@ -977,15 +975,14 @@ async fn test_command_non_json_body_returns_400() {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let text = String::from_utf8_lossy(&body);
+    let json: serde_json::Value = serde_json::from_slice(&body)
+        .expect("the 400 rejection body must be CommandResponse JSON (D61)");
+    assert_eq!(json["success"], false, "got {json}");
     assert!(
-        text.contains("Failed to parse the request body as JSON"),
-        "400 body should be axum's JSON parse rejection, got: {text}"
-    );
-    // It is plaintext, not a CommandResponse JSON object.
-    assert!(
-        serde_json::from_slice::<serde_json::Value>(&body).is_err(),
-        "the 400 rejection body is plaintext, not JSON"
+        json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("Invalid JSON")),
+        "the error must say the JSON was invalid, got {json}"
     );
 }
 

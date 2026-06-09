@@ -26,6 +26,10 @@ the things most likely to silently break a UI.
   (`commands.rs:36-38`). The raw `POST /command` always returns `200 {success:true}` on **enqueue** — it does
   **not** validate the command or report parse errors to the caller (`handlers.rs:154-175`). The UI cannot use
   the HTTP status to confirm a command was valid.
+- **A non-JSON `/command` body returns 400 with the `CommandResponse` JSON shape** (D61, daemon Sprint 14):
+  `{"success": false, "error": "Invalid JSON: …"}` — previously this was axum's plaintext rejection, the one
+  `/command` error that did not parse like the others. Clients that special-cased the plaintext body should
+  read the JSON shape instead.
 
 ## 2. Commands (runtime-controllable; fully UI-drivable)
 
