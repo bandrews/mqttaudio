@@ -84,6 +84,8 @@ tempfile = "3.8"
 tower = "0.5"
 proptest = "1"
 tokio-tungstenite = "0.24"
+# test-util enables tokio's paused-time clock for deterministic gate tests.
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [[bench]]
 name = "mixer_benchmark"

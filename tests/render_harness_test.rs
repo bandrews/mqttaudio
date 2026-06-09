@@ -28,7 +28,7 @@ fn constant_sample(id: u64, voice: &str, value: f32, frames: usize) -> ActiveSam
 /// A `DuckingApplier` with one voice already ducking toward `target` over
 /// `fade_frames`, as the control thread would have armed it via a SetDuckTarget.
 fn applier_ducking(voice: &str, target: f32, fade_frames: usize) -> DuckingApplier {
-    let mut applier = DuckingApplier::new();
+    let mut applier = DuckingApplier::with_ducked_voices([voice]);
     applier.apply_target(&DuckTargetChange {
         voice: voice.to_string(),
         target_volume: target,
@@ -926,5 +926,72 @@ fn duck_gain_is_smooth_per_frame_without_buffer_stairstep() {
         out[last] < value * 0.2,
         "the voice should be well ducked after the full fade, got {}",
         out[last]
+    );
+}
+
+#[test]
+fn shipped_corrector_enable_matches_the_no_gap_behavior() {
+    // D56 parity: enabling pitch correction through the control-side-built
+    // PitchBundle (apply_shipped_speed — the running daemon's path) must show the
+    // same no-gap pre-roll behavior as enable_pitch_correction (the F10 contract
+    // asserted above).
+    use mqttaudio::audio::mixer::PitchBundle;
+
+    let block = 512;
+    let amp = 0.5;
+    let freq = 220.0;
+    let total = block * 160;
+    let buffer = decoded(sine(freq, SR, total, 2, amp), 2, SR);
+    let sample = ActiveSample::new(1, "v".to_string(), buffer, 1.0, 1.0, "tone.wav".to_string());
+    let mut state = SceneBuilder::new(2).sample(sample).build();
+
+    let warm = render(&mut state, block, 40);
+    assert!(rms(&warm, 0, 2) > 0.2, "pre-enable tone should be present");
+
+    // The dispatcher builds the bundle (channels/rate/speed/max block) and ships
+    // it; the audio thread installs it with pure moves.
+    let mut bundle = Some(Box::new(PitchBundle::for_voice(2, SR, 0.9, block)));
+    let mut displaced = None;
+    assert!(
+        state.active_samples[0].apply_shipped_speed(0.9, true, &mut bundle, &mut displaced),
+        "the shipped enable must accept the speed"
+    );
+    assert!(
+        bundle
+            .as_ref()
+            .map(|b| b.corrector.is_none())
+            .unwrap_or(false),
+        "the corrector is taken; the box stays for the husk ride home"
+    );
+
+    let post = render(&mut state, block, 6);
+    let first_rms = rms(&post[..block * 2], 0, 2);
+    assert!(
+        first_rms > 0.005,
+        "first post-enable block must not be warm-up silence: rms {first_rms}"
+    );
+    let early_rms = rms(&post[..3 * block * 2], 0, 2);
+    assert!(
+        early_rms > 0.08,
+        "the warm-up window must carry energy: rms {early_rms}"
+    );
+    let recovered_rms = rms(&post[3 * block * 2..4 * block * 2], 0, 2);
+    assert!(
+        recovered_rms > 0.25,
+        "level must recover after the shipped enable: rms {recovered_rms}"
+    );
+
+    // Disabling moves the corrector out instead of dropping it on the caller.
+    let mut none_bundle = None;
+    let mut displaced = None;
+    assert!(state.active_samples[0].apply_shipped_speed(
+        1.0,
+        false,
+        &mut none_bundle,
+        &mut displaced
+    ));
+    assert!(
+        displaced.is_some(),
+        "the displaced corrector must ride out for off-RT drop"
     );
 }

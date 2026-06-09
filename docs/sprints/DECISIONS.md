@@ -210,3 +210,111 @@ seek/loop/pitch SFX and 2-hour beds that must never OOM.
   (`PersistTarget`/`PersistSink` → `record_streamed_download`), so a replay hits disk with no extra GET. A live
   source (no `Content-Length`) or a per-play `cacheable: false` windows without persisting. The remaining
   unpersisted case is the small-asset HTTP *full-load* streaming path (noted in `docs/bugs.md`).
+
+## Performance & RT-hardening program — sprints 10–14 (owner Q&A, 2026-06-09)
+
+The owner's priorities for this tier, locked in conversation: **cold first-play latency** is the
+metric that matters most (disk and HTTP sourcing), warm latency second, glitch-free playback
+always; measure before optimizing (no absolute latency targets until baselines exist);
+core-audio/latency focus plus the cheap quality backlog; webui-adjacent items are in **only** as
+daemon-side plumbing, never front-end work.
+
+- **D50 · Six-stage play-latency model.** Stages: t0 command receipt → t1 parsed/dispatch →
+  t2 cache decision → t3 decode/prebuffer ready → t4 command pushed onto the ring → t5 first
+  frame mixed. t0–t4 are control-side `Instant`s emitted as one `tracing::info!` per play (and
+  retained as control-side last/max atomics for `/metrics`). t4→t5 crosses into the RT thread:
+  the sample carries `enqueued_at` plus a pre-allocated `Arc<AtomicU64>`, stored once with
+  `Ordering::Relaxed` on the sample's first mixed buffer (the xruns pattern). The alloc harness
+  must prove the publication is 0 alloc / 0 free. *Why:* Sprint 12 cannot claim wins, and
+  regressions cannot be caught, without a number; one branch per sample per buffer is the entire
+  RT cost.
+- **D51 · All full-load cold paths return a progressive buffer immediately.** Local files and
+  disk-cached HTTP unify onto the `start_streaming_load` machinery (`StreamingDecoder` over any
+  `MediaSource`, `StreamingBuffer`, `active_loads`, promotion on completion) and return
+  `SampleBuffer::Streaming` at once, as uncached HTTP already does. Exceptions and edges:
+  plays requesting **pitch correction** keep the blocking full decode (pitch requires `Complete`
+  buffers — preserves behavior exactly); `record_local_stat` is captured at **load start** (an
+  edit mid-decode then mismatches and re-decodes — the safe direction); promotion is
+  **generation-guarded** (a load whose source changed underneath it is dropped, not published);
+  a `start_position` beyond the loaded edge **gates** on `frames_loaded` with the prebuffer
+  gate's deadline-then-start shape. *Why:* this is the owner's reported cold-start problem, and
+  the fix is wiring three paths onto the one that already works — no new machinery.
+  *Implementation amendments (Sprint 12, evidence-driven per the override protocol):* (1) the
+  Play command carries no pitch parameter, so the "pitch exception" was vacuous — pitch arrives
+  only via later Speed commands, which no-op on `Streaming`-variant buffers even after the fill
+  completes. To preserve full feature parity, the reaper **upgrades** a cold play to its
+  promoted Complete buffer once the decode finishes (`AudioCommand::UpgradeSampleBuffer`: an
+  RT-side `mem::swap` of identical PCM, the displaced buffer dropped off-RT via the husk), so
+  pitch/seek/loop-crossfade regain full-decode semantics within roughly the decode time of the
+  start. (2) The decoder is constructed **synchronously** (a header parse, microseconds for
+  local files) before the buffer is returned, so the channel count and total-frames estimate
+  are correct immediately — `/status` and the crossfade-length warning depend on them.
+- **D52 · Invalidation abandons in-flight loads; the revalidation tick is already safe.**
+  `invalidate`/`cache_reload` must mark the matching `active_loads` entry abandoned: completion
+  skips promotion and the entry no longer joins new plays. The background
+  `revalidate_stale_http` tick was traced and is **not** racy today (it only touches
+  disk-cached ∩ memory-resident URLs; an active load implies neither) — do not "fix" it; the
+  post-unification disk-swap hazard is covered by D51's generation guard. *Why:* the only
+  confirmed stale-content path is invalidate-during-load; fix the real race, not the suspected
+  one.
+- **D53 · The prebuffer gate is event-driven.** The streamed-source producer signals a
+  `tokio::sync::Notify`/`watch` on threshold crossing (and completion/error); the gate is
+  `timeout(deadline, notified())`, preserving deadline-start-anyway semantics exactly. D51's
+  `start_position` gate reuses it. *Why:* removes the 5 ms poll quantization from every
+  windowed start for trivial complexity.
+- **D54 · Probe results are cached.** A small bounded map in `CacheManager` keyed
+  `(canonical_path, mtime, size)` → `Probe` (capped ~256 entries). *Why:* windowed plays never
+  enter the memory cache, so today every replay of a large file re-pays a ~5–20 ms header
+  parse.
+- **D55 · The HTTP header open overlaps local setup — SUPERSEDED by reuse (Sprint 12,
+  evidence-driven).** Implementation found the premise hollow: the "local setup" available to
+  overlap totals microseconds, so overlapping buys nothing. The real serialized cost was that a
+  small uncached HTTP asset paid **two GETs** — the windowing probe opened the response, then
+  `windowed=false` dropped the connection and the full-load path re-fetched. Amended decision:
+  when the probe decides full-load, **reuse the already-open response** for a progressive
+  full-load decode (`start_streaming_load_from_reader` over the bounded reader) — one request
+  total, a full RTT+TTFB saved — and tee a cacheable download to the disk cache during playback
+  (also closing the documented HTTP-full-load-never-persists gap). D49's single-request
+  property now holds for *every* uncached HTTP play shape.
+- **D56 · The pitch corrector's lifecycle is control-side.** `SetSpeedMatching` ships a
+  pre-built corrector (with its pre-sized tail buffer); the RT side moves it in on enable and
+  returns any displaced corrector via the command-return/graveyard ring for off-RT drop. The
+  C++-side (signalsmith) allocation caveat remains documented — Rust-harness + render parity +
+  soak is the acceptance. *Why:* the last designed-in RT allocation on a documented command
+  path.
+- **D57 · No `tracing` on steady-state RT paths.** The negative-speed-with-pitch warn moves to
+  command dispatch (control-side validation; the RT branch keeps its silent reject). The input
+  capture-path sites become relaxed atomic counters (`resample_errors`,
+  `overflow_dropped_samples`, `ratio_rejects`) drained-and-logged off-RT and surfaced on
+  `/metrics`. Stream *error callbacks* (`input.rs:565`, the xruns site) keep `tracing` — they
+  are not the steady-state path. *Why:* tracing's non-blocking guarantee is subscriber-
+  dependent; counters are unconditionally RT-safe and more observable.
+- **D58 · Scratch buffers pre-size to the stream's maximum block.** Fixed `audio.buffer_size`
+  ⇒ that value; otherwise the device-reported max clamped to a documented cap (8192 frames),
+  cap on `Unknown`. The `resize` fallback stays, **counted** (`scratch_regrows` on `/metrics`)
+  so a pathological device is visible instead of silently reallocating. *Why:* closes the
+  mid-run regrow edge without trusting every backend's buffer-size honesty.
+- **D59 · Resampler sinc interpolation: `Linear` → `Cubic` — OVERRIDDEN in Sprint 14 (stay
+  `Linear`), per this document's evidence rule.** Implementation measured the two interpolation
+  types at the daemon's actual presets (sinc_len ≥ 64, oversampling ≥ 64; 15 kHz tone,
+  44.1k→48k, least-squares tone-residual metric): identical to ~0.015% of an already ≈-60 dB
+  residual — the error floor is the sinc filter itself, so the premise ("quality up at
+  negligible cost") does not hold and no test could pin a difference. The switch would have
+  changed every rate-converted file's PCM for no measurable benefit. R1 is closed as "stay
+  Linear" with the measured floor pinned by
+  `resampler::tests::fast_preset_off_tone_residual_stays_below_minus_50_dbfs`. Anyone wanting
+  more rate-conversion quality should raise `resampler_quality` (the sinc/oversampling
+  presets), which is the lever that actually moves the floor.
+- **D60 · Remove `audio.channel_names`.** The field is declared, deserialized, and tested but
+  never read; only `channel_aliases` is real. Serde tolerates the key in existing configs
+  (locked by a test). Changelog. *Why:* dead config surface misleads config authors.
+- **D61 · `/command` 400 rejections return `CommandResponse` JSON** (owner-approved as daemon
+  plumbing). Use a `JsonRejection`-handling extractor; delete the unreachable internal
+  "Invalid JSON" branch; flip `test_command_non_json_body_returns_400` to the new contract;
+  update `docs/webui/API-CONTRACT.md`. *Why:* the daemon's one plaintext error contradicts its
+  own response contract.
+- **D62 · Wire `WebSocketLogLayer` into the tracing subscriber** (owner-approved as daemon
+  plumbing). Create the `LogBroadcaster` in `main.rs` before logging init, add the layer to
+  both registry branches, pass the broadcaster into `start_server`. *Why:* `/ws` log streaming
+  is documented as working and never has; the layer exists and is tested — it was simply never
+  installed.

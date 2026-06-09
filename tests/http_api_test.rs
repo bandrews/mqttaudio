@@ -65,6 +65,8 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         output_meters: Arc::new(Vec::new()),
         state_broadcaster: Arc::new(LogBroadcaster::new()),
         config_json: Arc::new(serde_json::json!({})),
+        latency: Arc::new(mqttaudio::http::PlayLatencyStats::default()),
+        input_telemetry: Arc::new(Vec::new()),
     };
 
     (state, cmd_rx)
@@ -956,11 +958,9 @@ async fn test_command_non_json_body_returns_400() {
     let app = create_router(state, false, false);
 
     // A body that is not valid JSON, sent with the JSON content type, is
-    // rejected by axum's `Json<Value>` extractor with 400 before the handler
-    // runs. The rejection body is axum's plaintext parse error, NOT a
-    // `CommandResponse` — `handle_command`'s own invalid-JSON branch is
-    // unreachable because re-serializing an already-parsed `Value` cannot fail
-    // (see docs/bugs.md: surfaced dead error branch).
+    // rejected with 400 whose body is the daemon's own `CommandResponse` JSON
+    // shape (Sprint 14, D61) — not axum's plaintext rejection — so every error
+    // a client sees from /command parses the same way.
     let request = Request::builder()
         .method(Method::POST)
         .uri("/command")
@@ -975,15 +975,14 @@ async fn test_command_non_json_body_returns_400() {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let text = String::from_utf8_lossy(&body);
+    let json: serde_json::Value = serde_json::from_slice(&body)
+        .expect("the 400 rejection body must be CommandResponse JSON (D61)");
+    assert_eq!(json["success"], false, "got {json}");
     assert!(
-        text.contains("Failed to parse the request body as JSON"),
-        "400 body should be axum's JSON parse rejection, got: {text}"
-    );
-    // It is plaintext, not a CommandResponse JSON object.
-    assert!(
-        serde_json::from_slice::<serde_json::Value>(&body).is_err(),
-        "the 400 rejection body is plaintext, not JSON"
+        json["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("Invalid JSON")),
+        "the error must say the JSON was invalid, got {json}"
     );
 }
 
@@ -1288,6 +1287,65 @@ async fn test_version_endpoint_returns_name_and_version() {
         env!("CARGO_PKG_VERSION"),
         "version must be the crate version"
     );
+}
+
+#[tokio::test]
+async fn test_metrics_reports_play_latency_through_the_tracker() {
+    // Sprint 11 (D50): /metrics surfaces the first-start latency aggregate. The
+    // values flow through the real probe-fold path: a probe is registered, the
+    // audio thread's store is simulated (the RT-side store itself is covered by
+    // the alloc harness and latency_test against real mixes), the fold runs, and
+    // /metrics reports the folded numbers verbatim.
+    use mqttaudio::http::{LatencyTracker, PlayLatencyStats};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let stats = Arc::new(PlayLatencyStats::default());
+    let tracker = LatencyTracker::new(stats.clone());
+    let probe = tracker.new_probe();
+    probe.store(123_456, Ordering::Relaxed); // the audio thread's first-mix store
+    tracker.fold_fired(); // the reaper tick
+
+    let (mut state, _rx) = create_test_state();
+    state.latency = stats;
+    let json = get_json(state, "/metrics").await;
+
+    assert_eq!(
+        json["latency"]["play_to_first_mix_ns"]["last"], 123_456,
+        "last latency must be the folded probe value"
+    );
+    assert_eq!(
+        json["latency"]["play_to_first_mix_ns"]["max"], 123_456,
+        "max latency must track the folded value"
+    );
+    assert_eq!(
+        json["latency"]["plays_measured"], 1,
+        "one play was measured"
+    );
+}
+
+#[tokio::test]
+async fn test_metrics_reports_input_capture_counters() {
+    // Sprint 13 (D57): /metrics surfaces each configured input's capture-path
+    // counters verbatim from the shared atomics.
+    use mqttaudio::audio::input::InputTelemetry;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let telemetry = Arc::new(InputTelemetry::default());
+    telemetry
+        .overflow_dropped_samples
+        .store(7, Ordering::Relaxed);
+    telemetry.ratio_rejects.store(2, Ordering::Relaxed);
+
+    let (mut state, _rx) = create_test_state();
+    state.input_telemetry = Arc::new(vec![("mic".to_string(), telemetry)]);
+    let json = get_json(state, "/metrics").await;
+
+    assert_eq!(json["input_capture"]["mic"]["resample_errors"], 0);
+    assert_eq!(json["input_capture"]["mic"]["overflow_dropped_samples"], 7);
+    assert_eq!(json["input_capture"]["mic"]["ratio_rejects"], 2);
+    assert_eq!(json["input_capture"]["mic"]["scratch_regrows"], 0);
 }
 
 #[tokio::test]

@@ -382,3 +382,33 @@ fn format_dispatch_accepts_supported_and_rejects_unknown() {
         "I8 is not a supported input format and must be rejected"
     );
 }
+
+#[test]
+fn ring_overflow_bumps_the_telemetry_counter_instead_of_logging() {
+    // D57: the capture path reports drops through relaxed atomic counters (the
+    // control thread logs deltas off-RT); a starved ring must grow
+    // overflow_dropped_samples, never panic or log on the capture thread.
+    use std::sync::atomic::Ordering;
+
+    let channels = 2usize;
+    // A tiny ring: one resampler chunk overflows it many times over.
+    let (mut producer, _consumer) = create_ring_buffer(64);
+    let mut state = ResampleState::new(48000, 48000, channels, 64).unwrap();
+    let telemetry = state.telemetry();
+
+    // Feed several chunks so the resampler emits well past the ring's capacity.
+    let block = vec![0.25f32; 1024 * channels];
+    for _ in 0..4 {
+        resample_block(&mut state, &block, &mut producer);
+    }
+
+    assert!(
+        telemetry.overflow_dropped_samples.load(Ordering::Relaxed) > 0,
+        "a starved ring must be counted as overflow drops"
+    );
+    assert_eq!(
+        telemetry.resample_errors.load(Ordering::Relaxed),
+        0,
+        "well-formed chunks must not count as resample errors"
+    );
+}

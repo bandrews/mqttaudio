@@ -7,7 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`/ws` now actually streams the daemon's log lines (Sprint 14, D62).** The WebSocket log layer existed
+  but was never installed in the tracing subscriber, so `/ws` clients got the welcome frame and then silence.
+  It is now wired in `main` alongside the console/MQTT layers; every log line arrives as a
+  `{"type":"log","message":…}` frame, as `docs/http-api.md` always claimed.
+- **`/command` rejects non-JSON bodies with `CommandResponse` JSON (Sprint 14, D61).** A body the JSON
+  extractor cannot parse now returns `400 {"success":false,"error":"Invalid JSON: …"}` instead of axum's
+  plaintext rejection, so every `/command` error parses the same way. Clients that special-cased the
+  plaintext body must read the JSON shape.
+- **Removed the dead `audio.channel_names` config field (Sprint 14, D60).** It was deserialized and never
+  read (channel routing uses `channel_aliases`). Old configs carrying the key still parse — unknown keys are
+  tolerated.
+- **Resampler interpolation stays `Linear` — R1 closed by measurement (Sprint 14, D59 overridden on
+  evidence).** At the daemon's quality presets, Linear and Cubic sinc-table interpolation measure identical
+  to ~0.015% of an already ≈-60 dB residual, so the planned switch was dropped rather than changing every
+  rate-converted file's PCM for no measurable benefit. The measured quality floor is now pinned by a test.
+
+- **The audio and capture threads no longer log or allocate on any steady-state path (Sprint 13).**
+  Remaining real-time residuals are closed: ducking states are pre-populated at startup so the FIRST duck of
+  a voice is allocation-free; pitch correction is built control-side and shipped to the audio thread inside
+  the Speed command (`SetSpeedWithCorrector` + `PitchBundle`), with the displaced corrector dropped off the
+  audio thread — toggling pitch mid-play is now Rust-side alloc/free-free; the capture path's
+  resample-error/overflow/ratio-reject logging became relaxed atomic counters surfaced on `/metrics`
+  (`input_capture.*`) and drained into off-thread log lines; conversion/pitch scratch buffers are pre-sized
+  to the stream's maximum block with counted (`scratch_regrows`, `pitch_scratch_regrows`) fallbacks.
+- **Hard voice cap (Sprint 13, D18, owner-approved).** Beyond 256 simultaneous voices a new play now steals
+  the oldest non-looping voice (or is rejected if every voice loops) instead of growing the pool on the audio
+  thread. Unreachable in normal use; changelogged because >256-voice behavior changes.
+- **Speed-command validation moved to dispatch (Sprint 13, D57).** A negative speed with pitch correction now
+  warns at the control plane and is not sent (it was previously ignored per-voice on the audio thread); pitch
+  correction targeting a still-loading cold play warns that it engages when the load completes.
+
+- **Cold plays start instantly (Sprint 12, D51).** Local files and disk-cached HTTP downloads in
+  full-load mode now decode progressively, exactly as uncached HTTP always did: the play returns a
+  playable buffer immediately (measured ~0.2 ms for a 5-minute WAV that previously waited ~210 ms —
+  and on Pi-class hardware, seconds — for the whole decode) and audio begins with the first decoded
+  chunk. Once the decode finishes, the playing voice is upgraded in place to the fully-loaded buffer,
+  so seek/loop-crossfade/pitch behave exactly as before from that point on. Observable differences:
+  pitch correction enabled in the first moments of a cold play (before its decode finishes) is
+  deferred until the upgrade (it was previously available immediately, after the long blocking wait);
+  a `start_position` deep into a cold file waits (bounded by `stream_prebuffer_deadline_ms`) for the
+  decode to reach it; `/status/samples` reports the header's total-frames estimate for a still-loading
+  play. The cold play's cached PCM comes from the chunked resampling path (an inaudible,
+  tolerance-tested divergence from the one-shot path, already shipping for uncached HTTP).
+- **One request per uncached HTTP play (Sprint 12, D55).** When the windowing probe decides a small
+  uncached HTTP asset should full-load, the already-open response is decoded directly instead of being
+  dropped and re-fetched — saving a full round-trip — and a cacheable download is teed to the disk
+  cache during playback (previously the HTTP full-load path never persisted, so a restart re-downloaded).
+- **The windowed prebuffer gate is event-driven (Sprint 12, D53).** The producer wakes the gate the
+  moment the threshold is crossed; the ~5 ms polling quantum is gone (measured prebuffer-ready time
+  fell from ~5.2 ms to ~0.2 ms plus actual fill). Deadline semantics are unchanged.
+- **`cache_reload`/invalidation now abandons in-flight loads (Sprint 12, D52).** Previously a
+  streaming load racing an invalidation could re-promote stale content into the cache and new plays
+  could join the stale stream. Errored streaming loads are likewise dropped instead of lingering
+  (replays of a failed URL retry instead of silently joining a dead buffer).
+
 ### Added
+
+- **First-start play-latency telemetry (Sprint 11, D50).** Every play now measures the time from its command
+  reaching the audio ring to the first block in which it mixes loaded audio, published from the audio thread
+  via a pre-allocated atomic (one relaxed store on the publishing block — no allocation, no lock, proven by
+  the allocation harness). `GET /metrics` gains `latency.play_to_first_mix_ns{last,max}` and
+  `latency.plays_measured`, and each play emits one `latency`-target log event with its control-side stage
+  durations (dispatch → decision → ready → enqueue). Purely additive — no play-path behavior changes.
 
 - **Opt-in live-position telemetry (`GET`/`POST /telemetry`).** Off by default. When enabled, the audio thread
   publishes each playing sample's live frame position into a pre-allocated atomic once per block (a single

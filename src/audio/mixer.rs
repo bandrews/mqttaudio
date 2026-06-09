@@ -195,6 +195,21 @@ pub struct ActiveSample {
     /// The atomic is constructed off-RT and moved in with the sample, never
     /// allocated on the audio thread.
     pub position_publisher: Option<Arc<AtomicUsize>>,
+
+    /// When the control thread enqueued this sample's AddSample command (Sprint 11,
+    /// D50). Paired with `first_mix_latency`; `None` for samples built outside the
+    /// daemon's play path (tests, benches), which therefore publish nothing.
+    enqueued_at: Option<std::time::Instant>,
+
+    /// First-mix latency sink (Sprint 11, D50): on the first block in which this
+    /// sample mixes loaded audio, the callback stores the nanoseconds elapsed since
+    /// `enqueued_at` — a single relaxed store into a pre-allocated atomic, no
+    /// alloc/lock, mirroring `position_publisher`.
+    first_mix_latency: Option<Arc<AtomicU64>>,
+
+    /// Set once the first-mix latency has been published, so later blocks take a
+    /// single-bool fast path.
+    first_mix_published: bool,
 }
 
 impl ActiveSample {
@@ -245,6 +260,9 @@ impl ActiveSample {
             pitch_crossfade_total: 0,
             pitch_crossfade_direct_pos: 0.0,
             position_publisher: None,
+            enqueued_at: None,
+            first_mix_latency: None,
+            first_mix_published: false,
         }
     }
 
@@ -292,6 +310,9 @@ impl ActiveSample {
             pitch_crossfade_total: 0,
             pitch_crossfade_direct_pos: 0.0,
             position_publisher: None,
+            enqueued_at: None,
+            first_mix_latency: None,
+            first_mix_published: false,
         }
     }
 
@@ -336,6 +357,9 @@ impl ActiveSample {
             pitch_crossfade_total: 0,
             pitch_crossfade_direct_pos: 0.0,
             position_publisher: None,
+            enqueued_at: None,
+            first_mix_latency: None,
+            first_mix_published: false,
         }
     }
 
@@ -360,6 +384,37 @@ impl ActiveSample {
             .unwrap_or(1.0)
     }
 
+    /// Attach the latency probe (Sprint 11, D50): the instant the play path
+    /// enqueued this sample and the pre-allocated sink for its first-mix latency.
+    /// Called off-RT before the sample is moved onto the command ring.
+    pub fn set_latency_probe(&mut self, enqueued_at: std::time::Instant, sink: Arc<AtomicU64>) {
+        self.enqueued_at = Some(enqueued_at);
+        self.first_mix_latency = Some(sink);
+        self.first_mix_published = false;
+    }
+
+    /// Publish the first-mix latency (D50) if this sample is about to mix loaded
+    /// audio for the first time. A one-bool fast path once published; a single
+    /// relaxed store into the pre-allocated atomic on the publishing block. Called
+    /// from `mix_audio` with `position` at the block's start, so "started" means
+    /// the read cursor sits inside the decoded region — a still-streaming buffer
+    /// that has not reached the cursor yet emits silence and does not count.
+    fn publish_first_mix_if_started(&mut self) {
+        if self.first_mix_published {
+            return;
+        }
+        let Some(ref latency) = self.first_mix_latency else {
+            return;
+        };
+        if self.position >= self.buffer.frames() {
+            return;
+        }
+        if let Some(at) = self.enqueued_at {
+            latency.store(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        self.first_mix_published = true;
+    }
+
     /// Set the playback speed.
     ///
     /// Without pitch correction: supports -100.0 to 100.0 (negative = reverse)
@@ -369,12 +424,10 @@ impl ActiveSample {
     /// (e.g., negative speed with pitch correction enabled).
     pub fn set_speed(&mut self, speed: f32) -> bool {
         if self.pitch_corrector.is_some() {
-            // Pitch correction: 0.05 to 8.0, no reverse
+            // Pitch correction: 0.05 to 8.0, no reverse. Rejected silently — this
+            // runs on the audio thread (D57); the dispatcher validates and warns
+            // control-side before sending.
             if speed < 0.0 {
-                tracing::warn!(
-                    "Negative speed ({}) not supported with pitch correction, ignoring",
-                    speed
-                );
                 return false;
             }
             self.speed = speed.clamp(0.05, 8.0);
@@ -475,6 +528,72 @@ impl ActiveSample {
             self.disable_pitch_correction();
         }
         // Then set speed
+        self.set_speed(speed)
+    }
+
+    /// Apply a Speed command whose pitch corrector (and pre-sized buffers) were
+    /// built control-side and shipped in a [`PitchBundle`] (D56). Runs on the
+    /// audio thread and only MOVES:
+    /// - enabling installs the shipped corrector (taking the bundle's pre-sized
+    ///   tail/scratch by swap, so the sample's old vecs ride back inside the
+    ///   bundle box for off-RT drop) and pre-rolls it like
+    ///   [`enable_pitch_correction`](Self::enable_pitch_correction);
+    /// - disabling moves the sample's corrector into `displaced` so its heap
+    ///   (Rust and C++) is dropped off-RT by the reaper;
+    /// - an already-enabled sample leaves the unused bundle in place (it rides
+    ///   the husk back).
+    ///
+    /// Returns whether the speed was accepted (mirrors
+    /// [`set_speed_with_mode`](Self::set_speed_with_mode)).
+    pub fn apply_shipped_speed(
+        &mut self,
+        speed: f32,
+        pitch_correction: bool,
+        bundle: &mut Option<Box<PitchBundle>>,
+        displaced: &mut Option<PitchCorrector>,
+    ) -> bool {
+        if pitch_correction {
+            if self.pitch_corrector.is_none() {
+                let Some(b) = bundle.as_mut() else {
+                    // The dispatcher always ships a bundle when enabling; without
+                    // one we will not allocate here — leave the mode unchanged.
+                    return false;
+                };
+                let Some(mut pc) = b.corrector.take() else {
+                    return false;
+                };
+                // Adopt the pre-sized buffers; the old vecs ride back in the box.
+                std::mem::swap(&mut self.pitch_tail_buffer, &mut b.tail_buffer);
+                std::mem::swap(&mut self.pitch_scratch, &mut b.scratch);
+
+                // Mirror enable_pitch_correction: prime at the CURRENT speed,
+                // reset the carry state, arm the direct->stretched crossfade.
+                pc.set_speed(self.speed);
+                self.preroll_corrector(&mut pc);
+                self.pitch_input_accumulator = 0.0;
+                self.pitch_tail_remaining = None;
+                self.pitch_tail_pos = 0;
+                if self.position > 0 {
+                    let xfade = (self.buffer.sample_rate() as usize / 200).max(1); // ~5 ms
+                    self.pitch_crossfade_remaining = xfade;
+                    self.pitch_crossfade_total = xfade;
+                    self.pitch_crossfade_direct_pos = self.precise_position();
+                } else {
+                    self.pitch_crossfade_remaining = 0;
+                    self.pitch_crossfade_total = 0;
+                }
+                self.pitch_corrector = Some(pc);
+            }
+        } else if self.pitch_corrector.is_some() {
+            // Move the corrector out for off-RT drop and clear the carry state
+            // (the same resets disable_pitch_correction does, minus the drop).
+            *displaced = self.pitch_corrector.take();
+            self.pitch_input_accumulator = 0.0;
+            self.pitch_tail_remaining = None;
+            self.pitch_tail_pos = 0;
+            self.pitch_crossfade_remaining = 0;
+            self.pitch_crossfade_total = 0;
+        }
         self.set_speed(speed)
     }
 
@@ -821,6 +940,18 @@ pub struct StreamedSource {
     /// Set off the audio thread (by the reaper, on stop or drop) to ask the producer
     /// task to stop early. Held so the source owns the flag for the producer's life.
     stop_flag: Arc<AtomicBool>,
+
+    /// When the control thread enqueued this source's AddStreamedSource command
+    /// (Sprint 11, D50). `None` outside the daemon's play path.
+    enqueued_at: Option<std::time::Instant>,
+
+    /// First-mix latency sink (Sprint 11, D50): on the first block in which this
+    /// source pops real frames from its ring, the callback stores the nanoseconds
+    /// elapsed since `enqueued_at` — one relaxed store into a pre-allocated atomic.
+    first_mix_latency: Option<Arc<AtomicU64>>,
+
+    /// Set once the first-mix latency has been published (one-bool fast path).
+    first_mix_published: bool,
 }
 
 impl StreamedSource {
@@ -855,7 +986,35 @@ impl StreamedSource {
             fade_state: FadeState::None,
             producer_done,
             stop_flag,
+            enqueued_at: None,
+            first_mix_latency: None,
+            first_mix_published: false,
         }
+    }
+
+    /// Attach the latency probe (Sprint 11, D50): the instant the play path
+    /// enqueued this source and the pre-allocated sink for its first-mix latency.
+    /// Called off-RT before the source is moved onto the command ring.
+    pub fn set_latency_probe(&mut self, enqueued_at: std::time::Instant, sink: Arc<AtomicU64>) {
+        self.enqueued_at = Some(enqueued_at);
+        self.first_mix_latency = Some(sink);
+        self.first_mix_published = false;
+    }
+
+    /// Publish the first-mix latency (D50) after a block in which this source
+    /// popped real frames from its ring. One-bool fast path once published; a
+    /// single relaxed store on the publishing block.
+    fn publish_first_mix_if_started(&mut self) {
+        if self.first_mix_published {
+            return;
+        }
+        let Some(ref latency) = self.first_mix_latency else {
+            return;
+        };
+        if let Some(at) = self.enqueued_at {
+            latency.store(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        self.first_mix_published = true;
     }
 
     /// Set the fade state for this source (fade-in on start, fade-out on stop).
@@ -910,6 +1069,49 @@ impl Drop for StreamedSource {
     /// the graveyard, so this drop runs off the real-time thread.
     fn drop(&mut self) {
         self.signal_stop();
+    }
+}
+
+/// Counts pitch-scratch regrows on the audio thread (D58): the scratch is
+/// pre-sized when pitch correction is enabled, so this moves only when a device
+/// delivers blocks beyond the pre-size (or pitch was enabled through the
+/// lib-only unsized path). Surfaced on `/metrics`.
+pub static PITCH_SCRATCH_REGROWS: AtomicU64 = AtomicU64::new(0);
+
+/// A control-side-built pitch-correction payload (D56): the corrector plus the
+/// pre-sized tail and scratch buffers a pitch-corrected sample needs, so enabling
+/// pitch on the audio thread is pure moves — no construction, no resize. After
+/// the install swap, the box carries the sample's old vecs back through the
+/// spent-command husk for off-RT drop.
+pub struct PitchBundle {
+    /// The pre-built corrector; taken on install, leaving the box intact.
+    pub corrector: Option<PitchCorrector>,
+    /// Tail-flush buffer sized to one full flush (`output_latency * channels`).
+    pub tail_buffer: Vec<f32>,
+    /// Pitch mix scratch sized to the largest output block (D58).
+    pub scratch: Vec<f32>,
+}
+
+impl PitchBundle {
+    /// Build the bundle for a sample with `channels` at `sample_rate`, targeting
+    /// `speed`, with the scratch sized for blocks up to `max_block_frames`.
+    /// Allocates — control thread only.
+    pub fn for_voice(
+        channels: usize,
+        sample_rate: u32,
+        speed: f32,
+        max_block_frames: usize,
+    ) -> Self {
+        let channels = channels.max(1);
+        let mut corrector = PitchCorrector::new(channels, sample_rate);
+        corrector.set_speed(speed.clamp(0.05, 8.0));
+        let tail_buffer = vec![0.0; corrector.output_latency() * channels];
+        let scratch = vec![0.0; max_block_frames.max(1) * channels];
+        Self {
+            corrector: Some(corrector),
+            tail_buffer,
+            scratch,
+        }
     }
 }
 
@@ -1131,6 +1333,10 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
         // This voice's duck multipliers at the buffer's start and end (D1); the mix
         // loop lerps between them per frame (D2). An unducked voice reads (1.0, 1.0).
         let duck = ducking.map_or((1.0, 1.0), |a| a.buffer_endpoints(&sample.voice_id));
+
+        // First-mix latency probe (Sprint 11, D50): a one-bool fast path per
+        // sample per block once published.
+        sample.publish_first_mix_if_started();
 
         let position_advanced =
             mix_sample_into_output(sample, output, frames, output_channels, duck);
@@ -1429,6 +1635,12 @@ fn mix_sample_with_pitch_correction(
     // other fields of `sample`; returned at the end of the function.
     let mut stretched = std::mem::take(&mut sample.pitch_scratch);
     if stretched.len() < output_samples {
+        if stretched.capacity() < output_samples {
+            // Counted fallback (D58): pre-sizing should make this unreachable in
+            // the running daemon; a pathological block size is visible on /metrics
+            // instead of silently reallocating on the audio thread.
+            PITCH_SCRATCH_REGROWS.fetch_add(1, Ordering::Relaxed);
+        }
         stretched.resize(output_samples, 0.0);
     }
     // Match the previous freshly-zeroed buffer so partially-filled output is silence.
@@ -1748,6 +1960,13 @@ fn mix_streamed_source_into_output(
         // Advance the fade once per frame (the duck fade is advanced once per buffer
         // in mix_audio; this fade is per-source, so it lives here).
         source.fade_state.advance();
+    }
+
+    // First-mix latency probe (Sprint 11, D50): published only when the block
+    // popped at least one real frame from the ring (a fully underrun block is
+    // silence, not a start).
+    if underrun_frames < frames {
+        source.publish_first_mix_if_started();
     }
 }
 

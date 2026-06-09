@@ -6,7 +6,7 @@ mod routes;
 mod websocket;
 
 pub use routes::create_router;
-pub use websocket::LogBroadcaster;
+pub use websocket::{LogBroadcaster, WebSocketLogLayer};
 
 use crate::cache::CacheManager;
 use crate::config::HttpConfig;
@@ -29,6 +29,9 @@ pub struct SampleStatus {
     pub file_path: String,
     pub total_frames: usize,
     pub sample_rate: u32,
+    /// Decoded channel count — the Speed dispatcher sizes a shipped pitch
+    /// corrector from it (D56).
+    pub channels: usize,
     pub volume: f32,
     pub voice_volume: f32,
     pub speed: f32,
@@ -62,6 +65,69 @@ pub struct StatusSnapshot {
     pub output_channels: usize,
     pub samples: Vec<SampleStatus>,
     pub inputs: Vec<InputStatus>,
+}
+
+/// Control-side aggregate of first-start play latency (Sprint 11, D50): the time
+/// from a play command's enqueue onto the audio ring to the first block in which
+/// the sample mixed loaded audio, in nanoseconds. The audio thread stores each
+/// play's value into its own pre-allocated probe atomic; the control-side reaper
+/// folds fired probes into these fields; `/metrics` reads them. Zero values mean
+/// no play has been measured yet.
+#[derive(Default)]
+pub struct PlayLatencyStats {
+    /// The most recently measured play's enqueue-to-first-mix latency (ns).
+    pub last_ns: AtomicU64,
+    /// The largest latency measured since startup (ns).
+    pub max_ns: AtomicU64,
+    /// How many plays have been measured.
+    pub plays_measured: AtomicU64,
+}
+
+/// Registers per-play first-mix probes and folds fired ones into a
+/// [`PlayLatencyStats`] aggregate (Sprint 11, D50). The play path registers a
+/// probe and attaches it to the outgoing sample (`set_latency_probe`); the audio
+/// thread stores the measured latency into the probe on the sample's first mixed
+/// block; the control-side reaper tick calls [`fold_fired`](Self::fold_fired).
+pub struct LatencyTracker {
+    pending: Mutex<Vec<Arc<AtomicU64>>>,
+    stats: Arc<PlayLatencyStats>,
+}
+
+impl LatencyTracker {
+    pub fn new(stats: Arc<PlayLatencyStats>) -> Self {
+        Self {
+            pending: Mutex::new(Vec::new()),
+            stats,
+        }
+    }
+
+    /// Create and register a probe for one play. The caller attaches the clone to
+    /// the sample before enqueueing it; the tracker keeps the other reference for
+    /// folding.
+    pub fn new_probe(&self) -> Arc<AtomicU64> {
+        let probe = Arc::new(AtomicU64::new(0));
+        self.pending.lock().push(probe.clone());
+        probe
+    }
+
+    /// Fold every fired probe (non-zero value) into the aggregate and drop it.
+    /// An unfired probe whose sample is gone (the tracker holds the only
+    /// reference left) is dropped without folding — the play never reached its
+    /// first mix (stopped early or failed). Called off-RT by the reaper tick.
+    pub fn fold_fired(&self) {
+        use std::sync::atomic::Ordering;
+        let mut pending = self.pending.lock();
+        pending.retain(|probe| {
+            let v = probe.load(Ordering::Relaxed);
+            if v == 0 {
+                return Arc::strong_count(probe) > 1;
+            }
+            self.stats.last_ns.store(v, Ordering::Relaxed);
+            self.stats.max_ns.fetch_max(v, Ordering::Relaxed);
+            self.stats.plays_measured.fetch_add(1, Ordering::Relaxed);
+            false
+        });
+    }
 }
 
 /// Shared application state passed to all HTTP handlers.
@@ -111,6 +177,11 @@ pub struct AppState {
     /// `GET /config`. Config is read once at startup (DW8), so this is a startup
     /// snapshot; secrets (auth_token, mqtt password) are nulled out.
     pub config_json: Arc<serde_json::Value>,
+    /// First-start play latency aggregate (Sprint 11, D50), for `/metrics`.
+    pub latency: Arc<PlayLatencyStats>,
+    /// Per-input capture-path counters (Sprint 13, D57), for `/metrics`:
+    /// (voice id, counters) per configured live input.
+    pub input_telemetry: Arc<Vec<(String, Arc<crate::audio::input::InputTelemetry>)>>,
 }
 
 /// Redact secrets from a serialized config for `GET /config` (DW11):
@@ -164,8 +235,10 @@ pub async fn start_server(
     telemetry_enabled: Arc<AtomicBool>,
     output_meters: Arc<Vec<AtomicU32>>,
     config_json: Arc<serde_json::Value>,
+    latency: Arc<PlayLatencyStats>,
+    input_telemetry: Arc<Vec<(String, Arc<crate::audio::input::InputTelemetry>)>>,
+    log_broadcaster: Arc<LogBroadcaster>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
-    let log_broadcaster = Arc::new(LogBroadcaster::new());
     let state_broadcaster = Arc::new(LogBroadcaster::new());
 
     // Clones for the state-event tick timer (Sprint W7), taken before `status` etc.
@@ -191,6 +264,8 @@ pub async fn start_server(
         output_meters,
         state_broadcaster: state_broadcaster.clone(),
         config_json,
+        latency,
+        input_telemetry,
     };
 
     // State-event tick timer (~15 Hz, DW12): only does work when telemetry is on AND

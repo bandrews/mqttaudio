@@ -158,26 +158,33 @@ async fn main() {
         _ => tracing::Level::INFO,
     };
 
-    // Initialize logging: a console fmt layer (text or JSON per logging.format)
-    // plus, when an MQTT log topic is configured, a composable MQTT publish layer.
-    // Both sinks live in one registry so the format choice applies regardless of
-    // whether MQTT logging is on (F13/D40).
+    // Initialize logging: a console fmt layer (text or JSON per logging.format),
+    // the WebSocket log layer (D62 — created BEFORE logging init and shared with
+    // the HTTP server so /ws clients stream live log lines), plus, when an MQTT
+    // log topic is configured, a composable MQTT publish layer. All sinks live in
+    // one registry so the format choice applies regardless (F13/D40).
+    let log_broadcaster = std::sync::Arc::new(http::LogBroadcaster::new());
     let mqtt_log_receiver = {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
 
         let fmt_layer = build_fmt_layer(&config.logging.format, log_level, std::io::stdout);
+        let ws_layer = http::WebSocketLogLayer::new(log_broadcaster.clone());
 
         if config.logging.mqtt_topic.is_some() {
             let (sender, receiver) = mqtt::logger::create_log_channel(100);
             let mqtt_layer = mqtt::logger::MqttLogLayer::new(sender, log_level);
             tracing_subscriber::registry()
                 .with(fmt_layer)
+                .with(ws_layer)
                 .with(mqtt_layer)
                 .init();
             Some(receiver)
         } else {
-            tracing_subscriber::registry().with(fmt_layer).init();
+            tracing_subscriber::registry()
+                .with(fmt_layer)
+                .with(ws_layer)
+                .init();
             None
         }
     };
@@ -332,6 +339,13 @@ async fn main() {
     let sample_format = output_config.sample_format;
     let output_sample_rate = stream_config.sample_rate;
     let output_channels = stream_config.channels as usize;
+    // The largest block the output stream can deliver, for pre-sizing the
+    // shipped pitch scratch (D56/D58): the fixed size when configured, else a
+    // documented cap (the per-block resize fallback is counted on /metrics).
+    let max_block_frames = match stream_config.buffer_size {
+        cpal::BufferSize::Fixed(n) => n as usize,
+        cpal::BufferSize::Default => 8192,
+    };
 
     tracing::info!("Audio device: {}", device_name);
     tracing::info!("  Sample rate: {} Hz", output_sample_rate);
@@ -359,7 +373,14 @@ async fn main() {
         None
     };
     let ducking_applier = if ducking_engine.is_some() {
-        Some(DuckingApplier::new())
+        // Pre-populated with every duckable voice so the first duck of a voice
+        // never inserts (allocates) on the audio thread (Sprint 13 F1).
+        Some(DuckingApplier::with_ducked_voices(
+            config
+                .ducking_rules
+                .iter()
+                .flat_map(|rule| rule.ducked_voices.iter().cloned()),
+        ))
     } else {
         None
     };
@@ -463,6 +484,10 @@ async fn main() {
     // status is recorded for the control-side snapshot.
     let mut _active_inputs: Vec<audio::input::ActiveInput> = Vec::new();
     let mut input_statuses: Vec<http::InputStatus> = Vec::new();
+    // Per-input capture-path counters (D57): the capture callback bumps them, the
+    // reaper logs deltas off-RT, and /metrics sums the totals.
+    let mut input_telemetry: Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)> =
+        Vec::new();
     let mut cmd_tx = cmd_tx;
     for (idx, input_config) in config.inputs.iter().enumerate() {
         let stream_config = audio::input::InputStreamConfig {
@@ -534,6 +559,10 @@ async fn main() {
                         volume: input_config.volume,
                         channels: active_input.channels,
                     });
+                    input_telemetry.push((
+                        input_config.voice_id.clone(),
+                        std::sync::Arc::clone(&active_input.telemetry),
+                    ));
 
                     // Add to the mix via the command ring (drained once the
                     // output stream starts).
@@ -709,6 +738,21 @@ async fn main() {
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
 
+    // Capture-path telemetry (D57): shared with the HTTP layer for /metrics and
+    // drained into log lines by the reaper tick.
+    let input_telemetry = std::sync::Arc::new(input_telemetry);
+    let mut input_telemetry_drain = InputTelemetryDrain::new(input_telemetry.clone());
+
+    // First-start play-latency aggregate + probe registry (Sprint 11, D50): the
+    // stats feed /metrics; the tracker registers a probe per play and the reaper
+    // tick folds fired probes into the stats.
+    let latency_stats = Arc::new(http::PlayLatencyStats::default());
+    let latency_tracker = http::LatencyTracker::new(latency_stats.clone());
+
+    // Cold plays awaiting their buffer upgrade once the progressive load
+    // finishes (D51); the reaper tick drains it.
+    let mut streaming_upgrades: Vec<StreamingUpgrade> = Vec::new();
+
     // Create the text-command channel (HTTP/MQTT payloads -> control loop).
     let (text_tx, mut text_rx) = mpsc::channel::<String>(100);
 
@@ -728,6 +772,9 @@ async fn main() {
             telemetry_enabled.clone(),
             output_meters.clone(),
             config_json.clone(),
+            latency_stats.clone(),
+            input_telemetry.clone(),
+            log_broadcaster.clone(),
         )
         .await
         {
@@ -806,6 +853,9 @@ async fn main() {
                             output_channels,
                             output_sample_rate,
                             config: &config,
+                            latency: &latency_tracker,
+                            streaming_upgrades: &mut streaming_upgrades,
+                            max_block_frames,
                         };
                         handle_command(cmd, &mut ctx).await;
                     }
@@ -829,6 +879,19 @@ async fn main() {
                     &input_statuses,
                     output_channels,
                 );
+                // Fold any first-mix latency probes the audio thread fired into
+                // the /metrics aggregate (Sprint 11, D50).
+                latency_tracker.fold_fired();
+                // Upgrade cold plays whose progressive load finished (D51).
+                upgrade_completed_streaming_plays(
+                    &mut streaming_upgrades,
+                    &cache_manager,
+                    &mut cmd_tx,
+                    &mut playing,
+                )
+                .await;
+                // Turn capture-path counter growth into off-RT log lines (D57).
+                input_telemetry_drain.drain_and_log();
             }
             _ = freshness_tick.tick() => {
                 if config.cache.freshness != config::FreshnessMode::Pinned {
@@ -1098,6 +1161,165 @@ fn reap_finished_samples(
 /// mutations are sent to the audio thread through `cmd_tx`; the control thread
 /// owns the ducking engine, voice-activity counts, live sample map, and the
 /// status snapshot, and never touches the audio thread's `MixerState`.
+/// Turns capture-path counter growth into off-RT log lines (D57): the capture
+/// thread only bumps relaxed atomics; the reaper tick calls `drain_and_log`,
+/// which emits at most one warning per input per tick when a counter moved.
+struct InputTelemetryDrain {
+    inputs: std::sync::Arc<Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)>>,
+    last: Vec<[u64; 4]>,
+}
+
+impl InputTelemetryDrain {
+    fn new(
+        inputs: std::sync::Arc<Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)>>,
+    ) -> Self {
+        let last = vec![[0u64; 4]; inputs.len()];
+        Self { inputs, last }
+    }
+
+    fn drain_and_log(&mut self) {
+        use std::sync::atomic::Ordering;
+        for ((voice, telemetry), last) in self.inputs.iter().zip(self.last.iter_mut()) {
+            let now = [
+                telemetry.resample_errors.load(Ordering::Relaxed),
+                telemetry.overflow_dropped_samples.load(Ordering::Relaxed),
+                telemetry.ratio_rejects.load(Ordering::Relaxed),
+                telemetry.scratch_regrows.load(Ordering::Relaxed),
+            ];
+            if now != *last {
+                tracing::warn!(
+                    "Input '{}' capture counters moved: +{} resample errors, +{} overflowed \
+                     samples, +{} ratio rejects, +{} scratch regrows (totals {}/{}/{}/{})",
+                    voice,
+                    now[0] - last[0],
+                    now[1] - last[1],
+                    now[2] - last[2],
+                    now[3] - last[3],
+                    now[0],
+                    now[1],
+                    now[2],
+                    now[3]
+                );
+                *last = now;
+            }
+        }
+    }
+}
+
+/// A cold full-load play still on its progressive buffer, awaiting the upgrade
+/// to the promoted Complete buffer once its decode finishes (D51).
+struct StreamingUpgrade {
+    internal_id: u64,
+    buffer: audio::streaming::SampleBuffer,
+    file: String,
+}
+
+/// Upgrade cold plays whose progressive load finished: run the cache's promotion
+/// pass, then swap each playing sample onto its promoted Complete buffer over the
+/// command ring — restoring the full random-access feature set (pitch correction
+/// needs slice access) that a full decode used to provide. Runs on the reaper
+/// tick, entirely off-RT; the displaced streaming buffer returns via the spent
+/// husk for off-RT drop. A play whose promotion was skipped (stale generation or
+/// an over-budget cache) simply keeps its streaming buffer.
+async fn upgrade_completed_streaming_plays(
+    upgrades: &mut Vec<StreamingUpgrade>,
+    cache_manager: &std::sync::Arc<tokio::sync::Mutex<cache::CacheManager>>,
+    cmd_tx: &mut rt_engine::CommandProducer,
+    playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
+) {
+    if upgrades.is_empty() {
+        return;
+    }
+    // A finished/stopped play no longer needs (or can take) an upgrade.
+    upgrades.retain(|u| playing.contains_key(&u.internal_id));
+    if !upgrades.iter().any(|u| u.buffer.is_complete()) {
+        return;
+    }
+
+    let mut cache = cache_manager.lock().await;
+    cache.cleanup_completed_loads();
+
+    let mut remaining = Vec::with_capacity(upgrades.len());
+    for upgrade in upgrades.drain(..) {
+        if !upgrade.buffer.is_complete() {
+            remaining.push(upgrade);
+            continue;
+        }
+        if let Some(decoded) = cache.get_cached(&upgrade.file) {
+            let frames = decoded.frames;
+            let command = rt_engine::AudioCommand::UpgradeSampleBuffer {
+                id: upgrade.internal_id,
+                buffer: audio::streaming::SampleBuffer::Complete(decoded),
+            };
+            if cmd_tx.push(command).is_err() {
+                tracing::error!(
+                    "Audio command ring full; buffer upgrade dropped for {}",
+                    upgrade.file
+                );
+            } else {
+                if let Some(status) = playing.get_mut(&upgrade.internal_id) {
+                    status.total_frames = frames;
+                }
+                tracing::debug!(
+                    "Upgraded cold play of {} to its complete buffer",
+                    upgrade.file
+                );
+            }
+        }
+    }
+    *upgrades = remaining;
+}
+
+/// Control-side stage clock for one play command (Sprint 11, D50). Captures the
+/// dispatch instant and the instants the windowing decision and the buffer/
+/// prebuffer readiness were reached; `log_enqueued` emits the one per-play
+/// latency event once the command is on the ring. Copy so the play path can
+/// hand it through the windowed helpers without an ownership dance.
+#[derive(Clone, Copy)]
+struct PlayStages {
+    t0_dispatch: std::time::Instant,
+    t2_decision: Option<std::time::Instant>,
+    t3_ready: Option<std::time::Instant>,
+}
+
+impl PlayStages {
+    fn begin() -> Self {
+        Self {
+            t0_dispatch: std::time::Instant::now(),
+            t2_decision: None,
+            t3_ready: None,
+        }
+    }
+
+    /// The windowing/load decision for this play has been made.
+    fn decision(&mut self) {
+        self.t2_decision = Some(std::time::Instant::now());
+    }
+
+    /// The buffer is loaded / the prebuffer gate released; the sample can be built.
+    fn ready(&mut self) {
+        self.t3_ready = Some(std::time::Instant::now());
+    }
+
+    /// Emit the per-play stage event. Durations are micros from dispatch; a stage
+    /// that was not reached on this path reports 0.
+    fn log_enqueued(&self, file: &str, kind: &str, t4_enqueued: std::time::Instant) {
+        let us = |t: Option<std::time::Instant>| {
+            t.map(|t| t.duration_since(self.t0_dispatch).as_micros() as u64)
+                .unwrap_or(0)
+        };
+        tracing::info!(
+            target: "latency",
+            kind,
+            file,
+            decision_us = us(self.t2_decision),
+            ready_us = us(self.t3_ready),
+            enqueue_us = t4_enqueued.duration_since(self.t0_dispatch).as_micros() as u64,
+            "play stages"
+        );
+    }
+}
+
 struct CommandCtx<'a> {
     cache_manager: &'a std::sync::Arc<tokio::sync::Mutex<cache::CacheManager>>,
     voice_manager: &'a std::sync::Arc<parking_lot::Mutex<voice::VoiceManager>>,
@@ -1114,6 +1336,15 @@ struct CommandCtx<'a> {
     output_channels: usize,
     output_sample_rate: u32,
     config: &'a config::Config,
+    /// Per-play first-mix latency probe registry (Sprint 11, D50).
+    latency: &'a http::LatencyTracker,
+    /// Cold plays awaiting their buffer upgrade once the progressive load
+    /// finishes (D51); drained by the reaper tick's upgrade pass.
+    streaming_upgrades: &'a mut Vec<StreamingUpgrade>,
+    /// The largest output block the stream can deliver (fixed buffer size, or a
+    /// documented cap when the device default is unknown) — sizes the shipped
+    /// pitch scratch (D56/D58).
+    max_block_frames: usize,
 }
 
 impl CommandCtx<'_> {
@@ -1151,8 +1382,11 @@ async fn handle_stream_play(
     loop_mode: bool,
     window_ms: Option<u32>,
     prebuffer_ms: Option<u32>,
+    mut stages: PlayStages,
     ctx: &mut CommandCtx<'_>,
 ) {
+    // The caller decided to window this play (Sprint 11, D50).
+    stages.decision();
     let config = ctx.config;
     let output_sample_rate = ctx.output_sample_rate;
 
@@ -1213,6 +1447,7 @@ async fn handle_stream_play(
         loop_mode,
         prebuffer_frames,
         deadline_ms,
+        stages,
         ctx,
     )
     .await;
@@ -1233,6 +1468,7 @@ async fn finish_streamed_play(
     loop_mode: bool,
     prebuffer_frames: usize,
     deadline_ms: u32,
+    mut stages: PlayStages,
     ctx: &mut CommandCtx<'_>,
 ) {
     use std::sync::atomic::Ordering;
@@ -1240,29 +1476,29 @@ async fn finish_streamed_play(
     let output_sample_rate = ctx.output_sample_rate;
     let voice_id = voice.unwrap_or_else(next_auto_voice_id);
 
-    // Gate on the prebuffer so the first audio is glitch-free, but never wait past the
-    // deadline (start anyway; the underrun fade covers any gap). Polling with a tokio
-    // sleep never blocks a worker thread.
-    let started = tokio::time::Instant::now();
-    let deadline = std::time::Duration::from_millis(deadline_ms as u64);
-    loop {
-        let buffered = handles.frames_buffered.load(Ordering::Acquire);
-        if buffered >= prebuffer_frames || handles.producer_done.load(Ordering::Acquire) {
-            break;
-        }
-        if started.elapsed() >= deadline {
-            tracing::warn!(
-                "Streamed source {} hit the {}ms prebuffer deadline with {}/{} frames; \
-                 starting anyway",
-                file,
-                deadline_ms,
-                buffered,
-                prebuffer_frames
-            );
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    // Gate on the prebuffer so the first audio is glitch-free, but never wait past
+    // the deadline (start anyway; the underrun fade covers any gap). Event-driven
+    // (D53): the producer's notify wakes the gate the moment data lands, so there
+    // is no polling quantum on the start latency.
+    let filled = handles
+        .wait_prebuffer(
+            prebuffer_frames,
+            std::time::Duration::from_millis(deadline_ms as u64),
+        )
+        .await;
+    if !filled {
+        tracing::warn!(
+            "Streamed source {} hit the {}ms prebuffer deadline with {}/{} frames; \
+             starting anyway",
+            file,
+            deadline_ms,
+            handles.frames_buffered.load(Ordering::Acquire),
+            prebuffer_frames
+        );
     }
+    // Prebuffer gate released (threshold, producer done, or deadline): the source
+    // is as ready as it will be before start (Sprint 11, D50).
+    stages.ready();
 
     // Resolve the internal id and the voice's current volume.
     let mut voice_mgr = ctx.voice_manager.lock();
@@ -1321,6 +1557,7 @@ async fn finish_streamed_play(
         file_path: source.file_path.clone(),
         total_frames: 0, // unbounded / unknown for a stream
         sample_rate: output_sample_rate,
+        channels,
         volume: source.volume,
         voice_volume: source.voice_volume,
         speed: 1.0,
@@ -1343,7 +1580,13 @@ async fn finish_streamed_play(
     *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
     ctx.playing.insert(status.internal_id, status);
     ctx.streamed_voices.insert(voice_id.clone());
+
+    // First-mix latency probe (Sprint 11, D50), mirroring the full-load path.
+    let enqueued_at = std::time::Instant::now();
+    source.set_latency_probe(enqueued_at, ctx.latency.new_probe());
+
     ctx.send(rt_engine::AudioCommand::AddStreamedSource(source));
+    stages.log_enqueued(&file, "windowed", enqueued_at);
     ctx.refresh();
     tracing::info!(
         "Now streaming {} (voice '{}'); {} active voices",
@@ -1362,22 +1605,37 @@ async fn should_window_local(file: &str, mode: config::LoadMode, ctx: &CommandCt
     let config = ctx.config;
     let rate = ctx.output_sample_rate;
 
-    let (resident, headroom) = {
+    let (resident, headroom, cached_probe) = {
         let cache_mgr = ctx.cache_manager.lock().await;
-        (cache_mgr.is_resident(file), cache_mgr.memory_headroom())
+        (
+            cache_mgr.is_resident(file),
+            cache_mgr.memory_headroom(),
+            cache_mgr.cached_probe(file),
+        )
     };
     if resident {
         return false; // already decoded: serve from cache with full features
     }
 
-    let quality = config.advanced.resampler_quality;
-    let file_owned = file.to_string();
-    let probe = tokio::task::spawn_blocking(move || {
-        cache::strategy::probe_local_file(&file_owned, rate, quality)
-    })
-    .await
-    .ok()
-    .flatten();
+    // The probe cache (D54) skips the header open+parse on replays — windowed
+    // plays never enter the memory cache, so they probe on every play otherwise.
+    let probe = match cached_probe {
+        Some(probe) => Some(probe),
+        None => {
+            let quality = config.advanced.resampler_quality;
+            let file_owned = file.to_string();
+            let probe = tokio::task::spawn_blocking(move || {
+                cache::strategy::probe_local_file(&file_owned, rate, quality)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(probe) = probe {
+                ctx.cache_manager.lock().await.store_probe(file, probe);
+            }
+            probe
+        }
+    };
 
     let Some(probe) = probe else {
         return false; // header unreadable: let the full-load path surface the error
@@ -1408,6 +1666,60 @@ async fn should_window_local(file: &str, mode: config::LoadMode, ctx: &CommandCt
     }
 }
 
+/// How the HTTP play path resolved a Play (D55).
+enum HttpPlayOutcome {
+    /// Handled as a windowed streamed source; nothing more to do.
+    Windowed,
+    /// Not windowed: the probe's open response was reused to start a progressive
+    /// full load on a single request; proceed with this buffer.
+    FullLoad(audio::streaming::SampleBuffer),
+    /// Not handled here (cached, or the open failed): take the cache load path.
+    Fallthrough,
+}
+
+/// Build the disk-persist tee for a cacheable HTTP download (finite
+/// Content-Length, not overridden `cacheable: false`) and spawn the watcher that
+/// registers the finalized file with the disk cache. Shared by the windowed and
+/// reused-request full-load paths.
+async fn make_persist_target(
+    open: &cache::http_stream::OpenHttpStream,
+    file: &str,
+    cacheable: Option<bool>,
+    ctx: &CommandCtx<'_>,
+) -> Option<cache::http_stream::PersistTarget> {
+    let is_cacheable = open.content_length().is_some() && cacheable != Some(false);
+    if !is_cacheable {
+        return None;
+    }
+    let etag = open.etag().map(|s| s.to_string());
+    let last_modified = open.last_modified().map(|s| s.to_string());
+    let content_type = open.content_type().map(|s| s.to_string());
+    let (temp_path, final_path) = ctx.cache_manager.lock().await.windowed_persist_paths(file);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<u64>();
+    let cache_manager = std::sync::Arc::clone(ctx.cache_manager);
+    let url = file.to_string();
+    tokio::spawn(async move {
+        // Resolves only when the download finalized cleanly (temp renamed into place).
+        if let Ok(file_size) = done_rx.await {
+            let mut guard = cache_manager.lock().await;
+            match guard.record_streamed_download(&url, file_size, etag, last_modified, content_type)
+            {
+                Ok(()) => tracing::info!(
+                    "Persisted streamed {} to disk cache ({} bytes)",
+                    url,
+                    file_size
+                ),
+                Err(e) => tracing::warn!("Failed to register persisted stream {}: {}", url, e),
+            }
+        }
+    });
+    Some(cache::http_stream::PersistTarget {
+        temp_path,
+        final_path,
+        done: done_tx,
+    })
+}
+
 /// For an HTTP URL, decide whether to window the play (bounded memory) and, if so, start
 /// a windowed download and register the streamed source. Returns true if it handled the
 /// play; false means the caller should fall back to the full (cache) load — the URL is
@@ -1429,8 +1741,9 @@ async fn try_windowed_http_play(
     window_ms: Option<u32>,
     prebuffer_ms: Option<u32>,
     cacheable: Option<bool>,
+    mut stages: PlayStages,
     ctx: &mut CommandCtx<'_>,
-) -> bool {
+) -> HttpPlayOutcome {
     let config = ctx.config;
     let output_sample_rate = ctx.output_sample_rate;
 
@@ -1440,7 +1753,7 @@ async fn try_windowed_http_play(
         (cm.is_cached(file), cm.memory_headroom())
     };
     if cached {
-        return false;
+        return HttpPlayOutcome::Fallthrough;
     }
 
     // Open the response (headers only) to learn the size, then decide.
@@ -1452,7 +1765,7 @@ async fn try_windowed_http_play(
                 file,
                 e
             );
-            return false;
+            return HttpPlayOutcome::Fallthrough;
         }
     };
     let content_length = open.content_length();
@@ -1466,8 +1779,21 @@ async fn try_windowed_http_play(
             headroom,
         ) == cache::strategy::Strategy::Windowed;
     if !windowed {
-        return false; // drop `open` → connection closes; caller full-loads
+        // Full load on the SAME request (D55): reuse the probe's open response
+        // instead of dropping it and paying a second GET. The download is teed
+        // to the disk cache when cacheable, so a replay needs no network at all.
+        let persist = make_persist_target(&open, file, cacheable, ctx).await;
+        let estimated_frames = content_length.map(|len| (len / 4) as usize);
+        let reader = open.into_bounded_reader(persist);
+        let buffer = ctx
+            .cache_manager
+            .lock()
+            .await
+            .start_streaming_load_from_reader(file, reader, output_sample_rate, estimated_frames);
+        return HttpPlayOutcome::FullLoad(buffer);
     }
+    // Committed to a windowed HTTP play (Sprint 11, D50).
+    stages.decision();
 
     // Window + prebuffer (per-play override beats config).
     let window_ms = window_ms.unwrap_or(config.cache.stream_window_ms);
@@ -1482,43 +1808,7 @@ async fn try_windowed_http_play(
     // disk while it plays, so the next play of this URL hits disk with no extra request.
     // A live stream (no Content-Length) or an explicit `cacheable: false` is never
     // persisted. Registration happens off this path, after the download finalizes.
-    let is_cacheable = content_length.is_some() && cacheable != Some(false);
-    let persist = if is_cacheable {
-        let etag = open.etag().map(|s| s.to_string());
-        let last_modified = open.last_modified().map(|s| s.to_string());
-        let content_type = open.content_type().map(|s| s.to_string());
-        let (temp_path, final_path) = ctx.cache_manager.lock().await.windowed_persist_paths(file);
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<u64>();
-        let cache_manager = std::sync::Arc::clone(ctx.cache_manager);
-        let url = file.to_string();
-        tokio::spawn(async move {
-            // Resolves only when the download finalized cleanly (temp renamed into place).
-            if let Ok(file_size) = done_rx.await {
-                let mut guard = cache_manager.lock().await;
-                match guard.record_streamed_download(
-                    &url,
-                    file_size,
-                    etag,
-                    last_modified,
-                    content_type,
-                ) {
-                    Ok(()) => tracing::info!(
-                        "Persisted streamed {} to disk cache ({} bytes)",
-                        url,
-                        file_size
-                    ),
-                    Err(e) => tracing::warn!("Failed to register persisted stream {}: {}", url, e),
-                }
-            }
-        });
-        Some(cache::http_stream::PersistTarget {
-            temp_path,
-            final_path,
-            done: done_tx,
-        })
-    } else {
-        None
-    };
+    let persist = make_persist_target(&open, file, cacheable, ctx).await;
 
     let reader = open.into_bounded_reader(persist);
     let label = file.to_string();
@@ -1536,11 +1826,12 @@ async fn try_windowed_http_play(
         Ok(Ok(h)) => h,
         Ok(Err(e)) => {
             tracing::error!("Failed to start windowed HTTP source for {}: {}", file, e);
-            return true; // the stream was consumed; do not double-download via full load
+            // The stream was consumed; do not double-download via full load.
+            return HttpPlayOutcome::Windowed;
         }
         Err(e) => {
             tracing::error!("Windowed HTTP spawn task failed for {}: {}", file, e);
-            return true;
+            return HttpPlayOutcome::Windowed;
         }
     };
 
@@ -1556,10 +1847,11 @@ async fn try_windowed_http_play(
         false,
         prebuffer_frames,
         deadline_ms,
+        stages,
         ctx,
     )
     .await;
-    true
+    HttpPlayOutcome::Windowed
 }
 
 /// Whether a selector targets a voice that currently has a windowed/streamed source.
@@ -1604,6 +1896,9 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             freshness,
             cacheable,
         } => {
+            // Stage clock for this play's latency event (Sprint 11, D50).
+            let mut stages = PlayStages::begin();
+
             // Windowed streaming gives bounded memory (O(window)) and low time-to-first-
             // sample for big/long assets. `mode=stream` forces it; `auto`/`full` are
             // decided from a cheap probe and the live memory budget, which force-windows
@@ -1611,8 +1906,11 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             // Local files probe the header; HTTP probes Content-Length on the same
             // connection, and an unknown-size live stream always windows.
             let is_http = file.starts_with("http://") || file.starts_with("https://");
+            // A full-load buffer already started over the probe's reused HTTP
+            // request (D55), when the HTTP path resolved that way.
+            let mut preopened_http: Option<audio::streaming::SampleBuffer> = None;
             if is_http {
-                if try_windowed_http_play(
+                match try_windowed_http_play(
                     &file,
                     id.clone(),
                     volume,
@@ -1623,14 +1921,16 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     window_ms,
                     prebuffer_ms,
                     cacheable,
+                    stages,
                     ctx,
                 )
                 .await
                 {
-                    return;
+                    HttpPlayOutcome::Windowed => return,
+                    HttpPlayOutcome::FullLoad(buffer) => preopened_http = Some(buffer),
+                    // Cached or open failed: fall through to the full (cache) load.
+                    HttpPlayOutcome::Fallthrough => {}
                 }
-                // Not windowed (cached, fits the budget, or open failed): fall through to
-                // the full (cache) load below.
             } else {
                 let go_windowed =
                     mode == config::LoadMode::Stream || should_window_local(&file, mode, ctx).await;
@@ -1645,6 +1945,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                         loop_mode,
                         window_ms,
                         prebuffer_ms,
+                        stages,
                         ctx,
                     )
                     .await;
@@ -1652,17 +1953,33 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 }
             }
 
+            // The decision is full-load from here (Sprint 11, D50).
+            stages.decision();
+
             // Load file (full in-memory load, with streaming support for faster startup).
-            // A per-play freshness override beats the configured default.
-            let resolved_freshness = freshness.unwrap_or(config.cache.freshness);
-            let mut cache_mgr = cache_manager.lock().await;
-            let buffer_result = cache_mgr
-                .get_or_load_streaming_with_freshness(&file, output_sample_rate, resolved_freshness)
-                .await;
-            drop(cache_mgr);
+            // A per-play freshness override beats the configured default. The
+            // reused-request HTTP buffer (D55) skips the cache load entirely.
+            let buffer_result = match preopened_http {
+                Some(buffer) => Ok(buffer),
+                None => {
+                    let resolved_freshness = freshness.unwrap_or(config.cache.freshness);
+                    let mut cache_mgr = cache_manager.lock().await;
+                    let result = cache_mgr
+                        .get_or_load_streaming_with_freshness(
+                            &file,
+                            output_sample_rate,
+                            resolved_freshness,
+                        )
+                        .await;
+                    drop(cache_mgr);
+                    result
+                }
+            };
 
             match buffer_result {
                 Ok(buffer) => {
+                    stages.ready();
+
                     // Use provided voice or auto-generate a unique one.
                     let voice_id = voice.unwrap_or_else(next_auto_voice_id);
 
@@ -1703,11 +2020,14 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                         );
                     }
 
-                    // Get sample ID and voice volume from voice manager
-                    let mut voice_mgr = voice_manager.lock();
-                    let sample_id = voice_mgr.add_sample_to_voice(&voice_id);
-                    let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
-                    drop(voice_mgr);
+                    // Get sample ID and voice volume from voice manager. Scoped so
+                    // the guard provably cannot live across the awaits below.
+                    let (sample_id, voice_volume) = {
+                        let mut voice_mgr = voice_manager.lock();
+                        let sample_id = voice_mgr.add_sample_to_voice(&voice_id);
+                        let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
+                        (sample_id, voice_volume)
+                    };
 
                     // Convert crossfade_ms to samples
                     let crossfade_samples =
@@ -1821,8 +2141,38 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             .saturating_sub(1);
                         sample.position = target_frame.min(max_frame);
                         if is_streaming && !buffer.is_frame_loaded(sample.position) {
+                            // Gate (D51): a start beyond the loaded edge would play
+                            // silence until the decode reaches it; hold the start
+                            // (bounded by the prebuffer deadline, like the windowed
+                            // gate) so seek-starts keep the instant semantics a
+                            // full decode used to give.
+                            if let Some(notify) = buffer.notifier() {
+                                let deadline = tokio::time::Instant::now()
+                                    + std::time::Duration::from_millis(
+                                        config.cache.stream_prebuffer_deadline_ms as u64,
+                                    );
+                                loop {
+                                    let notified = notify.notified();
+                                    tokio::pin!(notified);
+                                    notified.as_mut().enable();
+                                    if buffer.is_frame_loaded(sample.position)
+                                        || buffer.is_complete()
+                                    {
+                                        break;
+                                    }
+                                    if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                                        tracing::warn!(
+                                            "Start position {}ms of {} not decoded within the \
+                                             deadline; starting with silence until it loads",
+                                            start_ms,
+                                            file
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
                             tracing::debug!(
-                                "Starting at position {}ms (frame {}), waiting for data to load",
+                                "Starting at position {}ms (frame {})",
                                 start_ms,
                                 sample.position
                             );
@@ -1860,8 +2210,14 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                         sample_id: sample.sample_id.clone(),
                         voice_id: voice_id.clone(),
                         file_path: sample.file_path.clone(),
-                        total_frames: sample.buffer.frames(),
+                        // A still-loading progressive buffer reports its header
+                        // estimate so /status carries a real total from the start.
+                        total_frames: sample
+                            .buffer
+                            .total_frames_or_estimate()
+                            .unwrap_or_else(|| sample.buffer.frames()),
                         sample_rate: sample.buffer.sample_rate(),
+                        channels: sample.buffer.channels(),
                         volume: sample.volume,
                         voice_volume: sample.voice_volume,
                         speed: sample.speed,
@@ -1884,7 +2240,30 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     }
                     *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
                     ctx.playing.insert(status.internal_id, status);
+
+                    // First-mix latency probe (Sprint 11, D50): registered with the
+                    // tracker, attached to the sample, published by the audio thread
+                    // on the sample's first mixed block, folded by the reaper tick.
+                    let enqueued_at = std::time::Instant::now();
+                    sample.set_latency_probe(enqueued_at, ctx.latency.new_probe());
+
+                    // A cold play is upgraded to its Complete buffer once the
+                    // progressive load finishes (D51, the reaper's upgrade pass).
+                    if is_streaming {
+                        ctx.streaming_upgrades.push(StreamingUpgrade {
+                            internal_id: sample.id,
+                            buffer: buffer.clone(),
+                            file: file.clone(),
+                        });
+                    }
+
+                    let kind = if is_streaming {
+                        "full_load_streaming"
+                    } else {
+                        "full_load"
+                    };
                     ctx.send(rt_engine::AudioCommand::AddSample(sample));
+                    stages.log_enqueued(&file, kind, enqueued_at);
                     ctx.refresh();
                     tracing::info!("Now playing {} active samples", ctx.playing.len());
                 }
@@ -2109,6 +2488,13 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         } => {
             if selector.is_empty() {
                 tracing::warn!("Speed command with empty selector - no samples targeted");
+            } else if pitch_correction && speed < 0.0 {
+                // Validated here, off the audio thread (D57): the RT-side
+                // set_speed rejects this combination silently.
+                tracing::warn!(
+                    "Negative speed ({}) is not supported with pitch correction; ignoring",
+                    speed
+                );
             } else if selector_targets_streamed_voice(&selector, ctx.streamed_voices) {
                 tracing::warn!(
                     "Speed/pitch is not supported for windowed/streamed voices; ignoring (a \
@@ -2121,18 +2507,58 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     "normal"
                 };
                 tracing::info!("Set speed to {}x ({}) for matching samples", speed, mode);
-                // Keep the snapshot's per-sample speed in step for samples the
-                // control thread knows match the selector.
+                // Expand the selector control-side (D56): one command per
+                // matching sample, each carrying its own pre-built corrector
+                // bundle when enabling pitch, so the audio thread never
+                // constructs or frees a stretcher. The snapshot's per-sample
+                // speed is kept in step in the same pass.
+                let mut commands = Vec::new();
                 for status in ctx.playing.values_mut() {
-                    if sample_status_matches(&selector, status) {
-                        status.speed = speed;
+                    if status.windowed || !sample_status_matches(&selector, status) {
+                        continue;
+                    }
+                    status.speed = speed;
+                    let bundle = if pitch_correction {
+                        Some(Box::new(audio::mixer::PitchBundle::for_voice(
+                            status.channels,
+                            status.sample_rate,
+                            speed,
+                            ctx.max_block_frames,
+                        )))
+                    } else {
+                        None
+                    };
+                    commands.push(rt_engine::AudioCommand::SetSpeedWithCorrector {
+                        id: status.internal_id,
+                        speed,
+                        pitch_correction,
+                        bundle,
+                        displaced: None,
+                    });
+                }
+                // Pitch correction stays dormant while a cold play's progressive
+                // load is still filling (the mixer needs slice access); it engages
+                // when the D51 upgrade lands. Tell the operator instead of
+                // silently doing nothing in the meantime.
+                if pitch_correction {
+                    for upgrade in ctx.streaming_upgrades.iter() {
+                        let matches = ctx
+                            .playing
+                            .get(&upgrade.internal_id)
+                            .map(|s| sample_status_matches(&selector, s))
+                            .unwrap_or(false);
+                        if matches && !upgrade.buffer.is_complete() {
+                            tracing::warn!(
+                                "Pitch correction for {} is deferred: its cold play is \
+                                 still loading; it engages when the load completes",
+                                upgrade.file
+                            );
+                        }
                     }
                 }
-                ctx.send(rt_engine::AudioCommand::SetSpeedMatching {
-                    selector,
-                    speed,
-                    pitch_correction,
-                });
+                for command in commands {
+                    ctx.send(command);
+                }
                 ctx.refresh();
             }
         }
@@ -2279,6 +2705,9 @@ mod tests {
         ducking_snapshot: Arc<RwLock<HashMap<String, f32>>>,
         inputs: Vec<http::InputStatus>,
         config: config::Config,
+        latency_stats: Arc<http::PlayLatencyStats>,
+        latency: http::LatencyTracker,
+        streaming_upgrades: Vec<StreamingUpgrade>,
         _cache_dir: tempfile::TempDir,
     }
 
@@ -2292,10 +2721,12 @@ mod tests {
             let (ducking_engine, ducking_applier) = if ducking_rules.is_empty() {
                 (None, None)
             } else {
-                (
-                    Some(DuckingEngine::new(ducking_rules, SR)),
-                    Some(DuckingApplier::new()),
-                )
+                let applier = DuckingApplier::with_ducked_voices(
+                    ducking_rules
+                        .iter()
+                        .flat_map(|rule| rule.ducked_voices.iter().cloned()),
+                );
+                (Some(DuckingEngine::new(ducking_rules, SR)), Some(applier))
             };
             let mixer = MixerState {
                 ducking_applier,
@@ -2305,6 +2736,7 @@ mod tests {
             let (cmd_return_tx, cmd_return_rx) = rt_engine::command_return_channel(1024);
             let (grave_tx, grave_rx) = rt_engine::graveyard_channel(1024);
             let (streamed_grave_tx, streamed_grave_rx) = rt_engine::streamed_graveyard_channel(256);
+            let latency_stats = Arc::new(http::PlayLatencyStats::default());
             Self {
                 cache_manager: Arc::new(tokio::sync::Mutex::new(cache)),
                 voice_manager: Arc::new(Mutex::new(VoiceManager::new())),
@@ -2330,8 +2762,22 @@ mod tests {
                 ducking_snapshot: Arc::new(RwLock::new(HashMap::new())),
                 inputs: Vec::new(),
                 config: config::Config::default(),
+                latency_stats: latency_stats.clone(),
+                latency: http::LatencyTracker::new(latency_stats),
+                streaming_upgrades: Vec::new(),
                 _cache_dir: cache_dir,
             }
+        }
+
+        /// Run the reaper tick's buffer-upgrade pass (D51), as the control loop does.
+        async fn run_upgrades(&mut self) {
+            upgrade_completed_streaming_plays(
+                &mut self.streaming_upgrades,
+                &self.cache_manager,
+                &mut self.cmd_tx,
+                &mut self.playing,
+            )
+            .await;
         }
 
         /// Run a parsed command through `handle_command`, pushing the resulting
@@ -2351,6 +2797,9 @@ mod tests {
                 output_channels: 2,
                 output_sample_rate: SR,
                 config: &self.config,
+                latency: &self.latency,
+                streaming_upgrades: &mut self.streaming_upgrades,
+                max_block_frames: 512,
             };
             handle_command(cmd, &mut ctx).await;
         }
@@ -2358,14 +2807,15 @@ mod tests {
         /// Apply every queued audio command to the mixer, as the audio callback
         /// would, so the test can assert the resulting `MixerState`. Spent mutation
         /// commands are routed to the return ring, mirroring the callback.
-        fn drain(&mut self) {
+        fn drain(&mut self) -> usize {
             rt_engine::drain_commands(
                 &mut self.cmd_rx,
                 &mut self.mixer,
                 &mut self.cmd_return_tx,
+                &mut self.grave_tx,
                 SR,
                 1024,
-            );
+            )
         }
 
         /// Drive the control-side reaper exactly as the 20ms tick does, draining
@@ -2660,6 +3110,410 @@ mod tests {
         fixture.run(cmd).await;
         let captured = warnings.lock().unwrap().clone();
         captured
+    }
+
+    /// One captured per-play latency stage event (Sprint 11, D50).
+    #[derive(Default, Clone, Debug)]
+    struct StageEvent {
+        kind: String,
+        decision_us: u64,
+        ready_us: u64,
+        enqueue_us: u64,
+    }
+
+    /// Captures events on the "latency" target so a test can assert the recorded
+    /// play stages without them leaking to the console.
+    struct StageCaptureLayer {
+        events: Arc<std::sync::Mutex<Vec<StageEvent>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for StageCaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "latency" {
+                return;
+            }
+            let mut ev = StageEvent::default();
+            event.record(&mut StageVisitor { ev: &mut ev });
+            self.events.lock().unwrap().push(ev);
+        }
+    }
+
+    struct StageVisitor<'a> {
+        ev: &'a mut StageEvent,
+    }
+
+    impl tracing::field::Visit for StageVisitor<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "decision_us" => self.ev.decision_us = value,
+                "ready_us" => self.ev.ready_us = value,
+                "enqueue_us" => self.ev.enqueue_us = value,
+                _ => {}
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "kind" {
+                self.ev.kind = value.to_string();
+            }
+        }
+
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    /// Run `cmd` through `handle_command` under a stage-capturing subscriber and
+    /// return every captured per-play latency event.
+    async fn run_capturing_stages(fixture: &mut Fixture, cmd: AudioCommand) -> Vec<StageEvent> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(StageCaptureLayer {
+            events: events.clone(),
+        });
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        fixture.run(cmd).await;
+        let captured = events.lock().unwrap().clone();
+        captured
+    }
+
+    /// Mix one block through the fixture's mixer, as the audio callback would.
+    fn mix_one_block(fixture: &mut Fixture) {
+        let mut block = vec![0.0f32; 512 * 2];
+        audio::mixer::mix_audio(&mut block, &mut fixture.mixer);
+    }
+
+    #[tokio::test]
+    async fn play_emits_monotone_stage_latency_event() {
+        // Sprint 11 (D50): every play emits exactly one stage event whose
+        // dispatch->decision->ready->enqueue durations are monotone.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let events = run_capturing_stages(&mut fixture, play_crossfade(false, 0)).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one latency event per play, got {events:?}"
+        );
+        let e = &events[0];
+        // A cold local play is progressive after D51 (Sprint 12).
+        assert_eq!(e.kind, "full_load_streaming", "cold local play kind: {e:?}");
+        assert!(
+            e.decision_us <= e.ready_us && e.ready_us <= e.enqueue_us,
+            "stages must be monotone: {e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hit_play_ready_stage_is_bounded() {
+        // Sprint 11: a memory-cache-hit replay must not decode; its decision->ready
+        // stage stays under a generous ceiling so a reintroduced blocking decode on
+        // the hit path fails loudly here.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await; // cold: decodes + caches
+        let events = run_capturing_stages(&mut fixture, play_crossfade(false, 0)).await;
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert!(
+            e.ready_us.saturating_sub(e.decision_us) < 250_000,
+            "cache-hit load stage must be far below 250ms: {e:?}"
+        );
+        // A warm replay may be a Complete cache hit ("full_load") or, if the cold
+        // decode is still in flight, join the progressive load — either way the
+        // ready stage above stays bounded.
+        assert!(
+            e.kind == "full_load" || e.kind == "full_load_streaming",
+            "warm replay kind: {e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_first_mix_latency_folds_into_stats() {
+        // Sprint 11 (D50): the audio thread publishes enqueue->first-mix into the
+        // play's probe; the reaper fold turns it into /metrics values.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain(); // AddSample reaches the mixer
+                         // The cold play is progressive (D51): silence blocks do not count as a
+                         // start, so wait for the decode to land audio before mixing.
+        let mut attempts = 0;
+        while fixture.mixer.active_samples[0].buffer.frames() == 0 && attempts < 500 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            attempts += 1;
+        }
+        assert!(fixture.mixer.active_samples[0].buffer.frames() > 0);
+        mix_one_block(&mut fixture); // first audible block publishes the probe
+        fixture.latency.fold_fired();
+        use std::sync::atomic::Ordering;
+        let last = fixture.latency_stats.last_ns.load(Ordering::Relaxed);
+        let max = fixture.latency_stats.max_ns.load(Ordering::Relaxed);
+        let plays = fixture.latency_stats.plays_measured.load(Ordering::Relaxed);
+        assert_eq!(plays, 1, "one measured play");
+        assert!(last > 0, "a real first-mix latency was published");
+        assert!(max >= last, "max folds correctly");
+    }
+
+    #[tokio::test]
+    async fn windowed_play_emits_stage_event_and_publishes_first_mix() {
+        // Sprint 11 (D50): the windowed path emits its stage event after the
+        // prebuffer gate and publishes first-mix latency from the ring mix.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let mut cmd = play_crossfade(false, 0);
+        if let AudioCommand::Play { mode, .. } = &mut cmd {
+            *mode = config::LoadMode::Stream;
+        }
+        let events = run_capturing_stages(&mut fixture, cmd).await;
+        assert_eq!(events.len(), 1, "one latency event, got {events:?}");
+        let e = &events[0];
+        assert_eq!(e.kind, "windowed", "windowed play kind: {e:?}");
+        assert!(
+            e.decision_us <= e.ready_us && e.ready_us <= e.enqueue_us,
+            "stages must be monotone: {e:?}"
+        );
+
+        fixture.drain(); // AddStreamedSource reaches the mixer
+        mix_one_block(&mut fixture); // the gate guaranteed ring audio; this publishes
+        fixture.latency.fold_fired();
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            fixture.latency_stats.plays_measured.load(Ordering::Relaxed),
+            1,
+            "the windowed first mix must be measured"
+        );
+        assert!(fixture.latency_stats.last_ns.load(Ordering::Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn cold_play_gates_a_deep_start_position_until_loaded() {
+        // D51: a start_position beyond the progressive buffer's loaded edge gates
+        // AddSample until decode reaches it (bounded by the prebuffer deadline),
+        // preserving the instant-seek semantics full decodes used to give.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let mut cmd = play_crossfade(false, 0);
+        if let AudioCommand::Play {
+            start_position_ms, ..
+        } = &mut cmd
+        {
+            *start_position_ms = Some(1500);
+        }
+        fixture.run(cmd).await;
+        fixture.drain();
+        let sample = &fixture.mixer.active_samples[0];
+        assert_eq!(sample.position, 1500 * 48, "1500ms at 48k");
+        assert!(
+            sample.buffer.is_frame_loaded(sample.position),
+            "the gate must hold AddSample until the start position is decoded"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_play_upgrades_to_a_complete_buffer_for_full_features() {
+        // D51: a cold play starts on the progressive buffer and, once the decode
+        // finishes and promotes, is upgraded to the Complete buffer over the
+        // command ring — restoring pitch correction (which needs slice access).
+        use audio::streaming::SampleBuffer;
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain();
+        assert!(
+            matches!(
+                fixture.mixer.active_samples[0].buffer,
+                SampleBuffer::Streaming(_)
+            ),
+            "a cold play starts on the progressive buffer"
+        );
+
+        let mut attempts = 0;
+        while !fixture.mixer.active_samples[0].buffer.is_complete() && attempts < 500 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            attempts += 1;
+        }
+        assert!(
+            fixture.mixer.active_samples[0].buffer.is_complete(),
+            "the background decode must finish"
+        );
+
+        fixture.run_upgrades().await;
+        fixture.drain();
+        assert!(
+            matches!(
+                fixture.mixer.active_samples[0].buffer,
+                SampleBuffer::Complete(_)
+            ),
+            "the play must be upgraded once the decode completes"
+        );
+
+        // Pitch correction works on the upgraded buffer.
+        fixture
+            .run(AudioCommand::Speed {
+                selector: SampleSelector {
+                    internal_id: None,
+                    voice: Some("v".to_string()),
+                    id: None,
+                    file: None,
+                },
+                speed: 1.2,
+                pitch_correction: true,
+            })
+            .await;
+        fixture.drain();
+        assert!(
+            fixture.mixer.active_samples[0].pitch_corrector.is_some(),
+            "pitch correction must engage on the upgraded Complete buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn speed_with_pitch_ships_a_corrector_per_matching_sample() {
+        // D56: the dispatcher expands the selector control-side, shipping one
+        // pre-built corrector bundle per matching sample; the audio thread
+        // installs by move. Disabling moves the correctors back out.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.run(play_crossfade(false, 0)).await; // same voice "v"
+        fixture.drain();
+        // Wait for the cold progressive loads, then upgrade to Complete buffers
+        // (pitch needs slice access).
+        let mut attempts = 0;
+        while fixture
+            .mixer
+            .active_samples
+            .iter()
+            .any(|s| !s.buffer.is_complete())
+            && attempts < 500
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            attempts += 1;
+        }
+        fixture.run_upgrades().await;
+        fixture.drain();
+
+        let speed_cmd = |speed: f32, pitch: bool| AudioCommand::Speed {
+            selector: SampleSelector {
+                internal_id: None,
+                id: None,
+                file: None,
+                voice: Some("v".to_string()),
+            },
+            speed,
+            pitch_correction: pitch,
+        };
+
+        fixture.run(speed_cmd(1.3, true)).await;
+        assert_eq!(
+            fixture.drain(),
+            2,
+            "one shipped command per matching sample"
+        );
+        for sample in &fixture.mixer.active_samples {
+            assert!(
+                sample.has_pitch_correction(),
+                "every matching sample gets its own shipped corrector"
+            );
+            assert!((sample.speed - 1.3).abs() < 1e-6);
+        }
+
+        fixture.run(speed_cmd(1.0, false)).await;
+        fixture.drain();
+        for sample in &fixture.mixer.active_samples {
+            assert!(
+                !sample.has_pitch_correction(),
+                "disable must move every corrector out for off-RT drop"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pitch_on_a_still_loading_cold_play_warns_at_dispatch() {
+        // Sprint 13 F6: pitch correction targeting a cold play whose progressive
+        // load is still filling stays dormant until the D51 upgrade; the
+        // dispatcher says so instead of silently doing nothing.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain();
+
+        // Pin the play's upgrade entry to a provably still-loading buffer (the
+        // real 2s WAV may decode before the Speed command lands).
+        let stalled = audio::streaming::SampleBuffer::Streaming(Arc::new(RwLock::new(
+            audio::streaming::StreamingBuffer::new(2, SR, None),
+        )));
+        assert_eq!(fixture.streaming_upgrades.len(), 1);
+        fixture.streaming_upgrades[0].buffer = stalled;
+
+        let warnings = run_capturing_warnings(
+            &mut fixture,
+            AudioCommand::Speed {
+                selector: SampleSelector {
+                    internal_id: None,
+                    id: None,
+                    file: None,
+                    voice: Some("v".to_string()),
+                },
+                speed: 1.2,
+                pitch_correction: true,
+            },
+        )
+        .await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("deferred") && w.contains("still loading")),
+            "a still-loading pitch target must warn, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_speed_with_pitch_warns_at_dispatch_and_sends_nothing() {
+        // D57: the invalid speed+pitch combination is validated control-side (the
+        // RT-side set_speed keeps a silent reject); the command never reaches the
+        // ring.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain();
+
+        let warnings = run_capturing_warnings(
+            &mut fixture,
+            AudioCommand::Speed {
+                selector: SampleSelector {
+                    internal_id: None,
+                    id: None,
+                    file: None,
+                    voice: Some("v".to_string()),
+                },
+                speed: -1.5,
+                pitch_correction: true,
+            },
+        )
+        .await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Negative speed") && w.contains("pitch")),
+            "dispatch must warn about negative speed with pitch correction, got {warnings:?}"
+        );
+        assert_eq!(
+            fixture.drain(),
+            0,
+            "the invalid command must not be sent to the audio thread"
+        );
+        assert_eq!(
+            fixture.mixer.active_samples[0].speed, 1.0,
+            "the sample's speed must be untouched"
+        );
     }
 
     #[tokio::test]
@@ -3382,6 +4236,8 @@ mod tests {
             rt_engine::AudioCommand::SeekMatching { .. } => "SeekMatching",
             rt_engine::AudioCommand::SetSpeedMatching { .. } => "SetSpeedMatching",
             rt_engine::AudioCommand::SetVolumeMatching { .. } => "SetVolumeMatching",
+            rt_engine::AudioCommand::SetSpeedWithCorrector { .. } => "SetSpeedWithCorrector",
+            rt_engine::AudioCommand::UpgradeSampleBuffer { .. } => "UpgradeSampleBuffer",
         }
     }
 

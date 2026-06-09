@@ -101,7 +101,14 @@ fn soak_sustained_plays_and_stops_stays_bounded() {
                 streamed_graveyard,
                 output_sample_rate,
             } = acs;
-            drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
+            drain_commands(
+                commands,
+                mixer,
+                command_returns,
+                graveyard,
+                *output_sample_rate,
+                64,
+            );
             mix_audio(&mut block, mixer);
             reap_finished(mixer, graveyard);
             reap_finished_streamed(mixer, streamed_graveyard);
@@ -129,5 +136,107 @@ fn soak_sustained_plays_and_stops_stays_bounded() {
     assert!(
         resident <= max_active,
         "resident samples {resident} should not exceed the peak {max_active}"
+    );
+}
+
+#[test]
+fn soak_past_the_voice_cap_steals_and_stays_capped() {
+    // Sprint 13 F2 (D18): a burst far past MAX_VOICES with no stops must hold the
+    // pool exactly at the cap (steal-oldest), route every displaced sample
+    // through the graveyard, and never panic. Long samples so nothing finishes
+    // on its own during the burst.
+    let mut mixer = SceneBuilder::new(2).build();
+    mixer.active_samples.reserve(MAX_VOICES);
+
+    let (mut cmd_tx, cmd_rx) = command_channel(1024);
+    let (cret_tx, mut cret_rx) = command_return_channel(1024);
+    let (grave_tx, mut grave_rx) = graveyard_channel(1024);
+    let (streamed_grave_tx, _streamed_grave_rx) = streamed_graveyard_channel(256);
+    let callback_state = Mutex::new(AudioCallbackState {
+        mixer,
+        commands: cmd_rx,
+        command_returns: cret_tx,
+        graveyard: grave_tx,
+        streamed_graveyard: streamed_grave_tx,
+        output_sample_rate: SR,
+    });
+    let mut block = vec![0.0f32; BLOCK * 2];
+
+    let sample_frames = BLOCK * 10_000; // far longer than the run
+    let total_plays = MAX_VOICES * 3; // three times over the cap
+    let mut displaced = 0usize;
+
+    // One shared decoded buffer (an Arc clone per play), so the soak measures the
+    // pool behavior rather than waveform generation.
+    let shared = decoded(sine(440.0, SR, sample_frames, 2, 0.1), 2, SR);
+
+    for i in 0..total_plays {
+        let s = ActiveSample::new(
+            i as u64,
+            format!("v{}", i % 8),
+            std::sync::Arc::clone(&shared),
+            1.0,
+            1.0,
+            "f".to_string(),
+        );
+        let _ = cmd_tx.push(AudioCommand::AddSample(s));
+
+        {
+            let mut guard = callback_state.lock();
+            let acs = &mut *guard;
+            let AudioCallbackState {
+                mixer,
+                commands,
+                command_returns,
+                graveyard,
+                streamed_graveyard,
+                output_sample_rate,
+            } = acs;
+            drain_commands(
+                commands,
+                mixer,
+                command_returns,
+                graveyard,
+                *output_sample_rate,
+                64,
+            );
+            mix_audio(&mut block, mixer);
+            reap_finished(mixer, graveyard);
+            reap_finished_streamed(mixer, streamed_graveyard);
+            assert!(
+                mixer.active_samples.len() <= MAX_VOICES,
+                "the pool must never exceed the hard cap"
+            );
+        }
+        while grave_rx.pop().is_some() {
+            displaced += 1;
+        }
+        while cret_rx.pop().is_some() {}
+    }
+
+    let guard = callback_state.lock();
+    assert_eq!(
+        guard.mixer.active_samples.len(),
+        MAX_VOICES,
+        "the pool holds exactly the cap after a 3x burst"
+    );
+    // Every play past the cap displaced one earlier sample.
+    assert_eq!(
+        displaced,
+        total_plays - MAX_VOICES,
+        "each over-cap play steals exactly one voice"
+    );
+    // The newest plays are the survivors (oldest were stolen first).
+    let min_id = guard
+        .mixer
+        .active_samples
+        .iter()
+        .map(|s| s.id)
+        .min()
+        .unwrap();
+    assert_eq!(
+        min_id,
+        (total_plays - MAX_VOICES) as u64,
+        "the oldest non-looping voices were stolen in order"
     );
 }

@@ -207,3 +207,76 @@ Lane A green · Lane B green (incl. real-device smoke where the sprint touches d
 new tests + harness assertions added · Windows steps appended to `MANUAL-VERIFICATION.md` where relevant ·
 out-of-scope items logged to `docs/bugs.md` · committed on a branch ·
 `cargo build --release` warning-free.
+
+---
+
+# Performance & RT-hardening program (sprints 10–14)
+
+A second program tier, planned 2026-06-09 from a principal-engineer evaluation of the core audio
+loop and first-start latency (the owner's stated priority: **cold first-play latency** for disk
+and HTTP sourcing, warm latency, and glitch-free playback). The evaluation, the verified
+findings, and the program design are recorded in
+[sprint-10](sprint-10-perf-program-plan.md). **The Charter above applies verbatim.** Decisions
+for this tier are **D50–D62** in [`DECISIONS.md`](DECISIONS.md).
+
+Ordering: 11 (measure) strictly before 12 (optimize); 12 before 13 because latency is the
+owner's priority; 14 last (lowest risk, and its resampler re-pins follow 12's test changes).
+
+> **Lane A environment note (sprints 11–14 execution, 2026-06-09):** this execution environment
+> has no Docker daemon, so Lane A was run as the documented host approximation — the same gate
+> steps (`cargo fmt --check`, `clippy --all-targets -- -D warnings`,
+> `RUSTFLAGS=-D warnings cargo build --release`, full `cargo test`, benches) on the host
+> toolchain (rust 1.94.1 vs the image's pinned 1.95). `[A]` boxes below were genuinely verified
+> under that approximation; a confirming run of `scripts/validate.sh` on a Docker-capable
+> machine is recommended before release. `[B]` boxes remain for the partner's native macOS pass.
+
+## Status board
+
+| # | Sprint | Status | Depends on | File |
+|---|--------|--------|-----------|------|
+| 10 | Performance & RT-hardening program plan | Done | 0–9 | [sprint-10](sprint-10-perf-program-plan.md) |
+| 11 | Latency instrumentation & baselines | Done | 10 | [sprint-11](sprint-11-latency-instrumentation.md) |
+| 12 | First-start latency | Done | 11 | [sprint-12](sprint-12-first-start-latency.md) |
+| 13 | RT-path hardening | Done | 11 (soft: after 12) | [sprint-13](sprint-13-rt-path-hardening.md) |
+| 14 | Quality & correctness backlog | Done | 11 (soft: after 13) | [sprint-14](sprint-14-quality-and-correctness.md) |
+
+## Acceptance criteria
+
+### Sprint 10 — Performance & RT-hardening program plan
+- [x] Sprint docs 11–14 written in the established format with every `Verified at:` citation re-checked against the live tree (doc-only)
+- [x] DECISIONS.md D50–D62 recorded; tracker section added; Charter noted as applying verbatim (doc-only)
+- [x] `docs/bugs.md` reconciled: stale entries (DiskCache hashing, dead-code banners, `windowed` flag) marked resolved with citations; open residuals cross-linked to owning sprints (doc-only)
+- [x] SWR race traced and characterized: revalidation tick refuted; `invalidate`-vs-`active_loads` race confirmed (→ Sprint 12 F2); post-unification generation hazard identified (→ Sprint 12 F1) (doc-only)
+
+### Sprint 11 — Latency instrumentation & baselines
+- [x] Six-stage play-latency model (D50) captured per play and logged; first-mix latency published from the audio thread via pre-allocated atomics with the alloc harness proving the publication is 0 alloc / 0 free `[A]` — stage capture starts at the dispatch boundary (t0/t1 collapsed; deviation recorded in sprint-11)
+- [x] `/metrics` exposes `latency.play_to_first_mix_ns{last,max}` + `plays_measured` with real values asserted by an HTTP test `[A]`
+- [x] Latency tests drive cache-hit, cold-local, and windowed plays offline and assert populated, monotone stages `[A]` — split lib (`tests/latency_test.rs`) / binary (`src/main.rs` test module) per the binary-crate architecture; deviation recorded in sprint-11
+- [x] Criterion baselines recorded in sprint-11 doc for warm hit, cold local, cold HTTP, probe, and prebuffer-ready `[A]`
+- [ ] Real-device sanity: cached play shows sub-50 ms first-mix latency on `/metrics` `[B]` — partner's pass
+
+### Sprint 12 — First-start latency
+- [x] Cold local and disk-cached-HTTP full-loads return a progressive buffer immediately and are audible before decode completes; promotion, freshness (stat-at-start), and the generation guard are test-covered `[A]` — the "pitch exception" became the stronger `UpgradeSampleBuffer` mechanism (D51 amendment; plays carry no pitch parameter)
+- [x] `invalidate`/`cache_reload` abandons in-flight streaming loads (no stale promotion, no stale joins); errored loads dropped too (found in passing) `[A]`
+- [x] Windowed prebuffer gate is event-driven with deadline semantics preserved (paused-time tests) `[A]`
+- [x] Probe results cached by (path, mtime, size); warm windowed replay skips the header parse `[A]`
+- [x] Uncached HTTP full-load reuses the probe's request — one GET, counted by a stub-server test — and persists cacheable downloads (D55 amendment: reuse supersedes the hollow "overlap") `[A]`
+- [x] Before/after table recorded against Sprint 11 baselines; cold-start playable time is ~223 µs for a 300 s file (was ~211 ms, ∝ length) `[A]`
+- [ ] Long cold local file audibly starts near-instantly on the real device `[B]` — partner's pass
+
+### Sprint 13 — RT-path hardening
+- [x] First duck of a never-seen voice is 0 alloc / 0 free on the callback (warm-up crutch removed from the harness) `[A]`
+- [x] D18 over-cap policy implemented: steal oldest non-looping else reject, displaced sample via graveyard, alloc-free past 256; soak past the cap green `[A]`
+- [x] Pitch-corrector lifecycle is control-side: toggle mid-play is Rust-side alloc/free-free; displaced corrector dropped off-RT; no-gap crossfade parity kept `[A]` — shipped per-sample via dispatch expansion (deviation note in sprint-13)
+- [x] No `tracing` call sites remain on the audio or capture steady-state paths (`mixer.rs` set_speed warn moved control-side; `input.rs` capture sites are relaxed counters surfaced on `/metrics` and drained off-RT) `[A]`
+- [x] Scratch buffers pre-sized to the stream's max block with a counted regrow fallback `[A]`
+- [x] Dispatch warning when pitch correction targets a still-streaming buffer `[A]`
+- [ ] Real-device smoke: pitch toggle + over-cap burst with zero xruns `[B]` — partner's pass (MANUAL-VERIFICATION note appended)
+
+### Sprint 14 — Quality & correctness backlog
+- [x] `/ws` streams real `{type:"log"}` frames from the live tracing subscriber (integration-tested); `docs/http-api.md` is true `[A]`
+- [x] `/command` 400 rejections return the `CommandResponse` JSON shape; contract test updated; API-CONTRACT.md updated `[A]`
+- [x] R1 closed: D59 overridden on measurement (stay `Linear` — Linear/Cubic identical to ~0.015% at our presets; no pinnable difference exists); the measured quality floor is pinned by a new resampler test; recorded in DECISIONS.md/bugs.md/sprint-14 `[A]`
+- [x] `audio.channel_names` removed; configs containing it still parse (locked by test); changelog'd `[A]`
+- [x] `docs/bugs.md` sweep complete: program-resolved entries closed with citations, retained items intact `[A]`
+- [ ] Live `/ws` log lines observed against a running daemon `[B]` — partner's pass

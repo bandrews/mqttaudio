@@ -1009,6 +1009,13 @@ async fn cacheable_windowed_play_persists_and_replay_hits_disk() {
     );
 
     let buffer = cm.get_or_load_streaming(&url, 48000).await.unwrap();
+    // D51: the disk-cached replay decodes progressively; wait for the background
+    // decode to produce audio before asserting on it.
+    let mut attempts = 0;
+    while buffer.frames() == 0 && !buffer.is_complete() && attempts < 200 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        attempts += 1;
+    }
     assert!(
         buffer.frames() > 0,
         "replay must decode audio from the disk file"
@@ -1018,4 +1025,479 @@ async fn cacheable_windowed_play_persists_and_replay_hits_disk() {
         gets_after_download,
         "replay must hit disk with zero extra GETs"
     );
+}
+
+// =============================================================================
+// Event-driven prebuffer gate (Sprint 12 F3, D53)
+// =============================================================================
+
+/// Build a bare StreamHandles for gate tests: no producer thread, the test plays
+/// the producer's role through the shared atomics + notify.
+fn gate_test_handles() -> mqttaudio::audio::streamed_source::StreamHandles {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::Arc;
+    let (_producer, consumer) = mqttaudio::audio::input::create_ring_buffer(1024);
+    mqttaudio::audio::streamed_source::StreamHandles {
+        consumer,
+        channels: 2,
+        producer_done: Arc::new(AtomicBool::new(false)),
+        stop_flag: Arc::new(AtomicBool::new(false)),
+        frames_buffered: Arc::new(AtomicUsize::new(0)),
+        data_notify: Arc::new(tokio::sync::Notify::new()),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn prebuffer_gate_releases_on_threshold_without_poll_quantum() {
+    // D53: the gate wakes on the producer's notify the moment the threshold is
+    // crossed — under paused time the release instant is EXACTLY the producer's
+    // store instant, proving there is no polling quantum left.
+    use std::sync::atomic::Ordering;
+    let handles = gate_test_handles();
+    let fb = handles.frames_buffered.clone();
+    let notify = handles.data_notify.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(37)).await;
+        fb.store(4800, Ordering::Release);
+        notify.notify_waiters();
+    });
+
+    let start = tokio::time::Instant::now();
+    let filled = handles
+        .wait_prebuffer(4800, std::time::Duration::from_millis(200))
+        .await;
+    assert!(filled, "the gate must report the prebuffer as filled");
+    assert_eq!(
+        start.elapsed(),
+        std::time::Duration::from_millis(37),
+        "the gate must release at the producer's instant, not a poll tick"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn prebuffer_gate_starts_anyway_at_the_deadline() {
+    // The deadline-start-anyway semantics are preserved exactly: a stalled
+    // producer releases the gate at the deadline, reported as unfilled.
+    let handles = gate_test_handles();
+    let start = tokio::time::Instant::now();
+    let filled = handles
+        .wait_prebuffer(4800, std::time::Duration::from_millis(200))
+        .await;
+    assert!(!filled, "a stalled producer must report unfilled");
+    assert_eq!(
+        start.elapsed(),
+        std::time::Duration::from_millis(200),
+        "the gate must release exactly at the deadline"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn prebuffer_gate_releases_when_the_producer_finishes_early() {
+    // A short file can finish decoding below the prebuffer threshold; there is
+    // nothing more to wait for, so the gate releases on producer_done.
+    use std::sync::atomic::Ordering;
+    let handles = gate_test_handles();
+    let done = handles.producer_done.clone();
+    let notify = handles.data_notify.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(12)).await;
+        done.store(true, Ordering::Release);
+        notify.notify_waiters();
+    });
+
+    let start = tokio::time::Instant::now();
+    let filled = handles
+        .wait_prebuffer(4800, std::time::Duration::from_millis(200))
+        .await;
+    assert!(filled, "producer-done must release the gate");
+    assert_eq!(start.elapsed(), std::time::Duration::from_millis(12));
+}
+
+#[tokio::test]
+async fn real_producer_releases_the_gate_through_the_notify() {
+    // End-to-end: a real local-file producer must wake the gate (no test doubles
+    // on the producer side). Real time, generous deadline; asserts filled=true
+    // and that the buffered count actually reached the threshold.
+    use std::sync::atomic::Ordering;
+    let temp_dir = TempDir::new().unwrap();
+    let wav = temp_dir.path().join("gate.wav");
+    generate_test_wav(&wav, 2.0);
+
+    let handles = tokio::task::spawn_blocking({
+        let path = wav.to_str().unwrap().to_string();
+        move || {
+            mqttaudio::audio::streamed_source::spawn_local_file_stream(
+                path,
+                48000,
+                ResamplerQuality::Fast,
+                48000, // 1s window
+                false,
+            )
+            .unwrap()
+        }
+    })
+    .await
+    .unwrap();
+
+    let filled = handles
+        .wait_prebuffer(4800, std::time::Duration::from_secs(5))
+        .await;
+    assert!(filled, "the real producer must fill a 100ms prebuffer");
+    assert!(handles.frames_buffered.load(Ordering::Acquire) >= 4800);
+    handles.stop_flag.store(true, Ordering::Release);
+}
+
+// =============================================================================
+// Invalidation abandons in-flight streaming loads (Sprint 12 F2, D52)
+// =============================================================================
+
+/// Serve `data` with correct Content-Length but stall after `initial` bytes until
+/// `release` is notified — keeps a streaming load reliably in flight while a test
+/// invalidates it.
+async fn start_stalling_server(
+    data: Vec<u8>,
+    initial: usize,
+) -> (
+    u16,
+    std::sync::Arc<tokio::sync::Notify>,
+    oneshot::Sender<()>,
+) {
+    use axum::routing::get;
+    use axum::Router;
+
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let serve_release = release.clone();
+    let app = Router::new().route(
+        "/file.wav",
+        get(move || {
+            let data = data.clone();
+            let release = serve_release.clone();
+            async move {
+                let head = axum::body::Bytes::copy_from_slice(&data[..initial]);
+                let tail = axum::body::Bytes::copy_from_slice(&data[initial..]);
+                let total = data.len();
+                let stream = futures::stream::unfold(
+                    (Some(head), Some(tail), release),
+                    |(head, tail, release)| async move {
+                        if let Some(h) = head {
+                            return Some((Ok::<_, std::io::Error>(h), (None, tail, release)));
+                        }
+                        if let Some(t) = tail {
+                            release.notified().await;
+                            return Some((Ok(t), (None, None, release)));
+                        }
+                        None
+                    },
+                );
+                axum::response::Response::builder()
+                    .header("content-length", total.to_string())
+                    .header("content-type", "audio/wav")
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap()
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    (port, release, shutdown_tx)
+}
+
+#[tokio::test]
+async fn invalidate_abandons_an_in_flight_streaming_load() {
+    // D52: `invalidate` (the cache_reload path) must abandon an in-flight
+    // streaming load of the same URL — its completion must NOT promote stale
+    // content into the freshly invalidated memory cache, and a new play must not
+    // join the abandoned stream.
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("stall.wav");
+    generate_test_wav(&wav_path, 0.5);
+    let data = std::fs::read(&wav_path).unwrap();
+
+    // Stall after 4KB: enough for the header + some audio, far from complete.
+    let (port, release, shutdown) = start_stalling_server(data, 4096).await;
+    let url = format!("http://127.0.0.1:{}/file.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
+    let stale = match &buffer {
+        SampleBuffer::Streaming(b) => Arc::clone(b),
+        SampleBuffer::Complete(_) => panic!("expected an in-flight streaming load"),
+    };
+    assert!(!buffer.is_complete(), "the stalled load must be in flight");
+
+    // Invalidate while the load is provably in flight.
+    cache_manager.invalidate(&url).unwrap();
+
+    // A play arriving after the invalidation must not join the abandoned stream.
+    let rejoined = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
+    match &rejoined {
+        SampleBuffer::Streaming(b) => assert!(
+            !Arc::ptr_eq(b, &stale),
+            "a post-invalidate play must not join the abandoned streaming load"
+        ),
+        SampleBuffer::Complete(_) => {
+            panic!("the second request stalls too; it cannot be complete here")
+        }
+    }
+
+    // Abandon the second load too, so the decisive assertion below can only be
+    // violated by an abandoned load's stale promotion.
+    drop(rejoined);
+    cache_manager.invalidate(&url).unwrap();
+
+    // Let the abandoned downloads finish, then run the promotion pass.
+    release.notify_waiters();
+    let mut attempts = 0;
+    while !buffer.is_complete() && attempts < 100 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        attempts += 1;
+    }
+    assert!(
+        buffer.is_complete(),
+        "the abandoned load should still finish"
+    );
+    cache_manager.cleanup_completed_loads();
+
+    assert!(
+        !cache_manager.is_in_memory_cache(&url),
+        "an abandoned streaming load must not promote stale content after invalidate"
+    );
+
+    let _ = shutdown.send(());
+}
+
+// =============================================================================
+// Progressive cold full-loads (Sprint 12 F1, D51)
+// =============================================================================
+
+#[tokio::test]
+async fn cold_local_full_load_returns_a_progressive_buffer_immediately() {
+    // D51: a cold local full-load returns SampleBuffer::Streaming at once and is
+    // playable while the decode fills it — first sound no longer waits for the
+    // whole file. The header is parsed synchronously, so channel count and the
+    // total-frames estimate are correct immediately (the crossfade-length warning
+    // and /status need them).
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("cold_local.wav");
+    generate_test_wav(&wav_path, 5.0);
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    let buffer = cache_manager
+        .get_or_load_streaming(wav_path.to_str().unwrap(), 48000)
+        .await
+        .unwrap();
+
+    match &buffer {
+        SampleBuffer::Streaming(_) => {}
+        SampleBuffer::Complete(_) => {
+            panic!("a cold local full-load must return a progressive buffer (D51)")
+        }
+    }
+    assert_eq!(
+        buffer.channels(),
+        2,
+        "channels known from the sync header parse"
+    );
+    assert!(
+        buffer.total_frames_or_estimate().is_some(),
+        "the total estimate must be available immediately"
+    );
+
+    // The decode finishes in the background and the content is intact.
+    let mut attempts = 0;
+    while !buffer.is_complete() && attempts < 200 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        attempts += 1;
+    }
+    assert!(buffer.is_complete(), "background decode must finish");
+    // 5s at 48k after 44.1k->48k resample.
+    let frames = buffer.frames();
+    assert!(
+        (frames as i64 - 240_000).unsigned_abs() < 4800,
+        "decoded length must match the file (~240k frames), got {frames}"
+    );
+}
+
+#[tokio::test]
+async fn stale_promotion_is_skipped_when_the_file_changed_during_the_load() {
+    // D51 generation guard: a load whose source file changed underneath it must
+    // not publish its (stale) content to the memory cache; the next play decodes
+    // the new content fresh.
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("regen.wav");
+    generate_test_wav(&wav_path, 1.0);
+    let path = wav_path.to_str().unwrap().to_string();
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    let buffer = cache_manager
+        .get_or_load_streaming(&path, 48000)
+        .await
+        .unwrap();
+    let mut attempts = 0;
+    while !buffer.is_complete() && attempts < 200 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        attempts += 1;
+    }
+    assert!(buffer.is_complete());
+
+    // The file changes (different length => different size) before the promotion
+    // pass runs: the load's generation no longer matches.
+    generate_test_wav(&wav_path, 2.0);
+    cache_manager.cleanup_completed_loads();
+    assert!(
+        !cache_manager.is_in_memory_cache(&path),
+        "a stale load must not be promoted after the file changed"
+    );
+
+    // A fresh play decodes the NEW content.
+    let fresh = cache_manager
+        .get_or_load_streaming(&path, 48000)
+        .await
+        .unwrap();
+    let mut attempts = 0;
+    while !fresh.is_complete() && attempts < 200 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        attempts += 1;
+    }
+    let frames = fresh.frames();
+    assert!(
+        (frames as i64 - 96_000).unsigned_abs() < 4800,
+        "the fresh load must carry the new 2s content (~96k frames), got {frames}"
+    );
+}
+
+#[tokio::test]
+async fn disk_cached_http_full_load_returns_a_progressive_buffer() {
+    // D51: a full-load of a disk-cached HTTP URL decodes the cached file
+    // progressively instead of blocking on the whole decode.
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("disk_hit.wav");
+    generate_test_wav(&wav_path, 2.0);
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/disk_hit.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    // Populate the disk cache (download + full decode).
+    {
+        let mut warm = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+        warm.get_or_load(&url, 48000).await.unwrap();
+    }
+
+    // A fresh manager over the same disk cache: memory-cold, disk-warm.
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
+    match &buffer {
+        SampleBuffer::Streaming(_) => {}
+        SampleBuffer::Complete(_) => {
+            panic!("a disk-cached HTTP full-load must return a progressive buffer (D51)")
+        }
+    }
+
+    let mut attempts = 0;
+    while !buffer.is_complete() && attempts < 200 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        attempts += 1;
+    }
+    assert!(buffer.is_complete());
+    assert!(buffer.frames() > 0);
+    assert_eq!(buffer.channels(), 2);
+
+    let _ = shutdown.send(());
+}
+
+// =============================================================================
+// Reused-request HTTP full load (Sprint 12 F5, D55)
+// =============================================================================
+
+#[tokio::test]
+async fn http_full_load_reuses_the_probe_request_and_persists() {
+    // D55: when the windowing probe decides full-load, the already-open response
+    // is decoded directly — ONE request total — and a cacheable download is teed
+    // to the disk cache so a replay needs no network at all.
+    use mqttaudio::cache::http_stream::{open_http_stream, PersistTarget};
+    use std::sync::atomic::Ordering;
+
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("small.wav");
+    generate_test_wav(&wav_path, 0.5);
+    let body = std::fs::read(&wav_path).unwrap();
+    let content_length = body.len() as u64;
+
+    let (port, count, shutdown) = start_counting_server(body).await;
+    let url = format!("http://127.0.0.1:{}/cue.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cm = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    // The probe open (the only GET).
+    let open = open_http_stream(&url).await.unwrap();
+    assert_eq!(open.content_length(), Some(content_length));
+    let content_type = open.content_type().map(|s| s.to_string());
+
+    // Persist tee, as the play path builds it for a cacheable source.
+    let (temp_path, final_path) = cm.windowed_persist_paths(&url);
+    let (done_tx, done_rx) = oneshot::channel::<u64>();
+    let reader = open.into_bounded_reader(Some(PersistTarget {
+        temp_path,
+        final_path,
+        done: done_tx,
+    }));
+
+    let estimated = Some((content_length / 4) as usize);
+    let buffer = cm.start_streaming_load_from_reader(&url, reader, 48000, estimated);
+    let mut attempts = 0;
+    while !buffer.is_complete() && attempts < 200 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+        attempts += 1;
+    }
+    assert!(
+        buffer.is_complete(),
+        "the reused-request decode must finish"
+    );
+    assert!(buffer.frames() > 0);
+    assert_eq!(buffer.channels(), 2);
+
+    // The completed load promotes to the memory cache like any streaming load.
+    cm.cleanup_completed_loads();
+    assert!(cm.is_in_memory_cache(&url), "completion must promote");
+
+    // The download finalized to disk; registering it makes the replay disk-warm.
+    let persisted = done_rx.await.expect("a cacheable download must finalize");
+    assert_eq!(persisted, content_length);
+    cm.record_streamed_download(&url, persisted, None, None, content_type)
+        .unwrap();
+    assert!(cm.is_cached(&url));
+
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "the full-load play must cost exactly one GET"
+    );
+    let _ = shutdown.send(());
 }

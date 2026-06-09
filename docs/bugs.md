@@ -28,11 +28,34 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   the entry (`http_stream::PersistTarget`/`PersistSink` → `CacheManager::record_streamed_download`), so a
   restart/replay hits disk with no extra GET (covered by
   `streaming_test::cacheable_windowed_play_persists_and_replay_hits_disk`). A live source (no `Content-Length`)
-  or `cacheable: false` is intentionally not persisted. *Still not persisted:* an HTTP play that takes the
-  **full-load** streaming path (`start_streaming_load`, used when the asset is small enough to full-load and is
-  not yet disk-cached) writes only to the memory cache, so a restart re-downloads it — the blocking precache
-  path and `cache_reload` cover the managed case, and this only affects small, ad-hoc, never-precached URLs, so
-  it is left as is.
+  or `cacheable: false` is intentionally not persisted. *Update (Sprint 12, D55):* a small uncached HTTP **play**
+  now full-loads over the probe's reused response and tees a cacheable download to disk
+  (`start_streaming_load_from_reader`), closing the main re-download case. The remaining unpersisted case is the
+  direct cache-API full-load streaming path (`start_streaming_load`, e.g. `precache` of an uncached URL in
+  non-blocking mode), which still writes only to the memory cache — narrow and managed, left as is.
+- **Cold local and disk-cached-HTTP full-loads block on a complete decode before any sound (Sprint 10
+  evaluation — RESOLVED in Sprint 12, D51).** All three cold full-load paths now return a progressive
+  `SampleBuffer::Streaming` immediately (`start_file_streaming_decode` in `src/cache/mod.rs`; the decoder is
+  constructed synchronously so channels and the total estimate are right from the start), with
+  stat-at-load-start freshness, a generation-guarded promotion, a `start_position` gate, and a
+  reaper-driven upgrade of the playing voice to the promoted Complete buffer (the `UpgradeSampleBuffer`
+  command) so seek/loop-crossfade/pitch regain full-decode semantics once the load finishes. Measured: a
+  cold 300 s WAV is playable in ~0.2 ms vs ~210 ms before (x86). See
+  `docs/sprints/sprint-12-first-start-latency.md` and the CHANGELOG.
+- **`invalidate`/`cache_reload` does not abandon in-flight streaming loads (Sprint 10 trace — RESOLVED in
+  Sprint 12, D52).** `invalidate` now removes the matching `active_loads` entry: completion no longer
+  promotes stale content and new plays no longer join the abandoned stream (the playing voice keeps its own
+  Arc and finishes normally). Discovered and fixed in the same pass: an **errored** streaming load used to
+  linger in `active_loads` forever, so replays of a failed URL silently joined the dead buffer —
+  `cleanup_completed_loads` now drops errored loads (without promotion) so replays retry fresh. The related
+  suspicion about the background `revalidate_stale_http` tick was **refuted** — it only touches URLs both
+  disk-cached and memory-resident, which an active load can never be.
+- **Streaming-buffer promotion copies the whole buffer (Sprint 10 observation — LOW, not scheduled).**
+  `cleanup_completed_loads` promotes via `guard.data().to_vec()` (`src/cache/mod.rs:483`), a transient 2×
+  memory spike bounded by `full_load_max_bytes` (≤ ~64 MiB total at the 32 MiB default). Acceptable today;
+  if it ever matters, promote by moving the storage out of the `StreamingBuffer` instead of copying. Sprint
+  12 touches this code — re-evaluate in passing, do not redesign for it.
+
 - **The seek/speed gate for streamed voices is voice-keyed and best-effort (redesign S1 — LOW).**
   `selector_targets_streamed_voice` (`src/main.rs`) warns when a Seek/Speed selector names a voice that has a
   streamed source. A selector that targets a streamed source by `file`/`id` only, or a voice that mixes
@@ -62,7 +85,10 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   `tests/http_api_test.rs::test_command_non_json_body_returns_400` locks the *actual* behavior (400 +
   plaintext). Making the body a `CommandResponse` would mean adding a custom `JsonRejection` handler (or a
   `WithRejection` wrapper) — a production change owned by the HTTP-handlers work, out of scope for the
-  additive test-gap group. Left as-is and surfaced here.
+  additive test-gap group. **RESOLVED in Sprint 14 F3 (D61, owner-approved):** `handle_command` now extracts
+  `Result<Json<Value>, JsonRejection>` and answers a non-JSON body with 400 + the `CommandResponse` JSON
+  shape; the unreachable internal branch is gone; `test_command_non_json_body_returns_400` locks the new
+  contract; `docs/webui/API-CONTRACT.md` updated.
 
 - **Deployment `Dockerfile` Rust version vs `usize::is_multiple_of` (stable 1.87) (Sprint 8 — RESOLVED).**
   `src/audio/streaming.rs` and `src/audio/input.rs` call `usize::is_multiple_of`, which clippy `-D warnings`
@@ -98,13 +124,12 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   If pitch-correction RT-safety must be guaranteed, verify with a C++-level allocation tool (or a real-device
   xrun soak) — pairs with the Sprint 6/9 pitch follow-ups.
 
-- **Ducking `apply_target` clones the voice string on the RT thread on first duck (pre-existing, Sprint 5 — LOW).**
-  `DuckingApplier::apply_target` does `duck_states.entry(change.voice.clone()).or_insert_with(..)`; the first
-  time a given voice is ducked, the `HashMap` insert allocates (the owned key + possible map growth) on the
-  audio thread. It is one small allocation per *newly-ducked* voice (not per buffer), pre-dates Sprint 6, and
-  the alloc gate's ducking tests warm the voice first so they stay green. Eliminate by pre-populating
-  `duck_states` for the configured ducked voices at applier construction (off-RT). Fold into the Sprint 9
-  cleanup or the D18 voice-pool follow-up.
+- **Ducking `apply_target` clones the voice string on the RT thread on first duck (Sprint 5 residual —
+  RESOLVED in Sprint 13 F1).** `DuckingApplier::with_ducked_voices` pre-populates the duck states from the
+  configured rules' `ducked_voices` at construction (off-RT); `apply_target` is now `get_mut`-only and never
+  inserts or allocates on the audio thread, even for the FIRST duck of a voice. The harness's
+  warm-the-voice crutch is gone: `alloc_harness::first_duck_of_a_never_seen_voice_is_allocation_free` arms
+  around the first duck itself.
 
 - **Resampler (rubato) sinc interpolation stays `Linear` (Sprint 6 R1 — LOW, optional, no decision).** The
   sample-rate-conversion resampler (`src/audio/resampler.rs`, used when a file's rate differs from the device
@@ -114,28 +139,32 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   negligible — the table is precomputed) would change decoded PCM for every resampled file with no test
   pinning the result, so it was left as-is. `Fast` is intentionally not transparent; revisit with Sprint 9
   cleanup if transparency matters. The D27 cubic work above is the *playback-speed* interpolator, a separate
-  code path.
+  code path. **CLOSED in Sprint 14 F1 as "stay Linear" (D59 overridden on measurement, per the Charter's
+  evidence rule):** a least-squares tone-residual probe at the daemon's actual presets (sinc_len ≥ 64,
+  oversampling ≥ 64, 15 kHz tone, 44.1k→48k) measured Linear and Cubic identical to ~0.015% of an already
+  ≈-60 dB residual — the floor is the sinc filter, not the table interpolation, so the switch would change
+  every rate-converted file's PCM for no measurable benefit and no pinnable test. The measured quality floor
+  is now pinned by `resampler::tests::fast_preset_off_tone_residual_stays_below_minus_50_dbfs`, so R1 stops
+  haunting this file either way.
 
-- **Voice pool is a soft reserve, not a hard cap (Sprint 5, D17/D18).** `active_samples`/`live_inputs` are now
-  pre-reserved to `MAX_VOICES` (256) / `MAX_LIVE_INPUTS` (16) at construction (`src/audio/mixer.rs`), so a Play
-  never reallocates the Vec on the RT thread in practice — well past the documented "20+ simultaneous" target.
-  But it is a *soft* reserve: exceeding the reservation makes `drain_commands`' `AddSample` push reallocate the
-  backing store once, on the audio thread. The locked D18 over-cap policy (steal the oldest non-looping voice,
-  else reject the new Play — both moving the displaced/rejected sample to the graveyard for off-RT drop) is not
-  yet implemented; it needs the graveyard producer threaded into `drain_commands`. Until then the alloc gate
-  proves the common case (`adding_a_sample_into_the_reserved_pool_is_free_free`) but not the >256 over-cap path.
+- **Voice pool is a soft reserve, not a hard cap (Sprint 5, D17/D18 — RESOLVED in Sprint 13 F2,
+  owner-approved 2026-06-09).** The D18 over-cap policy is implemented: the graveyard producer is threaded
+  into `drain_commands`, and `add_sample_with_cap` (`src/rt_engine.rs`) holds the pool at `MAX_VOICES` —
+  at the cap a new Play steals the OLDEST non-looping voice (lowest internal id, displaced to the graveyard
+  for off-RT drop) or, if every slot loops, the new play is rejected to the graveyard. Alloc-free past the
+  cap (`alloc_harness::over_cap_play_steals_alloc_free`); behavior locked by rt_engine unit tests and
+  `soak_test::soak_past_the_voice_cap_steals_and_stays_capped`. Behavior change changelogged.
 
-- **A Speed command that TOGGLES pitch correction still allocates/frees on the RT thread (Sprint 5/9).**
-  `SetSpeedMatching { pitch_correction }` is applied on the audio thread by `apply_mutation` ->
-  `ActiveSample::set_speed_with_mode`, which calls `enable_pitch_correction` (constructs a signalsmith
-  `Stretch`/`PitchCorrector`) or `disable_pitch_correction` (drops it). When the command flips the mode on a
-  *live* voice, that create/drop happens in the callback — a heap allocation and/or free on the RT thread.
-  The command-return ring (Sprint 5) keeps the *command husk's* heap off the RT thread, but not this
-  corrector lifecycle. The alloc gate (`tests/alloc_harness.rs::draining_mutation_commands_is_free_free`)
-  deliberately does **not** toggle pitch, so it stays green; this residual is real but out of scope here.
-  Eliminating it needs the control thread to pre-build the `PitchCorrector` and send it inside the command,
-  and to return the displaced corrector via a graveyard for off-RT drop (mirroring the sample graveyard) —
-  a separate, larger change. Pairs with the Sprint-6 pitch-correction work.
+- **A Speed command that TOGGLES pitch correction still allocates/frees on the RT thread (Sprint 5/9 —
+  RESOLVED in Sprint 13 F3, D56).** The daemon's Speed dispatcher now expands the selector control-side into
+  one `SetSpeedWithCorrector` per matching sample, each shipping a control-built `PitchBundle` (corrector +
+  pre-sized tail and scratch buffers, D58); the audio thread installs by move and, on disable, moves the
+  displaced corrector into the husk for off-RT drop (`ActiveSample::apply_shipped_speed`). Rust-side
+  alloc/free-freedom is proven by `alloc_harness::pitch_toggle_mid_play_is_rust_side_alloc_free`; the F10
+  no-gap pre-roll parity by `render_harness_test::shipped_corrector_enable_matches_the_no_gap_behavior`.
+  The selector-based `SetSpeedMatching` (which toggles on the applying thread) remains lib/test-only — the
+  binary never sends it. The C++ (signalsmith) side stays invisible to the Rust harness as documented below;
+  its construction now happens control-side, where allocation is fine.
 
 - **`xruns` counter surfaced on `/status` and `/metrics` (Sprint 5 residual, CLOSED in Sprint 9).** The
   lock-free RT engine creates an `xruns: Arc<AtomicU64>` in `main.rs`, passes it to the output supervisor,
@@ -156,15 +185,22 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   the control thread over a dedicated channel (the audio thread publishing per-voice positions), not by
   locking the callback state. Recorded as a deliberate behavior change, not a regression; changelog'd.
 
-- **`DiskCache` uses `DefaultHasher` for cache keys (Sprint 3).** `src/cache/disk.rs:~147` derives the
-  on-disk filename from `std::collections::hash_map::DefaultHasher`, which is not guaranteed stable across
-  releases/platforms. Sprint 3 should switch to a stable content hash (truncated SHA-256 / xxhash).
+- **`DiskCache` uses `DefaultHasher` for cache keys (Sprint 3 — RESOLVED, entry was stale).** Sprint 3
+  shipped the fix (its tracker box "stable content hash replaces `DefaultHasher`" is checked) but this entry
+  was never closed. Verified 2026-06-09: `src/cache/disk.rs:153-158` derives the filename from the first 12
+  hex chars of a SHA-256 of the URL, stable across Rust versions and platforms. No work remains.
 
 - **`CacheError` variant names (`IoError`/`JsonError`/`HttpError`) (Sprint 9).** clippy's
   `enum_variant_names` fires on the shared `Error` suffix. Renaming ripples through many match arms, so it
   is suppressed with a targeted `#[allow(clippy::enum_variant_names)]` for now (`src/cache/disk.rs`).
 
-- **Two file-level `#![allow(dead_code)]` "Phase 10" banners remain in the streaming decode path (Sprint 9 F2 — deferred, LOW).**
+- **Two file-level `#![allow(dead_code)]` "Phase 10" banners remain in the streaming decode path (Sprint 9
+  F2 — RESOLVED, entry was stale).** Verified 2026-06-09: no file-level `#![allow(dead_code)]` remains
+  anywhere in `src/`, and the per-item dispositions below shipped with Sprint 9's final gate (its tracker
+  box: "all three blanket banners removed; dead `bytes_available`/`Cancelled` deleted; test-only accessors
+  narrow-allowed" — `bytes_available`/`Cancelled` are gone from `src/cache/http_stream.rs`; the remaining
+  `#[allow(dead_code)]` annotations are the narrow, per-item, justified kind). The audit text below is kept
+  for the record of what was dispositioned. No work remains.
   Sprint 9 F2 removed the stale banner in `src/audio/chunked_resampler.rs` (the three now-genuinely-dead
   test-only accessors `buffered_frames`/`chunk_size`/`ratio` were narrowed to `#[cfg(test)]`). The same
   "Allow dead_code until Phase 10 …" banner still sits at `src/audio/streaming_decoder.rs:4-6` and
@@ -214,7 +250,9 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   different PCM for the same source (the `matches_full_decode` test tolerates the diff); it is not an
   audible glitch. Sprint 4's promotion (F2) means a streamed URL resolves to the one-shot path on replay,
   so the divergence only affects the first, still-streaming play. Left for Sprint 9 cleanup — do not
-  rewrite the resampler for this.
+  rewrite the resampler for this. *Scope note (Sprint 12, D51):* with all cold full-loads now progressive,
+  every cold play of a rate-converted file takes the chunked path and its promoted cache entry keeps that
+  PCM; the divergence remains tolerance-tested (`matches_full_decode`) and inaudible.
 
 - **Reverse-loop crossfade still replays the overlapped tail (Sprint 6 F6, out of scope).** The F6
   overlap-on-wrap fix is forward-only, matching the sprint's F6 statement and its forward transient-loop
@@ -234,7 +272,9 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   calibration. It is undocumented and appears to be a vestigial parallel to `channel_aliases`. Discovered while
   auditing the docs against the code for the web control app. Cleanup (remove the field, or wire it to
   something real and document it) is a future task; left untouched here to avoid an unscoped serde/behavior
-  change.
+  change. **RESOLVED in Sprint 14 F2 (D60, owner-approved):** the field, its default, and its assertions are
+  removed; configs still carrying the key keep parsing (no struct opts into `deny_unknown_fields`), locked by
+  `config::tests::removed_channel_names_key_still_parses`.
 
 - **`/ws` never streams log lines — `WebSocketLogLayer` is not installed in the tracing subscriber (Sprint W1,
   daemon gap, MEDIUM).** `start_server` creates a `LogBroadcaster` (`src/http/mod.rs:123`) and `handle_socket`
@@ -249,13 +289,15 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   `LogBroadcaster` in `main.rs` before logging init, add `WebSocketLogLayer::new(broadcaster)` to the subscriber
   registry, and pass the same broadcaster into `start_server`. `docs/http-api.md` documents `/ws` log streaming
   as if it works, so it should be corrected or the layer wired. Discovered during Sprint W1 Lane B.
+  **RESOLVED in Sprint 14 F4 (D62, owner-approved):** `main` now creates the `LogBroadcaster` before logging
+  init, installs `WebSocketLogLayer` in the registry alongside the fmt/MQTT layers, and passes the same
+  broadcaster into `start_server` — `/ws` clients stream real `{type:"log"}` frames
+  (`websocket_test::ws_streams_live_tracing_log_lines_through_the_layer`); `docs/http-api.md` is now true.
 
-- **No per-sample `windowed` flag on `/status/samples` (Sprint W5 F3, daemon gap, LOW).** The transport UI must
-  gate seek/speed/reverse for windowed/streamed (forward-only) voices, but `/status/samples` carries no
-  is-windowed flag. The web app INFERS windowed from `total_frames === 0` (streamed plays construct their status
-  with `total_frames: 0`, `main.rs:1294`), in `webui/src/features/mixer/windowed.ts`. This is a heuristic; a
-  full-load sample with an unknown length could in principle also report 0. Sprint W6 F4 closes this by adding a
-  real `windowed` field to `SampleStatus`/`/status/samples`, at which point the web helper switches to the flag.
+- **No per-sample `windowed` flag on `/status/samples` (Sprint W5 F3 — RESOLVED, entry was stale).**
+  Sprint W6 F4 shipped the real flag: verified 2026-06-09, `/status/samples` emits `"windowed": s.windowed`
+  (`src/http/handlers.rs:749`). The web app's `total_frames === 0` inference was the interim heuristic. No
+  work remains.
 
 - **Sprint W7 telemetry — implemented scope vs deferred (LOW).** Sprint W7 shipped **output peak meters** (a
   per-output-channel atomic published from the limiter pass, alloc-free, gated) and the **`/ws/state` tick

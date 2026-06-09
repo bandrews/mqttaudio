@@ -4,6 +4,8 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Stream, SupportedStreamConfig};
 use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 /// List available audio input devices
 pub fn list_input_devices() {
@@ -142,6 +144,8 @@ pub struct ActiveInput {
     stream: Stream,
     consumer: Option<HeapConsumer<f32>>,
     pub channels: usize,
+    /// Capture-path counters (D57), drained/logged off-RT and surfaced on /metrics.
+    pub telemetry: Arc<InputTelemetry>,
 }
 
 impl ActiveInput {
@@ -195,7 +199,7 @@ pub fn create_input_stream(
     // clocked devices stay drift-bounded, even at equal nominal rates (D33). The
     // device sample format is handled orthogonally: a typed callback converts the
     // native format to f32 before the resampler sees it (D37).
-    let stream = build_resampling_input_stream(
+    let (stream, telemetry) = build_resampling_input_stream(
         &device,
         supported_config,
         sample_format,
@@ -213,6 +217,7 @@ pub fn create_input_stream(
         stream,
         consumer: Some(consumer),
         channels,
+        telemetry,
     })
 }
 
@@ -284,6 +289,24 @@ const STEER_FILL_SMOOTHING: f64 = 0.05;
 /// buffer, steering the resample ratio from the measured ring fill so two
 /// independently-clocked devices stay drift-bounded (D33). All working storage is
 /// pre-allocated so [`resample_block`] does no heap work on the RT capture thread.
+/// Capture-path telemetry counters (D57). The capture callback only does relaxed
+/// `fetch_add`s here — never `tracing`, whose cost depends on the installed
+/// subscriber — and the control thread drains/logs deltas off-RT and surfaces
+/// totals on `/metrics`.
+#[derive(Default)]
+pub struct InputTelemetry {
+    /// Resampler `process_into_buffer` failures (the chunk was dropped).
+    pub resample_errors: std::sync::atomic::AtomicU64,
+    /// Interleaved samples dropped because the ring was full (overflow).
+    pub overflow_dropped_samples: std::sync::atomic::AtomicU64,
+    /// `set_resample_ratio` rejections from the drift-control loop.
+    pub ratio_rejects: std::sync::atomic::AtomicU64,
+    /// Capture blocks larger than the pre-sized conversion scratch (D58): each
+    /// one cost a reallocation on the capture thread. Persistently non-zero means
+    /// the device delivers blocks beyond its advertised maximum.
+    pub scratch_regrows: std::sync::atomic::AtomicU64,
+}
+
 pub struct ResampleState {
     resampler: rubato::SincFixedIn<f32>,
     channels: usize,
@@ -302,9 +325,17 @@ pub struct ResampleState {
     /// Most recent ratio commanded by the drift-control loop (== nominal until
     /// the first steer). Exposed for tests/observability via [`ResampleState::current_ratio`].
     last_ratio: f64,
+    /// Capture-path counters (D57), shared with the control thread.
+    telemetry: Arc<InputTelemetry>,
 }
 
 impl ResampleState {
+    /// The capture-path telemetry counters this state increments (D57). The
+    /// builder hands the clone to the control thread for draining and `/metrics`.
+    pub fn telemetry(&self) -> Arc<InputTelemetry> {
+        Arc::clone(&self.telemetry)
+    }
+
     /// Build a resampler+accumulators sized for `channels` and the given nominal
     /// `output_rate / input_rate` ratio, feeding a ring of `ring_capacity`
     /// interleaved samples. All buffers are allocated here, off the RT thread.
@@ -353,6 +384,7 @@ impl ResampleState {
             ring_capacity,
             smoothed_fill: -1.0,
             last_ratio: nominal_ratio,
+            telemetry: Arc::new(InputTelemetry::default()),
         })
     }
 
@@ -420,8 +452,13 @@ pub fn resample_block(state: &mut ResampleState, data: &[f32], producer: &mut He
                 .process_into_buffer(&state.deinterleave, &mut state.output, None)
             {
                 Ok(counts) => counts,
-                Err(e) => {
-                    tracing::error!("Resampling error: {:?}", e);
+                Err(_) => {
+                    // A relaxed counter, never tracing, on the capture thread
+                    // (D57); the control thread logs the delta off-RT.
+                    state
+                        .telemetry
+                        .resample_errors
+                        .fetch_add(1, Ordering::Relaxed);
                     state.filled = 0;
                     continue;
                 }
@@ -438,7 +475,10 @@ pub fn resample_block(state: &mut ResampleState, data: &[f32], producer: &mut He
             }
         }
         if dropped > 0 {
-            tracing::debug!("Resampler output overflow: {} samples dropped", dropped);
+            state
+                .telemetry
+                .overflow_dropped_samples
+                .fetch_add(dropped as u64, Ordering::Relaxed);
         }
     }
 }
@@ -476,7 +516,12 @@ fn steer_ratio(state: &mut ResampleState, producer: &HeapProducer<f32>) {
     // Ramp so the change is spread across the chunk (no per-chunk step in pitch).
     match state.resampler.set_resample_ratio(new_ratio, true) {
         Ok(()) => state.last_ratio = new_ratio,
-        Err(e) => tracing::debug!("set_resample_ratio rejected {}: {:?}", new_ratio, e),
+        Err(_) => {
+            state
+                .telemetry
+                .ratio_rejects
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -492,7 +537,7 @@ fn build_resampling_input_stream(
     input_rate: u32,
     output_rate: u32,
     channels: usize,
-) -> Result<Stream, InputError> {
+) -> Result<(Stream, Arc<InputTelemetry>), InputError> {
     match input_stream_builder(sample_format) {
         Some(InputSampleHandling::F32) => build_typed_resampling_input_stream::<f32>(
             device,
@@ -544,19 +589,38 @@ fn build_typed_resampling_input_stream<T>(
     input_rate: u32,
     output_rate: u32,
     channels: usize,
-) -> Result<Stream, InputError>
+) -> Result<(Stream, Arc<InputTelemetry>), InputError>
 where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
 {
     let ring_capacity = producer.capacity();
     let mut state = ResampleState::new(input_rate, output_rate, channels, ring_capacity)?;
-    let mut scratch: Vec<f32> = Vec::new();
+    let telemetry = state.telemetry();
+    let callback_telemetry = Arc::clone(&telemetry);
+
+    // Pre-size the conversion scratch to the largest block the device says it can
+    // deliver (D58), clamped to a sane cap; `Unknown` gets the cap. The resize in
+    // `convert_input_block` then never reallocates for in-range blocks, and an
+    // out-of-range block is counted instead of silently reallocating.
+    const MAX_PRESIZE_FRAMES: usize = 8192;
+    let max_block_frames = match config.buffer_size() {
+        cpal::SupportedBufferSize::Range { max, .. } => (*max as usize).min(MAX_PRESIZE_FRAMES),
+        cpal::SupportedBufferSize::Unknown => MAX_PRESIZE_FRAMES,
+    };
+    let mut scratch: Vec<f32> = Vec::with_capacity(max_block_frames.max(1) * channels);
 
     let stream = device
         .build_input_stream(
             &config.into(),
             move |data: &[T], _: &cpal::InputCallbackInfo| {
+                if data.len() > scratch.capacity() {
+                    // Pathological device: a block beyond the advertised maximum
+                    // is about to regrow the scratch on the capture thread (D58).
+                    callback_telemetry
+                        .scratch_regrows
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 convert_input_block::<T>(data, &mut scratch, |f32s| {
                     resample_block(&mut state, f32s, &mut producer);
                 });
@@ -568,7 +632,7 @@ where
         )
         .map_err(|e| InputError::StreamError(e.to_string()))?;
 
-    Ok(stream)
+    Ok((stream, telemetry))
 }
 
 /// Error types for input operations

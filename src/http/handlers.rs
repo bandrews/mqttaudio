@@ -126,6 +126,35 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
         .map(|(voice, multiplier)| (voice.clone(), json!(multiplier)))
         .collect();
 
+    // First-start play latency (Sprint 11, D50): enqueue-to-first-mix, published
+    // by the audio thread and folded by the reaper. Zeros until a play is measured.
+    let latency_last = state.latency.last_ns.load(Ordering::Relaxed);
+    let latency_max = state.latency.max_ns.load(Ordering::Relaxed);
+    let plays_measured = state.latency.plays_measured.load(Ordering::Relaxed);
+
+    // Per-input capture-path counters (Sprint 13, D57): real relaxed-atomic
+    // totals bumped by the capture callback, never placeholders.
+    let input_capture: serde_json::Map<String, Value> = state
+        .input_telemetry
+        .iter()
+        .map(|(voice, t)| {
+            (
+                voice.clone(),
+                json!({
+                    "resample_errors": t.resample_errors.load(Ordering::Relaxed),
+                    "overflow_dropped_samples":
+                        t.overflow_dropped_samples.load(Ordering::Relaxed),
+                    "ratio_rejects": t.ratio_rejects.load(Ordering::Relaxed),
+                    "scratch_regrows": t.scratch_regrows.load(Ordering::Relaxed),
+                }),
+            )
+        })
+        .collect();
+
+    // Pitch-scratch regrows on the audio thread (Sprint 13, D58): zero unless a
+    // device delivers blocks beyond the pre-size.
+    let pitch_scratch_regrows = crate::audio::mixer::PITCH_SCRATCH_REGROWS.load(Ordering::Relaxed);
+
     Json(json!({
         "uptime_seconds": uptime_seconds,
         "clips": clips,
@@ -142,6 +171,15 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
             "disk_bytes": cache_disk_bytes,
         },
         "ducking": ducking,
+        "latency": {
+            "play_to_first_mix_ns": {
+                "last": latency_last,
+                "max": latency_max,
+            },
+            "plays_measured": plays_measured,
+        },
+        "input_capture": input_capture,
+        "pitch_scratch_regrows": pitch_scratch_regrows,
     }))
 }
 
@@ -150,20 +188,29 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
 // =============================================================================
 
 /// Handle any command by accepting raw JSON.
-/// Accepts the same JSON format as MQTT messages.
+/// Accepts the same JSON format as MQTT messages. A body the `Json` extractor
+/// rejects (not JSON at all) is answered with 400 and the daemon's own
+/// `CommandResponse` shape (D61), so every `/command` error parses the same way
+/// for clients — never axum's plaintext rejection.
 pub async fn handle_command(
     State(state): State<AppState>,
-    Json(body): Json<Value>,
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
-    let command_json = match serde_json::to_string(&body) {
+    let Json(body) = match body {
         Ok(json) => json,
-        Err(e) => {
+        Err(rejection) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(CommandResponse::error(&format!("Invalid JSON: {}", e))),
+                Json(CommandResponse::error(&format!(
+                    "Invalid JSON: {}",
+                    rejection.body_text()
+                ))),
             );
         }
     };
+
+    // An already-parsed `Value` always re-serializes.
+    let command_json = body.to_string();
 
     match send_command(&state, &command_json).await {
         Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),

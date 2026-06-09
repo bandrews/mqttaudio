@@ -127,3 +127,5 @@ config (`soak.json`) with **debug logging on** so the ring-overflow diagnostic i
 ---
 
 _Additional checks are appended by sprints as they land. Keep IDs stable (W-3, W-4, …)._
+
+- **Sprint 13 note:** the existing real-device listening soak now also covers the pitch-toggle path (enable/disable pitch correction on a live voice mid-play while listening for dropouts/clicks) and a scripted burst of >256 plays (`xruns` must stay 0; the oldest non-looping sounds cut out by design).

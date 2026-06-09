@@ -63,6 +63,11 @@ pub enum AudioCommand {
         position_ms: u64,
     },
     /// Set the playback speed (and pitch-correction mode) for matching samples.
+    /// The daemon dispatches per-sample [`AudioCommand::SetSpeedWithCorrector`]
+    /// instead (D56 — this selector form toggles the corrector on the applying
+    /// thread); it remains for the lib's tests and API, so it is dead in the bin
+    /// target.
+    #[allow(dead_code)]
     SetSpeedMatching {
         selector: SampleSelector,
         speed: f32,
@@ -72,6 +77,31 @@ pub enum AudioCommand {
     SetVolumeMatching {
         selector: SampleSelector,
         volume: f32,
+    },
+    /// Set speed + pitch mode for ONE sample (selected by internal id), with the
+    /// pitch corrector — when enabling — pre-built control-side and shipped in
+    /// `bundle` (D56). The daemon's Speed dispatcher expands a selector into one
+    /// of these per matching sample. On disable, the sample's corrector is moved
+    /// into `displaced`; bundle and displaced both ride the spent husk back to
+    /// the reaper for off-RT drop, so the callback never constructs or frees a
+    /// corrector. The selector-based [`AudioCommand::SetSpeedMatching`] remains
+    /// for lib/test use (it toggles the corrector on the calling thread).
+    SetSpeedWithCorrector {
+        id: u64,
+        speed: f32,
+        pitch_correction: bool,
+        bundle: Option<Box<crate::audio::mixer::PitchBundle>>,
+        displaced: Option<crate::audio::pitch_correction::PitchCorrector>,
+    },
+    /// Swap the buffer of the sample with internal id `id` for the Complete
+    /// version promoted from its finished progressive load (D51), restoring the
+    /// full random-access feature set (pitch correction needs slice access) to a
+    /// cold-played voice. The PCM is identical, so the playback position carries
+    /// over exactly. The displaced streaming buffer rides back in the spent husk
+    /// for off-RT drop.
+    UpgradeSampleBuffer {
+        id: u64,
+        buffer: crate::audio::streaming::SampleBuffer,
     },
 }
 
@@ -120,6 +150,22 @@ pub fn apply_command(state: &mut MixerState, cmd: AudioCommand, output_sample_ra
         AudioCommand::AddStreamedSource(source) => {
             state.streamed_sources.push(source);
         }
+        AudioCommand::SetSpeedWithCorrector {
+            id,
+            speed,
+            pitch_correction,
+            mut bundle,
+            mut displaced,
+        } => {
+            if let Some(sample) = state.active_samples.iter_mut().find(|s| s.id == id) {
+                sample.apply_shipped_speed(speed, pitch_correction, &mut bundle, &mut displaced);
+            }
+        }
+        AudioCommand::UpgradeSampleBuffer { id, buffer } => {
+            if let Some(sample) = state.active_samples.iter_mut().find(|s| s.id == id) {
+                sample.buffer = buffer;
+            }
+        }
         other => apply_mutation(state, &other, output_sample_rate),
     }
 }
@@ -142,7 +188,9 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
         // Handled by move in `drain_commands`/`apply_command`, never by reference.
         AudioCommand::AddSample(_)
         | AudioCommand::AddLiveInput(_)
-        | AudioCommand::AddStreamedSource(_) => {}
+        | AudioCommand::AddStreamedSource(_)
+        | AudioCommand::SetSpeedWithCorrector { .. }
+        | AudioCommand::UpgradeSampleBuffer { .. } => {}
         AudioCommand::SetDuckTarget(change) => {
             if let Some(ref mut applier) = state.ducking_applier {
                 applier.apply_target(change);
@@ -261,6 +309,7 @@ pub fn drain_commands(
     consumer: &mut CommandConsumer,
     state: &mut MixerState,
     returns: &mut CommandReturnProducer,
+    graveyard: &mut GraveyardProducer,
     output_sample_rate: u32,
     max: usize,
 ) -> usize {
@@ -268,13 +317,46 @@ pub fn drain_commands(
     while applied < max {
         match consumer.pop() {
             Some(AudioCommand::AddSample(sample)) => {
-                state.active_samples.push(sample);
+                add_sample_with_cap(state, sample, graveyard);
             }
             Some(AudioCommand::AddLiveInput(input)) => {
                 state.live_inputs.push(input);
             }
             Some(AudioCommand::AddStreamedSource(source)) => {
                 state.streamed_sources.push(source);
+            }
+            Some(AudioCommand::SetSpeedWithCorrector {
+                id,
+                speed,
+                pitch_correction,
+                mut bundle,
+                mut displaced,
+            }) => {
+                if let Some(sample) = state.active_samples.iter_mut().find(|s| s.id == id) {
+                    sample.apply_shipped_speed(
+                        speed,
+                        pitch_correction,
+                        &mut bundle,
+                        &mut displaced,
+                    );
+                }
+                // The husk carries the unused bundle and/or displaced corrector
+                // out for off-RT drop.
+                let _ = returns.push(AudioCommand::SetSpeedWithCorrector {
+                    id,
+                    speed,
+                    pitch_correction,
+                    bundle,
+                    displaced,
+                });
+            }
+            Some(AudioCommand::UpgradeSampleBuffer { id, mut buffer }) => {
+                // Swap in place (no alloc/free); a missing id means the sample
+                // finished first — the unused buffer still rides the husk out.
+                if let Some(sample) = state.active_samples.iter_mut().find(|s| s.id == id) {
+                    std::mem::swap(&mut sample.buffer, &mut buffer);
+                }
+                let _ = returns.push(AudioCommand::UpgradeSampleBuffer { id, buffer });
             }
             Some(cmd) => {
                 apply_mutation(state, &cmd, output_sample_rate);
@@ -286,6 +368,42 @@ pub fn drain_commands(
         applied += 1;
     }
     applied
+}
+
+/// Admit a new sample under the hard voice cap (D18). Below `MAX_VOICES` it is a
+/// plain push into the pre-reserved Vec (no realloc). At the cap, the OLDEST
+/// non-looping voice (lowest internal id) is stolen — moved to the graveyard for
+/// off-RT drop — to admit the new play; if every slot is looping, the NEW sample
+/// is rejected to the graveyard instead. Either way the backing store never
+/// regrows on the audio thread. If the graveyard ring is momentarily full the
+/// displaced sample is dropped in place as a fallback (rare; the ring is sized
+/// generously) — mirroring the spent-husk fallback.
+fn add_sample_with_cap(
+    state: &mut MixerState,
+    sample: ActiveSample,
+    graveyard: &mut GraveyardProducer,
+) {
+    if state.active_samples.len() < crate::audio::mixer::MAX_VOICES {
+        state.active_samples.push(sample);
+        return;
+    }
+    let steal = state
+        .active_samples
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.loop_mode)
+        .min_by_key(|(_, s)| s.id)
+        .map(|(idx, _)| idx);
+    match steal {
+        Some(idx) => {
+            let displaced = state.active_samples.swap_remove(idx);
+            let _ = graveyard.push(displaced);
+            state.active_samples.push(sample);
+        }
+        None => {
+            let _ = graveyard.push(sample);
+        }
+    }
 }
 
 /// Producer half of the audio->reaper return ring ("graveyard"), held by the audio thread.
@@ -464,6 +582,98 @@ mod tests {
         )
     }
 
+    fn looping_sample(id: u64, voice: &str, file: &str) -> ActiveSample {
+        let buf = Arc::new(DecodedBuffer::new(vec![0.1f32; 200], 2, 48000)); // 100 frames
+        ActiveSample::new_with_id(
+            id,
+            voice.to_string(),
+            buf,
+            1.0,
+            1.0,
+            file.to_string(),
+            None,
+            true,
+            0,
+        )
+    }
+
+    #[test]
+    fn over_cap_play_steals_the_oldest_non_looping_voice() {
+        // D18: at the MAX_VOICES hard cap, a new play steals the OLDEST
+        // non-looping voice (lowest internal id), which leaves via the graveyard
+        // for off-RT drop; the pool never grows.
+        use crate::audio::mixer::MAX_VOICES;
+        let mut samples = Vec::with_capacity(MAX_VOICES);
+        samples.push(looping_sample(0, "bed", "bed.wav")); // oldest, but looping
+        for id in 1..MAX_VOICES as u64 {
+            samples.push(sample(id, "v", None, "s.wav"));
+        }
+        let mut state = state_with(samples);
+
+        let (mut tx, mut rx) = command_channel(8);
+        tx.push(AudioCommand::AddSample(sample(
+            9999, "new", None, "new.wav",
+        )))
+        .ok()
+        .expect("push add");
+        let (mut returns, _ret_rx) = command_return_channel(8);
+        let (mut grave, mut grave_rx) = graveyard_channel(16);
+        drain_commands(&mut rx, &mut state, &mut returns, &mut grave, 48000, 16);
+
+        assert_eq!(
+            state.active_samples.len(),
+            MAX_VOICES,
+            "the pool stays capped"
+        );
+        assert!(
+            state.active_samples.iter().any(|s| s.id == 9999),
+            "the new play is admitted"
+        );
+        assert!(
+            !state.active_samples.iter().any(|s| s.id == 1),
+            "the oldest non-looping voice (id 1) is stolen"
+        );
+        assert!(
+            state.active_samples.iter().any(|s| s.id == 0),
+            "the older LOOPING voice is never stolen"
+        );
+        let displaced = grave_rx
+            .pop()
+            .expect("the displaced sample reaches the graveyard");
+        assert_eq!(displaced.id, 1);
+    }
+
+    #[test]
+    fn over_cap_play_is_rejected_when_every_voice_loops() {
+        // D18: with every slot looping there is nothing to steal; the NEW play is
+        // rejected to the graveyard and the pool is untouched.
+        use crate::audio::mixer::MAX_VOICES;
+        let samples: Vec<ActiveSample> = (0..MAX_VOICES as u64)
+            .map(|id| looping_sample(id, "bed", "bed.wav"))
+            .collect();
+        let mut state = state_with(samples);
+
+        let (mut tx, mut rx) = command_channel(8);
+        tx.push(AudioCommand::AddSample(sample(
+            9999, "new", None, "new.wav",
+        )))
+        .ok()
+        .expect("push add");
+        let (mut returns, _ret_rx) = command_return_channel(8);
+        let (mut grave, mut grave_rx) = graveyard_channel(16);
+        drain_commands(&mut rx, &mut state, &mut returns, &mut grave, 48000, 16);
+
+        assert_eq!(state.active_samples.len(), MAX_VOICES);
+        assert!(
+            !state.active_samples.iter().any(|s| s.id == 9999),
+            "the new play is rejected"
+        );
+        let rejected = grave_rx
+            .pop()
+            .expect("the rejected sample reaches the graveyard");
+        assert_eq!(rejected.id, 9999);
+    }
+
     fn state_with(samples: Vec<ActiveSample>) -> MixerState {
         let mut state = MixerState::new(2);
         state.active_samples = samples;
@@ -498,7 +708,7 @@ mod tests {
     #[test]
     fn set_duck_target_ducks_the_voice() {
         let mut state = state_with(vec![]);
-        state.ducking_applier = Some(DuckingApplier::new());
+        state.ducking_applier = Some(DuckingApplier::with_ducked_voices(["music"]));
 
         apply_command(
             &mut state,
@@ -776,7 +986,8 @@ mod tests {
 
         let mut state = state_with(vec![]);
         let (mut returns, _ret_rx) = command_return_channel(8);
-        let applied = drain_commands(&mut rx, &mut state, &mut returns, 48000, 16);
+        let (mut grave, _grave_rx) = graveyard_channel(16);
+        let applied = drain_commands(&mut rx, &mut state, &mut returns, &mut grave, 48000, 16);
         assert_eq!(applied, 2);
         assert_eq!(state.active_samples.len(), 1);
         assert!(is_fading_out(&state.active_samples[0]));
@@ -800,7 +1011,8 @@ mod tests {
 
         let mut state = state_with(vec![]);
         let (mut returns, mut ret_rx) = command_return_channel(8);
-        let applied = drain_commands(&mut rx, &mut state, &mut returns, 48000, 16);
+        let (mut grave, _grave_rx) = graveyard_channel(16);
+        let applied = drain_commands(&mut rx, &mut state, &mut returns, &mut grave, 48000, 16);
 
         assert_eq!(applied, 2);
         // The AddSample was moved into the mixer and its fade applied.
@@ -877,13 +1089,14 @@ mod tests {
         }
         let mut state = state_with(vec![]);
         let (mut returns, _ret_rx) = command_return_channel(8);
+        let (mut grave, _grave_rx) = graveyard_channel(16);
         // Only two drained this pass; the rest remain queued for the next callback.
         assert_eq!(
-            drain_commands(&mut rx, &mut state, &mut returns, 48000, 2),
+            drain_commands(&mut rx, &mut state, &mut returns, &mut grave, 48000, 2),
             2
         );
         assert_eq!(
-            drain_commands(&mut rx, &mut state, &mut returns, 48000, 16),
+            drain_commands(&mut rx, &mut state, &mut returns, &mut grave, 48000, 16),
             3
         );
     }
@@ -940,7 +1153,8 @@ mod tests {
         .expect("push add streamed");
         let mut state = state_with(vec![]);
         let (mut returns, mut ret_rx) = command_return_channel(8);
-        let applied = drain_commands(&mut rx, &mut state, &mut returns, 48000, 16);
+        let (mut grave, _grave_rx) = graveyard_channel(16);
+        let applied = drain_commands(&mut rx, &mut state, &mut returns, &mut grave, 48000, 16);
         assert_eq!(applied, 1);
         assert_eq!(state.streamed_sources.len(), 1);
         // A move-in command leaves nothing on the return ring (no heap to drop off-RT).

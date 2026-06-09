@@ -255,4 +255,61 @@ mod tests {
             );
         }
     }
+
+    /// Pins the rate-conversion quality floor that closed R1 (D59, Sprint 14):
+    /// at the Fast preset, a 15 kHz tone resampled 44.1k→48k keeps its
+    /// off-tone residual below -50 dBFS. Measured 2026-06-09: Linear and Cubic
+    /// sinc interpolation are identical to ~0.015% at our oversampling factors
+    /// (≥64) — the floor is the sinc filter itself — so the interpolation type
+    /// stays `Linear` and THIS bound is the property worth guarding.
+    #[test]
+    fn fast_preset_off_tone_residual_stays_below_minus_50_dbfs() {
+        let sr_in = 44100u32;
+        let sr_out = 48000u32;
+        let f0 = 15_000.0f64;
+        let amp = 0.5f32;
+        let frames = 44_100usize;
+        let input: Vec<f32> = (0..frames)
+            .map(|i| {
+                ((i as f64 / sr_in as f64 * f0 * std::f64::consts::TAU).sin() * amp as f64) as f32
+            })
+            .collect();
+
+        let output = resample(input, sr_in, sr_out, 1, ResamplerQuality::Fast).unwrap();
+        // Steady-state window (skip the filter's edge transients).
+        let take = 32_768.min(output.len().saturating_sub(2_000));
+        let mid = &output[output.len() - take..];
+
+        // Least-squares fit of the tone at f0; what remains is resampler error.
+        let n = mid.len();
+        let (mut cs, mut sn) = (0.0f64, 0.0f64);
+        for (i, &x) in mid.iter().enumerate() {
+            let ph = i as f64 / sr_out as f64 * f0 * std::f64::consts::TAU;
+            cs += x as f64 * ph.cos();
+            sn += x as f64 * ph.sin();
+        }
+        let a = 2.0 * cs / n as f64;
+        let b = 2.0 * sn / n as f64;
+        let tone_amp = (a * a + b * b).sqrt();
+        assert!(
+            (tone_amp - amp as f64).abs() < 0.01,
+            "the tone must survive resampling at full level, got {tone_amp}"
+        );
+
+        let mut resid_sq = 0.0f64;
+        for (i, &x) in mid.iter().enumerate() {
+            let ph = i as f64 / sr_out as f64 * f0 * std::f64::consts::TAU;
+            let fit = a * ph.cos() + b * ph.sin();
+            let r = x as f64 - fit;
+            resid_sq += r * r;
+        }
+        let residual_rms = (resid_sq / n as f64).sqrt();
+        // Measured ~9.3e-4 (≈ -60.6 dB re the 0.5 tone); bound at -50 dBFS
+        // (3.16e-3) leaves honest headroom without letting a regression slip.
+        assert!(
+            residual_rms < 3.16e-3,
+            "Fast-preset resample residual regressed: {residual_rms} (≈{:.1} dBFS)",
+            20.0 * (residual_rms / 1.0).log10()
+        );
+    }
 }

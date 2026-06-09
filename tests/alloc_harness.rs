@@ -160,6 +160,152 @@ fn telemetry_position_publish_is_allocation_free() {
 }
 
 #[test]
+fn first_mix_latency_publish_is_allocation_free() {
+    // Sprint 11 (D50): a sample carrying a latency probe stores its first-mix
+    // latency (nanos since enqueue) into a pre-allocated atomic exactly once, on
+    // the first block in which it mixes loaded audio. Both the publishing block
+    // and the already-published fast path on later blocks must be 0 alloc / 0 free.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let plain = ActiveSample::new(
+        1,
+        "a".to_string(),
+        decoded(sine(440.0, SR, SR as usize, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "a".to_string(),
+    );
+    let mut state = SceneBuilder::new(2).sample(plain).build();
+
+    let mut block = vec![0.0f32; BLOCK * 2];
+    mix_audio(&mut block, &mut state); // warm up off the armed region (no probe yet)
+
+    // Attach the probe off-RT, as the control thread does before enqueueing; the
+    // first armed mix is the publishing one.
+    let probe = Arc::new(AtomicU64::new(0));
+    state.active_samples[0].set_latency_probe(std::time::Instant::now(), probe.clone());
+
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..8 {
+            mix_audio(&mut block, &mut state);
+        }
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "first-mix latency publish allocated {allocs} times"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "first-mix latency publish freed {deallocs} times"
+    );
+    assert!(
+        probe.load(Ordering::Relaxed) > 0,
+        "the first-mix latency should have been published"
+    );
+}
+
+#[test]
+fn streamed_first_mix_latency_publish_is_allocation_free() {
+    // Sprint 11 (D50): the windowed StreamedSource publishes its first-mix latency
+    // on the first block in which it pops real frames from the ring; the publish
+    // and the published fast path must be 0 alloc / 0 free on the RT thread.
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let mut mixer = SceneBuilder::new(2).build();
+    let (mut producer, consumer) = create_ring_buffer(BLOCK * 2 * 16);
+    let seed = vec![0.3f32; BLOCK * 2 * 12];
+    producer.push_slice(&seed);
+    let mut source = StreamedSource::new(
+        1,
+        "bed".to_string(),
+        "stream.wav".to_string(),
+        None,
+        consumer,
+        2,
+        1.0,
+        vec![(0, 0), (1, 1)],
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let probe = Arc::new(AtomicU64::new(0));
+    source.set_latency_probe(std::time::Instant::now(), probe.clone());
+    mixer.streamed_sources.push(source);
+
+    let mut block = vec![0.0f32; BLOCK * 2];
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..8 {
+            mix_audio(&mut block, &mut mixer);
+        }
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "streamed first-mix latency publish allocated {allocs} times"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "streamed first-mix latency publish freed {deallocs} times"
+    );
+    assert!(
+        probe.load(Ordering::Relaxed) > 0,
+        "the streamed first-mix latency should have been published"
+    );
+}
+
+#[test]
+fn first_duck_of_a_never_seen_voice_is_allocation_free() {
+    // Sprint 13 F1: duck states are pre-populated at applier construction, so the
+    // FIRST duck of a voice does no heap work on the callback. The old harness
+    // tests warmed the voice before arming; this one applies the first duck and
+    // mixes entirely inside the armed region.
+    let plain = ActiveSample::new(
+        1,
+        "a".to_string(),
+        decoded(sine(440.0, SR, SR as usize, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "a".to_string(),
+    );
+    let applier = DuckingApplier::with_ducked_voices(["a"]);
+    let mut state = SceneBuilder::new(2).sample(plain).ducking(applier).build();
+
+    let mut block = vec![0.0f32; BLOCK * 2];
+    mix_audio(&mut block, &mut state); // warm the mix path; NO duck applied yet
+
+    // The change is built off-RT (the control thread owns it); applying it and
+    // mixing the first ducked blocks must be alloc/free-free.
+    let change = DuckTargetChange {
+        voice: "a".to_string(),
+        target_volume: 0.4,
+        fade_frames: SR as usize,
+    };
+    let (allocs, deallocs) = count_allocs(|| {
+        if let Some(ref mut applier) = state.ducking_applier {
+            applier.apply_target(&change);
+        }
+        for _ in 0..4 {
+            mix_audio(&mut block, &mut state);
+        }
+    });
+
+    assert_eq!(allocs, 0, "first duck allocated {allocs} times");
+    assert_eq!(deallocs, 0, "first duck freed {deallocs} times");
+    // The duck is genuinely engaged (not silently ignored).
+    let endpoints = state
+        .ducking_applier
+        .as_ref()
+        .map(|a| a.buffer_endpoints("a"))
+        .unwrap();
+    assert!(
+        endpoints.1 < 1.0,
+        "the voice must actually be ducking, got {endpoints:?}"
+    );
+}
+
+#[test]
 fn live_input_underrun_mix_is_allocation_free_after_warmup() {
     // F3: the graceful-underrun fade in mix_live_input_into_output runs on the RT
     // thread (inside mix_audio). It holds the last frame and fades it to silence
@@ -389,7 +535,7 @@ fn callback_step_is_allocation_free_after_warmup() {
 
     // Duck voice "a" to 0.5 over a long fade so the multiplier keeps advancing
     // (exercising the applier's per-block fade update) without ever finishing.
-    let mut applier = DuckingApplier::new();
+    let mut applier = DuckingApplier::with_ducked_voices(["a"]);
     applier.apply_target(&DuckTargetChange {
         voice: "a".to_string(),
         target_volume: 0.5,
@@ -434,7 +580,14 @@ fn callback_step_is_allocation_free_after_warmup() {
             streamed_graveyard,
             output_sample_rate,
         } = acs;
-        drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
+        drain_commands(
+            commands,
+            mixer,
+            command_returns,
+            graveyard,
+            *output_sample_rate,
+            64,
+        );
         mix_audio(block, mixer);
         reap_finished(mixer, graveyard);
         reap_finished_streamed(mixer, streamed_graveyard);
@@ -512,7 +665,14 @@ fn draining_mutation_commands_is_free_free() {
             streamed_graveyard,
             output_sample_rate,
         } = acs;
-        drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
+        drain_commands(
+            commands,
+            mixer,
+            command_returns,
+            graveyard,
+            *output_sample_rate,
+            64,
+        );
         mix_audio(block, mixer);
         reap_finished(mixer, graveyard);
         reap_finished_streamed(mixer, streamed_graveyard);
@@ -601,7 +761,14 @@ fn adding_a_sample_into_the_reserved_pool_is_free_free() {
             streamed_graveyard,
             output_sample_rate,
         } = acs;
-        drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
+        drain_commands(
+            commands,
+            mixer,
+            command_returns,
+            graveyard,
+            *output_sample_rate,
+            64,
+        );
         mix_audio(block, mixer);
         reap_finished(mixer, graveyard);
         reap_finished_streamed(mixer, streamed_graveyard);
@@ -635,6 +802,215 @@ fn adding_a_sample_into_the_reserved_pool_is_free_free() {
         deallocs, 0,
         "adding a sample into the reserved pool must not free on the RT thread, got {deallocs}"
     );
+}
+
+#[test]
+fn pitch_toggle_mid_play_is_rust_side_alloc_free() {
+    // Sprint 13 F3 (D56): toggling pitch correction on a live voice through the
+    // shipped-corrector command is pure moves on the RT thread — the corrector is
+    // built control-side (off the armed region), installed by move, and on
+    // disable moved out through the husk for off-RT drop. Rust-side 0 alloc /
+    // 0 free across enable + mixed blocks + disable. (The C++ stretcher's own
+    // allocations are invisible to this harness — documented in docs/bugs.md —
+    // and are construction-time, which happens off-armed here.)
+    use mqttaudio::audio::mixer::PitchBundle;
+
+    let sample = ActiveSample::new(
+        1,
+        "v".to_string(),
+        decoded(sine(220.0, SR, SR as usize * 2, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "tone.wav".to_string(),
+    );
+    let mixer = SceneBuilder::new(2).sample(sample).build();
+
+    let (mut cmd_tx, cmd_rx) = command_channel(64);
+    let (cmd_return_tx, _cmd_return_rx) = command_return_channel(64);
+    let (grave_tx, _grave_rx) = graveyard_channel(64);
+    let (streamed_grave_tx, _streamed_grave_rx) = streamed_graveyard_channel(16);
+    let callback_state = Mutex::new(AudioCallbackState {
+        mixer,
+        commands: cmd_rx,
+        command_returns: cmd_return_tx,
+        graveyard: grave_tx,
+        streamed_graveyard: streamed_grave_tx,
+        output_sample_rate: SR,
+    });
+    let mut block = vec![0.0f32; BLOCK * 2];
+
+    let step = |callback_state: &Mutex<AudioCallbackState>, block: &mut [f32]| {
+        let mut guard = callback_state.lock();
+        let acs = &mut *guard;
+        let AudioCallbackState {
+            mixer,
+            commands,
+            command_returns,
+            graveyard,
+            streamed_graveyard,
+            output_sample_rate,
+        } = acs;
+        drain_commands(
+            commands,
+            mixer,
+            command_returns,
+            graveyard,
+            *output_sample_rate,
+            64,
+        );
+        mix_audio(block, mixer);
+        let _ = streamed_graveyard;
+    };
+
+    // Warm up: play a while so the enable happens mid-playback (pre-roll path).
+    for _ in 0..8 {
+        step(&callback_state, &mut block);
+    }
+
+    // Control side (off-armed): build and queue the enable, then later the
+    // disable, exactly as the daemon's Speed dispatcher does.
+    let enable = AudioCommand::SetSpeedWithCorrector {
+        id: 1,
+        speed: 0.9,
+        pitch_correction: true,
+        bundle: Some(Box::new(PitchBundle::for_voice(2, SR, 0.9, BLOCK))),
+        displaced: None,
+    };
+    let _ = cmd_tx.push(enable);
+
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..4 {
+            step(&callback_state, &mut block); // enable lands on the first step
+        }
+    });
+    assert_eq!(
+        allocs, 0,
+        "pitch enable allocated {allocs} times on the RT thread"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "pitch enable freed {deallocs} times on the RT thread"
+    );
+    assert!(
+        callback_state.lock().mixer.active_samples[0].has_pitch_correction(),
+        "the shipped corrector must be installed"
+    );
+
+    let disable = AudioCommand::SetSpeedWithCorrector {
+        id: 1,
+        speed: 1.0,
+        pitch_correction: false,
+        bundle: None,
+        displaced: None,
+    };
+    let _ = cmd_tx.push(disable);
+
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..4 {
+            step(&callback_state, &mut block);
+        }
+    });
+    assert_eq!(
+        allocs, 0,
+        "pitch disable allocated {allocs} times on the RT thread"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "pitch disable freed {deallocs} times on the RT thread"
+    );
+    assert!(
+        !callback_state.lock().mixer.active_samples[0].has_pitch_correction(),
+        "the corrector must be moved out on disable"
+    );
+}
+
+#[test]
+fn over_cap_play_steals_alloc_free() {
+    // Sprint 13 F2 (D18): a Play past the MAX_VOICES hard cap steals the oldest
+    // non-looping voice — swap_remove + a graveyard push + a push into the freed
+    // slot — with zero alloc/free on the RT thread (the displaced sample's heap
+    // is dropped off-RT by the reaper).
+    use mqttaudio::audio::mixer::MAX_VOICES;
+
+    let mut mixer = SceneBuilder::new(2).build();
+    // Fill the pre-reserved pool to the cap, off the armed region.
+    for id in 0..MAX_VOICES as u64 {
+        mixer.active_samples.push(ActiveSample::new(
+            id,
+            "v".to_string(),
+            decoded(sine(220.0, SR, 200, 2, 0.2), 2, SR),
+            1.0,
+            1.0,
+            "fill.wav".to_string(),
+        ));
+    }
+
+    let (mut cmd_tx, cmd_rx) = command_channel(1024);
+    let (cmd_return_tx, _cmd_return_rx) = command_return_channel(1024);
+    let (grave_tx, mut grave_rx) = graveyard_channel(1024);
+    let (streamed_grave_tx, _streamed_grave_rx) = streamed_graveyard_channel(256);
+    let callback_state = Mutex::new(AudioCallbackState {
+        mixer,
+        commands: cmd_rx,
+        command_returns: cmd_return_tx,
+        graveyard: grave_tx,
+        streamed_graveyard: streamed_grave_tx,
+        output_sample_rate: SR,
+    });
+    let mut block = vec![0.0f32; BLOCK * 2];
+
+    let step = |callback_state: &Mutex<AudioCallbackState>, block: &mut [f32]| {
+        let mut guard = callback_state.lock();
+        let acs = &mut *guard;
+        let AudioCallbackState {
+            mixer,
+            commands,
+            command_returns,
+            graveyard,
+            streamed_graveyard,
+            output_sample_rate,
+        } = acs;
+        drain_commands(
+            commands,
+            mixer,
+            command_returns,
+            graveyard,
+            *output_sample_rate,
+            64,
+        );
+        mix_audio(block, mixer);
+        // NOTE: no reap here — the displaced sample must stay in the graveyard
+        // ring (off-RT drop is the reaper's job, outside this armed region).
+        let _ = streamed_graveyard;
+    };
+
+    step(&callback_state, &mut block); // warm up at the cap
+
+    // The 257th play, built and queued off the armed region.
+    let sample = ActiveSample::new(
+        9999,
+        "new".to_string(),
+        decoded(sine(330.0, SR, 200, 2, 0.2), 2, SR),
+        1.0,
+        1.0,
+        "new.wav".to_string(),
+    );
+    let _ = cmd_tx.push(AudioCommand::AddSample(sample));
+
+    let (allocs, deallocs) = count_allocs(|| {
+        step(&callback_state, &mut block);
+    });
+
+    assert_eq!(allocs, 0, "over-cap steal allocated {allocs} times");
+    assert_eq!(deallocs, 0, "over-cap steal freed {deallocs} times");
+
+    // The steal really happened: pool capped, new play in, displaced sample out.
+    let guard = callback_state.lock();
+    assert_eq!(guard.mixer.active_samples.len(), MAX_VOICES);
+    assert!(guard.mixer.active_samples.iter().any(|s| s.id == 9999));
+    drop(guard);
+    let displaced = grave_rx.pop().expect("displaced sample in the graveyard");
+    assert_eq!(displaced.id, 0, "the oldest non-looping voice was stolen");
 }
 
 /// Drive `resample_block` for many capture blocks at the given rates while armed
@@ -812,7 +1188,14 @@ fn windowed_source_mix_is_allocation_free_after_warmup() {
             streamed_graveyard,
             output_sample_rate,
         } = acs;
-        drain_commands(commands, mixer, command_returns, *output_sample_rate, 64);
+        drain_commands(
+            commands,
+            mixer,
+            command_returns,
+            graveyard,
+            *output_sample_rate,
+            64,
+        );
         mix_audio(block, mixer);
         reap_finished(mixer, graveyard);
         reap_finished_streamed(mixer, streamed_graveyard);
