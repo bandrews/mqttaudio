@@ -37,6 +37,12 @@ impl LogBroadcaster {
     pub fn subscribe(&self) -> broadcast::Receiver<String> {
         self.sender.subscribe()
     }
+
+    /// Number of connected subscribers (used to gate the state-event tick timer:
+    /// it only does work when telemetry is on AND someone is listening, DW3).
+    pub fn receiver_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
 }
 
 impl Default for LogBroadcaster {
@@ -123,6 +129,51 @@ async fn handle_socket(socket: WebSocket, broadcaster: Arc<LogBroadcaster>) {
     }
 
     // Clean up
+    send_task.abort();
+}
+
+/// Handle the state-event WebSocket upgrade (`/ws/state`, Sprint W7). Unlike the
+/// log stream, frames here are already typed JSON (tick frames with positions +
+/// meters, and discrete state events) produced by the control thread, so they are
+/// forwarded verbatim.
+pub async fn handle_state_websocket(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_state_socket(socket, state.state_broadcaster))
+}
+
+async fn handle_state_socket(socket: WebSocket, broadcaster: Arc<LogBroadcaster>) {
+    let (mut sender, mut receiver) = socket.split();
+    let mut state_rx = broadcaster.subscribe();
+
+    let send_task = tokio::spawn(async move {
+        loop {
+            match state_rx.recv().await {
+                Ok(frame) => {
+                    if sender.send(Message::Text(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::trace!("state WebSocket client lagged, missed {} frames", n);
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    while let Some(result) = receiver.next().await {
+        match result {
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!("state WebSocket error: {}", e);
+                break;
+            }
+        }
+    }
+
     send_task.abort();
 }
 

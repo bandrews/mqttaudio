@@ -228,6 +228,47 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   adding it would be an unverified change to the twin path. Pick it up if reverse looped crossfades are
   exercised in earnest.
 
+- **Dead config field `audio.channel_names` (web-UI doc reconciliation, out of scope, LOW).** `channel_names`
+  is declared, deserialized, and unit-tested in `src/config.rs` (around `config.rs:84`) but is never read by
+  the audio path — only `channel_aliases` (name → index) is used for routing/resolution and per-channel
+  calibration. It is undocumented and appears to be a vestigial parallel to `channel_aliases`. Discovered while
+  auditing the docs against the code for the web control app. Cleanup (remove the field, or wire it to
+  something real and document it) is a future task; left untouched here to avoid an unscoped serde/behavior
+  change.
+
+- **`/ws` never streams log lines — `WebSocketLogLayer` is not installed in the tracing subscriber (Sprint W1,
+  daemon gap, MEDIUM).** `start_server` creates a `LogBroadcaster` (`src/http/mod.rs:123`) and `handle_socket`
+  forwards whatever it broadcasts (`src/http/websocket.rs:57-103`), but the only producer of real frames,
+  `WebSocketLogLayer::on_event` (`src/http/websocket.rs:144-169`), is `#[allow(dead_code)]` and referenced only
+  by unit tests — it is **never added to the `tracing_subscriber` registry in `main.rs`**. So a `/ws` client
+  receives the `{type:"connected"}` welcome frame and then nothing; the daemon's tracing output goes only to
+  stdout/the MQTT log layer, never to the socket. Verified live: a running daemon logs `Processing command:
+  StopAll` to stdout but emits no `{type:"log"}` frame. Impact: the web app's log console (Sprint W1) correctly
+  renders connection state + the welcome (daemon version), but shows no log lines against a real daemon until
+  this is wired. Fix (a daemon-side follow-up, out of scope for the frontend-only Sprint W1 per DW1): create the
+  `LogBroadcaster` in `main.rs` before logging init, add `WebSocketLogLayer::new(broadcaster)` to the subscriber
+  registry, and pass the same broadcaster into `start_server`. `docs/http-api.md` documents `/ws` log streaming
+  as if it works, so it should be corrected or the layer wired. Discovered during Sprint W1 Lane B.
+
+- **No per-sample `windowed` flag on `/status/samples` (Sprint W5 F3, daemon gap, LOW).** The transport UI must
+  gate seek/speed/reverse for windowed/streamed (forward-only) voices, but `/status/samples` carries no
+  is-windowed flag. The web app INFERS windowed from `total_frames === 0` (streamed plays construct their status
+  with `total_frames: 0`, `main.rs:1294`), in `webui/src/features/mixer/windowed.ts`. This is a heuristic; a
+  full-load sample with an unknown length could in principle also report 0. Sprint W6 F4 closes this by adding a
+  real `windowed` field to `SampleStatus`/`/status/samples`, at which point the web helper switches to the flag.
+
+- **Sprint W7 telemetry — implemented scope vs deferred (LOW).** Sprint W7 shipped **output peak meters** (a
+  per-output-channel atomic published from the limiter pass, alloc-free, gated) and the **`/ws/state` tick
+  channel** (a ~15 Hz control-side timer broadcasting `{type:"tick", samples:[{internal_id,position_ms,
+  progress_percent}], meters:{output:[...]}}` only when telemetry is on AND ≥1 client is subscribed) plus a
+  `GET /status/meters` poll fallback. **Deferred (carry forward when wanted):** (1) **per-input capture-level
+  meters** — needs a peak atomic in the live-input capture path (`input.rs`/`mix_live_input_into_output`) and a
+  per-input field on the tick frame; (2) **RMS** alongside peak; (3) **discrete state-event frames** (separate
+  `play`/`stop`/`seek`/`voice`/`ducking`/`sample_finished` messages) — the tick frame's sample list already
+  carries the live state (a finished sample simply drops out of it), so the live experience works without them;
+  emitting discrete events from the control-thread mutation points is an optimization. The web meters render the
+  output bars live; per-input meters show nothing until (1) lands.
+
 ## Implementation notes
 
 - **Auto voice-id format: `_auto_<millis>_<n>` shipped, reconciling DECISIONS.md D24 vs D41/Sprint-9 F5.**

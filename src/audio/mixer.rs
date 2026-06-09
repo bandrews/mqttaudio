@@ -8,7 +8,7 @@ use crate::audio::streaming::SampleBuffer;
 use crate::audio::types::DecodedBuffer;
 use crate::config::{DEFAULT_MASTER_GAIN, DEFAULT_OUTPUT_CEILING_DB};
 use ringbuf::HeapConsumer;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Fade state for audio samples
@@ -187,6 +187,14 @@ pub struct ActiveSample {
     pitch_crossfade_remaining: usize,
     pitch_crossfade_total: usize,
     pitch_crossfade_direct_pos: f64,
+
+    /// Optional live-position publisher (Sprint W6 telemetry, DW3/DW12). When set
+    /// and telemetry is enabled, the callback stores `position` into this atomic
+    /// once per block — a single relaxed store, no alloc/lock — so the control
+    /// thread can read live playback position without touching the mixer (D22a).
+    /// The atomic is constructed off-RT and moved in with the sample, never
+    /// allocated on the audio thread.
+    pub position_publisher: Option<Arc<AtomicUsize>>,
 }
 
 impl ActiveSample {
@@ -236,6 +244,7 @@ impl ActiveSample {
             pitch_crossfade_remaining: 0,
             pitch_crossfade_total: 0,
             pitch_crossfade_direct_pos: 0.0,
+            position_publisher: None,
         }
     }
 
@@ -282,6 +291,7 @@ impl ActiveSample {
             pitch_crossfade_remaining: 0,
             pitch_crossfade_total: 0,
             pitch_crossfade_direct_pos: 0.0,
+            position_publisher: None,
         }
     }
 
@@ -325,6 +335,7 @@ impl ActiveSample {
             pitch_crossfade_remaining: 0,
             pitch_crossfade_total: 0,
             pitch_crossfade_direct_pos: 0.0,
+            position_publisher: None,
         }
     }
 
@@ -1044,6 +1055,19 @@ pub struct MixerState {
     /// Count of samples that exceeded the ceiling and were limited. Incremented on
     /// the audio thread (lock-free), read by `/status`.
     pub clip_count: Arc<AtomicU64>,
+
+    /// Opt-in telemetry gate (Sprint W6, DW3). Off by default. When set, the
+    /// callback publishes each sample's live position into its `position_publisher`
+    /// atomic (one relaxed store per sample per block); when clear it does no new
+    /// work beyond a single relaxed load. The control thread shares this Arc and
+    /// flips it (POST /telemetry); it never locks the RT state (D22a).
+    pub telemetry_enabled: Arc<AtomicBool>,
+
+    /// Per-output-channel peak meters (Sprint W7), length `output_channels`. When
+    /// telemetry is on, the callback stores each channel's post-limiter peak (as
+    /// f32 bits) once per block — relaxed, alloc-free. The control thread reads them
+    /// for the state-event tick. Empty disables metering.
+    pub output_meters: Arc<Vec<AtomicU32>>,
 }
 
 impl MixerState {
@@ -1068,6 +1092,8 @@ impl MixerState {
             output_ceiling: db_to_linear(DEFAULT_OUTPUT_CEILING_DB),
             master_gain: DEFAULT_MASTER_GAIN,
             clip_count: Arc::new(AtomicU64::new(0)),
+            telemetry_enabled: Arc::new(AtomicBool::new(false)),
+            output_meters: Arc::new((0..output_channels).map(|_| AtomicU32::new(0)).collect()),
         }
     }
 }
@@ -1096,6 +1122,10 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
     let ducking = state.ducking_applier.as_ref();
     let output_channels = state.output_channels;
 
+    // Opt-in telemetry gate (Sprint W6, DW3): read once per block. When clear, the
+    // per-sample position store below is skipped — no new RT work beyond this load.
+    let publish_positions = state.telemetry_enabled.load(Ordering::Relaxed);
+
     // Mix each active sample into the output
     for sample in &mut state.active_samples {
         // This voice's duck multipliers at the buffer's start and end (D1); the mix
@@ -1110,6 +1140,15 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
         // skip the generic speed-based advance for it to avoid double-counting.
         if !position_advanced {
             sample.advance_position(frames);
+        }
+
+        // Publish the post-advance live position (DW12): a single relaxed store into
+        // a pre-allocated atomic moved in with the sample — no alloc, no lock. The
+        // control thread reads it without ever touching the mixer (D22a).
+        if publish_positions {
+            if let Some(ref publisher) = sample.position_publisher {
+                publisher.store(sample.position, Ordering::Relaxed);
+            }
         }
     }
 
@@ -1147,6 +1186,10 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
     let ceiling = state.output_ceiling;
     let channel_gains = &state.channel_gains;
     let mut clip_events: u64 = 0;
+    // Per-channel output peak for the meters (Sprint W7), tracked during the limiter
+    // pass on a fixed-size stack array (no alloc) and published below if telemetry on.
+    const MAX_METER_CHANNELS: usize = 64;
+    let mut peaks = [0.0f32; MAX_METER_CHANNELS];
     for frame in output.chunks_exact_mut(channels) {
         for (ch, s) in frame.iter_mut().enumerate() {
             // `channel_gains` is sized to `output_channels` at construction, so this
@@ -1162,10 +1205,25 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
                 clip_events += 1;
             }
             *s = soft_limit(gained, ceiling).clamp(-ceiling, ceiling);
+            if ch < MAX_METER_CHANNELS {
+                let a = s.abs();
+                if a > peaks[ch] {
+                    peaks[ch] = a;
+                }
+            }
         }
     }
     if clip_events > 0 {
         state.clip_count.fetch_add(clip_events, Ordering::Relaxed);
+    }
+    // Publish per-channel output peaks (gated; relaxed alloc-free stores, mirroring
+    // the position publish). The control thread reads these for the state tick.
+    if publish_positions {
+        let meters = &state.output_meters;
+        let n = channels.min(meters.len()).min(MAX_METER_CHANNELS);
+        for (ch, slot) in meters.iter().take(n).enumerate() {
+            slot.store(peaks[ch].to_bits(), Ordering::Relaxed);
+        }
     }
 }
 

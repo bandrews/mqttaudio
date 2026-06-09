@@ -42,7 +42,7 @@ fn list_devices_cpal_only() {
     match host.output_devices() {
         Ok(devices) => {
             for device in devices {
-                if let Ok(name) = device.name() {
+                if let Ok(name) = device.description().map(|d| d.name().to_string()) {
                     let mut info = DeviceInfo::new(name.clone(), DeviceCategory::Hardware);
 
                     // Query supported configs
@@ -54,13 +54,13 @@ fn list_devices_cpal_only() {
                         const MAX_REASONABLE_SAMPLE_RATE: u32 = 384000;
 
                         for config in configs {
-                            let config_max_rate = config.max_sample_rate().0;
+                            let config_max_rate = config.max_sample_rate();
                             if config_max_rate > MAX_REASONABLE_SAMPLE_RATE {
                                 continue;
                             }
 
                             max_channels = max_channels.max(config.channels());
-                            min_rate = min_rate.min(config.min_sample_rate().0);
+                            min_rate = min_rate.min(config.min_sample_rate());
                             max_rate = max_rate.max(config_max_rate);
                         }
 
@@ -75,8 +75,8 @@ fn list_devices_cpal_only() {
                     if info.cpal_channels.is_none() {
                         if let Ok(config) = device.default_output_config() {
                             info.cpal_channels = Some(config.channels());
-                            info.cpal_sample_rate_min = Some(config.sample_rate().0);
-                            info.cpal_sample_rate_max = Some(config.sample_rate().0);
+                            info.cpal_sample_rate_min = Some(config.sample_rate());
+                            info.cpal_sample_rate_max = Some(config.sample_rate());
                         }
                     }
 
@@ -103,7 +103,7 @@ pub fn get_default_device_config() -> Result<DeviceConfig, Box<dyn std::error::E
     let config = device.default_output_config()?;
 
     Ok(DeviceConfig {
-        sample_rate: config.sample_rate().0,
+        sample_rate: config.sample_rate(),
         channels: config.channels() as usize,
         buffer_size: 512, // Default buffer size
     })
@@ -120,7 +120,7 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
             // First try to find in enumerated devices
             if let Ok(devices) = host.output_devices() {
                 for device in devices {
-                    if let Ok(n) = device.name() {
+                    if let Ok(n) = device.description().map(|d| d.name().to_string()) {
                         if n == device_name {
                             return Ok(device);
                         }
@@ -135,7 +135,7 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
             {
                 if let Ok(devices) = host.output_devices() {
                     for device in devices {
-                        if let Ok(n) = device.name() {
+                        if let Ok(n) = device.description().map(|d| d.name().to_string()) {
                             // Try matching ALSA device names by card number
                             // Supports hw:, plughw:, sysdefault:
                             if let Some(matched) = try_match_alsa_device(device_name, &n) {
@@ -311,8 +311,8 @@ pub fn find_output_config(
         .map(|c| ConfigOption {
             channels: c.channels(),
             sample_format: c.sample_format(),
-            min_rate: c.min_sample_rate().0,
-            max_rate: c.max_sample_rate().0,
+            min_rate: c.min_sample_rate(),
+            max_rate: c.max_sample_rate(),
             buffer: match c.buffer_size() {
                 cpal::SupportedBufferSize::Range { min, max } => BufferLimits::Range {
                     min: *min,
@@ -337,14 +337,19 @@ pub fn find_output_config(
     let requested_rate = requested_sample_rate.unwrap_or_else(|| {
         device
             .default_output_config()
-            .map(|c| c.sample_rate().0)
+            .map(|c| c.sample_rate())
             .unwrap_or(48000)
     });
 
     // On ALSA a raw `hw:` device may advertise a continuous range but accept
     // only discrete rates; prefer the probed discrete set when available.
     #[cfg(target_os = "linux")]
-    let discrete = crate::audio::alsa_probe::discrete_rates_for(&device.name().unwrap_or_default());
+    let discrete = crate::audio::alsa_probe::discrete_rates_for(
+        &device
+            .description()
+            .map(|d| d.name().to_string())
+            .unwrap_or_default(),
+    );
     #[cfg(not(target_os = "linux"))]
     let discrete: Option<Vec<u32>> = None;
 
@@ -366,8 +371,8 @@ pub fn find_output_config(
     let supported_here = supported.iter().any(|c| {
         c.channels() == channels
             && c.sample_format() == sample_format
-            && sample_rate >= c.min_sample_rate().0
-            && sample_rate <= c.max_sample_rate().0
+            && sample_rate >= c.min_sample_rate()
+            && sample_rate <= c.max_sample_rate()
     });
     if !supported_here {
         return Err(format!(
@@ -380,7 +385,7 @@ pub fn find_output_config(
     Ok(OutputConfig {
         stream_config: cpal::StreamConfig {
             channels,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             buffer_size,
         },
         sample_format,

@@ -105,7 +105,16 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         .route("/status/cache", get(handlers::handle_cache_status))
         .route("/status/inputs", get(handlers::handle_inputs))
         .route("/version", get(handlers::handle_version))
-        .route("/metrics", get(handlers::handle_metrics));
+        .route("/metrics", get(handlers::handle_metrics))
+        // Per-output-channel peak meters poll fallback (Sprint W7).
+        .route("/status/meters", get(handlers::handle_meters))
+        // Read-only running config, secrets redacted (Sprint W8, DW11).
+        .route("/config", get(handlers::handle_config))
+        // Telemetry opt-in (Sprint W6, DW3): GET reads the flag, POST sets it.
+        .route(
+            "/telemetry",
+            get(handlers::handle_telemetry_get).post(handlers::handle_telemetry_set),
+        );
 
     // Health check (no auth)
     let health_route = Router::new().route("/health", get(handlers::handle_health));
@@ -130,6 +139,7 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         if websocket_enabled {
             let ws = Router::new()
                 .route("/ws", get(websocket::handle_websocket))
+                .route("/ws/state", get(websocket::handle_state_websocket))
                 .layer(middleware::from_fn_with_state(
                     state.clone(),
                     auth_middleware,
@@ -139,7 +149,9 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
     } else {
         app = app.merge(status_routes).merge(authenticated_commands);
         if websocket_enabled {
-            app = app.route("/ws", get(websocket::handle_websocket));
+            app = app
+                .route("/ws", get(websocket::handle_websocket))
+                .route("/ws/state", get(websocket::handle_state_websocket));
         }
     }
 

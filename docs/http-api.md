@@ -72,10 +72,19 @@ Config file example:
 | `/voice/volume` | POST | Set voice volume |
 | `/voice/fade_out` | POST | Fade out a voice |
 | `/voice/stop` | POST | Stop a voice |
+| `/input/volume` | POST | Set live-input volume |
+| `/input/mute` | POST | Mute/unmute a live input |
 | `/cache/clear` | POST | Clear all caches |
 | `/cache/invalidate` | POST | Invalidate specific cache entry |
 | `/cache/reload` | POST | Invalidate then re-precache an entry (fresh + instant) |
 | `/precache` | POST | Pre-cache an audio file |
+
+> **Typed endpoints vs `/command`.** The convenience endpoints above deserialize a fixed set of fields. In
+> particular, `POST /play` accepts only `file`, `id`, `volume`, `voice`, `fade_in`, `start_position_ms`,
+> `loop` (also `loop_mode`), and `crossfade_ms`. It does **not** accept `channel_map`, `mode`, `window_ms`,
+> `prebuffer_ms`, `freshness`, or `cacheable` — to use those, POST the full command JSON to `/command`
+> (which accepts the same payload as MQTT). Unknown fields sent to a typed endpoint are silently ignored.
+> Note also that `POST /voice/fade_out` takes `time_ms`, whereas the raw command / MQTT key is `time`.
 
 ## Authentication
 
@@ -117,6 +126,8 @@ Returns a summary of playback and cache state:
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `status` | string | Service state (e.g. `"running"`) |
+| `version` | string | Package version string |
 | `active_samples` | integer | Number of samples currently playing |
 | `active_inputs` | integer | Number of active live inputs |
 | `active_voices` | integer | Number of active voice groups |
@@ -232,6 +243,42 @@ Returns active samples with playback position and timing information:
 | `speed` | float | Playback speed multiplier |
 | `loop_mode` | boolean | Whether looping is enabled |
 | `progress_percent` | float | Playback progress (0-100) |
+
+> **Live position note.** `position`, `position_ms`, and `progress_percent` are currently reported as `0`.
+> Live playback position is advanced by the real-time audio thread and is not mirrored to the control thread
+> that serves this endpoint, so the example values above show the field shapes, not live progress. The other
+> fields (`file`, `voice`, `total_ms`, `volume`, `voice_volume`, `speed`, `loop_mode`) are live.
+
+### `/status/inputs` Response
+
+Returns the configured live inputs and their current volume/mute state:
+
+```json
+{
+  "inputs": [
+    { "index": 0, "voice_id": "gamemaster_mic", "volume": 0.8, "channels": 1, "muted": false }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `index` | integer | Zero-based input index |
+| `voice_id` | string | Voice group the input feeds |
+| `volume` | float | Current input volume (0.0-1.0) |
+| `channels` | integer | Input channel count |
+| `muted` | boolean | Derived as `volume == 0.0` |
+
+### `/status/cache` Response
+
+Returns memory and disk cache totals (the `size_mb` fields are not present in the `/status` cache summary):
+
+```json
+{
+  "memory": { "entries": 3, "size_bytes": 1572864, "size_mb": 1.5 },
+  "disk": { "entries": 10, "size_bytes": 5242880, "size_mb": 5.0 }
+}
+```
 
 ## WebSocket Log Streaming
 

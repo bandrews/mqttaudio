@@ -13,7 +13,7 @@ pub fn list_input_devices() {
     match host.input_devices() {
         Ok(devices) => {
             for (i, device) in devices.enumerate() {
-                if let Ok(name) = device.name() {
+                if let Ok(name) = device.description().map(|d| d.name().to_string()) {
                     println!("  {}. {}", i, name);
 
                     // Query all supported configs to find max channels
@@ -26,14 +26,14 @@ pub fn list_input_devices() {
                         const MAX_REASONABLE_SAMPLE_RATE: u32 = 384000;
 
                         for config in configs {
-                            let max_rate = config.max_sample_rate().0;
+                            let max_rate = config.max_sample_rate();
                             // Skip configs from ALSA plugins that claim unrealistic capabilities
                             if max_rate > MAX_REASONABLE_SAMPLE_RATE {
                                 continue;
                             }
 
                             max_channels = max_channels.max(config.channels());
-                            let min_rate = config.min_sample_rate().0;
+                            let min_rate = config.min_sample_rate();
                             // Collect unique sample rate ranges
                             if !sample_rates
                                 .iter()
@@ -60,12 +60,12 @@ pub fn list_input_devices() {
                         } else if let Ok(config) = device.default_input_config() {
                             // All configs were filtered out - fall back to default
                             // This happens with ALSA plugin devices
-                            println!("     Sample rate: {} Hz (plugin)", config.sample_rate().0);
+                            println!("     Sample rate: {} Hz (plugin)", config.sample_rate());
                             println!("     Channels: {} (plugin)", config.channels());
                         }
                     } else if let Ok(config) = device.default_input_config() {
                         // Fallback to default config if supported_input_configs fails
-                        println!("     Sample rate: {} Hz", config.sample_rate().0);
+                        println!("     Sample rate: {} Hz", config.sample_rate());
                         println!("     Channels: {}", config.channels());
                     }
                 }
@@ -86,7 +86,7 @@ pub fn get_input_device(name: Option<&str>) -> Result<Device, InputError> {
                 .map_err(|e| InputError::DeviceEnumeration(e.to_string()))?;
 
             for device in devices {
-                if let Ok(n) = device.name() {
+                if let Ok(n) = device.description().map(|d| d.name().to_string()) {
                     if n == device_name {
                         return Ok(device);
                     }
@@ -159,10 +159,13 @@ pub fn create_input_stream(
     target_sample_rate: u32,
 ) -> Result<ActiveInput, InputError> {
     let device = get_input_device(config.device_name.as_deref())?;
-    let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+    let device_name = device
+        .description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|_| "Unknown".to_string());
     let supported_config = get_input_config(&device)?;
 
-    let input_sample_rate = supported_config.sample_rate().0;
+    let input_sample_rate = supported_config.sample_rate();
     let channels = supported_config.channels() as usize;
 
     // Calculate ring buffer size based on OUTPUT sample rate (after potential resampling)

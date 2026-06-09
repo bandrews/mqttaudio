@@ -700,10 +700,14 @@ pub async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn handle_samples(State(state): State<AppState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+
+    // Live position is published by the audio thread into each sample's atomic only
+    // when telemetry is opted in (Sprint W6, DW3). When off, position-derived fields
+    // are reported as 0 exactly as before — and the RT thread does no new work.
+    let telemetry = state.telemetry_enabled.load(Ordering::Relaxed);
     let snapshot = state.status.read().unwrap();
 
-    // The control thread owns this snapshot but not the live playback position,
-    // which the audio thread advances; position-derived fields are reported as 0.
     let samples: Vec<Value> = snapshot
         .samples
         .iter()
@@ -713,13 +717,28 @@ pub async fn handle_samples(State(state): State<AppState>) -> impl IntoResponse 
             } else {
                 0
             };
+            let position = if telemetry {
+                s.position.as_ref().map_or(0, |p| p.load(Ordering::Relaxed))
+            } else {
+                0
+            };
+            let position_ms = if s.sample_rate > 0 {
+                (position as u64 * 1000) / s.sample_rate as u64
+            } else {
+                0
+            };
+            let progress_percent = if s.total_frames > 0 {
+                (position as f64 / s.total_frames as f64 * 100.0).clamp(0.0, 100.0)
+            } else {
+                0.0
+            };
             json!({
                 "internal_id": s.internal_id.to_string(),
                 "id": s.sample_id,
                 "voice": s.voice_id,
                 "file": s.file_path,
-                "position": 0,
-                "position_ms": 0,
+                "position": position,
+                "position_ms": position_ms,
                 "total_frames": s.total_frames,
                 "total_ms": total_ms,
                 "sample_rate": s.sample_rate,
@@ -727,7 +746,8 @@ pub async fn handle_samples(State(state): State<AppState>) -> impl IntoResponse 
                 "voice_volume": s.voice_volume,
                 "speed": s.speed,
                 "loop_mode": s.loop_mode,
-                "progress_percent": 0.0
+                "windowed": s.windowed,
+                "progress_percent": progress_percent
             })
         })
         .collect();
@@ -796,4 +816,58 @@ pub async fn handle_inputs(State(state): State<AppState>) -> impl IntoResponse {
         .collect();
 
     Json(json!({ "inputs": inputs }))
+}
+
+// =============================================================================
+// Telemetry opt-in (Sprint W6, DW3)
+// =============================================================================
+
+#[derive(Deserialize)]
+pub struct TelemetryParams {
+    enabled: bool,
+}
+
+/// Per-output-channel peak meters (Sprint W7), a poll fallback for the `/ws/state`
+/// tick channel. Linear amplitudes; all zero when telemetry is off.
+pub async fn handle_meters(State(state): State<AppState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
+    let telemetry = state.telemetry_enabled.load(Ordering::Relaxed);
+    let output: Vec<f32> = if telemetry {
+        state
+            .output_meters
+            .iter()
+            .map(|m| f32::from_bits(m.load(Ordering::Relaxed)))
+            .collect()
+    } else {
+        vec![0.0; state.output_meters.len()]
+    };
+    Json(json!({ "output": output }))
+}
+
+/// Read-only running config (Sprint W8, DW11), secrets redacted. Config is read
+/// once at startup, so this is a startup snapshot. The web app shows current
+/// values and emits restart-required config snippets (config has no hot-reload).
+pub async fn handle_config(State(state): State<AppState>) -> impl IntoResponse {
+    Json((*state.config_json).clone())
+}
+
+/// Current telemetry-enable state.
+pub async fn handle_telemetry_get(State(state): State<AppState>) -> impl IntoResponse {
+    let enabled = state
+        .telemetry_enabled
+        .load(std::sync::atomic::Ordering::Relaxed);
+    Json(json!({ "enabled": enabled }))
+}
+
+/// Opt in/out of live telemetry. OFF by default; when on, the audio thread
+/// publishes live sample positions (and, from Sprint W7, meters + state events).
+/// Off by default keeps the RT path free until a client is watching.
+pub async fn handle_telemetry_set(
+    State(state): State<AppState>,
+    Json(params): Json<TelemetryParams>,
+) -> impl IntoResponse {
+    state
+        .telemetry_enabled
+        .store(params.enabled, std::sync::atomic::Ordering::Relaxed);
+    Json(json!({ "enabled": params.enabled }))
 }

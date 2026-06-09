@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Opt-in live-position telemetry (`GET`/`POST /telemetry`).** Off by default. When enabled, the audio thread
+  publishes each playing sample's live frame position into a pre-allocated atomic once per block (a single
+  relaxed store — no allocation, no lock, RT-safe), and `GET /status/samples` then reports real `position`,
+  `position_ms`, and `progress_percent` instead of `0`. With telemetry off the callback does no new work and
+  those fields stay `0` exactly as before, so nothing changes for existing clients. `POST /telemetry`
+  (`{"enabled": true|false}`) flips it; `GET /telemetry` reads it. Added for the web control app's live
+  progress bars; it is opt-in because it adds a little real-time work. `/status/samples` also gains a
+  `windowed` boolean (a streamed/forward-only sample) so a UI can gate seek/speed/reverse reliably.
+- **Live output meters + state-event channel (`/ws/state`, `GET /status/meters`).** Also opt-in (the same
+  `/telemetry` gate). When enabled, the audio thread publishes per-output-channel peak levels into atomics (a
+  relaxed store per block in the limiter pass — no allocation, no lock), and a ~15 Hz control-side timer
+  broadcasts a compact tick frame (`{type:"tick", samples:[{internal_id,position_ms,progress_percent}],
+  meters:{output:[…]}}`) over a new `/ws/state` WebSocket — **only while telemetry is on and at least one client
+  is connected**, so it costs nothing otherwise. `GET /status/meters` is a poll fallback. Added for the web
+  app's live meters and smoother position updates.
+- **Read-only `GET /config`.** Returns the running configuration as JSON with secrets redacted
+  (`http.auth_token` and `mqtt.password` are nulled out). Config is read once at startup, so this is a startup
+  snapshot. Added so the web app can show current values and generate restart-required config snippets for
+  tuning (the daemon has no hot-reload).
 - **Windowed streaming for big files (`mode=stream`, and via the default `mode=auto`).** A `play` of a large
   or long file — local **or** `http(s)://` — is now played through a bounded ring (a fixed window, default
   1.5 s) fed by a background decoder, instead of being fully decoded into memory, so a multi-hour cue costs
@@ -77,6 +96,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`cpal` upgraded from `0.15` to `0.17`.** Brings the current cross-platform audio I/O layer (including the
+  CoreAudio device backend) and adopts cpal's reworked device-identity API: device names are now read through
+  `Device::description()` (the `Device::name()` call used through `0.15` is deprecated), and `SupportedStreamConfig`
+  exposes the sample rate as a plain `u32`. No change to the device-selection policy, the lock-free RT callback,
+  or the audio output: the bump is API adaptation plus the newer backend. Device enumeration and name-based
+  selection (`audio.device`) are covered by real-device round-trip tests (`tests/device_smoke_test.rs`,
+  `[RB]`-gated), and the RT callback remains 0-allocation / 0-free (alloc harness green).
 - **`cache.max_memory_mb: 0` now means auto-detect a bounded cap, not unlimited.** Previously `0` (and the
   former `512` default) meant an unlimited cache, which could OOM the box on a big file. `0` is the new
   default and resolves to the auto memory budget. A positive `max_memory_mb` is still an explicit hard cap
