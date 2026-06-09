@@ -1,7 +1,7 @@
 // ABOUTME: Performance benchmarks for audio loading and caching.
 // ABOUTME: Measures cold/hot load times, HTTP streaming, and memory usage.
 
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -41,10 +41,10 @@ fn bench_cold_load_file(c: &mut Criterion) {
 
                         let start = Instant::now();
                         rt.block_on(async {
-                            cache_mgr.get_or_load(
-                                file_path.to_str().unwrap(),
-                                48000,
-                            ).await.unwrap()
+                            cache_mgr
+                                .get_or_load(file_path.to_str().unwrap(), 48000)
+                                .await
+                                .unwrap()
                         });
                         total += start.elapsed();
                     }
@@ -70,18 +70,23 @@ fn bench_hot_load(c: &mut Criterion) {
 
     // Pre-load into cache
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let mut cache_mgr = rt.block_on(async {
-        mqttaudio::cache::CacheManager::new(cache_dir).unwrap()
-    });
+    let mut cache_mgr =
+        rt.block_on(async { mqttaudio::cache::CacheManager::new(cache_dir).unwrap() });
 
     rt.block_on(async {
-        cache_mgr.get_or_load(file_path.to_str().unwrap(), 48000).await.unwrap()
+        cache_mgr
+            .get_or_load(file_path.to_str().unwrap(), 48000)
+            .await
+            .unwrap()
     });
 
     group.bench_function("60s_cached", |b| {
         b.iter(|| {
             rt.block_on(async {
-                cache_mgr.get_or_load(file_path.to_str().unwrap(), 48000).await.unwrap()
+                cache_mgr
+                    .get_or_load(file_path.to_str().unwrap(), 48000)
+                    .await
+                    .unwrap()
             })
         });
     });
@@ -105,9 +110,7 @@ fn bench_cold_load_http(c: &mut Criterion) {
 
     // Start embedded HTTP server
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let server = rt.block_on(async {
-        TestHttpServer::start(temp_dir.path().to_path_buf()).await
-    });
+    let server = rt.block_on(async { TestHttpServer::start(temp_dir.path().to_path_buf()).await });
 
     let url = format!("{}/test_http.wav", server.base_url());
 
@@ -121,9 +124,7 @@ fn bench_cold_load_http(c: &mut Criterion) {
                 let _ = cache_mgr.clear_all();
 
                 let start = Instant::now();
-                rt.block_on(async {
-                    cache_mgr.get_or_load(&url, 48000).await.unwrap()
-                });
+                rt.block_on(async { cache_mgr.get_or_load(&url, 48000).await.unwrap() });
                 total += start.elapsed();
             }
             total
@@ -146,8 +147,11 @@ fn bench_precache(c: &mut Criterion) {
     let cache_dir = temp_dir.path().join("cache");
 
     // Test various durations
-    for duration_secs in [60, 300, 900] { // 1min, 5min, 15min
-        let file_path = temp_dir.path().join(format!("precache_{}s.wav", duration_secs));
+    for duration_secs in [60, 300, 900] {
+        // 1min, 5min, 15min
+        let file_path = temp_dir
+            .path()
+            .join(format!("precache_{}s.wav", duration_secs));
         generate_wav_file(&file_path, duration_secs, 48000, 2);
 
         group.bench_with_input(
@@ -165,7 +169,10 @@ fn bench_precache(c: &mut Criterion) {
 
                         let start = Instant::now();
                         rt.block_on(async {
-                            cache_mgr.precache(file_path.to_str().unwrap(), 48000).await.unwrap()
+                            cache_mgr
+                                .precache(file_path.to_str().unwrap(), 48000)
+                                .await
+                                .unwrap()
                         });
                         total += start.elapsed();
                     }
@@ -204,13 +211,140 @@ fn bench_time_to_first_sample(c: &mut Criterion) {
 
                 let start = Instant::now();
                 let buffer = rt.block_on(async {
-                    cache_mgr.get_or_load(file_path.to_str().unwrap(), 48000).await.unwrap()
+                    cache_mgr
+                        .get_or_load(file_path.to_str().unwrap(), 48000)
+                        .await
+                        .unwrap()
                 });
-                // Time includes full load currently - this is what we want to improve
+                // The full-load path decodes the entire file before the first sample;
+                // its cost grows with the file's length. The windowed path instead
+                // starts after a small prebuffer regardless of length — measured and
+                // bounded by the windowed_time_to_first_sample_is_low_and_precedes_full_decode
+                // test in src/audio/streamed_source.rs.
                 total += start.elapsed();
 
                 // Verify we got data
                 assert!(buffer.frames > 0);
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark the local-file header probe used by the auto-windowing decision
+/// (Sprint 11 baseline; Sprint 12 caches its result keyed by path+mtime+size).
+fn bench_probe_local_file(c: &mut Criterion) {
+    let mut group = c.benchmark_group("probe_local_file");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(5));
+
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("probe_60s.wav");
+    generate_wav_file(&file_path, 60, 48000, 2);
+    let path = file_path.to_str().unwrap().to_string();
+
+    group.bench_function("60s_wav_header", |b| {
+        b.iter(|| {
+            mqttaudio::cache::strategy::probe_local_file(
+                &path,
+                48000,
+                mqttaudio::config::ResamplerQuality::Fast,
+            )
+            .unwrap()
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark a windowed play's prebuffer-ready time: producer spawn + ring fill to
+/// the default 100ms prebuffer through the control loop's gate. Sprint 11 measured
+/// the 5ms-poll gate at ~5.16ms; Sprint 12 (D53) made the gate event-driven, so this
+/// now measures producer spin-up + actual fill time.
+fn bench_windowed_prebuffer_ready(c: &mut Criterion) {
+    use std::sync::atomic::Ordering;
+
+    let mut group = c.benchmark_group("windowed_prebuffer_ready");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(10));
+
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("windowed_300s.wav");
+    generate_wav_file(&file_path, 300, 48000, 2);
+    let path = file_path.to_str().unwrap().to_string();
+
+    const PREBUFFER_FRAMES: usize = 48000 / 10; // 100ms at 48k (config default)
+    const WINDOW_FRAMES: usize = 48000 / 2; // 500ms window (config default)
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    group.bench_function("300s_wav_100ms_prebuffer", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let start = Instant::now();
+                let handles = mqttaudio::audio::streamed_source::spawn_local_file_stream(
+                    path.clone(),
+                    48000,
+                    mqttaudio::config::ResamplerQuality::Fast,
+                    WINDOW_FRAMES,
+                    false,
+                )
+                .unwrap();
+                // The control loop's gate (event-driven, D53).
+                rt.block_on(handles.wait_prebuffer(PREBUFFER_FRAMES, Duration::from_secs(5)));
+                total += start.elapsed();
+                handles.stop_flag.store(true, Ordering::Release);
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
+/// Time until a cold local play has a PLAYABLE buffer (D51): the progressive
+/// load returns a streaming buffer immediately, so this no longer scales with
+/// file length (contrast `cold_load_file`, which measures the legacy blocking
+/// full-decode API).
+fn bench_cold_streaming_playable(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cold_streaming_playable");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(5));
+
+    let temp_dir = TempDir::new().unwrap();
+    let cache_dir = temp_dir.path().join("cache");
+    let file_path = temp_dir.path().join("playable_300s.wav");
+    generate_wav_file(&file_path, 300, 48000, 2);
+    let path = file_path.to_str().unwrap().to_string();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    group.bench_function("300s_file_cold", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let mut cache_mgr = rt.block_on(async {
+                    mqttaudio::cache::CacheManager::new(cache_dir.clone()).unwrap()
+                });
+                let _ = cache_mgr.clear_all();
+
+                let start = Instant::now();
+                let buffer = rt
+                    .block_on(async { cache_mgr.get_or_load_streaming(&path, 48000).await })
+                    .unwrap();
+                total += start.elapsed();
+
+                // Drain the background decode outside the timed region so decode
+                // tasks do not pile up across iterations.
+                while !buffer.is_complete() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
             total
         });
@@ -248,7 +382,10 @@ fn bench_memory_usage(c: &mut Criterion) {
                 let start = Instant::now();
                 for path in &file_paths {
                     rt.block_on(async {
-                        cache_mgr.get_or_load(path.to_str().unwrap(), 48000).await.unwrap()
+                        cache_mgr
+                            .get_or_load(path.to_str().unwrap(), 48000)
+                            .await
+                            .unwrap()
                     });
                 }
                 total += start.elapsed();
@@ -256,7 +393,10 @@ fn bench_memory_usage(c: &mut Criterion) {
                 // Report memory usage
                 let stats = cache_mgr.memory_stats();
                 let mb = stats.size_bytes as f64 / (1024.0 * 1024.0);
-                eprintln!("Memory usage: {:.2} MB for {} entries", mb, stats.entry_count);
+                eprintln!(
+                    "Memory usage: {:.2} MB for {} entries",
+                    mb, stats.entry_count
+                );
             }
             total
         });
@@ -277,7 +417,9 @@ fn bench_resampling(c: &mut Criterion) {
 
     // Test with files at 44100Hz (common for MP3s)
     for duration_secs in [30, 60, 300] {
-        let file_path = temp_dir.path().join(format!("resample_{}s.wav", duration_secs));
+        let file_path = temp_dir
+            .path()
+            .join(format!("resample_{}s.wav", duration_secs));
         // Generate at 44100 Hz - will require resampling to 48000 Hz
         generate_wav_file(&file_path, duration_secs, 44100, 2);
 
@@ -297,7 +439,10 @@ fn bench_resampling(c: &mut Criterion) {
                         let start = Instant::now();
                         rt.block_on(async {
                             // Target 48000 Hz - forces resampling
-                            cache_mgr.get_or_load(file_path.to_str().unwrap(), 48000).await.unwrap()
+                            cache_mgr
+                                .get_or_load(file_path.to_str().unwrap(), 48000)
+                                .await
+                                .unwrap()
                         });
                         total += start.elapsed();
                     }
@@ -309,7 +454,9 @@ fn bench_resampling(c: &mut Criterion) {
 
     // Also test no-resample baseline for comparison
     for duration_secs in [30, 60, 300] {
-        let file_path = temp_dir.path().join(format!("no_resample_{}s.wav", duration_secs));
+        let file_path = temp_dir
+            .path()
+            .join(format!("no_resample_{}s.wav", duration_secs));
         // Generate at 48000 Hz - no resampling needed
         generate_wav_file(&file_path, duration_secs, 48000, 2);
 
@@ -328,7 +475,10 @@ fn bench_resampling(c: &mut Criterion) {
 
                         let start = Instant::now();
                         rt.block_on(async {
-                            cache_mgr.get_or_load(file_path.to_str().unwrap(), 48000).await.unwrap()
+                            cache_mgr
+                                .get_or_load(file_path.to_str().unwrap(), 48000)
+                                .await
+                                .unwrap()
                         });
                         total += start.elapsed();
                     }
@@ -348,6 +498,9 @@ criterion_group!(
     bench_cold_load_http,
     bench_precache,
     bench_time_to_first_sample,
+    bench_probe_local_file,
+    bench_windowed_prebuffer_ready,
+    bench_cold_streaming_playable,
     bench_memory_usage,
     bench_resampling,
 );

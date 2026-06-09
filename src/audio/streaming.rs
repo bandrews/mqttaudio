@@ -65,13 +65,14 @@ impl StreamingBuffer {
     /// Called by loader thread with interleaved samples.
     pub fn append(&mut self, samples: &[f32]) {
         debug_assert!(
-            samples.len() % self.channels == 0,
+            samples.len().is_multiple_of(self.channels),
             "Sample count must be divisible by channel count"
         );
         let new_frames = samples.len() / self.channels;
         self.data.extend_from_slice(samples);
         // Use Release ordering so readers see the new data
-        self.frames_available.fetch_add(new_frames, Ordering::Release);
+        self.frames_available
+            .fetch_add(new_frames, Ordering::Release);
         self.data_available.notify_waiters();
     }
 
@@ -144,7 +145,11 @@ impl StreamingBuffer {
         if !matches!(self.state, LoadingState::Complete) {
             return None;
         }
-        Some(DecodedBuffer::new(self.data, self.channels, self.sample_rate))
+        Some(DecodedBuffer::new(
+            self.data,
+            self.channels,
+            self.sample_rate,
+        ))
     }
 }
 
@@ -165,9 +170,7 @@ impl SampleBuffer {
     pub fn channels(&self) -> usize {
         match self {
             SampleBuffer::Complete(buf) => buf.channels,
-            SampleBuffer::Streaming(buf) => {
-                buf.try_read().map(|b| b.channels).unwrap_or(0)
-            }
+            SampleBuffer::Streaming(buf) => buf.try_read().map(|b| b.channels).unwrap_or(0),
         }
     }
 
@@ -175,9 +178,7 @@ impl SampleBuffer {
     pub fn sample_rate(&self) -> u32 {
         match self {
             SampleBuffer::Complete(buf) => buf.sample_rate,
-            SampleBuffer::Streaming(buf) => {
-                buf.try_read().map(|b| b.sample_rate).unwrap_or(0)
-            }
+            SampleBuffer::Streaming(buf) => buf.try_read().map(|b| b.sample_rate).unwrap_or(0),
         }
     }
 
@@ -225,9 +226,10 @@ impl SampleBuffer {
     pub fn is_frame_loaded(&self, frame: usize) -> bool {
         match self {
             SampleBuffer::Complete(buf) => frame < buf.frames,
-            SampleBuffer::Streaming(buf) => {
-                buf.try_read().map(|b| b.is_frame_loaded(frame)).unwrap_or(false)
-            }
+            SampleBuffer::Streaming(buf) => buf
+                .try_read()
+                .map(|b| b.is_frame_loaded(frame))
+                .unwrap_or(false),
         }
     }
 
@@ -236,9 +238,7 @@ impl SampleBuffer {
     pub fn total_frames_or_estimate(&self) -> Option<usize> {
         match self {
             SampleBuffer::Complete(buf) => Some(buf.frames),
-            SampleBuffer::Streaming(buf) => {
-                buf.try_read().ok().and_then(|b| b.total_frames)
-            }
+            SampleBuffer::Streaming(buf) => buf.try_read().ok().and_then(|b| b.total_frames),
         }
     }
 
@@ -248,9 +248,7 @@ impl SampleBuffer {
     pub fn notifier(&self) -> Option<Arc<Notify>> {
         match self {
             SampleBuffer::Complete(_) => None,
-            SampleBuffer::Streaming(buf) => {
-                buf.try_read().map(|b| b.notifier()).ok()
-            }
+            SampleBuffer::Streaming(buf) => buf.try_read().map(|b| b.notifier()).ok(),
         }
     }
 
@@ -263,11 +261,6 @@ impl SampleBuffer {
         }
     }
 }
-
-/// Minimum frames of data required before starting playback.
-/// At 48kHz, 2560 frames = ~53ms = ~5 callback buffers at 512 frames/callback.
-#[allow(dead_code)] // Used by tests and future buffering logic
-pub const MIN_BUFFER_FRAMES: usize = 2560;
 
 #[cfg(test)]
 mod tests {
@@ -289,8 +282,8 @@ mod tests {
 
         // Append 10 frames of stereo audio with exact values
         let samples: Vec<f32> = vec![
-            0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9,
-            1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7, 1.8, 1.9,
+            0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6,
+            1.7, 1.8, 1.9,
         ];
         buf.append(&samples);
 
@@ -351,7 +344,10 @@ mod tests {
         buf.mark_error("Connection failed".to_string());
         assert!(!buf.is_complete());
         assert!(buf.has_error());
-        assert_eq!(buf.state, LoadingState::Error("Connection failed".to_string()));
+        assert_eq!(
+            buf.state,
+            LoadingState::Error("Connection failed".to_string())
+        );
     }
 
     #[test]
@@ -360,7 +356,9 @@ mod tests {
         buf.append(&[0.5; 20]); // 10 frames
 
         // Can't convert while still loading
-        assert!(StreamingBuffer::new(2, 48000, None).into_decoded_buffer().is_none());
+        assert!(StreamingBuffer::new(2, 48000, None)
+            .into_decoded_buffer()
+            .is_none());
 
         buf.mark_complete();
         let decoded = buf.into_decoded_buffer().unwrap();
@@ -416,15 +414,6 @@ mod tests {
     }
 
     #[test]
-    fn test_min_buffer_frames_constant() {
-        // Verify the constant is reasonable for 48kHz playback
-        // 2560 frames at 48000Hz = 53.3ms
-        let duration_ms = MIN_BUFFER_FRAMES as f64 / 48000.0 * 1000.0;
-        assert!(duration_ms > 50.0);
-        assert!(duration_ms < 60.0);
-    }
-
-    #[test]
     fn test_concurrent_read_write() {
         use std::thread;
         use std::time::Duration;
@@ -471,7 +460,11 @@ mod tests {
         // 1. Reader completed all iterations (never blocked indefinitely)
         assert_eq!(reads, 1000);
         // 2. At least some reads succeeded (got actual samples)
-        assert!(successful > 0, "Expected some successful reads, got {}", successful);
+        assert!(
+            successful > 0,
+            "Expected some successful reads, got {}",
+            successful
+        );
     }
 
     #[test]
@@ -563,7 +556,11 @@ mod tests {
     #[test]
     fn test_seek_behavior_complete_buffer() {
         // Complete buffer can "seek" to any frame in bounds
-        let decoded = Arc::new(DecodedBuffer::new(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], 2, 48000));
+        let decoded = Arc::new(DecodedBuffer::new(
+            vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            2,
+            48000,
+        ));
         let buf = SampleBuffer::Complete(decoded);
 
         // 6 samples / 2 channels = 3 frames

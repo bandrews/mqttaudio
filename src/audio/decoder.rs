@@ -4,6 +4,8 @@
 use crate::audio::resampler;
 use crate::audio::types::DecodedBuffer;
 use crate::config::ResamplerQuality;
+use std::fs::File;
+use std::path::Path;
 use symphonia::core::audio::{AudioBufferRef, Signal};
 use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
@@ -11,8 +13,6 @@ use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
-use std::fs::File;
-use std::path::Path;
 
 #[derive(Debug)]
 pub enum DecodeError {
@@ -86,36 +86,31 @@ pub fn decode_file(
     let format_opts = FormatOptions::default();
     let metadata_opts = MetadataOptions::default();
 
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &format_opts, &metadata_opts)?;
+    let probed =
+        symphonia::default::get_probe().format(&hint, mss, &format_opts, &metadata_opts)?;
 
     let mut format = probed.format;
 
     // Get the default track
-    let track = format
-        .default_track()
-        .ok_or(DecodeError::NoDefaultTrack)?;
+    let track = format.default_track().ok_or(DecodeError::NoDefaultTrack)?;
 
     let track_id = track.id;
 
     // Get codec parameters
     let codec_params = &track.codec_params;
-    let channels = codec_params.channels
+    let channels = codec_params
+        .channels
         .ok_or(DecodeError::UnsupportedFormat)?
         .count();
-    let sample_rate = codec_params.sample_rate
+    let sample_rate = codec_params
+        .sample_rate
         .ok_or(DecodeError::UnsupportedFormat)?;
 
-    tracing::debug!(
-        "Track info: {} channels, {} Hz",
-        channels,
-        sample_rate
-    );
+    tracing::debug!("Track info: {} channels, {} Hz", channels, sample_rate);
 
     // Create a decoder
     let decoder_opts = DecoderOptions::default();
-    let mut decoder = symphonia::default::get_codecs()
-        .make(codec_params, &decoder_opts)?;
+    let mut decoder = symphonia::default::get_codecs().make(codec_params, &decoder_opts)?;
 
     // Decode all packets
     let mut samples = Vec::new();
@@ -184,7 +179,9 @@ fn convert_samples_to_f32(audio_buf: &AudioBufferRef, output: &mut Vec<f32>) {
             convert_typed_to_f32(buf, output, |s| (s.inner() as f32 - 8388608.0) / 8388608.0);
         }
         AudioBufferRef::U32(buf) => {
-            convert_typed_to_f32(buf, output, |s| (s as f64 - 2147483648.0) as f32 / 2147483648.0);
+            convert_typed_to_f32(buf, output, |s| {
+                (s as f64 - 2147483648.0) as f32 / 2147483648.0
+            });
         }
         AudioBufferRef::S8(buf) => {
             convert_typed_to_f32(buf, output, |s| s as f32 / 128.0);

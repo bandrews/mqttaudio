@@ -8,7 +8,7 @@ license = "MIT"
 
 [dependencies]
 # Audio I/O
-cpal = "0.15"
+cpal = "0.17"
 
 # Audio decoding
 symphonia = { version = "0.5", features = ["all"] }
@@ -40,13 +40,13 @@ signalsmith-stretch = "0.1"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["json"] }
 
 # Lock-free structures
 ringbuf = "0.3"
 
-# Signal handling
-ctrlc = "3.4"
+# Non-poisoning mutex for control-plane / RT-shared state
+parking_lot = "0.12"
 
 # HTTP server
 axum = { version = "0.7", features = ["ws"] }
@@ -68,6 +68,12 @@ chrono = "0.4"
 # Directory utilities
 dirs = "5.0"
 
+# Stable content hashing for cache keys
+sha2 = "0.10"
+
+# System memory detection for the auto memory budget (read once at startup)
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+
 # Linux-specific: ALSA bindings for device probing
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.9"
@@ -76,6 +82,10 @@ alsa = "0.9"
 criterion = "0.5"
 tempfile = "3.8"
 tower = "0.5"
+proptest = "1"
+tokio-tungstenite = "0.24"
+# test-util enables tokio's paused-time clock for deterministic gate tests.
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [[bench]]
 name = "mixer_benchmark"

@@ -48,6 +48,11 @@ Play an audio file.
 | `fade_in` | integer | 0 | Fade-in duration (milliseconds) |
 | `start_position_ms` | integer | 0 | Start position (milliseconds) |
 | `channel_map` | array | auto | Channel routing (see below) |
+| `mode` | string | `auto` | Load strategy: `auto` (decide by size/duration + memory budget), `full` (always in-memory), or `stream` (window a big/long file). Applies to local files and `http(s)://` URLs. A windowed voice plays forward only |
+| `window_ms` | integer | config | Windowed-source ring depth override (streamed plays) |
+| `prebuffer_ms` | integer | config | Windowed-source prebuffer override (streamed plays) |
+| `freshness` | string | config | Cache freshness override: `trusting`, `dev`, or `pinned` |
+| `cacheable` | boolean | `true` | HTTP windowed plays only: `true` (default) tees the download to the disk cache so a replay hits disk; `false` treats the source as live (window, never persist). A URL with no `Content-Length` is always live |
 
 **Channel Mapping:**
 
@@ -91,6 +96,23 @@ You can route one source to multiple destinations:
 }
 ```
 
+Each route accepts an optional `gain` (default `1.0`). When several source channels are routed to the same
+destination they sum, which can clip; a per-route `gain` lets you attenuate (or boost) each route. A route
+without `gain` is unity, so existing maps are unaffected:
+
+```json
+{
+  "command": "play",
+  "file": "/quad.wav",
+  "channel_map": [
+    {"src": 0, "dest": 0, "gain": 0.5},
+    {"src": 2, "dest": 0, "gain": 0.5},
+    {"src": 1, "dest": 1, "gain": 0.5},
+    {"src": 3, "dest": 1, "gain": 0.5}
+  ]
+}
+```
+
 ### stopall
 
 Stop all playing audio immediately.
@@ -119,12 +141,13 @@ Stop specific samples.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
 | `id` | string | — | Stop sample with this ID |
 | `file` | string | — | Stop all samples playing this file |
 | `voice` | string | — | Stop all samples in this voice |
 | `fade_out_ms` | integer | 0 | Fade-out duration (milliseconds) |
 
-At least one of `id`, `file`, or `voice` is required. Multiple selectors use OR logic.
+At least one of `internal_id`, `id`, `file`, or `voice` is required. Multiple selectors use OR logic (a sample matches if any one criterion matches). An empty selector matches nothing and is silently a no-op.
 
 ### seek
 
@@ -140,6 +163,7 @@ Jump to a position in a playing sample.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target all samples playing this file |
 | `voice` | string | — | Target all samples in this voice |
@@ -160,6 +184,7 @@ Change playback speed.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target samples playing this file |
 | `voice` | string | — | Target samples in this voice |
@@ -184,6 +209,7 @@ Adjust volume of specific samples.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target samples playing this file |
 | `voice` | string | — | Target samples in this voice |
@@ -271,6 +297,18 @@ Remove a specific file from cache.
 {
   "command": "cache_invalidate",
   "file": "https://example.com/updated-file.wav"
+}
+```
+
+### cache_reload
+
+Invalidate a cached entry and immediately re-precache it, so the next play is both fresh and instant. Useful
+after a content pipeline republishes an asset.
+
+```json
+{
+  "command": "cache_reload",
+  "file": "/sounds/updated-cue.wav"
 }
 ```
 
@@ -460,4 +498,16 @@ For backward compatibility, commands also accept parameters wrapped in a `messag
 }
 ```
 
-This format is equivalent to the flattened format shown throughout this document. When both formats are present in the same message, the `message` object takes precedence.
+This format is equivalent to the flattened format shown throughout this document. When both formats are present in the same message, the `message` object takes precedence (its contents replace the flattened keys wholesale rather than merging).
+
+### Legacy command names
+
+Three commands also accept a legacy alias for their `command` value:
+
+| Canonical | Legacy alias |
+|-----------|--------------|
+| `play` | `soundPlay` |
+| `stopall` | `soundStopAll` |
+| `precache` | `soundPrecache` |
+
+These aliases are accepted only for those three commands; every other command uses its canonical name. Command names are matched case-sensitively.

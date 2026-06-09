@@ -1,11 +1,11 @@
 // ABOUTME: Configuration loading and management.
 // ABOUTME: Parses JSON config files and merges with CLI arguments.
 
+use crate::audio::ducking::DuckingRule;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs;
-use crate::audio::ducking::DuckingRule;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -21,6 +21,19 @@ pub struct MqttConfig {
     /// MQTT broker password for authentication
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// Opt-in TLS. When present, the broker connection uses TLS; absent = plain TCP
+    /// (the default, even on port 8883, so a legacy plain broker is never broken).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls: Option<MqttTlsConfig>,
+}
+
+/// Opt-in MQTT TLS configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct MqttTlsConfig {
+    /// Path to a PEM CA certificate to trust (for self-signed / private brokers).
+    /// When omitted, the system root certificate store is used (public CAs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_path: Option<String>,
 }
 
 impl Default for MqttConfig {
@@ -33,8 +46,31 @@ impl Default for MqttConfig {
             reconnect_delay_seconds: 10,
             username: None,
             password: None,
+            tls: None,
         }
     }
+}
+
+/// Default limiter ceiling in dBFS. The summed bus is limited so its peak never
+/// exceeds this level, leaving headroom below digital full scale.
+pub const DEFAULT_OUTPUT_CEILING_DB: f32 = -1.0;
+
+/// Default master gain applied to the summed bus before limiting (unity).
+pub const DEFAULT_MASTER_GAIN: f32 = 1.0;
+
+fn default_output_ceiling_db() -> f32 {
+    DEFAULT_OUTPUT_CEILING_DB
+}
+
+fn default_master_gain() -> f32 {
+    DEFAULT_MASTER_GAIN
+}
+
+/// Default LFE trim gain for bass management (unity).
+pub const DEFAULT_LFE_GAIN: f32 = 1.0;
+
+fn default_lfe_gain() -> f32 {
+    DEFAULT_LFE_GAIN
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -45,12 +81,17 @@ pub struct AudioConfig {
     pub channels: Option<usize>,
     pub buffer_size: u32,
     #[serde(default)]
-    pub channel_names: HashMap<String, String>,
-    #[serde(default)]
     pub channel_volumes: HashMap<String, f32>,
     /// Maps alias names to channel numbers (e.g., "front_left" -> 0)
     #[serde(default)]
     pub channel_aliases: HashMap<String, usize>,
+    /// Limiter ceiling in dBFS. The summed output bus is soft-limited so its peak
+    /// stays at or below this level (default -1.0 dBFS). Must be <= 0 dBFS.
+    #[serde(default = "default_output_ceiling_db")]
+    pub output_ceiling_db: f32,
+    /// Linear gain applied to the whole bus before limiting (default 1.0 = unity).
+    #[serde(default = "default_master_gain")]
+    pub master_gain: f32,
 }
 
 /// A channel reference that can be either a numeric index or a string alias.
@@ -62,16 +103,24 @@ pub enum ChannelRef {
 }
 
 impl ChannelRef {
+    /// Build a `ChannelRef` from a map key string: a value parseable as an index is
+    /// an `Index`, otherwise it is an `Alias` (mirrors string deserialization).
+    pub fn from_key(key: &str) -> Self {
+        match key.parse::<usize>() {
+            Ok(idx) => ChannelRef::Index(idx),
+            Err(_) => ChannelRef::Alias(key.to_string()),
+        }
+    }
+
     /// Resolve this channel reference to a numeric index using the alias map.
     /// Returns an error if the alias is not found.
     pub fn resolve(&self, aliases: &HashMap<String, usize>) -> Result<usize, String> {
         match self {
             ChannelRef::Index(idx) => Ok(*idx),
-            ChannelRef::Alias(name) => {
-                aliases.get(name)
-                    .copied()
-                    .ok_or_else(|| format!("Unknown channel alias: '{}'", name))
-            }
+            ChannelRef::Alias(name) => aliases
+                .get(name)
+                .copied()
+                .ok_or_else(|| format!("Unknown channel alias: '{}'", name)),
         }
     }
 }
@@ -146,9 +195,10 @@ impl Default for AudioConfig {
             sample_rate: 48000,
             channels: None,
             buffer_size: 512,
-            channel_names: HashMap::new(),
             channel_volumes: HashMap::new(),
             channel_aliases: HashMap::new(),
+            output_ceiling_db: DEFAULT_OUTPUT_CEILING_DB,
+            master_gain: DEFAULT_MASTER_GAIN,
         }
     }
 }
@@ -162,14 +212,40 @@ pub struct CacheConfig {
     /// List of files to precache on startup
     #[serde(default)]
     pub precache: Vec<String>,
-    /// Maximum memory cache size in megabytes.
-    /// When exceeded, least-recently-used entries are evicted.
-    /// Set to 0 for unlimited (default: 512 MB).
+    /// Simple memory-cache cap in megabytes. `0` (the default) auto-detects a bounded
+    /// cap from system memory at startup; a positive value is an explicit hard cap of
+    /// that many MiB and always wins over the auto default. For an explicit `unlimited`
+    /// or to tune the auto fraction/clamp, set `memory_budget` (it overrides this).
     pub max_memory_mb: u32,
+    /// Advanced memory budget. When present it overrides `max_memory_mb`: a mode of
+    /// `auto` (a clamped fraction of available RAM), `explicit` (a fixed MiB cap), or
+    /// `unlimited` (opt out of the cap entirely — risks OOM on big files).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_budget: Option<MemoryBudget>,
     /// Block startup until all precache files are loaded.
     /// When true (default): App waits for all files to load before accepting commands.
     /// When false: App starts immediately, files load in background (lazy-load).
     pub precache_blocking: bool,
+    /// Window (ring) depth in milliseconds for windowed streamed sources. Bounds the
+    /// resident memory of each streamed voice independently of the asset's length.
+    pub stream_window_ms: u32,
+    /// Milliseconds of audio to prebuffer before a streamed source starts playing, so
+    /// the first audio is glitch-free.
+    pub stream_prebuffer_ms: u32,
+    /// Maximum milliseconds to wait for the prebuffer before starting anyway, so a slow
+    /// source never stalls playback (the underrun fade covers any gap).
+    pub stream_prebuffer_deadline_ms: u32,
+    /// Default load strategy when a Play does not specify one: `auto` (decide from the
+    /// asset's size/duration and the memory budget), `full`, or `stream`.
+    pub load_mode: LoadMode,
+    /// Auto threshold: a local asset whose estimated decoded size exceeds this many
+    /// bytes is windowed rather than fully loaded.
+    pub full_load_max_bytes: u64,
+    /// Auto threshold: a local asset longer than this many seconds is windowed.
+    pub full_load_max_seconds: u32,
+    /// Default freshness policy: `trusting` (serve cache, refresh in the background),
+    /// `dev` (re-check every load), or `pinned` (never auto-check).
+    pub freshness: FreshnessMode,
 }
 
 impl Default for CacheConfig {
@@ -179,25 +255,44 @@ impl Default for CacheConfig {
             directory: "~/.mqttaudio/cache".to_string(),
             revalidate_after_seconds: 300,
             precache: Vec::new(),
-            max_memory_mb: 512,
+            max_memory_mb: 0,
+            memory_budget: None,
             precache_blocking: true,
+            stream_window_ms: 1500,
+            stream_prebuffer_ms: 150,
+            stream_prebuffer_deadline_ms: 300,
+            load_mode: LoadMode::Auto,
+            full_load_max_bytes: 32 * 1024 * 1024,
+            full_load_max_seconds: 60,
+            freshness: FreshnessMode::Trusting,
+        }
+    }
+}
+
+impl CacheConfig {
+    /// Resolve the effective memory cap. `memory_budget` wins when present; otherwise
+    /// the simple `max_memory_mb` knob applies — `0` (the default) auto-detects a
+    /// bounded cap (so the daemon never camps all RAM), a positive value is an explicit
+    /// hard cap. `available_bytes` is the system's available memory (None => the auto
+    /// path falls back to its ceiling, never unlimited).
+    pub fn resolve_memory_cap(&self, available_bytes: Option<u64>) -> MemoryCap {
+        if let Some(budget) = self.memory_budget {
+            return budget.resolve(available_bytes);
+        }
+        if self.max_memory_mb == 0 {
+            MemoryBudget::default_auto().resolve(available_bytes)
+        } else {
+            MemoryCap::Bytes(mib_to_bytes(self.max_memory_mb))
         }
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct SecurityConfig {
     #[serde(default)]
     pub allowed_directories: Vec<String>,
-}
-
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        Self {
-            allowed_directories: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -205,6 +300,9 @@ impl Default for SecurityConfig {
 pub struct LoggingConfig {
     pub level: String,
     pub verbose: bool,
+    /// Log record format: `"text"` (human-readable, default) or `"json"`
+    /// (line-delimited JSON) for production log aggregation.
+    pub format: String,
     /// MQTT topic to publish log messages to (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mqtt_topic: Option<String>,
@@ -215,6 +313,7 @@ impl Default for LoggingConfig {
         Self {
             level: "info".to_string(),
             verbose: false,
+            format: "text".to_string(),
             mqtt_topic: None,
         }
     }
@@ -229,6 +328,9 @@ pub struct BassManagementConfig {
     #[serde(default)]
     pub source_channels: Vec<ChannelRef>,
     pub remove_bass_from_sources: bool,
+    /// Linear trim applied to the count-normalized summed LFE (D32).
+    #[serde(default = "default_lfe_gain")]
+    pub lfe_gain: f32,
 }
 
 impl Default for BassManagementConfig {
@@ -238,7 +340,11 @@ impl Default for BassManagementConfig {
             lfe_channel: ChannelRef::Index(3), // Standard 5.1 LFE position
             crossover_frequency_hz: 80.0,
             source_channels: Vec::new(),
-            remove_bass_from_sources: false,
+            // Proper bass management high-passes the mains so they no longer carry
+            // the bass routed to the sub (D30). The additive "LFE+Main" mode is
+            // still available by setting this false.
+            remove_bass_from_sources: true,
+            lfe_gain: DEFAULT_LFE_GAIN,
         }
     }
 }
@@ -251,6 +357,7 @@ pub struct ResolvedBassManagement {
     pub crossover_frequency_hz: f32,
     pub source_channels: Vec<usize>,
     pub remove_bass_from_sources: bool,
+    pub lfe_gain: f32,
 }
 
 /// Configuration for a single input-to-output route
@@ -293,9 +400,11 @@ impl Default for InputConfig {
 /// Resampler quality preset
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ResamplerQuality {
     /// Fastest resampling, acceptable quality for most content.
     /// sinc_len=64, oversample=64. ~60ms for 1 min stereo.
+    #[default]
     Fast,
     /// Balanced quality and speed.
     /// sinc_len=128, oversample=128. ~95ms for 1 min stereo.
@@ -307,12 +416,6 @@ pub enum ResamplerQuality {
     /// sinc_len=256, oversample=256. ~230ms for 1 min stereo.
     /// Only recommended when precaching everything on startup.
     Maximum,
-}
-
-impl Default for ResamplerQuality {
-    fn default() -> Self {
-        ResamplerQuality::Fast
-    }
 }
 
 impl ResamplerQuality {
@@ -335,6 +438,129 @@ impl ResamplerQuality {
             ResamplerQuality::Maximum => 256,
         }
     }
+}
+
+/// How a Play chooses between fully loading an asset into memory (full random access:
+/// seek/loop/pitch) and windowed streaming (bounded memory, low time-to-first-sample).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum LoadMode {
+    /// Pick automatically from the asset's estimated size/duration and the memory
+    /// budget (the windowed path is forced when a full load would not fit).
+    #[default]
+    Auto,
+    /// Force a full in-memory load: all features (seek/loop/crossfade/reverse/speed/
+    /// pitch), at the cost of full decode latency and resident memory.
+    Full,
+    /// Force windowed streaming: bounded memory and low latency, but forward playback
+    /// only (no seek/loop-crossfade/reverse/variable-speed/pitch).
+    Stream,
+}
+
+/// Default fraction of available memory the auto budget targets.
+fn default_budget_fraction() -> f32 {
+    0.4
+}
+/// Default floor (MiB) for the auto budget, so small assets still cache on a tiny box.
+fn default_budget_floor_mb() -> u32 {
+    128
+}
+/// Default ceiling (MiB) for the auto budget, so the daemon never camps all RAM.
+fn default_budget_ceiling_mb() -> u32 {
+    1024
+}
+
+/// Convert mebibytes to bytes.
+fn mib_to_bytes(mib: u32) -> usize {
+    (mib as usize) * 1024 * 1024
+}
+
+/// How much memory the decoded-audio cache may use. Resolved once at startup (the
+/// `auto` mode reads system memory) into a [`MemoryCap`].
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum MemoryBudget {
+    /// No cap. Opt-in only: a single large file can then exhaust memory.
+    Unlimited,
+    /// A fixed hard cap of `mb` mebibytes.
+    Explicit { mb: u32 },
+    /// A clamped fraction of *available* system memory: `clamp(available * fraction,
+    /// floor_mb, ceiling_mb)`. The ceiling keeps the daemon from camping all RAM; the
+    /// floor keeps small assets cacheable on a tiny box. If autodetection fails the cap
+    /// falls back to `ceiling_mb` (never unlimited).
+    Auto {
+        #[serde(default = "default_budget_fraction")]
+        fraction: f32,
+        #[serde(default = "default_budget_floor_mb")]
+        floor_mb: u32,
+        #[serde(default = "default_budget_ceiling_mb")]
+        ceiling_mb: u32,
+    },
+}
+
+impl MemoryBudget {
+    /// The default `auto` budget (40% of available, clamped to [128 MiB, 1 GiB]).
+    pub fn default_auto() -> Self {
+        MemoryBudget::Auto {
+            fraction: default_budget_fraction(),
+            floor_mb: default_budget_floor_mb(),
+            ceiling_mb: default_budget_ceiling_mb(),
+        }
+    }
+
+    /// Resolve to a concrete cap. `available_bytes` is the system's available memory
+    /// (None if autodetection failed or was not attempted).
+    pub fn resolve(&self, available_bytes: Option<u64>) -> MemoryCap {
+        match *self {
+            MemoryBudget::Unlimited => MemoryCap::Unlimited,
+            MemoryBudget::Explicit { mb } => MemoryCap::Bytes(mib_to_bytes(mb)),
+            MemoryBudget::Auto {
+                fraction,
+                floor_mb,
+                ceiling_mb,
+            } => {
+                let floor = mib_to_bytes(floor_mb);
+                // Guard a misconfigured ceiling below the floor.
+                let ceiling = mib_to_bytes(ceiling_mb).max(floor);
+                let cap = match available_bytes {
+                    Some(avail) => {
+                        let target = (avail as f64 * fraction.clamp(0.0, 1.0) as f64) as usize;
+                        target.clamp(floor, ceiling)
+                    }
+                    None => ceiling,
+                };
+                MemoryCap::Bytes(cap)
+            }
+        }
+    }
+}
+
+/// A resolved memory-cache cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryCap {
+    /// No cap (the cache may grow without bound).
+    Unlimited,
+    /// A hard cap in bytes.
+    Bytes(usize),
+}
+
+/// How aggressively the cache checks whether an asset changed before serving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+#[derive(Default)]
+pub enum FreshnessMode {
+    /// Serve the cached copy immediately; pick up local changes via a cheap `stat`
+    /// each load, and refresh remote entries in the background once past the
+    /// revalidation window. Never blocks a play on the network. (Default.)
+    #[default]
+    Trusting,
+    /// Check on every load: re-`stat` local files each play and revalidate remote
+    /// entries with no freshness window, so an edited asset is picked up immediately.
+    /// For active development.
+    Dev,
+    /// Never auto-check; changes are picked up only via an explicit reload or restart.
+    Pinned,
 }
 
 /// Advanced configuration settings.
@@ -393,6 +619,10 @@ pub struct HttpConfig {
     pub websocket_enabled: bool,
     /// Allow CORS from any origin (useful for web admin panels)
     pub cors_permissive: bool,
+    /// Opt-in: require a valid token on ALL routes (including status and ws).
+    /// Default false preserves the open status/health/ws endpoints.
+    #[serde(default)]
+    pub require_auth: bool,
 }
 
 impl Default for HttpConfig {
@@ -404,13 +634,25 @@ impl Default for HttpConfig {
             auth_token: None,
             websocket_enabled: true,
             cors_permissive: false,
+            require_auth: false,
         }
     }
 }
 
+/// Config schema version this build understands. An absent `schema_version`
+/// means "current"; a value greater than this is from a newer mqttaudio and may
+/// use fields this build ignores, so it warns (F4/D38). Bump this when the config
+/// schema changes in a way operators should be told about.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct Config {
+    /// Optional config schema version. Absent = current. A newer value warns at
+    /// startup (this build may ignore fields it does not know).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_version: Option<u32>,
     pub mqtt: MqttConfig,
     pub audio: AudioConfig,
     pub cache: CacheConfig,
@@ -433,32 +675,14 @@ pub struct Config {
     pub macros: HashMap<String, serde_json::Value>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            mqtt: MqttConfig::default(),
-            audio: AudioConfig::default(),
-            cache: CacheConfig::default(),
-            security: SecurityConfig::default(),
-            logging: LoggingConfig::default(),
-            http: HttpConfig::default(),
-            ducking_rules: Vec::new(),
-            bass_management: BassManagementConfig::default(),
-            inputs: Vec::new(),
-            advanced: AdvancedConfig::default(),
-            macros: HashMap::new(),
-        }
-    }
-}
-
 impl Config {
     /// Load configuration from a JSON file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let contents = fs::read_to_string(path.as_ref())
-            .map_err(|e| ConfigError::IoError(e.to_string()))?;
+        let contents =
+            fs::read_to_string(path.as_ref()).map_err(|e| ConfigError::IoError(e.to_string()))?;
 
-        let config: Config = serde_json::from_str(&contents)
-            .map_err(|e| ConfigError::ParseError(e.to_string()))?;
+        let config: Config =
+            serde_json::from_str(&contents).map_err(|e| ConfigError::ParseError(e.to_string()))?;
 
         Ok(config)
     }
@@ -474,13 +698,7 @@ impl Config {
             PathBuf::from("/etc/mqttaudio/config.json"),
         ];
 
-        for path in search_paths {
-            if path.exists() {
-                return Some(path);
-            }
-        }
-
-        None
+        search_paths.into_iter().find(|path| path.exists())
     }
 
     /// Load config from default search paths or create default config
@@ -522,10 +740,32 @@ impl Config {
     /// Get expanded allowed directories
     #[cfg(test)]
     pub fn allowed_directories(&self) -> Vec<PathBuf> {
-        self.security.allowed_directories
+        self.security
+            .allowed_directories
             .iter()
             .map(|d| PathBuf::from(Self::expand_tilde(d)))
             .collect()
+    }
+
+    /// Whether `path` is permitted by the allowlist. An **empty** allowlist permits
+    /// any path (the open-by-default behavior); a non-empty allowlist canonicalizes
+    /// both the path and each allowed directory (resolving symlinks and `..`) and
+    /// requires the path to be contained within one of them.
+    pub fn is_path_allowed(path: &Path, allowed: &[String]) -> bool {
+        if allowed.is_empty() {
+            return true;
+        }
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => return false, // unresolvable path -> reject under an allowlist
+        };
+        allowed.iter().any(|dir| {
+            let expanded = Self::expand_tilde(dir);
+            match Path::new(&expanded).canonicalize() {
+                Ok(allowed_dir) => canonical.starts_with(&allowed_dir),
+                Err(_) => false,
+            }
+        })
     }
 
     /// Merge CLI arguments into this config (CLI args override config file)
@@ -609,10 +849,34 @@ impl Config {
         channel.resolve(&self.audio.channel_aliases)
     }
 
+    /// Resolve `audio.channel_volumes` into a per-output-channel gain vector of
+    /// length `output_channels`, defaulting to unity. Keys may be numeric channel
+    /// indices or aliases; entries that resolve outside the channel range (or to an
+    /// unknown alias) are skipped with a warning so a misconfiguration never aborts
+    /// startup or panics the audio thread.
+    pub fn resolve_channel_gains(&self, output_channels: usize) -> Vec<f32> {
+        let mut gains = vec![1.0; output_channels];
+        for (key, &volume) in &self.audio.channel_volumes {
+            let channel = ChannelRef::from_key(key);
+            match self.resolve_channel(&channel) {
+                Ok(index) if index < output_channels => gains[index] = volume,
+                Ok(index) => tracing::warn!(
+                    "audio.channel_volumes: channel {} is beyond the {} output channels; ignoring",
+                    index,
+                    output_channels
+                ),
+                Err(e) => tracing::warn!("audio.channel_volumes: {}; ignoring '{}'", e, key),
+            }
+        }
+        gains
+    }
+
     /// Resolve bass management channel references to numeric indices
     pub fn resolve_bass_management(&self) -> Result<ResolvedBassManagement, String> {
         let lfe = self.resolve_channel(&self.bass_management.lfe_channel)?;
-        let sources: Result<Vec<usize>, String> = self.bass_management.source_channels
+        let sources: Result<Vec<usize>, String> = self
+            .bass_management
+            .source_channels
             .iter()
             .map(|ch| self.resolve_channel(ch))
             .collect();
@@ -622,12 +886,17 @@ impl Config {
             crossover_frequency_hz: self.bass_management.crossover_frequency_hz,
             source_channels: sources?,
             remove_bass_from_sources: self.bass_management.remove_bass_from_sources,
+            lfe_gain: self.bass_management.lfe_gain,
         })
     }
 
     /// Resolve input route channel references to numeric indices
-    pub fn resolve_input_routes(&self, routes: &[InputRouteConfig]) -> Result<Vec<(usize, usize)>, String> {
-        routes.iter()
+    pub fn resolve_input_routes(
+        &self,
+        routes: &[InputRouteConfig],
+    ) -> Result<Vec<(usize, usize)>, String> {
+        routes
+            .iter()
             .map(|r| {
                 let src = self.resolve_channel(&r.source_channel)?;
                 let dest = self.resolve_channel(&r.dest_channel)?;
@@ -679,6 +948,21 @@ impl Config {
         result
     }
 
+    /// Warning string when the configured `schema_version` is newer than this build
+    /// understands, else `None`. An absent or current/older version produces no
+    /// warning. Kept separate from `validate()` so an unknown version is a heads-up,
+    /// not a hard failure — the config still loads and runs (F4/D38).
+    pub fn schema_version_warning(&self) -> Option<String> {
+        match self.schema_version {
+            Some(v) if v > CURRENT_SCHEMA_VERSION => Some(format!(
+                "config schema_version {} is newer than this build supports ({}); \
+                 newer fields may be ignored — update mqttaudio or the config",
+                v, CURRENT_SCHEMA_VERSION
+            )),
+            _ => None,
+        }
+    }
+
     /// Validate configuration
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
@@ -698,35 +982,124 @@ impl Config {
             errors.push("audio.buffer_size must be between 64 and 8192".to_string());
         }
 
+        // Streamed-source window and prebuffer must be sane and consistent.
+        if self.cache.stream_window_ms < 100 || self.cache.stream_window_ms > 60000 {
+            errors.push("cache.stream_window_ms must be between 100 and 60000".to_string());
+        }
+        if self.cache.stream_prebuffer_ms > self.cache.stream_window_ms {
+            errors.push(
+                "cache.stream_prebuffer_ms must not exceed cache.stream_window_ms".to_string(),
+            );
+        }
+        if self.cache.stream_prebuffer_deadline_ms < self.cache.stream_prebuffer_ms {
+            errors.push(
+                "cache.stream_prebuffer_deadline_ms must be >= cache.stream_prebuffer_ms"
+                    .to_string(),
+            );
+        }
+
         // Channel volumes must be 0.0 to 1.0
         for (ch, vol) in &self.audio.channel_volumes {
             if *vol < 0.0 || *vol > 1.0 {
-                errors.push(format!("audio.channel_volumes.{} must be between 0.0 and 1.0", ch));
+                errors.push(format!(
+                    "audio.channel_volumes.{} must be between 0.0 and 1.0",
+                    ch
+                ));
+            }
+        }
+
+        // Limiter ceiling must be a finite level at or below full scale, and not
+        // absurdly low (a floor keeps a misconfigured value from muting everything).
+        let ceiling = self.audio.output_ceiling_db;
+        if !ceiling.is_finite() || !(-60.0..=0.0).contains(&ceiling) {
+            errors.push(
+                "audio.output_ceiling_db must be a finite value between -60.0 and 0.0".to_string(),
+            );
+        }
+
+        // Master gain must be a finite, non-negative trim with a sane upper bound.
+        let master_gain = self.audio.master_gain;
+        if !master_gain.is_finite() || !(0.0..=8.0).contains(&master_gain) {
+            errors.push("audio.master_gain must be a finite value between 0.0 and 8.0".to_string());
+        }
+
+        // Ducking target volumes must be finite and within [0.0, 1.0]
+        for (i, rule) in self.ducking_rules.iter().enumerate() {
+            let v = rule.target_volume;
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                errors.push(format!(
+                    "ducking_rules[{}].target_volume must be a finite value between 0.0 and 1.0",
+                    i
+                ));
             }
         }
 
         // Logging level must be valid
-        let valid_levels = vec!["error", "warn", "info", "debug", "trace"];
+        let valid_levels = ["error", "warn", "info", "debug", "trace"];
         if !valid_levels.contains(&self.logging.level.as_str()) {
-            errors.push(format!("logging.level must be one of: {}", valid_levels.join(", ")));
+            errors.push(format!(
+                "logging.level must be one of: {}",
+                valid_levels.join(", ")
+            ));
+        }
+
+        // Logging format must be a recognized renderer.
+        let valid_formats = ["text", "json"];
+        if !valid_formats.contains(&self.logging.format.as_str()) {
+            errors.push(format!(
+                "logging.format must be one of: {} (got '{}')",
+                valid_formats.join(", "),
+                self.logging.format
+            ));
         }
 
         // Bass management validation
         if self.bass_management.enabled {
             if self.bass_management.crossover_frequency_hz < 10.0
-                || self.bass_management.crossover_frequency_hz > 200.0 {
-                errors.push("bass_management.crossover_frequency_hz must be between 10 and 200".to_string());
+                || self.bass_management.crossover_frequency_hz > 200.0
+            {
+                errors.push(
+                    "bass_management.crossover_frequency_hz must be between 10 and 200".to_string(),
+                );
             }
             if self.bass_management.source_channels.is_empty() {
-                errors.push("bass_management.source_channels must not be empty when enabled".to_string());
+                errors.push(
+                    "bass_management.source_channels must not be empty when enabled".to_string(),
+                );
             }
             // Validate channel aliases resolve
-            if let Err(e) = self.resolve_channel(&self.bass_management.lfe_channel) {
+            let resolved_lfe = self.resolve_channel(&self.bass_management.lfe_channel);
+            if let Err(ref e) = resolved_lfe {
                 errors.push(format!("bass_management.lfe_channel: {}", e));
             }
+            // Resolve each source so duplicate/LFE-collision checks compare numeric
+            // indices (aliases and indices that name the same channel collide too).
+            let mut resolved_sources: Vec<usize> = Vec::new();
             for (i, ch) in self.bass_management.source_channels.iter().enumerate() {
-                if let Err(e) = self.resolve_channel(ch) {
-                    errors.push(format!("bass_management.source_channels[{}]: {}", i, e));
+                match self.resolve_channel(ch) {
+                    Ok(idx) => resolved_sources.push(idx),
+                    Err(e) => errors.push(format!("bass_management.source_channels[{}]: {}", i, e)),
+                }
+            }
+            // A duplicate source channel would extract and sum the same channel's bass
+            // twice and skew the count-normalization — reject it, naming the channel.
+            let mut seen = std::collections::HashSet::new();
+            for &idx in &resolved_sources {
+                if !seen.insert(idx) {
+                    errors.push(format!(
+                        "bass_management.source_channels contains duplicate channel {}",
+                        idx
+                    ));
+                }
+            }
+            // A source channel equal to the resolved LFE channel would feed the LFE
+            // output back into its own crossover — reject it, naming the channel.
+            if let Ok(lfe) = resolved_lfe {
+                if resolved_sources.contains(&lfe) {
+                    errors.push(format!(
+                        "bass_management.source_channels must not include the LFE channel {}",
+                        lfe
+                    ));
                 }
             }
         }
@@ -740,7 +1113,10 @@ impl Config {
                 errors.push(format!("inputs[{}].routes must not be empty", i));
             }
             if input.latency_ms < 5 || input.latency_ms > 500 {
-                errors.push(format!("inputs[{}].latency_ms must be between 5 and 500", i));
+                errors.push(format!(
+                    "inputs[{}].latency_ms must be between 5 and 500",
+                    i
+                ));
             }
             // Validate channel aliases in routes
             for (j, route) in input.routes.iter().enumerate() {
@@ -762,7 +1138,9 @@ impl Config {
             // Auth token should be reasonably long if set
             if let Some(ref token) = self.http.auth_token {
                 if token.len() < 8 {
-                    errors.push("http.auth_token should be at least 8 characters for security".to_string());
+                    errors.push(
+                        "http.auth_token should be at least 8 characters for security".to_string(),
+                    );
                 }
             }
         }
@@ -795,8 +1173,8 @@ impl std::error::Error for ConfigError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use std::io::Write;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn test_default_config() {
@@ -809,7 +1187,7 @@ mod tests {
         assert_eq!(config.mqtt.password, None);
         assert_eq!(config.audio.sample_rate, 48000);
         assert_eq!(config.audio.buffer_size, 512);
-        assert_eq!(config.cache.enabled, true);
+        assert!(config.cache.enabled);
         assert_eq!(config.cache.revalidate_after_seconds, 300);
         assert_eq!(config.logging.level, "info");
     }
@@ -847,7 +1225,16 @@ mod tests {
         assert!(config.mqtt.password.is_none());
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
             Some("cli_user".to_string()),
             Some("cli_pass".to_string()),
             None,
@@ -871,7 +1258,16 @@ mod tests {
         let mut config: Config = serde_json::from_str(json).unwrap();
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
             Some("cli_user".to_string()),
             Some("cli_pass".to_string()),
             None,
@@ -913,8 +1309,8 @@ mod tests {
                 "sample_rate": 96000,
                 "buffer_size": 1024,
                 "channel_names": {
-                    "0": "front_left",
-                    "1": "front_right"
+                    "_comment": "removed field (D60): old configs carrying it must still parse",
+                    "0": "front_left"
                 },
                 "channel_volumes": {
                     "front_left": 0.9,
@@ -949,10 +1345,9 @@ mod tests {
         assert_eq!(config.audio.device, Some("USB Audio".to_string()));
         assert_eq!(config.audio.sample_rate, 96000);
         assert_eq!(config.audio.buffer_size, 1024);
-        assert_eq!(config.audio.channel_names.get("0"), Some(&"front_left".to_string()));
         assert_eq!(config.audio.channel_volumes.get("front_left"), Some(&0.9));
 
-        assert_eq!(config.cache.enabled, false);
+        assert!(!config.cache.enabled);
         assert_eq!(config.cache.directory, "/tmp/cache");
         assert_eq!(config.cache.revalidate_after_seconds, 60);
 
@@ -960,18 +1355,22 @@ mod tests {
         assert_eq!(config.security.allowed_directories[0], "/opt/sounds");
 
         assert_eq!(config.logging.level, "debug");
-        assert_eq!(config.logging.verbose, true);
+        assert!(config.logging.verbose);
     }
 
     #[test]
     fn test_load_from_file() {
         let mut temp_file = NamedTempFile::new().unwrap();
-        write!(temp_file, r#"{{
+        write!(
+            temp_file,
+            r#"{{
             "mqtt": {{
                 "server": "testserver",
                 "topic": "test/topic"
             }}
-        }}"#).unwrap();
+        }}"#
+        )
+        .unwrap();
 
         let config = Config::from_file(temp_file.path()).unwrap();
 
@@ -1016,10 +1415,8 @@ mod tests {
     #[test]
     fn test_allowed_directories_expansion() {
         let mut config = Config::default();
-        config.security.allowed_directories = vec![
-            "~/sounds".to_string(),
-            "/opt/audio".to_string(),
-        ];
+        config.security.allowed_directories =
+            vec!["~/sounds".to_string(), "/opt/audio".to_string()];
 
         let expanded = config.allowed_directories();
         assert_eq!(expanded.len(), 2);
@@ -1034,7 +1431,9 @@ mod tests {
 
         assert!(result.is_err());
         let errors = result.unwrap_err();
-        assert!(errors.iter().any(|e| e.contains("mqtt.topic") || e.contains("http.enabled")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("mqtt.topic") || e.contains("http.enabled")));
     }
 
     #[test]
@@ -1083,6 +1482,63 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rejects_out_of_range_ducking_target() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.ducking_rules.push(DuckingRule {
+            primary_voice: "a".to_string(),
+            ducked_voices: vec!["b".to_string()],
+            target_volume: 1.5,
+            fade_duration_ms: 100,
+        });
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("target_volume")));
+    }
+
+    #[test]
+    fn test_validate_rejects_non_finite_ducking_target() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.ducking_rules.push(DuckingRule {
+            primary_voice: "a".to_string(),
+            ducked_voices: vec!["b".to_string()],
+            target_volume: f32::NAN,
+            fade_duration_ms: 100,
+        });
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("target_volume")));
+    }
+
+    #[test]
+    fn is_path_allowed_enforces_only_when_configured() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        // Empty allowlist: everything is allowed (open by default).
+        assert!(Config::is_path_allowed(Path::new("/etc/passwd"), &[]));
+
+        let dir = TempDir::new().unwrap();
+        let allowed = vec![dir.path().to_string_lossy().into_owned()];
+
+        // A file inside the allowed dir is permitted.
+        let good = dir.path().join("a.wav");
+        fs::write(&good, b"x").unwrap();
+        assert!(Config::is_path_allowed(&good, &allowed));
+
+        // A file outside it is rejected (also covers `..` traversal once canonicalized).
+        let outside = dir.path().parent().unwrap().join("escape.wav");
+        fs::write(&outside, b"x").unwrap();
+        assert!(!Config::is_path_allowed(&outside, &allowed));
+        let _ = fs::remove_file(&outside);
+
+        // An unresolvable / out-of-tree path is rejected under an allowlist.
+        assert!(!Config::is_path_allowed(Path::new("/etc/passwd"), &allowed));
+    }
+
+    #[test]
     fn test_validate_invalid_channel_volume() {
         let mut config = Config::default();
         config.mqtt.topic = Some("test".to_string());
@@ -1095,6 +1551,100 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_channel_gains_defaults_to_unity() {
+        let config = Config::default();
+        let gains = config.resolve_channel_gains(4);
+        assert_eq!(gains, vec![1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_by_numeric_key() {
+        let mut config = Config::default();
+        config.audio.channel_volumes.insert("0".to_string(), 0.5);
+        config.audio.channel_volumes.insert("2".to_string(), 0.25);
+        let gains = config.resolve_channel_gains(4);
+        assert_eq!(gains, vec![0.5, 1.0, 0.25, 1.0]);
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_by_alias() {
+        let mut config = Config::default();
+        config
+            .audio
+            .channel_aliases
+            .insert("front_left".to_string(), 0);
+        config
+            .audio
+            .channel_aliases
+            .insert("front_right".to_string(), 1);
+        config
+            .audio
+            .channel_volumes
+            .insert("front_left".to_string(), 0.5);
+        let gains = config.resolve_channel_gains(2);
+        assert_eq!(gains, vec![0.5, 1.0]);
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_ignores_out_of_range_and_unknown() {
+        let mut config = Config::default();
+        // Index beyond the output channel count is ignored (not applied, no panic).
+        config.audio.channel_volumes.insert("5".to_string(), 0.5);
+        // An unknown alias is ignored rather than aborting resolution.
+        config
+            .audio
+            .channel_volumes
+            .insert("nonexistent".to_string(), 0.3);
+        let gains = config.resolve_channel_gains(2);
+        assert_eq!(gains, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_output_stage_defaults() {
+        let config = Config::default();
+        assert_eq!(config.audio.output_ceiling_db, DEFAULT_OUTPUT_CEILING_DB);
+        assert_eq!(config.audio.output_ceiling_db, -1.0);
+        assert_eq!(config.audio.master_gain, DEFAULT_MASTER_GAIN);
+        assert_eq!(config.audio.master_gain, 1.0);
+    }
+
+    #[test]
+    fn test_validate_invalid_output_ceiling() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        // A ceiling above full scale is meaningless for a limiter.
+        config.audio.output_ceiling_db = 3.0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("output_ceiling_db")));
+
+        // Non-finite is rejected too.
+        config.audio.output_ceiling_db = f32::NAN;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("output_ceiling_db")));
+    }
+
+    #[test]
+    fn test_validate_invalid_master_gain() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.audio.master_gain = -1.0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("master_gain")));
+
+        config.audio.master_gain = 100.0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("master_gain")));
+    }
+
+    #[test]
+    fn test_validate_accepts_default_output_stage() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        // Defaults (-1.0 dBFS ceiling, unity master gain) must validate.
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     fn test_validate_invalid_log_level() {
         let mut config = Config::default();
         config.mqtt.topic = Some("test".to_string());
@@ -1104,6 +1654,39 @@ mod tests {
         assert!(result.is_err());
         let errors = result.unwrap_err();
         assert!(errors.iter().any(|e| e.contains("logging.level")));
+    }
+
+    #[test]
+    fn test_logging_format_defaults_to_text() {
+        // F13: an absent logging.format means the human-readable text renderer.
+        let config = Config::default();
+        assert_eq!(config.logging.format, "text");
+    }
+
+    #[test]
+    fn test_logging_format_json_parses_and_validates() {
+        // logging.format = "json" parses and is a valid format.
+        let json = r#"{"mqtt": {"topic": "t"}, "logging": {"format": "json"}}"#;
+        let config: Config = serde_json::from_str(json).expect("json format must parse");
+        assert_eq!(config.logging.format, "json");
+        assert!(config.validate().is_ok(), "json is a valid logging.format");
+    }
+
+    #[test]
+    fn test_validate_invalid_logging_format_names_the_value() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.logging.format = "yaml".to_string();
+
+        let result = config.validate();
+        assert!(result.is_err());
+        let errors = result.unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("logging.format") && e.contains("yaml")),
+            "the error must name logging.format and the offending value, got {errors:?}"
+        );
     }
 
     #[test]
@@ -1157,8 +1740,8 @@ mod tests {
             Some("audio/logs".to_string()), // log_topic
             Some("testuser".to_string()),   // mqtt_username
             Some("testpass".to_string()),   // mqtt_password
-            None, // http_port
-            None, // max_cache_mb
+            None,                           // http_port
+            None,                           // max_cache_mb
         );
 
         assert_eq!(config.mqtt.server, "newserver");
@@ -1169,7 +1752,7 @@ mod tests {
         assert_eq!(config.audio.device, Some("newdevice".to_string()));
         assert_eq!(config.audio.sample_rate, 96000);
         assert_eq!(config.audio.channels, Some(8));
-        assert_eq!(config.logging.verbose, true);
+        assert!(config.logging.verbose);
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
         assert_eq!(config.bass_management.lfe_channel, ChannelRef::Index(5));
@@ -1184,9 +1767,9 @@ mod tests {
         config.mqtt.topic = Some("original/topic".to_string());
 
         config.merge_cli_args(
-            None,  // Don't override server
-            Some(8883),  // Override port
-            None,  // Don't override topic
+            None,       // Don't override server
+            Some(8883), // Override port
+            None,       // Don't override topic
             None,
             None,
             None, // channels
@@ -1200,20 +1783,22 @@ mod tests {
             None, // max_cache_mb
         );
 
-        assert_eq!(config.mqtt.server, "original");  // Unchanged
-        assert_eq!(config.mqtt.port, 8883);  // Changed
-        assert_eq!(config.mqtt.topic, Some("original/topic".to_string()));  // Unchanged
+        assert_eq!(config.mqtt.server, "original"); // Unchanged
+        assert_eq!(config.mqtt.port, 8883); // Changed
+        assert_eq!(config.mqtt.topic, Some("original/topic".to_string())); // Unchanged
     }
 
     #[test]
     fn test_merge_cli_args_verbose_sets_debug() {
         let mut config = Config::default();
         assert_eq!(config.logging.level, "info");
-        assert_eq!(config.logging.verbose, false);
+        assert!(!config.logging.verbose);
 
-        config.merge_cli_args(None, None, None, None, None, None, true, None, None, None, None, None, None, None);
+        config.merge_cli_args(
+            None, None, None, None, None, None, true, None, None, None, None, None, None, None,
+        );
 
-        assert_eq!(config.logging.verbose, true);
+        assert!(config.logging.verbose);
         assert_eq!(config.logging.level, "debug");
     }
 
@@ -1221,11 +1806,14 @@ mod tests {
     fn test_bass_management_config_default() {
         let config = Config::default();
 
-        assert_eq!(config.bass_management.enabled, false);
+        assert!(!config.bass_management.enabled);
         assert_eq!(config.bass_management.lfe_channel, ChannelRef::Index(3));
         assert_eq!(config.bass_management.crossover_frequency_hz, 80.0);
         assert!(config.bass_management.source_channels.is_empty());
-        assert_eq!(config.bass_management.remove_bass_from_sources, false);
+        // D30: the default high-passes the mains when bass management is enabled
+        // (was false; the additive LFE+Main mode is now opt-in via false).
+        assert!(config.bass_management.remove_bass_from_sources);
+        assert_eq!(config.bass_management.lfe_gain, 1.0);
     }
 
     #[test]
@@ -1265,6 +1853,92 @@ mod tests {
 
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_bass_management_rejects_duplicate_source_channels() {
+        // F4: a duplicate source channel is a misconfiguration (the same channel's
+        // bass would be summed twice and inflate the count-normalization). It must be
+        // rejected with a message naming the offending channel.
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.bass_management.enabled = true;
+        config.bass_management.crossover_frequency_hz = 80.0;
+        config.bass_management.source_channels = vec![
+            ChannelRef::Index(0),
+            ChannelRef::Index(1),
+            ChannelRef::Index(0),
+        ];
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("source_channels")
+                && e.contains("duplicate")
+                && e.contains('0')),
+            "duplicate source channel must be rejected naming the channel, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_bass_management_rejects_source_channel_equal_to_lfe() {
+        // F4: a source channel equal to the resolved LFE channel would feed the LFE's
+        // own output back into the crossover. Reject it with a clear message naming
+        // the offending channel. LFE is 3; making 3 a source collides.
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.bass_management.enabled = true;
+        config.bass_management.crossover_frequency_hz = 80.0;
+        config.bass_management.lfe_channel = ChannelRef::Index(3);
+        config.bass_management.source_channels = vec![ChannelRef::Index(0), ChannelRef::Index(3)];
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("source_channels") && e.contains("LFE") && e.contains('3')),
+            "a source channel equal to the LFE channel must be rejected naming it, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn test_schema_version_absent_is_current_no_warning() {
+        // An absent schema_version means "current" — no warning.
+        let config = Config::default();
+        assert!(
+            config.schema_version_warning().is_none(),
+            "a config without schema_version must not warn"
+        );
+    }
+
+    #[test]
+    fn test_schema_version_current_no_warning() {
+        let json = format!(
+            r#"{{"schema_version": {}, "mqtt": {{"topic": "t"}}}}"#,
+            CURRENT_SCHEMA_VERSION
+        );
+        let config: Config = serde_json::from_str(&json).unwrap();
+        assert!(config.schema_version_warning().is_none());
+    }
+
+    #[test]
+    fn test_schema_version_newer_warns_naming_the_value() {
+        // A newer schema_version than this build understands must warn, naming both
+        // the configured value and the supported version, so an operator running an
+        // old binary against a new config gets a heads-up.
+        let newer = CURRENT_SCHEMA_VERSION + 1;
+        let json = format!(
+            r#"{{"schema_version": {}, "mqtt": {{"topic": "t"}}}}"#,
+            newer
+        );
+        let config: Config = serde_json::from_str(&json).unwrap();
+        let warning = config
+            .schema_version_warning()
+            .expect("a newer schema_version must warn");
+        assert!(
+            warning.contains(&newer.to_string())
+                && warning.contains(&CURRENT_SCHEMA_VERSION.to_string()),
+            "warning must name the configured and supported versions, got {warning}"
+        );
     }
 
     #[test]
@@ -1339,7 +2013,10 @@ mod tests {
         config.mqtt.topic = Some("test".to_string());
         config.inputs.push(InputConfig {
             volume: 1.5, // Invalid
-            routes: vec![InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) }],
+            routes: vec![InputRouteConfig {
+                source_channel: ChannelRef::Index(0),
+                dest_channel: ChannelRef::Index(0),
+            }],
             ..Default::default()
         });
 
@@ -1370,7 +2047,10 @@ mod tests {
         config.mqtt.topic = Some("test".to_string());
         config.inputs.push(InputConfig {
             latency_ms: 1000, // Invalid - too high
-            routes: vec![InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) }],
+            routes: vec![InputRouteConfig {
+                source_channel: ChannelRef::Index(0),
+                dest_channel: ChannelRef::Index(0),
+            }],
             ..Default::default()
         });
 
@@ -1389,8 +2069,14 @@ mod tests {
             volume: 0.8,
             voice_id: "mic".to_string(),
             routes: vec![
-                InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) },
-                InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(1) },
+                InputRouteConfig {
+                    source_channel: ChannelRef::Index(0),
+                    dest_channel: ChannelRef::Index(0),
+                },
+                InputRouteConfig {
+                    source_channel: ChannelRef::Index(0),
+                    dest_channel: ChannelRef::Index(1),
+                },
             ],
             latency_ms: 25,
         });
@@ -1432,6 +2118,85 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_stream_knob_defaults() {
+        let config = Config::default();
+        assert_eq!(config.cache.stream_window_ms, 1500);
+        assert_eq!(config.cache.stream_prebuffer_ms, 150);
+        assert_eq!(config.cache.stream_prebuffer_deadline_ms, 300);
+    }
+
+    #[test]
+    fn test_cache_stream_knobs_parse_and_are_backward_compatible() {
+        // A config that omits the stream knobs keeps the defaults (backward compat).
+        let legacy: Config =
+            serde_json::from_str(r#"{"mqtt": {"topic": "t"}, "cache": {"max_memory_mb": 256}}"#)
+                .unwrap();
+        assert_eq!(legacy.cache.stream_window_ms, 1500);
+
+        // Explicit values are honoured.
+        let config: Config = serde_json::from_str(
+            r#"{"mqtt": {"topic": "t"}, "cache": {"stream_window_ms": 2000, "stream_prebuffer_ms": 200, "stream_prebuffer_deadline_ms": 400}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.cache.stream_window_ms, 2000);
+        assert_eq!(config.cache.stream_prebuffer_ms, 200);
+        assert_eq!(config.cache.stream_prebuffer_deadline_ms, 400);
+    }
+
+    #[test]
+    fn test_load_mode_serde_lowercase_and_default() {
+        assert_eq!(
+            serde_json::from_str::<LoadMode>("\"auto\"").unwrap(),
+            LoadMode::Auto
+        );
+        assert_eq!(
+            serde_json::from_str::<LoadMode>("\"full\"").unwrap(),
+            LoadMode::Full
+        );
+        assert_eq!(
+            serde_json::from_str::<LoadMode>("\"stream\"").unwrap(),
+            LoadMode::Stream
+        );
+        assert_eq!(LoadMode::default(), LoadMode::Auto);
+    }
+
+    #[test]
+    fn test_freshness_mode_serde_and_default() {
+        assert_eq!(
+            serde_json::from_str::<FreshnessMode>("\"trusting\"").unwrap(),
+            FreshnessMode::Trusting
+        );
+        assert_eq!(
+            serde_json::from_str::<FreshnessMode>("\"dev\"").unwrap(),
+            FreshnessMode::Dev
+        );
+        assert_eq!(
+            serde_json::from_str::<FreshnessMode>("\"pinned\"").unwrap(),
+            FreshnessMode::Pinned
+        );
+        assert_eq!(FreshnessMode::default(), FreshnessMode::Trusting);
+        assert_eq!(Config::default().cache.freshness, FreshnessMode::Trusting);
+    }
+
+    #[test]
+    fn test_validate_rejects_inconsistent_stream_config() {
+        // Prebuffer larger than the window is contradictory.
+        let mut config = Config::default();
+        config.mqtt.topic = Some("t".to_string());
+        config.cache.stream_window_ms = 500;
+        config.cache.stream_prebuffer_ms = 1000;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("stream_prebuffer_ms")));
+
+        // A zero window is rejected.
+        let mut config = Config::default();
+        config.mqtt.topic = Some("t".to_string());
+        config.cache.stream_window_ms = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("stream_window_ms")));
+    }
+
+    #[test]
     fn test_cache_precache_blocking_false() {
         let json = r#"{
             "mqtt": {"topic": "test"},
@@ -1460,7 +2225,8 @@ mod tests {
     #[test]
     fn test_cache_max_memory_mb_default() {
         let config = Config::default();
-        assert_eq!(config.cache.max_memory_mb, 512);
+        // The default is 0, which resolve_memory_cap interprets as auto-detect.
+        assert_eq!(config.cache.max_memory_mb, 0);
     }
 
     #[test]
@@ -1477,7 +2243,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cache_max_memory_mb_unlimited() {
+    fn test_cache_max_memory_mb_zero_resolves_to_auto() {
         let json = r#"{
             "mqtt": {"topic": "test"},
             "cache": {
@@ -1487,6 +2253,102 @@ mod tests {
 
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.cache.max_memory_mb, 0);
+        // 0 now means auto-detect a bounded cap (not unlimited): with no system reading
+        // it falls back to the auto ceiling, never MemoryCap::Unlimited.
+        assert_eq!(
+            config.cache.resolve_memory_cap(None),
+            MemoryCap::Bytes(1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_resolve_memory_cap_explicit_max_memory_mb_wins() {
+        let mut cfg = CacheConfig {
+            max_memory_mb: 256,
+            ..CacheConfig::default()
+        };
+        cfg.memory_budget = None;
+        assert_eq!(
+            cfg.resolve_memory_cap(Some(8 * 1024 * 1024 * 1024)),
+            MemoryCap::Bytes(256 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_resolve_memory_cap_auto_clamps_to_floor() {
+        // 40% of 100 MiB = 40 MiB, below the 128 MiB floor -> clamp up to the floor.
+        let cfg = CacheConfig::default();
+        assert_eq!(
+            cfg.resolve_memory_cap(Some(100 * 1024 * 1024)),
+            MemoryCap::Bytes(128 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_resolve_memory_cap_auto_clamps_to_ceiling() {
+        // 40% of 100 GiB is far above the 1 GiB ceiling -> clamp down to the ceiling.
+        let cfg = CacheConfig::default();
+        assert_eq!(
+            cfg.resolve_memory_cap(Some(100 * 1024 * 1024 * 1024)),
+            MemoryCap::Bytes(1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_resolve_memory_cap_auto_in_band() {
+        // 40% of 1 GiB ~= 410 MiB, within [128, 1024].
+        let cfg = CacheConfig::default();
+        match cfg.resolve_memory_cap(Some(1024 * 1024 * 1024)) {
+            MemoryCap::Bytes(b) => assert!(
+                b > 380 * 1024 * 1024 && b < 440 * 1024 * 1024,
+                "expected ~410 MiB, got {b} bytes"
+            ),
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_memory_cap_explicit_budget_overrides_max_memory_mb() {
+        let cfg = CacheConfig {
+            max_memory_mb: 256,
+            memory_budget: Some(MemoryBudget::Explicit { mb: 64 }),
+            ..CacheConfig::default()
+        };
+        assert_eq!(
+            cfg.resolve_memory_cap(Some(8 * 1024 * 1024 * 1024)),
+            MemoryCap::Bytes(64 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn test_resolve_memory_cap_unlimited_is_an_explicit_opt_out() {
+        let cfg = CacheConfig {
+            memory_budget: Some(MemoryBudget::Unlimited),
+            ..CacheConfig::default()
+        };
+        assert_eq!(cfg.resolve_memory_cap(Some(1024)), MemoryCap::Unlimited);
+        // Distinct from the legacy 0 path, which is now auto (bounded), not unlimited.
+        assert_ne!(
+            CacheConfig::default().resolve_memory_cap(None),
+            MemoryCap::Unlimited
+        );
+    }
+
+    #[test]
+    fn test_memory_budget_serde_modes() {
+        assert_eq!(
+            serde_json::from_str::<MemoryBudget>(r#"{"mode":"unlimited"}"#).unwrap(),
+            MemoryBudget::Unlimited
+        );
+        assert_eq!(
+            serde_json::from_str::<MemoryBudget>(r#"{"mode":"explicit","mb":256}"#).unwrap(),
+            MemoryBudget::Explicit { mb: 256 }
+        );
+        // Auto with omitted params uses the defaults.
+        assert_eq!(
+            serde_json::from_str::<MemoryBudget>(r#"{"mode":"auto"}"#).unwrap(),
+            MemoryBudget::default_auto()
+        );
     }
 
     #[test]
@@ -1516,9 +2378,20 @@ mod tests {
         assert!(config.logging.mqtt_topic.is_none());
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
             Some("audio/logs".to_string()),
-            None, None, None, None,
+            None,
+            None,
+            None,
+            None,
         );
 
         assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
@@ -1529,16 +2402,19 @@ mod tests {
         let config = LoggingConfig {
             level: "debug".to_string(),
             verbose: true,
+            format: "json".to_string(),
             mqtt_topic: Some("test/logs".to_string()),
         };
 
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("\"mqtt_topic\":\"test/logs\""));
+        assert!(json.contains("\"format\":\"json\""));
 
         // With no mqtt_topic, it should be omitted
         let config_no_topic = LoggingConfig {
             level: "info".to_string(),
             verbose: false,
+            format: "text".to_string(),
             mqtt_topic: None,
         };
         let json_no_topic = serde_json::to_string(&config_no_topic).unwrap();
@@ -1607,8 +2483,14 @@ mod tests {
         let json = r#"{"source_channel": "mic_left", "dest_channel": "front_left"}"#;
         let route: InputRouteConfig = serde_json::from_str(json).unwrap();
 
-        assert_eq!(route.source_channel, ChannelRef::Alias("mic_left".to_string()));
-        assert_eq!(route.dest_channel, ChannelRef::Alias("front_left".to_string()));
+        assert_eq!(
+            route.source_channel,
+            ChannelRef::Alias("mic_left".to_string())
+        );
+        assert_eq!(
+            route.dest_channel,
+            ChannelRef::Alias("front_left".to_string())
+        );
     }
 
     #[test]
@@ -1643,7 +2525,10 @@ mod tests {
         let config: Config = serde_json::from_str(json).unwrap();
 
         // Check that aliases are stored as ChannelRef::Alias
-        assert_eq!(config.bass_management.lfe_channel, ChannelRef::Alias("lfe".to_string()));
+        assert_eq!(
+            config.bass_management.lfe_channel,
+            ChannelRef::Alias("lfe".to_string())
+        );
 
         // Resolve and check values
         let resolved = config.resolve_bass_management().unwrap();
@@ -1675,7 +2560,9 @@ mod tests {
 
         let config: Config = serde_json::from_str(json).unwrap();
 
-        let routes = config.resolve_input_routes(&config.inputs[0].routes).unwrap();
+        let routes = config
+            .resolve_input_routes(&config.inputs[0].routes)
+            .unwrap();
         assert_eq!(routes, vec![(0, 0), (0, 1)]);
     }
 
@@ -1854,12 +2741,12 @@ mod tests {
     fn test_http_config_default() {
         let config = HttpConfig::default();
 
-        assert_eq!(config.enabled, false);
+        assert!(!config.enabled);
         assert_eq!(config.port, 0);
         assert_eq!(config.bind_address, "127.0.0.1");
         assert!(config.auth_token.is_none());
-        assert_eq!(config.websocket_enabled, true);
-        assert_eq!(config.cors_permissive, false);
+        assert!(config.websocket_enabled);
+        assert!(!config.cors_permissive);
     }
 
     #[test]
@@ -1878,12 +2765,12 @@ mod tests {
 
         let config: Config = serde_json::from_str(json).unwrap();
 
-        assert_eq!(config.http.enabled, true);
+        assert!(config.http.enabled);
         assert_eq!(config.http.port, 8080);
         assert_eq!(config.http.bind_address, "0.0.0.0");
         assert_eq!(config.http.auth_token, Some("secrettoken123".to_string()));
-        assert_eq!(config.http.websocket_enabled, true);
-        assert_eq!(config.http.cors_permissive, true);
+        assert!(config.http.websocket_enabled);
+        assert!(config.http.cors_permissive);
     }
 
     #[test]
@@ -1940,7 +2827,18 @@ mod tests {
         assert_eq!(config.http.port, 0);
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
             Some(9000),
             None,
         );
@@ -1953,10 +2851,21 @@ mod tests {
     #[test]
     fn test_merge_cli_args_max_cache_mb() {
         let mut config = Config::default();
-        assert_eq!(config.cache.max_memory_mb, 512); // default
+        assert_eq!(config.cache.max_memory_mb, 0); // default (auto-detect)
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None, None, None, None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
             None,
             Some(1024),
         );
@@ -1991,9 +2900,16 @@ mod tests {
             ("high", ResamplerQuality::High),
             ("maximum", ResamplerQuality::Maximum),
         ] {
-            let json = format!(r#"{{"mqtt": {{"topic": "test"}}, "advanced": {{"resampler_quality": "{}"}}}}"#, json_value);
+            let json = format!(
+                r#"{{"mqtt": {{"topic": "test"}}, "advanced": {{"resampler_quality": "{}"}}}}"#,
+                json_value
+            );
             let config: Config = serde_json::from_str(&json).unwrap();
-            assert_eq!(config.advanced.resampler_quality, expected, "Failed for {}", json_value);
+            assert_eq!(
+                config.advanced.resampler_quality, expected,
+                "Failed for {}",
+                json_value
+            );
         }
     }
 
@@ -2089,14 +3005,28 @@ mod tests {
     fn test_macros_serialization() {
         let mut config = Config::default();
         config.mqtt.topic = Some("test".to_string());
-        config.macros.insert(
-            "test_macro".to_string(),
-            serde_json::json!({"volume": 0.5}),
-        );
+        config
+            .macros
+            .insert("test_macro".to_string(), serde_json::json!({"volume": 0.5}));
 
         let json = serde_json::to_string(&config).unwrap();
         assert!(json.contains("macros"));
         assert!(json.contains("test_macro"));
         assert!(json.contains("0.5"));
+    }
+
+    #[test]
+    fn removed_channel_names_key_still_parses() {
+        // D60: `audio.channel_names` was removed (it was never read); configs
+        // that still carry the key must keep parsing — serde tolerates unknown
+        // keys because no config struct opts into deny_unknown_fields.
+        let json = r#"{
+            "audio": {
+                "channel_names": { "0": "front_left" },
+                "channel_aliases": { "front_left": 0 }
+            }
+        }"#;
+        let config: Config = serde_json::from_str(json).expect("old configs must keep parsing");
+        assert_eq!(config.audio.channel_aliases.get("front_left"), Some(&0));
     }
 }

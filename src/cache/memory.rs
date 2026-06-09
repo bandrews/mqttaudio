@@ -2,9 +2,15 @@
 // ABOUTME: Provides fast access to frequently used samples with LRU eviction.
 
 use crate::audio::types::DecodedBuffer;
-use std::collections::{HashMap, HashSet};
+use crate::config::MemoryCap;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Returned by [`MemoryCache::try_put`] when a buffer cannot be cached under the hard
+/// cap (only playing-protected entries remain, or it is larger than the whole cap).
+#[derive(Debug, PartialEq, Eq)]
+pub struct CacheFull;
 
 /// Entry in the memory cache with access tracking for LRU eviction
 struct MemoryCacheEntry {
@@ -23,8 +29,6 @@ pub struct MemoryCache {
     max_size_bytes: Option<usize>,
     /// Current total size of cached data in bytes
     current_size_bytes: usize,
-    /// Keys of buffers currently being played (protected from eviction)
-    playing: HashSet<String>,
 }
 
 impl MemoryCache {
@@ -34,7 +38,6 @@ impl MemoryCache {
             entries: HashMap::new(),
             max_size_bytes: None,
             current_size_bytes: 0,
-            playing: HashSet::new(),
         }
     }
 
@@ -46,7 +49,21 @@ impl MemoryCache {
             entries: HashMap::new(),
             max_size_bytes: if max_size == 0 { None } else { Some(max_size) },
             current_size_bytes: 0,
-            playing: HashSet::new(),
+        }
+    }
+
+    /// Create a memory cache with a resolved [`MemoryCap`]. `Bytes(n)` is a hard cap
+    /// of `n` bytes; `Unlimited` is no cap. (Distinct from `with_max_size`, where `0`
+    /// means unlimited — here `Bytes(0)` would cache nothing.)
+    pub fn with_cap(cap: MemoryCap) -> Self {
+        let max_size_bytes = match cap {
+            MemoryCap::Unlimited => None,
+            MemoryCap::Bytes(n) => Some(n),
+        };
+        Self {
+            entries: HashMap::new(),
+            max_size_bytes,
+            current_size_bytes: 0,
         }
     }
 
@@ -78,32 +95,63 @@ impl MemoryCache {
         }
     }
 
-    /// Store a decoded buffer in the cache.
-    /// Evicts LRU entries if necessary to stay within the size limit.
-    pub fn put(&mut self, key: String, buffer: Arc<DecodedBuffer>) {
+    /// Sum of the bytes held by entries that cannot be evicted (still referenced /
+    /// playing, `strong_count > 1`), excluding the entry at `except` (which is about
+    /// to be replaced). These bytes must remain resident, so they reduce the room
+    /// available for a new buffer.
+    fn protected_bytes_excluding(&self, except: &str) -> usize {
+        self.entries
+            .iter()
+            .filter(|(k, e)| k.as_str() != except && Arc::strong_count(&e.buffer) > 1)
+            .map(|(_, e)| e.size_bytes)
+            .sum()
+    }
+
+    /// Bytes of new data the cache can accept right now without exceeding the cap,
+    /// after evicting everything evictable. `usize::MAX` when unlimited. The
+    /// load-strategy decision uses this to force an over-budget asset to windowed
+    /// streaming instead of a full load.
+    pub fn fit_headroom(&self) -> usize {
+        match self.max_size_bytes {
+            None => usize::MAX,
+            Some(max) => max.saturating_sub(self.protected_bytes_excluding("")),
+        }
+    }
+
+    /// Admit a buffer under the hard cap. Evicts evictable (not currently playing) LRU
+    /// entries to make room; if it still would not fit — only playing-protected
+    /// entries remain, or it is larger than the whole cap — it caches nothing and
+    /// returns [`CacheFull`] rather than over-allocating. Playing buffers are never
+    /// evicted (their accounting must stay live).
+    pub fn try_put(&mut self, key: String, buffer: Arc<DecodedBuffer>) -> Result<(), CacheFull> {
         let size = Self::buffer_size(&buffer);
 
-        // If we're replacing an existing entry, remove its size first
+        if let Some(max) = self.max_size_bytes {
+            // Cannot fit if larger than the whole cap, or larger than the room left
+            // once every evictable entry (all but the protected ones, excluding any
+            // entry we are replacing) is gone.
+            let protected = self.protected_bytes_excluding(&key);
+            if size > max || size > max.saturating_sub(protected) {
+                return Err(CacheFull);
+            }
+        }
+
+        // Replacing an existing entry frees its bytes first.
         if let Some(old_entry) = self.entries.get(&key) {
             self.current_size_bytes -= old_entry.size_bytes;
         }
 
-        // Evict entries if we would exceed the limit
+        // Evict evictable LRU entries until it fits. The admission check above
+        // guarantees there is room once the evictable entries are gone.
         if let Some(max_size) = self.max_size_bytes {
             while self.current_size_bytes + size > max_size {
                 if !self.evict_one() {
-                    // Could not evict anything (all entries are protected)
-                    // Log a warning but proceed anyway
-                    tracing::warn!(
-                        "Cache size limit exceeded but all entries are protected from eviction"
-                    );
                     break;
                 }
             }
         }
 
         tracing::debug!("Caching decoded buffer for: {} ({} bytes)", key, size);
-
         let entry = MemoryCacheEntry {
             buffer,
             last_access: Instant::now(),
@@ -111,15 +159,33 @@ impl MemoryCache {
         };
         self.entries.insert(key, entry);
         self.current_size_bytes += size;
+        Ok(())
     }
 
-    /// Evict the least recently used entry that is not currently playing.
-    /// Returns true if an entry was evicted, false if no evictable entries.
+    /// Store a decoded buffer, evicting LRU entries to stay within the cap. If it
+    /// cannot fit (only playing entries remain), it is dropped rather than cached —
+    /// the asset still plays from the caller's own reference, it just is not retained.
+    pub fn put(&mut self, key: String, buffer: Arc<DecodedBuffer>) {
+        let size = Self::buffer_size(&buffer);
+        if self.try_put(key.clone(), buffer).is_err() {
+            tracing::debug!(
+                "Memory cache full; not caching {} ({} bytes) — it still plays from the \
+                 caller's reference, it just is not retained",
+                key,
+                size
+            );
+        }
+    }
+
+    /// Evict the least recently used entry that no one is still playing.
+    /// A buffer is "in use" when something outside the cache holds an `Arc` to it
+    /// (`strong_count > 1`); those are skipped so a playing sample is never evicted
+    /// out from under its accounting. Returns true if an entry was evicted.
     fn evict_one(&mut self) -> bool {
-        // Find the LRU entry that is not playing
-        let lru_key = self.entries
+        let lru_key = self
+            .entries
             .iter()
-            .filter(|(key, _)| !self.playing.contains(*key))
+            .filter(|(_, entry)| Arc::strong_count(&entry.buffer) == 1)
             .min_by_key(|(_, entry)| entry.last_access)
             .map(|(key, _)| key.clone());
 
@@ -137,7 +203,6 @@ impl MemoryCache {
     pub fn remove(&mut self, key: &str) -> bool {
         if let Some(entry) = self.entries.remove(key) {
             self.current_size_bytes -= entry.size_bytes;
-            self.playing.remove(key);
             true
         } else {
             false
@@ -149,12 +214,10 @@ impl MemoryCache {
         let count = self.entries.len();
         self.entries.clear();
         self.current_size_bytes = 0;
-        self.playing.clear();
         tracing::info!("Cleared {} decoded buffers from memory cache", count);
     }
 
-    /// Check if a key is in the cache
-    #[cfg(test)]
+    /// Check if a key is resident in the cache, without touching LRU order.
     pub fn contains(&self, key: &str) -> bool {
         self.entries.contains_key(key)
     }
@@ -174,26 +237,6 @@ impl MemoryCache {
     /// (same as current_size_bytes, kept for API compatibility)
     pub fn memory_usage_bytes(&self) -> usize {
         self.current_size_bytes
-    }
-
-    /// Mark a buffer as currently playing (protected from eviction)
-    #[allow(dead_code)]
-    pub fn mark_playing(&mut self, key: &str) {
-        if self.entries.contains_key(key) {
-            self.playing.insert(key.to_string());
-        }
-    }
-
-    /// Mark a buffer as no longer playing (can be evicted)
-    #[allow(dead_code)]
-    pub fn mark_not_playing(&mut self, key: &str) {
-        self.playing.remove(key);
-    }
-
-    /// Check if a buffer is currently marked as playing
-    #[allow(dead_code)]
-    pub fn is_playing(&self, key: &str) -> bool {
-        self.playing.contains(key)
     }
 }
 
@@ -442,41 +485,96 @@ mod tests {
     }
 
     #[test]
+    fn externally_referenced_buffer_is_not_evicted() {
+        let buffer_size = 2 * 10000 * 4;
+        let mut cache = MemoryCache::with_max_size(buffer_size * 2);
+
+        // A "playing" buffer: we keep an Arc to it, exactly as an ActiveSample does.
+        let playing = Arc::new(create_test_buffer(2, 10000));
+        cache.put("playing.wav".to_string(), playing.clone());
+
+        // An unreferenced buffer (the temporary Arc is dropped after put).
+        cache.put(
+            "other.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        // Make `other` the most-recently-used (and drop the returned Arc immediately,
+        // so it stays unreferenced and therefore evictable).
+        let _ = cache.get("other.wav");
+
+        // Adding a third buffer forces an eviction. The still-referenced buffer must
+        // survive even though it is the least-recently-used.
+        cache.put(
+            "third.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+
+        assert!(
+            cache.contains("playing.wav"),
+            "a buffer still referenced by a player must not be evicted"
+        );
+        assert!(
+            !cache.contains("other.wav"),
+            "the unreferenced LRU entry should be evicted instead"
+        );
+        // Accounting reflects exactly the two resident buffers.
+        assert_eq!(cache.memory_usage_bytes(), buffer_size * 2);
+    }
+
+    #[test]
     fn test_playing_entries_never_evicted() {
         let buffer_size = 2 * 10000 * 4;
         let mut cache = MemoryCache::with_max_size(buffer_size * 2);
 
-        // Add two buffers
-        let buffer1 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("first.wav".to_string(), buffer1);
+        // Keep an external Arc to "first", so it counts as playing (strong_count > 1).
+        let first = Arc::new(create_test_buffer(2, 10000));
+        cache.put("first.wav".to_string(), first.clone());
 
-        let buffer2 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("second.wav".to_string(), buffer2);
+        cache.put(
+            "second.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
 
-        // Mark first as playing
-        cache.mark_playing("first.wav");
-
-        // Add third buffer - should evict second (first is protected)
-        let buffer3 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("third.wav".to_string(), buffer3);
-        assert!(cache.contains("first.wav")); // protected
+        // Add third buffer - should evict second (first is protected by its live Arc)
+        cache.put(
+            "third.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        assert!(cache.contains("first.wav")); // protected (still referenced)
         assert!(!cache.contains("second.wav")); // evicted
         assert!(cache.contains("third.wav"));
     }
 
     #[test]
-    fn test_mark_not_playing() {
+    fn test_buffer_evictable_after_external_ref_dropped() {
         let buffer_size = 2 * 10000 * 4;
         let mut cache = MemoryCache::with_max_size(buffer_size * 2);
 
-        let buffer1 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("first.wav".to_string(), buffer1);
+        // While "first" is referenced it is protected from eviction.
+        let first = Arc::new(create_test_buffer(2, 10000));
+        cache.put("first.wav".to_string(), first.clone());
+        cache.put(
+            "second.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        cache.put(
+            "third.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        assert!(cache.contains("first.wav"), "protected while referenced");
 
-        cache.mark_playing("first.wav");
-        assert!(cache.is_playing("first.wav"));
-
-        cache.mark_not_playing("first.wav");
-        assert!(!cache.is_playing("first.wav"));
+        // Drop the external reference; "first" is now just another cache entry.
+        drop(first);
+        // Touch the survivor so "first" is the LRU, then force another eviction.
+        let _ = cache.get("third.wav");
+        cache.put(
+            "fourth.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        assert!(
+            !cache.contains("first.wav"),
+            "evictable once no longer referenced"
+        );
     }
 
     #[test]
@@ -485,26 +583,29 @@ mod tests {
         // Limit that fits 3 buffers
         let mut cache = MemoryCache::with_max_size(buffer_size * 3);
 
-        // Add 3 buffers
-        let buffer1 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("first.wav".to_string(), buffer1);
-        let buffer2 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("second.wav".to_string(), buffer2);
-        let buffer3 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("third.wav".to_string(), buffer3);
+        cache.put(
+            "first.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        cache.put(
+            "second.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        // Keep an external Arc to "third", so it is protected (playing).
+        let third = Arc::new(create_test_buffer(2, 10000));
+        cache.put("third.wav".to_string(), third.clone());
 
         // Access second
         let _ = cache.get("second.wav");
 
-        // Mark third as playing
-        cache.mark_playing("third.wav");
-
         // Add fourth buffer - should evict first (LRU and not protected)
-        let buffer4 = Arc::new(create_test_buffer(2, 10000));
-        cache.put("fourth.wav".to_string(), buffer4);
+        cache.put(
+            "fourth.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
         assert!(!cache.contains("first.wav")); // evicted (oldest, not protected)
         assert!(cache.contains("second.wav")); // kept (accessed more recently)
-        assert!(cache.contains("third.wav")); // kept (playing)
+        assert!(cache.contains("third.wav")); // kept (referenced/playing)
         assert!(cache.contains("fourth.wav")); // just added
     }
 
@@ -525,5 +626,92 @@ mod tests {
         // Remove first
         cache.remove("test.wav");
         assert_eq!(cache.current_size_bytes(), 16000);
+    }
+
+    #[test]
+    fn try_put_rejects_when_only_protected_entries_remain() {
+        // Cap fits exactly one buffer. A playing (protected) buffer occupies it; a new
+        // buffer cannot evict it, so try_put refuses and caches nothing (no over-alloc).
+        let buffer_size = 2 * 10000 * 4; // 80000 bytes
+        let mut cache = MemoryCache::with_cap(MemoryCap::Bytes(buffer_size));
+        let playing = Arc::new(create_test_buffer(2, 10000));
+        cache.put("playing.wav".to_string(), playing.clone());
+
+        let result = cache.try_put(
+            "new.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        assert_eq!(result, Err(CacheFull));
+        assert!(!cache.contains("new.wav"));
+        assert!(cache.contains("playing.wav"));
+        assert_eq!(
+            cache.current_size_bytes(),
+            buffer_size,
+            "cap must not be exceeded"
+        );
+    }
+
+    #[test]
+    fn try_put_evicts_an_unreferenced_entry_to_admit() {
+        let buffer_size = 2 * 10000 * 4;
+        let mut cache = MemoryCache::with_cap(MemoryCap::Bytes(buffer_size));
+        // An unreferenced entry (the temporary Arc is dropped after put).
+        cache.put(
+            "old.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        // try_put admits by evicting the unreferenced LRU entry.
+        assert!(cache
+            .try_put(
+                "new.wav".to_string(),
+                Arc::new(create_test_buffer(2, 10000))
+            )
+            .is_ok());
+        assert!(cache.contains("new.wav"));
+        assert!(!cache.contains("old.wav"));
+        assert_eq!(cache.current_size_bytes(), buffer_size);
+    }
+
+    #[test]
+    fn try_put_rejects_a_buffer_larger_than_the_whole_cap() {
+        let mut cache = MemoryCache::with_cap(MemoryCap::Bytes(1000));
+        let big = Arc::new(create_test_buffer(2, 10000)); // 80000 bytes > cap
+        assert_eq!(cache.try_put("big.wav".to_string(), big), Err(CacheFull));
+        assert_eq!(cache.current_size_bytes(), 0);
+    }
+
+    #[test]
+    fn fit_headroom_subtracts_protected_bytes() {
+        let buffer_size = 2 * 10000 * 4;
+        let mut cache = MemoryCache::with_cap(MemoryCap::Bytes(buffer_size * 4));
+        // Two playing (protected) buffers occupy 2x; headroom is the remaining 2x.
+        let a = Arc::new(create_test_buffer(2, 10000));
+        let b = Arc::new(create_test_buffer(2, 10000));
+        cache.put("a.wav".to_string(), a.clone());
+        cache.put("b.wav".to_string(), b.clone());
+        assert_eq!(cache.fit_headroom(), buffer_size * 2);
+    }
+
+    #[test]
+    fn unlimited_cache_has_unbounded_headroom() {
+        let cache = MemoryCache::with_cap(MemoryCap::Unlimited);
+        assert_eq!(cache.fit_headroom(), usize::MAX);
+    }
+
+    #[test]
+    fn put_drops_silently_when_cache_full_instead_of_over_allocating() {
+        let buffer_size = 2 * 10000 * 4;
+        let mut cache = MemoryCache::with_cap(MemoryCap::Bytes(buffer_size));
+        let playing = Arc::new(create_test_buffer(2, 10000));
+        cache.put("playing.wav".to_string(), playing.clone());
+        cache.put(
+            "overflow.wav".to_string(),
+            Arc::new(create_test_buffer(2, 10000)),
+        );
+        assert!(
+            !cache.contains("overflow.wav"),
+            "put must not over-allocate"
+        );
+        assert_eq!(cache.current_size_bytes(), buffer_size, "cap not exceeded");
     }
 }
