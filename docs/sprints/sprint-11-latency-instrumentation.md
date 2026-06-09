@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | Not started |
+| Status | Done (Lane A via documented host approximation — see tracker note; Lane B pending partner) |
 | Depends on | 10 |
 | Effort | M |
 | Lanes | A (Docker) + B (native macOS) |
@@ -134,11 +134,37 @@ All citations re-verified against the current tree during Sprint 10.
 
    | Scenario | Baseline (pre-Sprint-12) | Notes |
    |---|---|---|
-   | Warm memory-cache hit → buffer returned | _measure_ | |
-   | Cold local full-load (60 s WAV) → buffer returned | _measure_ | expected ≈ full decode time |
-   | Cold disk-cached HTTP → buffer returned | _measure_ | expected ≈ full decode time |
-   | `probe_local_file` (WAV) | _measure_ | |
-   | Windowed play → prebuffer-ready | _measure_ | includes 5 ms-poll quantization |
+   | Warm memory-cache hit → buffer returned | **~148 ns** | `hot_load/60s_cached` |
+   | Cold local full-load → buffer returned | **5 s: 2.87 ms · 30 s: 17.3 ms · 60 s: 46.2 ms · 300 s: 211 ms** | linear in file length — the Sprint 12 target. Pi-class hardware is several times slower |
+   | Cold HTTP full-load (loopback, 30 s WAV) | **~91.6 ms** | `cold_load_http/30s_http`; includes download + full decode |
+   | `time_to_first_sample` cold 300 s file | **~208 ms** | identical to cold full-load — confirms first sound waits for the whole decode |
+   | `probe_local_file` (60 s WAV header) | **~4.4 µs** | far cheaper than the 5–20 ms estimate on this hardware (page-cached header read). Evidence note for Sprint 12 F4: the probe cache's win is small on fast storage; re-judge its priority against a measurement on slow media before building it |
+   | Windowed play → prebuffer-ready (100 ms prebuffer) | **~5.16 ms** | dominated by the 5 ms poll quantum — the fill itself is ~0.2 ms. Sprint 12 F3's event gate should cut this ~5–25× |
+
+   Measured 2026-06-09 on the Lane-A-approximation host (x86 container, rust 1.94.1,
+   `cargo bench --bench loading_benchmark`). Absolute numbers are faster than Pi-class
+   targets; the scaling shapes (cold-load ∝ length, poll-quantized gate) are the findings.
+
+### Implementation deviations (recorded honestly)
+
+- **t0/t1 collapsed at the dispatch boundary.** Stage capture begins at the `Play` arm of
+  `handle_command` (the dispatch boundary shared by MQTT and HTTP), so the JSON parse cost
+  (~µs–ms, off the audio path) is excluded rather than measured as a separate t1. The emitted
+  event fields are `decision_us`, `ready_us`, `enqueue_us` from dispatch.
+- **Latency tests are split lib/binary.** `handle_command` lives in the binary crate (the
+  documented binary-redeclares-modules architecture, `docs/bugs.md`), so integration tests in
+  `tests/` cannot drive it. The publication semantics (complete/streaming/start-position
+  gating, tracker folding) are in `tests/latency_test.rs` against the lib; the stage events
+  and probe-fold-through-`handle_command` tests live in `src/main.rs`'s test module
+  (`play_emits_monotone_stage_latency_event`, `cache_hit_play_ready_stage_is_bounded`,
+  `play_first_mix_latency_folds_into_stats`,
+  `windowed_play_emits_stage_event_and_publishes_first_mix`).
+- **The `/metrics` HTTP test drives the tracker, not the RT store.** The store itself is
+  covered by the alloc harness and `latency_test.rs` against real mixes; the HTTP test
+  (`test_metrics_reports_play_latency_through_the_tracker`) covers probe→fold→`/metrics`.
+- **"First mix" means first *audible* mix.** A streaming buffer mixing silence (nothing
+  decoded at the cursor) does not count as started — otherwise Sprint 12's progressive loads
+  would report near-zero latency while still silent. Locked into `tests/latency_test.rs`.
 
 ## Files to create / touch
 

@@ -233,6 +233,81 @@ fn bench_time_to_first_sample(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark the local-file header probe used by the auto-windowing decision
+/// (Sprint 11 baseline; Sprint 12 caches its result keyed by path+mtime+size).
+fn bench_probe_local_file(c: &mut Criterion) {
+    let mut group = c.benchmark_group("probe_local_file");
+    group.sample_size(20);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(5));
+
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("probe_60s.wav");
+    generate_wav_file(&file_path, 60, 48000, 2);
+    let path = file_path.to_str().unwrap().to_string();
+
+    group.bench_function("60s_wav_header", |b| {
+        b.iter(|| {
+            mqttaudio::cache::strategy::probe_local_file(
+                &path,
+                48000,
+                mqttaudio::config::ResamplerQuality::Fast,
+            )
+            .unwrap()
+        });
+    });
+
+    group.finish();
+}
+
+/// Benchmark a windowed play's prebuffer-ready time: producer spawn + ring fill to
+/// the default 100ms prebuffer, polled at the control loop's 5ms quantum (Sprint 11
+/// baseline; Sprint 12 replaces the poll with an event-driven gate).
+fn bench_windowed_prebuffer_ready(c: &mut Criterion) {
+    use std::sync::atomic::Ordering;
+
+    let mut group = c.benchmark_group("windowed_prebuffer_ready");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(10));
+
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("windowed_300s.wav");
+    generate_wav_file(&file_path, 300, 48000, 2);
+    let path = file_path.to_str().unwrap().to_string();
+
+    const PREBUFFER_FRAMES: usize = 48000 / 10; // 100ms at 48k (config default)
+    const WINDOW_FRAMES: usize = 48000 / 2; // 500ms window (config default)
+
+    group.bench_function("300s_wav_100ms_prebuffer", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                let start = Instant::now();
+                let handles = mqttaudio::audio::streamed_source::spawn_local_file_stream(
+                    path.clone(),
+                    48000,
+                    mqttaudio::config::ResamplerQuality::Fast,
+                    WINDOW_FRAMES,
+                    false,
+                )
+                .unwrap();
+                // The control loop's gate: poll frames_buffered every 5ms.
+                while handles.frames_buffered.load(Ordering::Acquire) < PREBUFFER_FRAMES
+                    && !handles.producer_done.load(Ordering::Acquire)
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                total += start.elapsed();
+                handles.stop_flag.store(true, Ordering::Release);
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
 /// Memory usage tracking
 fn bench_memory_usage(c: &mut Criterion) {
     let mut group = c.benchmark_group("memory_usage");
@@ -378,6 +453,8 @@ criterion_group!(
     bench_cold_load_http,
     bench_precache,
     bench_time_to_first_sample,
+    bench_probe_local_file,
+    bench_windowed_prebuffer_ready,
     bench_memory_usage,
     bench_resampling,
 );

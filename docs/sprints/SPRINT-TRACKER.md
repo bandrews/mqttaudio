@@ -222,12 +222,20 @@ for this tier are **D50–D62** in [`DECISIONS.md`](DECISIONS.md).
 Ordering: 11 (measure) strictly before 12 (optimize); 12 before 13 because latency is the
 owner's priority; 14 last (lowest risk, and its resampler re-pins follow 12's test changes).
 
+> **Lane A environment note (sprints 11–14 execution, 2026-06-09):** this execution environment
+> has no Docker daemon, so Lane A was run as the documented host approximation — the same gate
+> steps (`cargo fmt --check`, `clippy --all-targets -- -D warnings`,
+> `RUSTFLAGS=-D warnings cargo build --release`, full `cargo test`, benches) on the host
+> toolchain (rust 1.94.1 vs the image's pinned 1.95). `[A]` boxes below were genuinely verified
+> under that approximation; a confirming run of `scripts/validate.sh` on a Docker-capable
+> machine is recommended before release. `[B]` boxes remain for the partner's native macOS pass.
+
 ## Status board
 
 | # | Sprint | Status | Depends on | File |
 |---|--------|--------|-----------|------|
 | 10 | Performance & RT-hardening program plan | Done | 0–9 | [sprint-10](sprint-10-perf-program-plan.md) |
-| 11 | Latency instrumentation & baselines | Not started | 10 | [sprint-11](sprint-11-latency-instrumentation.md) |
+| 11 | Latency instrumentation & baselines | Done | 10 | [sprint-11](sprint-11-latency-instrumentation.md) |
 | 12 | First-start latency | Not started | 11 | [sprint-12](sprint-12-first-start-latency.md) |
 | 13 | RT-path hardening | Not started | 11 (soft: after 12) | [sprint-13](sprint-13-rt-path-hardening.md) |
 | 14 | Quality & correctness backlog | Not started | 11 (soft: after 13) | [sprint-14](sprint-14-quality-and-correctness.md) |
@@ -241,11 +249,11 @@ owner's priority; 14 last (lowest risk, and its resampler re-pins follow 12's te
 - [x] SWR race traced and characterized: revalidation tick refuted; `invalidate`-vs-`active_loads` race confirmed (→ Sprint 12 F2); post-unification generation hazard identified (→ Sprint 12 F1) (doc-only)
 
 ### Sprint 11 — Latency instrumentation & baselines
-- [ ] Six-stage play-latency model (D50) captured per play and logged; first-mix latency published from the audio thread via pre-allocated atomics with the alloc harness proving the publication is 0 alloc / 0 free `[A]`
-- [ ] `/metrics` exposes `latency.play_to_first_mix_ns{last,max}` + `plays_measured` with real values asserted by an HTTP test `[A]`
-- [ ] `tests/latency_test.rs` drives cache-hit, cold-local, and windowed plays offline and asserts populated, monotone stages `[A]`
-- [ ] Criterion baselines recorded in sprint-11 doc for warm hit, cold local, cold disk-cached HTTP, probe, and prebuffer-ready `[A]`
-- [ ] Real-device sanity: cached play shows sub-50 ms first-mix latency on `/metrics` `[B]`
+- [x] Six-stage play-latency model (D50) captured per play and logged; first-mix latency published from the audio thread via pre-allocated atomics with the alloc harness proving the publication is 0 alloc / 0 free `[A]` — stage capture starts at the dispatch boundary (t0/t1 collapsed; deviation recorded in sprint-11)
+- [x] `/metrics` exposes `latency.play_to_first_mix_ns{last,max}` + `plays_measured` with real values asserted by an HTTP test `[A]`
+- [x] Latency tests drive cache-hit, cold-local, and windowed plays offline and assert populated, monotone stages `[A]` — split lib (`tests/latency_test.rs`) / binary (`src/main.rs` test module) per the binary-crate architecture; deviation recorded in sprint-11
+- [x] Criterion baselines recorded in sprint-11 doc for warm hit, cold local, cold HTTP, probe, and prebuffer-ready `[A]`
+- [ ] Real-device sanity: cached play shows sub-50 ms first-mix latency on `/metrics` `[B]` — partner's pass
 
 ### Sprint 12 — First-start latency
 - [ ] Cold local and disk-cached-HTTP full-loads return a progressive buffer immediately and are audible before decode completes; pitch-corrected plays keep the full decode; promotion, freshness (stat-at-start), and the generation guard are test-covered `[A]`

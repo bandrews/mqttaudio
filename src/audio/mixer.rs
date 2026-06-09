@@ -195,6 +195,21 @@ pub struct ActiveSample {
     /// The atomic is constructed off-RT and moved in with the sample, never
     /// allocated on the audio thread.
     pub position_publisher: Option<Arc<AtomicUsize>>,
+
+    /// When the control thread enqueued this sample's AddSample command (Sprint 11,
+    /// D50). Paired with `first_mix_latency`; `None` for samples built outside the
+    /// daemon's play path (tests, benches), which therefore publish nothing.
+    enqueued_at: Option<std::time::Instant>,
+
+    /// First-mix latency sink (Sprint 11, D50): on the first block in which this
+    /// sample mixes loaded audio, the callback stores the nanoseconds elapsed since
+    /// `enqueued_at` — a single relaxed store into a pre-allocated atomic, no
+    /// alloc/lock, mirroring `position_publisher`.
+    first_mix_latency: Option<Arc<AtomicU64>>,
+
+    /// Set once the first-mix latency has been published, so later blocks take a
+    /// single-bool fast path.
+    first_mix_published: bool,
 }
 
 impl ActiveSample {
@@ -245,6 +260,9 @@ impl ActiveSample {
             pitch_crossfade_total: 0,
             pitch_crossfade_direct_pos: 0.0,
             position_publisher: None,
+            enqueued_at: None,
+            first_mix_latency: None,
+            first_mix_published: false,
         }
     }
 
@@ -292,6 +310,9 @@ impl ActiveSample {
             pitch_crossfade_total: 0,
             pitch_crossfade_direct_pos: 0.0,
             position_publisher: None,
+            enqueued_at: None,
+            first_mix_latency: None,
+            first_mix_published: false,
         }
     }
 
@@ -336,6 +357,9 @@ impl ActiveSample {
             pitch_crossfade_total: 0,
             pitch_crossfade_direct_pos: 0.0,
             position_publisher: None,
+            enqueued_at: None,
+            first_mix_latency: None,
+            first_mix_published: false,
         }
     }
 
@@ -358,6 +382,37 @@ impl ActiveSample {
             .get(route_idx)
             .copied()
             .unwrap_or(1.0)
+    }
+
+    /// Attach the latency probe (Sprint 11, D50): the instant the play path
+    /// enqueued this sample and the pre-allocated sink for its first-mix latency.
+    /// Called off-RT before the sample is moved onto the command ring.
+    pub fn set_latency_probe(&mut self, enqueued_at: std::time::Instant, sink: Arc<AtomicU64>) {
+        self.enqueued_at = Some(enqueued_at);
+        self.first_mix_latency = Some(sink);
+        self.first_mix_published = false;
+    }
+
+    /// Publish the first-mix latency (D50) if this sample is about to mix loaded
+    /// audio for the first time. A one-bool fast path once published; a single
+    /// relaxed store into the pre-allocated atomic on the publishing block. Called
+    /// from `mix_audio` with `position` at the block's start, so "started" means
+    /// the read cursor sits inside the decoded region — a still-streaming buffer
+    /// that has not reached the cursor yet emits silence and does not count.
+    fn publish_first_mix_if_started(&mut self) {
+        if self.first_mix_published {
+            return;
+        }
+        let Some(ref latency) = self.first_mix_latency else {
+            return;
+        };
+        if self.position >= self.buffer.frames() {
+            return;
+        }
+        if let Some(at) = self.enqueued_at {
+            latency.store(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        self.first_mix_published = true;
     }
 
     /// Set the playback speed.
@@ -821,6 +876,18 @@ pub struct StreamedSource {
     /// Set off the audio thread (by the reaper, on stop or drop) to ask the producer
     /// task to stop early. Held so the source owns the flag for the producer's life.
     stop_flag: Arc<AtomicBool>,
+
+    /// When the control thread enqueued this source's AddStreamedSource command
+    /// (Sprint 11, D50). `None` outside the daemon's play path.
+    enqueued_at: Option<std::time::Instant>,
+
+    /// First-mix latency sink (Sprint 11, D50): on the first block in which this
+    /// source pops real frames from its ring, the callback stores the nanoseconds
+    /// elapsed since `enqueued_at` — one relaxed store into a pre-allocated atomic.
+    first_mix_latency: Option<Arc<AtomicU64>>,
+
+    /// Set once the first-mix latency has been published (one-bool fast path).
+    first_mix_published: bool,
 }
 
 impl StreamedSource {
@@ -855,7 +922,35 @@ impl StreamedSource {
             fade_state: FadeState::None,
             producer_done,
             stop_flag,
+            enqueued_at: None,
+            first_mix_latency: None,
+            first_mix_published: false,
         }
+    }
+
+    /// Attach the latency probe (Sprint 11, D50): the instant the play path
+    /// enqueued this source and the pre-allocated sink for its first-mix latency.
+    /// Called off-RT before the source is moved onto the command ring.
+    pub fn set_latency_probe(&mut self, enqueued_at: std::time::Instant, sink: Arc<AtomicU64>) {
+        self.enqueued_at = Some(enqueued_at);
+        self.first_mix_latency = Some(sink);
+        self.first_mix_published = false;
+    }
+
+    /// Publish the first-mix latency (D50) after a block in which this source
+    /// popped real frames from its ring. One-bool fast path once published; a
+    /// single relaxed store on the publishing block.
+    fn publish_first_mix_if_started(&mut self) {
+        if self.first_mix_published {
+            return;
+        }
+        let Some(ref latency) = self.first_mix_latency else {
+            return;
+        };
+        if let Some(at) = self.enqueued_at {
+            latency.store(at.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+        self.first_mix_published = true;
     }
 
     /// Set the fade state for this source (fade-in on start, fade-out on stop).
@@ -1131,6 +1226,10 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
         // This voice's duck multipliers at the buffer's start and end (D1); the mix
         // loop lerps between them per frame (D2). An unducked voice reads (1.0, 1.0).
         let duck = ducking.map_or((1.0, 1.0), |a| a.buffer_endpoints(&sample.voice_id));
+
+        // First-mix latency probe (Sprint 11, D50): a one-bool fast path per
+        // sample per block once published.
+        sample.publish_first_mix_if_started();
 
         let position_advanced =
             mix_sample_into_output(sample, output, frames, output_channels, duck);
@@ -1748,6 +1847,13 @@ fn mix_streamed_source_into_output(
         // Advance the fade once per frame (the duck fade is advanced once per buffer
         // in mix_audio; this fade is per-source, so it lives here).
         source.fade_state.advance();
+    }
+
+    // First-mix latency probe (Sprint 11, D50): published only when the block
+    // popped at least one real frame from the ring (a fully underrun block is
+    // silence, not a start).
+    if underrun_frames < frames {
+        source.publish_first_mix_if_started();
     }
 }
 

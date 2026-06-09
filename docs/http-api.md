@@ -51,7 +51,7 @@ Config file example:
 |----------|--------|-------------|
 | `/health` | GET | Health check (returns service status) |
 | `/version` | GET | Build identity (`name`, `version`, optional `git_sha`) |
-| `/metrics` | GET | Operational telemetry (uptime, clips, xruns, active counts, per-voice ducking) |
+| `/metrics` | GET | Operational telemetry (uptime, clips, xruns, active counts, per-voice ducking, first-start play latency) |
 | `/status` | GET | Current playback status (samples, voices, cache) |
 | `/status/samples` | GET | List of active samples |
 | `/status/voices` | GET | List of active voices (with per-voice ducking multiplier) |
@@ -167,7 +167,11 @@ Operational telemetry for monitoring. Every field is real — no placeholders.
     "memory_cap_bytes": 1073741824,
     "disk_bytes": 0
   },
-  "ducking": { "music": 0.1 }
+  "ducking": { "music": 0.1 },
+  "latency": {
+    "play_to_first_mix_ns": { "last": 12400000, "max": 18100000 },
+    "plays_measured": 42
+  }
 }
 ```
 
@@ -186,6 +190,9 @@ Operational telemetry for monitoring. Every field is real — no placeholders.
 | `cache.memory_cap_bytes` | integer / null | The resolved hard memory-budget cap in bytes (`null` if the budget is unlimited); `memory_headroom_bytes` is the portion still free |
 | `cache.disk_bytes` | integer | Bytes held in the on-disk cache |
 | `ducking` | object | Map of voice id to its resolved ducking multiplier (`< 1.0` = ducked); voices at full volume are omitted |
+| `latency.play_to_first_mix_ns.last` | integer | The most recent play's enqueue-to-first-mix latency in nanoseconds (0 until a play is measured) |
+| `latency.play_to_first_mix_ns.max` | integer | The largest first-mix latency measured since startup |
+| `latency.plays_measured` | integer | How many plays have been measured |
 
 ### `/status/voices` Response
 

@@ -126,6 +126,12 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
         .map(|(voice, multiplier)| (voice.clone(), json!(multiplier)))
         .collect();
 
+    // First-start play latency (Sprint 11, D50): enqueue-to-first-mix, published
+    // by the audio thread and folded by the reaper. Zeros until a play is measured.
+    let latency_last = state.latency.last_ns.load(Ordering::Relaxed);
+    let latency_max = state.latency.max_ns.load(Ordering::Relaxed);
+    let plays_measured = state.latency.plays_measured.load(Ordering::Relaxed);
+
     Json(json!({
         "uptime_seconds": uptime_seconds,
         "clips": clips,
@@ -142,6 +148,13 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
             "disk_bytes": cache_disk_bytes,
         },
         "ducking": ducking,
+        "latency": {
+            "play_to_first_mix_ns": {
+                "last": latency_last,
+                "max": latency_max,
+            },
+            "plays_measured": plays_measured,
+        },
     }))
 }
 

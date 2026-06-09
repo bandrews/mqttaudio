@@ -709,6 +709,12 @@ async fn main() {
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
 
+    // First-start play-latency aggregate + probe registry (Sprint 11, D50): the
+    // stats feed /metrics; the tracker registers a probe per play and the reaper
+    // tick folds fired probes into the stats.
+    let latency_stats = Arc::new(http::PlayLatencyStats::default());
+    let latency_tracker = http::LatencyTracker::new(latency_stats.clone());
+
     // Create the text-command channel (HTTP/MQTT payloads -> control loop).
     let (text_tx, mut text_rx) = mpsc::channel::<String>(100);
 
@@ -728,6 +734,7 @@ async fn main() {
             telemetry_enabled.clone(),
             output_meters.clone(),
             config_json.clone(),
+            latency_stats.clone(),
         )
         .await
         {
@@ -806,6 +813,7 @@ async fn main() {
                             output_channels,
                             output_sample_rate,
                             config: &config,
+                            latency: &latency_tracker,
                         };
                         handle_command(cmd, &mut ctx).await;
                     }
@@ -829,6 +837,9 @@ async fn main() {
                     &input_statuses,
                     output_channels,
                 );
+                // Fold any first-mix latency probes the audio thread fired into
+                // the /metrics aggregate (Sprint 11, D50).
+                latency_tracker.fold_fired();
             }
             _ = freshness_tick.tick() => {
                 if config.cache.freshness != config::FreshnessMode::Pinned {
@@ -1098,6 +1109,56 @@ fn reap_finished_samples(
 /// mutations are sent to the audio thread through `cmd_tx`; the control thread
 /// owns the ducking engine, voice-activity counts, live sample map, and the
 /// status snapshot, and never touches the audio thread's `MixerState`.
+/// Control-side stage clock for one play command (Sprint 11, D50). Captures the
+/// dispatch instant and the instants the windowing decision and the buffer/
+/// prebuffer readiness were reached; `log_enqueued` emits the one per-play
+/// latency event once the command is on the ring. Copy so the play path can
+/// hand it through the windowed helpers without an ownership dance.
+#[derive(Clone, Copy)]
+struct PlayStages {
+    t0_dispatch: std::time::Instant,
+    t2_decision: Option<std::time::Instant>,
+    t3_ready: Option<std::time::Instant>,
+}
+
+impl PlayStages {
+    fn begin() -> Self {
+        Self {
+            t0_dispatch: std::time::Instant::now(),
+            t2_decision: None,
+            t3_ready: None,
+        }
+    }
+
+    /// The windowing/load decision for this play has been made.
+    fn decision(&mut self) {
+        self.t2_decision = Some(std::time::Instant::now());
+    }
+
+    /// The buffer is loaded / the prebuffer gate released; the sample can be built.
+    fn ready(&mut self) {
+        self.t3_ready = Some(std::time::Instant::now());
+    }
+
+    /// Emit the per-play stage event. Durations are micros from dispatch; a stage
+    /// that was not reached on this path reports 0.
+    fn log_enqueued(&self, file: &str, kind: &str, t4_enqueued: std::time::Instant) {
+        let us = |t: Option<std::time::Instant>| {
+            t.map(|t| t.duration_since(self.t0_dispatch).as_micros() as u64)
+                .unwrap_or(0)
+        };
+        tracing::info!(
+            target: "latency",
+            kind,
+            file,
+            decision_us = us(self.t2_decision),
+            ready_us = us(self.t3_ready),
+            enqueue_us = t4_enqueued.duration_since(self.t0_dispatch).as_micros() as u64,
+            "play stages"
+        );
+    }
+}
+
 struct CommandCtx<'a> {
     cache_manager: &'a std::sync::Arc<tokio::sync::Mutex<cache::CacheManager>>,
     voice_manager: &'a std::sync::Arc<parking_lot::Mutex<voice::VoiceManager>>,
@@ -1114,6 +1175,8 @@ struct CommandCtx<'a> {
     output_channels: usize,
     output_sample_rate: u32,
     config: &'a config::Config,
+    /// Per-play first-mix latency probe registry (Sprint 11, D50).
+    latency: &'a http::LatencyTracker,
 }
 
 impl CommandCtx<'_> {
@@ -1151,8 +1214,11 @@ async fn handle_stream_play(
     loop_mode: bool,
     window_ms: Option<u32>,
     prebuffer_ms: Option<u32>,
+    mut stages: PlayStages,
     ctx: &mut CommandCtx<'_>,
 ) {
+    // The caller decided to window this play (Sprint 11, D50).
+    stages.decision();
     let config = ctx.config;
     let output_sample_rate = ctx.output_sample_rate;
 
@@ -1213,6 +1279,7 @@ async fn handle_stream_play(
         loop_mode,
         prebuffer_frames,
         deadline_ms,
+        stages,
         ctx,
     )
     .await;
@@ -1233,6 +1300,7 @@ async fn finish_streamed_play(
     loop_mode: bool,
     prebuffer_frames: usize,
     deadline_ms: u32,
+    mut stages: PlayStages,
     ctx: &mut CommandCtx<'_>,
 ) {
     use std::sync::atomic::Ordering;
@@ -1263,6 +1331,9 @@ async fn finish_streamed_play(
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
+    // Prebuffer gate released (threshold, producer done, or deadline): the source
+    // is as ready as it will be before start (Sprint 11, D50).
+    stages.ready();
 
     // Resolve the internal id and the voice's current volume.
     let mut voice_mgr = ctx.voice_manager.lock();
@@ -1343,7 +1414,13 @@ async fn finish_streamed_play(
     *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
     ctx.playing.insert(status.internal_id, status);
     ctx.streamed_voices.insert(voice_id.clone());
+
+    // First-mix latency probe (Sprint 11, D50), mirroring the full-load path.
+    let enqueued_at = std::time::Instant::now();
+    source.set_latency_probe(enqueued_at, ctx.latency.new_probe());
+
     ctx.send(rt_engine::AudioCommand::AddStreamedSource(source));
+    stages.log_enqueued(&file, "windowed", enqueued_at);
     ctx.refresh();
     tracing::info!(
         "Now streaming {} (voice '{}'); {} active voices",
@@ -1429,6 +1506,7 @@ async fn try_windowed_http_play(
     window_ms: Option<u32>,
     prebuffer_ms: Option<u32>,
     cacheable: Option<bool>,
+    mut stages: PlayStages,
     ctx: &mut CommandCtx<'_>,
 ) -> bool {
     let config = ctx.config;
@@ -1468,6 +1546,8 @@ async fn try_windowed_http_play(
     if !windowed {
         return false; // drop `open` → connection closes; caller full-loads
     }
+    // Committed to a windowed HTTP play (Sprint 11, D50).
+    stages.decision();
 
     // Window + prebuffer (per-play override beats config).
     let window_ms = window_ms.unwrap_or(config.cache.stream_window_ms);
@@ -1556,6 +1636,7 @@ async fn try_windowed_http_play(
         false,
         prebuffer_frames,
         deadline_ms,
+        stages,
         ctx,
     )
     .await;
@@ -1604,6 +1685,9 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             freshness,
             cacheable,
         } => {
+            // Stage clock for this play's latency event (Sprint 11, D50).
+            let mut stages = PlayStages::begin();
+
             // Windowed streaming gives bounded memory (O(window)) and low time-to-first-
             // sample for big/long assets. `mode=stream` forces it; `auto`/`full` are
             // decided from a cheap probe and the live memory budget, which force-windows
@@ -1623,6 +1707,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     window_ms,
                     prebuffer_ms,
                     cacheable,
+                    stages,
                     ctx,
                 )
                 .await
@@ -1645,12 +1730,16 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                         loop_mode,
                         window_ms,
                         prebuffer_ms,
+                        stages,
                         ctx,
                     )
                     .await;
                     return;
                 }
             }
+
+            // The decision is full-load from here (Sprint 11, D50).
+            stages.decision();
 
             // Load file (full in-memory load, with streaming support for faster startup).
             // A per-play freshness override beats the configured default.
@@ -1663,6 +1752,8 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
 
             match buffer_result {
                 Ok(buffer) => {
+                    stages.ready();
+
                     // Use provided voice or auto-generate a unique one.
                     let voice_id = voice.unwrap_or_else(next_auto_voice_id);
 
@@ -1884,7 +1975,20 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     }
                     *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
                     ctx.playing.insert(status.internal_id, status);
+
+                    // First-mix latency probe (Sprint 11, D50): registered with the
+                    // tracker, attached to the sample, published by the audio thread
+                    // on the sample's first mixed block, folded by the reaper tick.
+                    let enqueued_at = std::time::Instant::now();
+                    sample.set_latency_probe(enqueued_at, ctx.latency.new_probe());
+
+                    let kind = if is_streaming {
+                        "full_load_streaming"
+                    } else {
+                        "full_load"
+                    };
                     ctx.send(rt_engine::AudioCommand::AddSample(sample));
+                    stages.log_enqueued(&file, kind, enqueued_at);
                     ctx.refresh();
                     tracing::info!("Now playing {} active samples", ctx.playing.len());
                 }
@@ -2279,6 +2383,8 @@ mod tests {
         ducking_snapshot: Arc<RwLock<HashMap<String, f32>>>,
         inputs: Vec<http::InputStatus>,
         config: config::Config,
+        latency_stats: Arc<http::PlayLatencyStats>,
+        latency: http::LatencyTracker,
         _cache_dir: tempfile::TempDir,
     }
 
@@ -2305,6 +2411,7 @@ mod tests {
             let (cmd_return_tx, cmd_return_rx) = rt_engine::command_return_channel(1024);
             let (grave_tx, grave_rx) = rt_engine::graveyard_channel(1024);
             let (streamed_grave_tx, streamed_grave_rx) = rt_engine::streamed_graveyard_channel(256);
+            let latency_stats = Arc::new(http::PlayLatencyStats::default());
             Self {
                 cache_manager: Arc::new(tokio::sync::Mutex::new(cache)),
                 voice_manager: Arc::new(Mutex::new(VoiceManager::new())),
@@ -2330,6 +2437,8 @@ mod tests {
                 ducking_snapshot: Arc::new(RwLock::new(HashMap::new())),
                 inputs: Vec::new(),
                 config: config::Config::default(),
+                latency_stats: latency_stats.clone(),
+                latency: http::LatencyTracker::new(latency_stats),
                 _cache_dir: cache_dir,
             }
         }
@@ -2351,6 +2460,7 @@ mod tests {
                 output_channels: 2,
                 output_sample_rate: SR,
                 config: &self.config,
+                latency: &self.latency,
             };
             handle_command(cmd, &mut ctx).await;
         }
@@ -2660,6 +2770,170 @@ mod tests {
         fixture.run(cmd).await;
         let captured = warnings.lock().unwrap().clone();
         captured
+    }
+
+    /// One captured per-play latency stage event (Sprint 11, D50).
+    #[derive(Default, Clone, Debug)]
+    struct StageEvent {
+        kind: String,
+        decision_us: u64,
+        ready_us: u64,
+        enqueue_us: u64,
+    }
+
+    /// Captures events on the "latency" target so a test can assert the recorded
+    /// play stages without them leaking to the console.
+    struct StageCaptureLayer {
+        events: Arc<std::sync::Mutex<Vec<StageEvent>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for StageCaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "latency" {
+                return;
+            }
+            let mut ev = StageEvent::default();
+            event.record(&mut StageVisitor { ev: &mut ev });
+            self.events.lock().unwrap().push(ev);
+        }
+    }
+
+    struct StageVisitor<'a> {
+        ev: &'a mut StageEvent,
+    }
+
+    impl tracing::field::Visit for StageVisitor<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "decision_us" => self.ev.decision_us = value,
+                "ready_us" => self.ev.ready_us = value,
+                "enqueue_us" => self.ev.enqueue_us = value,
+                _ => {}
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "kind" {
+                self.ev.kind = value.to_string();
+            }
+        }
+
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    /// Run `cmd` through `handle_command` under a stage-capturing subscriber and
+    /// return every captured per-play latency event.
+    async fn run_capturing_stages(fixture: &mut Fixture, cmd: AudioCommand) -> Vec<StageEvent> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(StageCaptureLayer {
+            events: events.clone(),
+        });
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        fixture.run(cmd).await;
+        let captured = events.lock().unwrap().clone();
+        captured
+    }
+
+    /// Mix one block through the fixture's mixer, as the audio callback would.
+    fn mix_one_block(fixture: &mut Fixture) {
+        let mut block = vec![0.0f32; 512 * 2];
+        audio::mixer::mix_audio(&mut block, &mut fixture.mixer);
+    }
+
+    #[tokio::test]
+    async fn play_emits_monotone_stage_latency_event() {
+        // Sprint 11 (D50): every play emits exactly one stage event whose
+        // dispatch->decision->ready->enqueue durations are monotone.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let events = run_capturing_stages(&mut fixture, play_crossfade(false, 0)).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one latency event per play, got {events:?}"
+        );
+        let e = &events[0];
+        assert_eq!(e.kind, "full_load", "local full-load play kind: {e:?}");
+        assert!(
+            e.decision_us <= e.ready_us && e.ready_us <= e.enqueue_us,
+            "stages must be monotone: {e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hit_play_ready_stage_is_bounded() {
+        // Sprint 11: a memory-cache-hit replay must not decode; its decision->ready
+        // stage stays under a generous ceiling so a reintroduced blocking decode on
+        // the hit path fails loudly here.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await; // cold: decodes + caches
+        let events = run_capturing_stages(&mut fixture, play_crossfade(false, 0)).await;
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert!(
+            e.ready_us.saturating_sub(e.decision_us) < 250_000,
+            "cache-hit load stage must be far below 250ms: {e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_first_mix_latency_folds_into_stats() {
+        // Sprint 11 (D50): the audio thread publishes enqueue->first-mix into the
+        // play's probe; the reaper fold turns it into /metrics values.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain(); // AddSample reaches the mixer
+        mix_one_block(&mut fixture); // first mixed block publishes the probe
+        fixture.latency.fold_fired();
+        use std::sync::atomic::Ordering;
+        let last = fixture.latency_stats.last_ns.load(Ordering::Relaxed);
+        let max = fixture.latency_stats.max_ns.load(Ordering::Relaxed);
+        let plays = fixture.latency_stats.plays_measured.load(Ordering::Relaxed);
+        assert_eq!(plays, 1, "one measured play");
+        assert!(last > 0, "a real first-mix latency was published");
+        assert!(max >= last, "max folds correctly");
+    }
+
+    #[tokio::test]
+    async fn windowed_play_emits_stage_event_and_publishes_first_mix() {
+        // Sprint 11 (D50): the windowed path emits its stage event after the
+        // prebuffer gate and publishes first-mix latency from the ring mix.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let mut cmd = play_crossfade(false, 0);
+        if let AudioCommand::Play { mode, .. } = &mut cmd {
+            *mode = config::LoadMode::Stream;
+        }
+        let events = run_capturing_stages(&mut fixture, cmd).await;
+        assert_eq!(events.len(), 1, "one latency event, got {events:?}");
+        let e = &events[0];
+        assert_eq!(e.kind, "windowed", "windowed play kind: {e:?}");
+        assert!(
+            e.decision_us <= e.ready_us && e.ready_us <= e.enqueue_us,
+            "stages must be monotone: {e:?}"
+        );
+
+        fixture.drain(); // AddStreamedSource reaches the mixer
+        mix_one_block(&mut fixture); // the gate guaranteed ring audio; this publishes
+        fixture.latency.fold_fired();
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            fixture.latency_stats.plays_measured.load(Ordering::Relaxed),
+            1,
+            "the windowed first mix must be measured"
+        );
+        assert!(fixture.latency_stats.last_ns.load(Ordering::Relaxed) > 0);
     }
 
     #[tokio::test]

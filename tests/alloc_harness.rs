@@ -160,6 +160,102 @@ fn telemetry_position_publish_is_allocation_free() {
 }
 
 #[test]
+fn first_mix_latency_publish_is_allocation_free() {
+    // Sprint 11 (D50): a sample carrying a latency probe stores its first-mix
+    // latency (nanos since enqueue) into a pre-allocated atomic exactly once, on
+    // the first block in which it mixes loaded audio. Both the publishing block
+    // and the already-published fast path on later blocks must be 0 alloc / 0 free.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let plain = ActiveSample::new(
+        1,
+        "a".to_string(),
+        decoded(sine(440.0, SR, SR as usize, 2, 0.3), 2, SR),
+        1.0,
+        1.0,
+        "a".to_string(),
+    );
+    let mut state = SceneBuilder::new(2).sample(plain).build();
+
+    let mut block = vec![0.0f32; BLOCK * 2];
+    mix_audio(&mut block, &mut state); // warm up off the armed region (no probe yet)
+
+    // Attach the probe off-RT, as the control thread does before enqueueing; the
+    // first armed mix is the publishing one.
+    let probe = Arc::new(AtomicU64::new(0));
+    state.active_samples[0].set_latency_probe(std::time::Instant::now(), probe.clone());
+
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..8 {
+            mix_audio(&mut block, &mut state);
+        }
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "first-mix latency publish allocated {allocs} times"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "first-mix latency publish freed {deallocs} times"
+    );
+    assert!(
+        probe.load(Ordering::Relaxed) > 0,
+        "the first-mix latency should have been published"
+    );
+}
+
+#[test]
+fn streamed_first_mix_latency_publish_is_allocation_free() {
+    // Sprint 11 (D50): the windowed StreamedSource publishes its first-mix latency
+    // on the first block in which it pops real frames from the ring; the publish
+    // and the published fast path must be 0 alloc / 0 free on the RT thread.
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    let mut mixer = SceneBuilder::new(2).build();
+    let (mut producer, consumer) = create_ring_buffer(BLOCK * 2 * 16);
+    let seed = vec![0.3f32; BLOCK * 2 * 12];
+    producer.push_slice(&seed);
+    let mut source = StreamedSource::new(
+        1,
+        "bed".to_string(),
+        "stream.wav".to_string(),
+        None,
+        consumer,
+        2,
+        1.0,
+        vec![(0, 0), (1, 1)],
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let probe = Arc::new(AtomicU64::new(0));
+    source.set_latency_probe(std::time::Instant::now(), probe.clone());
+    mixer.streamed_sources.push(source);
+
+    let mut block = vec![0.0f32; BLOCK * 2];
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..8 {
+            mix_audio(&mut block, &mut mixer);
+        }
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "streamed first-mix latency publish allocated {allocs} times"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "streamed first-mix latency publish freed {deallocs} times"
+    );
+    assert!(
+        probe.load(Ordering::Relaxed) > 0,
+        "the streamed first-mix latency should have been published"
+    );
+}
+
+#[test]
 fn live_input_underrun_mix_is_allocation_free_after_warmup() {
     // F3: the graceful-underrun fade in mix_live_input_into_output runs on the RT
     // thread (inside mix_audio). It holds the last frame and fades it to silence

@@ -65,6 +65,7 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         output_meters: Arc::new(Vec::new()),
         state_broadcaster: Arc::new(LogBroadcaster::new()),
         config_json: Arc::new(serde_json::json!({})),
+        latency: Arc::new(mqttaudio::http::PlayLatencyStats::default()),
     };
 
     (state, cmd_rx)
@@ -1287,6 +1288,41 @@ async fn test_version_endpoint_returns_name_and_version() {
         json["version"],
         env!("CARGO_PKG_VERSION"),
         "version must be the crate version"
+    );
+}
+
+#[tokio::test]
+async fn test_metrics_reports_play_latency_through_the_tracker() {
+    // Sprint 11 (D50): /metrics surfaces the first-start latency aggregate. The
+    // values flow through the real probe-fold path: a probe is registered, the
+    // audio thread's store is simulated (the RT-side store itself is covered by
+    // the alloc harness and latency_test against real mixes), the fold runs, and
+    // /metrics reports the folded numbers verbatim.
+    use mqttaudio::http::{LatencyTracker, PlayLatencyStats};
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let stats = Arc::new(PlayLatencyStats::default());
+    let tracker = LatencyTracker::new(stats.clone());
+    let probe = tracker.new_probe();
+    probe.store(123_456, Ordering::Relaxed); // the audio thread's first-mix store
+    tracker.fold_fired(); // the reaper tick
+
+    let (mut state, _rx) = create_test_state();
+    state.latency = stats;
+    let json = get_json(state, "/metrics").await;
+
+    assert_eq!(
+        json["latency"]["play_to_first_mix_ns"]["last"], 123_456,
+        "last latency must be the folded probe value"
+    );
+    assert_eq!(
+        json["latency"]["play_to_first_mix_ns"]["max"], 123_456,
+        "max latency must track the folded value"
+    );
+    assert_eq!(
+        json["latency"]["plays_measured"], 1,
+        "one play was measured"
     );
 }
 

@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **First-start play-latency telemetry (Sprint 11, D50).** Every play now measures the time from its command
+  reaching the audio ring to the first block in which it mixes loaded audio, published from the audio thread
+  via a pre-allocated atomic (one relaxed store on the publishing block — no allocation, no lock, proven by
+  the allocation harness). `GET /metrics` gains `latency.play_to_first_mix_ns{last,max}` and
+  `latency.plays_measured`, and each play emits one `latency`-target log event with its control-side stage
+  durations (dispatch → decision → ready → enqueue). Purely additive — no play-path behavior changes.
+
 - **Opt-in live-position telemetry (`GET`/`POST /telemetry`).** Off by default. When enabled, the audio thread
   publishes each playing sample's live frame position into a pre-allocated atomic once per block (a single
   relaxed store — no allocation, no lock, RT-safe), and `GET /status/samples` then reports real `position`,

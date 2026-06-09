@@ -46,6 +46,7 @@ fn build_state() -> (AppState, mpsc::Receiver<String>, Arc<LogBroadcaster>) {
         output_meters: Arc::new(Vec::new()),
         state_broadcaster: Arc::new(LogBroadcaster::new()),
         config_json: Arc::new(serde_json::json!({})),
+        latency: Arc::new(mqttaudio::http::PlayLatencyStats::default()),
     };
 
     (state, cmd_rx, log_broadcaster)
