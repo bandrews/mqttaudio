@@ -123,14 +123,12 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   If pitch-correction RT-safety must be guaranteed, verify with a C++-level allocation tool (or a real-device
   xrun soak) — pairs with the Sprint 6/9 pitch follow-ups.
 
-- **Ducking `apply_target` clones the voice string on the RT thread on first duck (pre-existing, Sprint 5 — LOW).**
-  `DuckingApplier::apply_target` does `duck_states.entry(change.voice.clone()).or_insert_with(..)`; the first
-  time a given voice is ducked, the `HashMap` insert allocates (the owned key + possible map growth) on the
-  audio thread. It is one small allocation per *newly-ducked* voice (not per buffer), pre-dates Sprint 6, and
-  the alloc gate's ducking tests warm the voice first so they stay green. Eliminate by pre-populating
-  `duck_states` for the configured ducked voices at applier construction (off-RT). **Owned by Sprint 13 F1**
-  (`docs/sprints/sprint-13-rt-path-hardening.md`), which also removes the warm-the-voice crutch from the
-  harness.
+- **Ducking `apply_target` clones the voice string on the RT thread on first duck (Sprint 5 residual —
+  RESOLVED in Sprint 13 F1).** `DuckingApplier::with_ducked_voices` pre-populates the duck states from the
+  configured rules' `ducked_voices` at construction (off-RT); `apply_target` is now `get_mut`-only and never
+  inserts or allocates on the audio thread, even for the FIRST duck of a voice. The harness's
+  warm-the-voice crutch is gone: `alloc_harness::first_duck_of_a_never_seen_voice_is_allocation_free` arms
+  around the first duck itself.
 
 - **Resampler (rubato) sinc interpolation stays `Linear` (Sprint 6 R1 — LOW, optional, no decision).** The
   sample-rate-conversion resampler (`src/audio/resampler.rs`, used when a file's rate differs from the device
@@ -143,29 +141,24 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   code path. **Decided 2026-06-09: owner approved the switch to `Cubic` — D59, owned by Sprint 14 F1**
   (`docs/sprints/sprint-14-quality-and-correctness.md`).
 
-- **Voice pool is a soft reserve, not a hard cap (Sprint 5, D17/D18).** `active_samples`/`live_inputs` are now
-  pre-reserved to `MAX_VOICES` (256) / `MAX_LIVE_INPUTS` (16) at construction (`src/audio/mixer.rs`), so a Play
-  never reallocates the Vec on the RT thread in practice — well past the documented "20+ simultaneous" target.
-  But it is a *soft* reserve: exceeding the reservation makes `drain_commands`' `AddSample` push reallocate the
-  backing store once, on the audio thread. The locked D18 over-cap policy (steal the oldest non-looping voice,
-  else reject the new Play — both moving the displaced/rejected sample to the graveyard for off-RT drop) is not
-  yet implemented; it needs the graveyard producer threaded into `drain_commands`. Until then the alloc gate
-  proves the common case (`adding_a_sample_into_the_reserved_pool_is_free_free`) but not the >256 over-cap path.
-  **Owner re-approved the D18 policy 2026-06-09 — owned by Sprint 13 F2**
-  (`docs/sprints/sprint-13-rt-path-hardening.md`).
+- **Voice pool is a soft reserve, not a hard cap (Sprint 5, D17/D18 — RESOLVED in Sprint 13 F2,
+  owner-approved 2026-06-09).** The D18 over-cap policy is implemented: the graveyard producer is threaded
+  into `drain_commands`, and `add_sample_with_cap` (`src/rt_engine.rs`) holds the pool at `MAX_VOICES` —
+  at the cap a new Play steals the OLDEST non-looping voice (lowest internal id, displaced to the graveyard
+  for off-RT drop) or, if every slot loops, the new play is rejected to the graveyard. Alloc-free past the
+  cap (`alloc_harness::over_cap_play_steals_alloc_free`); behavior locked by rt_engine unit tests and
+  `soak_test::soak_past_the_voice_cap_steals_and_stays_capped`. Behavior change changelogged.
 
-- **A Speed command that TOGGLES pitch correction still allocates/frees on the RT thread (Sprint 5/9).**
-  `SetSpeedMatching { pitch_correction }` is applied on the audio thread by `apply_mutation` ->
-  `ActiveSample::set_speed_with_mode`, which calls `enable_pitch_correction` (constructs a signalsmith
-  `Stretch`/`PitchCorrector`) or `disable_pitch_correction` (drops it). When the command flips the mode on a
-  *live* voice, that create/drop happens in the callback — a heap allocation and/or free on the RT thread.
-  The command-return ring (Sprint 5) keeps the *command husk's* heap off the RT thread, but not this
-  corrector lifecycle. The alloc gate (`tests/alloc_harness.rs::draining_mutation_commands_is_free_free`)
-  deliberately does **not** toggle pitch, so it stays green; this residual is real but out of scope here.
-  Eliminating it needs the control thread to pre-build the `PitchCorrector` and send it inside the command,
-  and to return the displaced corrector via a graveyard for off-RT drop (mirroring the sample graveyard) —
-  a separate, larger change. Pairs with the Sprint-6 pitch-correction work. **Locked as D56, owned by
-  Sprint 13 F3** (`docs/sprints/sprint-13-rt-path-hardening.md`).
+- **A Speed command that TOGGLES pitch correction still allocates/frees on the RT thread (Sprint 5/9 —
+  RESOLVED in Sprint 13 F3, D56).** The daemon's Speed dispatcher now expands the selector control-side into
+  one `SetSpeedWithCorrector` per matching sample, each shipping a control-built `PitchBundle` (corrector +
+  pre-sized tail and scratch buffers, D58); the audio thread installs by move and, on disable, moves the
+  displaced corrector into the husk for off-RT drop (`ActiveSample::apply_shipped_speed`). Rust-side
+  alloc/free-freedom is proven by `alloc_harness::pitch_toggle_mid_play_is_rust_side_alloc_free`; the F10
+  no-gap pre-roll parity by `render_harness_test::shipped_corrector_enable_matches_the_no_gap_behavior`.
+  The selector-based `SetSpeedMatching` (which toggles on the applying thread) remains lib/test-only — the
+  binary never sends it. The C++ (signalsmith) side stays invisible to the Rust harness as documented below;
+  its construction now happens control-side, where allocation is fine.
 
 - **`xruns` counter surfaced on `/status` and `/metrics` (Sprint 5 residual, CLOSED in Sprint 9).** The
   lock-free RT engine creates an `xruns: Arc<AtomicU64>` in `main.rs`, passes it to the output supervisor,

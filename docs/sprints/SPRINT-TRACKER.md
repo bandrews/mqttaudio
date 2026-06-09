@@ -237,7 +237,7 @@ owner's priority; 14 last (lowest risk, and its resampler re-pins follow 12's te
 | 10 | Performance & RT-hardening program plan | Done | 0–9 | [sprint-10](sprint-10-perf-program-plan.md) |
 | 11 | Latency instrumentation & baselines | Done | 10 | [sprint-11](sprint-11-latency-instrumentation.md) |
 | 12 | First-start latency | Done | 11 | [sprint-12](sprint-12-first-start-latency.md) |
-| 13 | RT-path hardening | Not started | 11 (soft: after 12) | [sprint-13](sprint-13-rt-path-hardening.md) |
+| 13 | RT-path hardening | Done | 11 (soft: after 12) | [sprint-13](sprint-13-rt-path-hardening.md) |
 | 14 | Quality & correctness backlog | Not started | 11 (soft: after 13) | [sprint-14](sprint-14-quality-and-correctness.md) |
 
 ## Acceptance criteria
@@ -265,13 +265,13 @@ owner's priority; 14 last (lowest risk, and its resampler re-pins follow 12's te
 - [ ] Long cold local file audibly starts near-instantly on the real device `[B]` — partner's pass
 
 ### Sprint 13 — RT-path hardening
-- [ ] First duck of a never-seen voice is 0 alloc / 0 free on the callback (warm-up crutch removed from the harness) `[A]`
-- [ ] D18 over-cap policy implemented: steal oldest non-looping else reject, displaced sample via graveyard, alloc-free past 256; soak past the cap green `[A]`
-- [ ] Pitch-corrector lifecycle is control-side: toggle mid-play is Rust-side alloc/free-free; displaced corrector dropped off-RT; no-gap crossfade parity kept `[A]`
-- [ ] No `tracing` call sites remain on the audio or capture steady-state paths (`mixer.rs` set_speed warn moved control-side; `input.rs` capture sites are relaxed counters surfaced on `/metrics` and drained off-RT) `[A]`
-- [ ] Scratch buffers pre-sized to the stream's max block with a counted regrow fallback `[A]`
-- [ ] Dispatch warning when pitch correction targets a still-streaming buffer `[A]`
-- [ ] Real-device smoke: pitch toggle + over-cap burst with zero xruns `[B]`
+- [x] First duck of a never-seen voice is 0 alloc / 0 free on the callback (warm-up crutch removed from the harness) `[A]`
+- [x] D18 over-cap policy implemented: steal oldest non-looping else reject, displaced sample via graveyard, alloc-free past 256; soak past the cap green `[A]`
+- [x] Pitch-corrector lifecycle is control-side: toggle mid-play is Rust-side alloc/free-free; displaced corrector dropped off-RT; no-gap crossfade parity kept `[A]` — shipped per-sample via dispatch expansion (deviation note in sprint-13)
+- [x] No `tracing` call sites remain on the audio or capture steady-state paths (`mixer.rs` set_speed warn moved control-side; `input.rs` capture sites are relaxed counters surfaced on `/metrics` and drained off-RT) `[A]`
+- [x] Scratch buffers pre-sized to the stream's max block with a counted regrow fallback `[A]`
+- [x] Dispatch warning when pitch correction targets a still-streaming buffer `[A]`
+- [ ] Real-device smoke: pitch toggle + over-cap burst with zero xruns `[B]` — partner's pass (MANUAL-VERIFICATION note appended)
 
 ### Sprint 14 — Quality & correctness backlog
 - [ ] `/ws` streams real `{type:"log"}` frames from the live tracing subscriber (integration-tested); `docs/http-api.md` is true `[A]`

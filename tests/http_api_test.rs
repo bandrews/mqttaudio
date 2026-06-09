@@ -66,6 +66,7 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         state_broadcaster: Arc::new(LogBroadcaster::new()),
         config_json: Arc::new(serde_json::json!({})),
         latency: Arc::new(mqttaudio::http::PlayLatencyStats::default()),
+        input_telemetry: Arc::new(Vec::new()),
     };
 
     (state, cmd_rx)
@@ -1324,6 +1325,30 @@ async fn test_metrics_reports_play_latency_through_the_tracker() {
         json["latency"]["plays_measured"], 1,
         "one play was measured"
     );
+}
+
+#[tokio::test]
+async fn test_metrics_reports_input_capture_counters() {
+    // Sprint 13 (D57): /metrics surfaces each configured input's capture-path
+    // counters verbatim from the shared atomics.
+    use mqttaudio::audio::input::InputTelemetry;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    let telemetry = Arc::new(InputTelemetry::default());
+    telemetry
+        .overflow_dropped_samples
+        .store(7, Ordering::Relaxed);
+    telemetry.ratio_rejects.store(2, Ordering::Relaxed);
+
+    let (mut state, _rx) = create_test_state();
+    state.input_telemetry = Arc::new(vec![("mic".to_string(), telemetry)]);
+    let json = get_json(state, "/metrics").await;
+
+    assert_eq!(json["input_capture"]["mic"]["resample_errors"], 0);
+    assert_eq!(json["input_capture"]["mic"]["overflow_dropped_samples"], 7);
+    assert_eq!(json["input_capture"]["mic"]["ratio_rejects"], 2);
+    assert_eq!(json["input_capture"]["mic"]["scratch_regrows"], 0);
 }
 
 #[tokio::test]

@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|-------|
-| Status | Not started |
+| Status | Done (Lane A via documented host approximation — see tracker note; Lane B pending partner) |
 | Depends on | 11 (uses its `/metrics` surface); soft-ordered after 12 (owner priority) |
 | Effort | L |
 | Lanes | A (Docker) + B (native macOS) |
@@ -161,6 +161,27 @@ All citations re-verified against the current tree during Sprint 10.
   Mirror the `selector_targets_streamed_voice` best-effort pattern — voice-keyed, no RT
   involvement. TDD: log-capture test (pristine-output style) asserting the warn fires for a
   streaming target and not for a complete one.
+
+## Implementation deviations (recorded honestly)
+
+- **F3 ships per-sample, not per-selector.** One `SetSpeedMatching` can match several samples but one
+  corrector serves one sample, so the dispatcher expands the selector control-side (it already mirrors
+  every play in `ctx.playing`, including the channel count added to `SampleStatus` for sizing) into one
+  `SetSpeedWithCorrector { id, bundle, displaced }` per match. The `PitchBundle` box is never freed on the
+  RT thread: the corrector is taken out of it, the sample's old vecs are swapped into it, and the box rides
+  the spent husk back. The selector-based `SetSpeedMatching` remains lib/test-only (`#[allow(dead_code)]`
+  with justification); the binary never sends it.
+- **F5's pitch half merged into F3's bundle** (the shipped scratch is pre-sized to the negotiated output
+  block, `max_block_frames` threaded through `CommandCtx`); the input half pre-sizes the conversion scratch
+  from the device's advertised maximum block. Both keep counted fallbacks (`scratch_regrows` per input,
+  `pitch_scratch_regrows` global) on `/metrics`.
+- **F4's RT alloc-on-error caveat:** the converted capture sites count via relaxed atomics; the
+  deterministically drivable counter (ring overflow) is unit-tested
+  (`input_resample_test::ring_overflow_bumps_the_telemetry_counter_instead_of_logging`); the resample-error
+  and ratio-reject counters are exercised by the same code shape but cannot be deterministically triggered
+  through the public API — verified by code review.
+- **F6's warning keys off the D51 upgrade registry** (`ctx.streaming_upgrades`), which is exactly the set of
+  still-loading cold plays, rather than re-deriving streaming-ness from the buffer.
 
 ## Caveats (refuted / over-stated — do not chase ghosts)
 

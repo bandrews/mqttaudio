@@ -332,6 +332,13 @@ async fn main() {
     let sample_format = output_config.sample_format;
     let output_sample_rate = stream_config.sample_rate;
     let output_channels = stream_config.channels as usize;
+    // The largest block the output stream can deliver, for pre-sizing the
+    // shipped pitch scratch (D56/D58): the fixed size when configured, else a
+    // documented cap (the per-block resize fallback is counted on /metrics).
+    let max_block_frames = match stream_config.buffer_size {
+        cpal::BufferSize::Fixed(n) => n as usize,
+        cpal::BufferSize::Default => 8192,
+    };
 
     tracing::info!("Audio device: {}", device_name);
     tracing::info!("  Sample rate: {} Hz", output_sample_rate);
@@ -359,7 +366,14 @@ async fn main() {
         None
     };
     let ducking_applier = if ducking_engine.is_some() {
-        Some(DuckingApplier::new())
+        // Pre-populated with every duckable voice so the first duck of a voice
+        // never inserts (allocates) on the audio thread (Sprint 13 F1).
+        Some(DuckingApplier::with_ducked_voices(
+            config
+                .ducking_rules
+                .iter()
+                .flat_map(|rule| rule.ducked_voices.iter().cloned()),
+        ))
     } else {
         None
     };
@@ -463,6 +477,10 @@ async fn main() {
     // status is recorded for the control-side snapshot.
     let mut _active_inputs: Vec<audio::input::ActiveInput> = Vec::new();
     let mut input_statuses: Vec<http::InputStatus> = Vec::new();
+    // Per-input capture-path counters (D57): the capture callback bumps them, the
+    // reaper logs deltas off-RT, and /metrics sums the totals.
+    let mut input_telemetry: Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)> =
+        Vec::new();
     let mut cmd_tx = cmd_tx;
     for (idx, input_config) in config.inputs.iter().enumerate() {
         let stream_config = audio::input::InputStreamConfig {
@@ -534,6 +552,10 @@ async fn main() {
                         volume: input_config.volume,
                         channels: active_input.channels,
                     });
+                    input_telemetry.push((
+                        input_config.voice_id.clone(),
+                        std::sync::Arc::clone(&active_input.telemetry),
+                    ));
 
                     // Add to the mix via the command ring (drained once the
                     // output stream starts).
@@ -709,6 +731,11 @@ async fn main() {
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
     );
 
+    // Capture-path telemetry (D57): shared with the HTTP layer for /metrics and
+    // drained into log lines by the reaper tick.
+    let input_telemetry = std::sync::Arc::new(input_telemetry);
+    let mut input_telemetry_drain = InputTelemetryDrain::new(input_telemetry.clone());
+
     // First-start play-latency aggregate + probe registry (Sprint 11, D50): the
     // stats feed /metrics; the tracker registers a probe per play and the reaper
     // tick folds fired probes into the stats.
@@ -739,6 +766,7 @@ async fn main() {
             output_meters.clone(),
             config_json.clone(),
             latency_stats.clone(),
+            input_telemetry.clone(),
         )
         .await
         {
@@ -819,6 +847,7 @@ async fn main() {
                             config: &config,
                             latency: &latency_tracker,
                             streaming_upgrades: &mut streaming_upgrades,
+                            max_block_frames,
                         };
                         handle_command(cmd, &mut ctx).await;
                     }
@@ -853,6 +882,8 @@ async fn main() {
                     &mut playing,
                 )
                 .await;
+                // Turn capture-path counter growth into off-RT log lines (D57).
+                input_telemetry_drain.drain_and_log();
             }
             _ = freshness_tick.tick() => {
                 if config.cache.freshness != config::FreshnessMode::Pinned {
@@ -1122,6 +1153,51 @@ fn reap_finished_samples(
 /// mutations are sent to the audio thread through `cmd_tx`; the control thread
 /// owns the ducking engine, voice-activity counts, live sample map, and the
 /// status snapshot, and never touches the audio thread's `MixerState`.
+/// Turns capture-path counter growth into off-RT log lines (D57): the capture
+/// thread only bumps relaxed atomics; the reaper tick calls `drain_and_log`,
+/// which emits at most one warning per input per tick when a counter moved.
+struct InputTelemetryDrain {
+    inputs: std::sync::Arc<Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)>>,
+    last: Vec<[u64; 4]>,
+}
+
+impl InputTelemetryDrain {
+    fn new(
+        inputs: std::sync::Arc<Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)>>,
+    ) -> Self {
+        let last = vec![[0u64; 4]; inputs.len()];
+        Self { inputs, last }
+    }
+
+    fn drain_and_log(&mut self) {
+        use std::sync::atomic::Ordering;
+        for ((voice, telemetry), last) in self.inputs.iter().zip(self.last.iter_mut()) {
+            let now = [
+                telemetry.resample_errors.load(Ordering::Relaxed),
+                telemetry.overflow_dropped_samples.load(Ordering::Relaxed),
+                telemetry.ratio_rejects.load(Ordering::Relaxed),
+                telemetry.scratch_regrows.load(Ordering::Relaxed),
+            ];
+            if now != *last {
+                tracing::warn!(
+                    "Input '{}' capture counters moved: +{} resample errors, +{} overflowed \
+                     samples, +{} ratio rejects, +{} scratch regrows (totals {}/{}/{}/{})",
+                    voice,
+                    now[0] - last[0],
+                    now[1] - last[1],
+                    now[2] - last[2],
+                    now[3] - last[3],
+                    now[0],
+                    now[1],
+                    now[2],
+                    now[3]
+                );
+                *last = now;
+            }
+        }
+    }
+}
+
 /// A cold full-load play still on its progressive buffer, awaiting the upgrade
 /// to the promoted Complete buffer once its decode finishes (D51).
 struct StreamingUpgrade {
@@ -1257,6 +1333,10 @@ struct CommandCtx<'a> {
     /// Cold plays awaiting their buffer upgrade once the progressive load
     /// finishes (D51); drained by the reaper tick's upgrade pass.
     streaming_upgrades: &'a mut Vec<StreamingUpgrade>,
+    /// The largest output block the stream can deliver (fixed buffer size, or a
+    /// documented cap when the device default is unknown) — sizes the shipped
+    /// pitch scratch (D56/D58).
+    max_block_frames: usize,
 }
 
 impl CommandCtx<'_> {
@@ -1469,6 +1549,7 @@ async fn finish_streamed_play(
         file_path: source.file_path.clone(),
         total_frames: 0, // unbounded / unknown for a stream
         sample_rate: output_sample_rate,
+        channels,
         volume: source.volume,
         voice_volume: source.voice_volume,
         speed: 1.0,
@@ -2128,6 +2209,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             .total_frames_or_estimate()
                             .unwrap_or_else(|| sample.buffer.frames()),
                         sample_rate: sample.buffer.sample_rate(),
+                        channels: sample.buffer.channels(),
                         volume: sample.volume,
                         voice_volume: sample.voice_volume,
                         speed: sample.speed,
@@ -2398,6 +2480,13 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         } => {
             if selector.is_empty() {
                 tracing::warn!("Speed command with empty selector - no samples targeted");
+            } else if pitch_correction && speed < 0.0 {
+                // Validated here, off the audio thread (D57): the RT-side
+                // set_speed rejects this combination silently.
+                tracing::warn!(
+                    "Negative speed ({}) is not supported with pitch correction; ignoring",
+                    speed
+                );
             } else if selector_targets_streamed_voice(&selector, ctx.streamed_voices) {
                 tracing::warn!(
                     "Speed/pitch is not supported for windowed/streamed voices; ignoring (a \
@@ -2410,18 +2499,58 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     "normal"
                 };
                 tracing::info!("Set speed to {}x ({}) for matching samples", speed, mode);
-                // Keep the snapshot's per-sample speed in step for samples the
-                // control thread knows match the selector.
+                // Expand the selector control-side (D56): one command per
+                // matching sample, each carrying its own pre-built corrector
+                // bundle when enabling pitch, so the audio thread never
+                // constructs or frees a stretcher. The snapshot's per-sample
+                // speed is kept in step in the same pass.
+                let mut commands = Vec::new();
                 for status in ctx.playing.values_mut() {
-                    if sample_status_matches(&selector, status) {
-                        status.speed = speed;
+                    if status.windowed || !sample_status_matches(&selector, status) {
+                        continue;
+                    }
+                    status.speed = speed;
+                    let bundle = if pitch_correction {
+                        Some(Box::new(audio::mixer::PitchBundle::for_voice(
+                            status.channels,
+                            status.sample_rate,
+                            speed,
+                            ctx.max_block_frames,
+                        )))
+                    } else {
+                        None
+                    };
+                    commands.push(rt_engine::AudioCommand::SetSpeedWithCorrector {
+                        id: status.internal_id,
+                        speed,
+                        pitch_correction,
+                        bundle,
+                        displaced: None,
+                    });
+                }
+                // Pitch correction stays dormant while a cold play's progressive
+                // load is still filling (the mixer needs slice access); it engages
+                // when the D51 upgrade lands. Tell the operator instead of
+                // silently doing nothing in the meantime.
+                if pitch_correction {
+                    for upgrade in ctx.streaming_upgrades.iter() {
+                        let matches = ctx
+                            .playing
+                            .get(&upgrade.internal_id)
+                            .map(|s| sample_status_matches(&selector, s))
+                            .unwrap_or(false);
+                        if matches && !upgrade.buffer.is_complete() {
+                            tracing::warn!(
+                                "Pitch correction for {} is deferred: its cold play is \
+                                 still loading; it engages when the load completes",
+                                upgrade.file
+                            );
+                        }
                     }
                 }
-                ctx.send(rt_engine::AudioCommand::SetSpeedMatching {
-                    selector,
-                    speed,
-                    pitch_correction,
-                });
+                for command in commands {
+                    ctx.send(command);
+                }
                 ctx.refresh();
             }
         }
@@ -2584,10 +2713,12 @@ mod tests {
             let (ducking_engine, ducking_applier) = if ducking_rules.is_empty() {
                 (None, None)
             } else {
-                (
-                    Some(DuckingEngine::new(ducking_rules, SR)),
-                    Some(DuckingApplier::new()),
-                )
+                let applier = DuckingApplier::with_ducked_voices(
+                    ducking_rules
+                        .iter()
+                        .flat_map(|rule| rule.ducked_voices.iter().cloned()),
+                );
+                (Some(DuckingEngine::new(ducking_rules, SR)), Some(applier))
             };
             let mixer = MixerState {
                 ducking_applier,
@@ -2660,6 +2791,7 @@ mod tests {
                 config: &self.config,
                 latency: &self.latency,
                 streaming_upgrades: &mut self.streaming_upgrades,
+                max_block_frames: 512,
             };
             handle_command(cmd, &mut ctx).await;
         }
@@ -2667,14 +2799,15 @@ mod tests {
         /// Apply every queued audio command to the mixer, as the audio callback
         /// would, so the test can assert the resulting `MixerState`. Spent mutation
         /// commands are routed to the return ring, mirroring the callback.
-        fn drain(&mut self) {
+        fn drain(&mut self) -> usize {
             rt_engine::drain_commands(
                 &mut self.cmd_rx,
                 &mut self.mixer,
                 &mut self.cmd_return_tx,
+                &mut self.grave_tx,
                 SR,
                 1024,
-            );
+            )
         }
 
         /// Drive the control-side reaper exactly as the 20ms tick does, draining
@@ -3230,6 +3363,148 @@ mod tests {
         assert!(
             fixture.mixer.active_samples[0].pitch_corrector.is_some(),
             "pitch correction must engage on the upgraded Complete buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn speed_with_pitch_ships_a_corrector_per_matching_sample() {
+        // D56: the dispatcher expands the selector control-side, shipping one
+        // pre-built corrector bundle per matching sample; the audio thread
+        // installs by move. Disabling moves the correctors back out.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.run(play_crossfade(false, 0)).await; // same voice "v"
+        fixture.drain();
+        // Wait for the cold progressive loads, then upgrade to Complete buffers
+        // (pitch needs slice access).
+        let mut attempts = 0;
+        while fixture
+            .mixer
+            .active_samples
+            .iter()
+            .any(|s| !s.buffer.is_complete())
+            && attempts < 500
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            attempts += 1;
+        }
+        fixture.run_upgrades().await;
+        fixture.drain();
+
+        let speed_cmd = |speed: f32, pitch: bool| AudioCommand::Speed {
+            selector: SampleSelector {
+                internal_id: None,
+                id: None,
+                file: None,
+                voice: Some("v".to_string()),
+            },
+            speed,
+            pitch_correction: pitch,
+        };
+
+        fixture.run(speed_cmd(1.3, true)).await;
+        assert_eq!(
+            fixture.drain(),
+            2,
+            "one shipped command per matching sample"
+        );
+        for sample in &fixture.mixer.active_samples {
+            assert!(
+                sample.has_pitch_correction(),
+                "every matching sample gets its own shipped corrector"
+            );
+            assert!((sample.speed - 1.3).abs() < 1e-6);
+        }
+
+        fixture.run(speed_cmd(1.0, false)).await;
+        fixture.drain();
+        for sample in &fixture.mixer.active_samples {
+            assert!(
+                !sample.has_pitch_correction(),
+                "disable must move every corrector out for off-RT drop"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pitch_on_a_still_loading_cold_play_warns_at_dispatch() {
+        // Sprint 13 F6: pitch correction targeting a cold play whose progressive
+        // load is still filling stays dormant until the D51 upgrade; the
+        // dispatcher says so instead of silently doing nothing.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain();
+
+        // Pin the play's upgrade entry to a provably still-loading buffer (the
+        // real 2s WAV may decode before the Speed command lands).
+        let stalled = audio::streaming::SampleBuffer::Streaming(Arc::new(RwLock::new(
+            audio::streaming::StreamingBuffer::new(2, SR, None),
+        )));
+        assert_eq!(fixture.streaming_upgrades.len(), 1);
+        fixture.streaming_upgrades[0].buffer = stalled;
+
+        let warnings = run_capturing_warnings(
+            &mut fixture,
+            AudioCommand::Speed {
+                selector: SampleSelector {
+                    internal_id: None,
+                    id: None,
+                    file: None,
+                    voice: Some("v".to_string()),
+                },
+                speed: 1.2,
+                pitch_correction: true,
+            },
+        )
+        .await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("deferred") && w.contains("still loading")),
+            "a still-loading pitch target must warn, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_speed_with_pitch_warns_at_dispatch_and_sends_nothing() {
+        // D57: the invalid speed+pitch combination is validated control-side (the
+        // RT-side set_speed keeps a silent reject); the command never reaches the
+        // ring.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain();
+
+        let warnings = run_capturing_warnings(
+            &mut fixture,
+            AudioCommand::Speed {
+                selector: SampleSelector {
+                    internal_id: None,
+                    id: None,
+                    file: None,
+                    voice: Some("v".to_string()),
+                },
+                speed: -1.5,
+                pitch_correction: true,
+            },
+        )
+        .await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Negative speed") && w.contains("pitch")),
+            "dispatch must warn about negative speed with pitch correction, got {warnings:?}"
+        );
+        assert_eq!(
+            fixture.drain(),
+            0,
+            "the invalid command must not be sent to the audio thread"
+        );
+        assert_eq!(
+            fixture.mixer.active_samples[0].speed, 1.0,
+            "the sample's speed must be untouched"
         );
     }
 
@@ -3953,6 +4228,7 @@ mod tests {
             rt_engine::AudioCommand::SeekMatching { .. } => "SeekMatching",
             rt_engine::AudioCommand::SetSpeedMatching { .. } => "SetSpeedMatching",
             rt_engine::AudioCommand::SetVolumeMatching { .. } => "SetVolumeMatching",
+            rt_engine::AudioCommand::SetSpeedWithCorrector { .. } => "SetSpeedWithCorrector",
             rt_engine::AudioCommand::UpgradeSampleBuffer { .. } => "UpgradeSampleBuffer",
         }
     }

@@ -132,6 +132,29 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
     let latency_max = state.latency.max_ns.load(Ordering::Relaxed);
     let plays_measured = state.latency.plays_measured.load(Ordering::Relaxed);
 
+    // Per-input capture-path counters (Sprint 13, D57): real relaxed-atomic
+    // totals bumped by the capture callback, never placeholders.
+    let input_capture: serde_json::Map<String, Value> = state
+        .input_telemetry
+        .iter()
+        .map(|(voice, t)| {
+            (
+                voice.clone(),
+                json!({
+                    "resample_errors": t.resample_errors.load(Ordering::Relaxed),
+                    "overflow_dropped_samples":
+                        t.overflow_dropped_samples.load(Ordering::Relaxed),
+                    "ratio_rejects": t.ratio_rejects.load(Ordering::Relaxed),
+                    "scratch_regrows": t.scratch_regrows.load(Ordering::Relaxed),
+                }),
+            )
+        })
+        .collect();
+
+    // Pitch-scratch regrows on the audio thread (Sprint 13, D58): zero unless a
+    // device delivers blocks beyond the pre-size.
+    let pitch_scratch_regrows = crate::audio::mixer::PITCH_SCRATCH_REGROWS.load(Ordering::Relaxed);
+
     Json(json!({
         "uptime_seconds": uptime_seconds,
         "clips": clips,
@@ -155,6 +178,8 @@ pub async fn handle_metrics(State(state): State<AppState>) -> impl IntoResponse 
             },
             "plays_measured": plays_measured,
         },
+        "input_capture": input_capture,
+        "pitch_scratch_regrows": pitch_scratch_regrows,
     }))
 }
 

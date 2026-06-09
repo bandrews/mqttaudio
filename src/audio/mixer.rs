@@ -424,12 +424,10 @@ impl ActiveSample {
     /// (e.g., negative speed with pitch correction enabled).
     pub fn set_speed(&mut self, speed: f32) -> bool {
         if self.pitch_corrector.is_some() {
-            // Pitch correction: 0.05 to 8.0, no reverse
+            // Pitch correction: 0.05 to 8.0, no reverse. Rejected silently — this
+            // runs on the audio thread (D57); the dispatcher validates and warns
+            // control-side before sending.
             if speed < 0.0 {
-                tracing::warn!(
-                    "Negative speed ({}) not supported with pitch correction, ignoring",
-                    speed
-                );
                 return false;
             }
             self.speed = speed.clamp(0.05, 8.0);
@@ -530,6 +528,72 @@ impl ActiveSample {
             self.disable_pitch_correction();
         }
         // Then set speed
+        self.set_speed(speed)
+    }
+
+    /// Apply a Speed command whose pitch corrector (and pre-sized buffers) were
+    /// built control-side and shipped in a [`PitchBundle`] (D56). Runs on the
+    /// audio thread and only MOVES:
+    /// - enabling installs the shipped corrector (taking the bundle's pre-sized
+    ///   tail/scratch by swap, so the sample's old vecs ride back inside the
+    ///   bundle box for off-RT drop) and pre-rolls it like
+    ///   [`enable_pitch_correction`](Self::enable_pitch_correction);
+    /// - disabling moves the sample's corrector into `displaced` so its heap
+    ///   (Rust and C++) is dropped off-RT by the reaper;
+    /// - an already-enabled sample leaves the unused bundle in place (it rides
+    ///   the husk back).
+    ///
+    /// Returns whether the speed was accepted (mirrors
+    /// [`set_speed_with_mode`](Self::set_speed_with_mode)).
+    pub fn apply_shipped_speed(
+        &mut self,
+        speed: f32,
+        pitch_correction: bool,
+        bundle: &mut Option<Box<PitchBundle>>,
+        displaced: &mut Option<PitchCorrector>,
+    ) -> bool {
+        if pitch_correction {
+            if self.pitch_corrector.is_none() {
+                let Some(b) = bundle.as_mut() else {
+                    // The dispatcher always ships a bundle when enabling; without
+                    // one we will not allocate here — leave the mode unchanged.
+                    return false;
+                };
+                let Some(mut pc) = b.corrector.take() else {
+                    return false;
+                };
+                // Adopt the pre-sized buffers; the old vecs ride back in the box.
+                std::mem::swap(&mut self.pitch_tail_buffer, &mut b.tail_buffer);
+                std::mem::swap(&mut self.pitch_scratch, &mut b.scratch);
+
+                // Mirror enable_pitch_correction: prime at the CURRENT speed,
+                // reset the carry state, arm the direct->stretched crossfade.
+                pc.set_speed(self.speed);
+                self.preroll_corrector(&mut pc);
+                self.pitch_input_accumulator = 0.0;
+                self.pitch_tail_remaining = None;
+                self.pitch_tail_pos = 0;
+                if self.position > 0 {
+                    let xfade = (self.buffer.sample_rate() as usize / 200).max(1); // ~5 ms
+                    self.pitch_crossfade_remaining = xfade;
+                    self.pitch_crossfade_total = xfade;
+                    self.pitch_crossfade_direct_pos = self.precise_position();
+                } else {
+                    self.pitch_crossfade_remaining = 0;
+                    self.pitch_crossfade_total = 0;
+                }
+                self.pitch_corrector = Some(pc);
+            }
+        } else if self.pitch_corrector.is_some() {
+            // Move the corrector out for off-RT drop and clear the carry state
+            // (the same resets disable_pitch_correction does, minus the drop).
+            *displaced = self.pitch_corrector.take();
+            self.pitch_input_accumulator = 0.0;
+            self.pitch_tail_remaining = None;
+            self.pitch_tail_pos = 0;
+            self.pitch_crossfade_remaining = 0;
+            self.pitch_crossfade_total = 0;
+        }
         self.set_speed(speed)
     }
 
@@ -1005,6 +1069,49 @@ impl Drop for StreamedSource {
     /// the graveyard, so this drop runs off the real-time thread.
     fn drop(&mut self) {
         self.signal_stop();
+    }
+}
+
+/// Counts pitch-scratch regrows on the audio thread (D58): the scratch is
+/// pre-sized when pitch correction is enabled, so this moves only when a device
+/// delivers blocks beyond the pre-size (or pitch was enabled through the
+/// lib-only unsized path). Surfaced on `/metrics`.
+pub static PITCH_SCRATCH_REGROWS: AtomicU64 = AtomicU64::new(0);
+
+/// A control-side-built pitch-correction payload (D56): the corrector plus the
+/// pre-sized tail and scratch buffers a pitch-corrected sample needs, so enabling
+/// pitch on the audio thread is pure moves — no construction, no resize. After
+/// the install swap, the box carries the sample's old vecs back through the
+/// spent-command husk for off-RT drop.
+pub struct PitchBundle {
+    /// The pre-built corrector; taken on install, leaving the box intact.
+    pub corrector: Option<PitchCorrector>,
+    /// Tail-flush buffer sized to one full flush (`output_latency * channels`).
+    pub tail_buffer: Vec<f32>,
+    /// Pitch mix scratch sized to the largest output block (D58).
+    pub scratch: Vec<f32>,
+}
+
+impl PitchBundle {
+    /// Build the bundle for a sample with `channels` at `sample_rate`, targeting
+    /// `speed`, with the scratch sized for blocks up to `max_block_frames`.
+    /// Allocates — control thread only.
+    pub fn for_voice(
+        channels: usize,
+        sample_rate: u32,
+        speed: f32,
+        max_block_frames: usize,
+    ) -> Self {
+        let channels = channels.max(1);
+        let mut corrector = PitchCorrector::new(channels, sample_rate);
+        corrector.set_speed(speed.clamp(0.05, 8.0));
+        let tail_buffer = vec![0.0; corrector.output_latency() * channels];
+        let scratch = vec![0.0; max_block_frames.max(1) * channels];
+        Self {
+            corrector: Some(corrector),
+            tail_buffer,
+            scratch,
+        }
     }
 }
 
@@ -1528,6 +1635,12 @@ fn mix_sample_with_pitch_correction(
     // other fields of `sample`; returned at the end of the function.
     let mut stretched = std::mem::take(&mut sample.pitch_scratch);
     if stretched.len() < output_samples {
+        if stretched.capacity() < output_samples {
+            // Counted fallback (D58): pre-sizing should make this unreachable in
+            // the running daemon; a pathological block size is visible on /metrics
+            // instead of silently reallocating on the audio thread.
+            PITCH_SCRATCH_REGROWS.fetch_add(1, Ordering::Relaxed);
+        }
         stretched.resize(output_samples, 0.0);
     }
     // Match the previous freshly-zeroed buffer so partially-filled output is silence.

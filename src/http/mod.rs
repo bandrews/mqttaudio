@@ -29,6 +29,9 @@ pub struct SampleStatus {
     pub file_path: String,
     pub total_frames: usize,
     pub sample_rate: u32,
+    /// Decoded channel count — the Speed dispatcher sizes a shipped pitch
+    /// corrector from it (D56).
+    pub channels: usize,
     pub volume: f32,
     pub voice_volume: f32,
     pub speed: f32,
@@ -176,6 +179,9 @@ pub struct AppState {
     pub config_json: Arc<serde_json::Value>,
     /// First-start play latency aggregate (Sprint 11, D50), for `/metrics`.
     pub latency: Arc<PlayLatencyStats>,
+    /// Per-input capture-path counters (Sprint 13, D57), for `/metrics`:
+    /// (voice id, counters) per configured live input.
+    pub input_telemetry: Arc<Vec<(String, Arc<crate::audio::input::InputTelemetry>)>>,
 }
 
 /// Redact secrets from a serialized config for `GET /config` (DW11):
@@ -230,6 +236,7 @@ pub async fn start_server(
     output_meters: Arc<Vec<AtomicU32>>,
     config_json: Arc<serde_json::Value>,
     latency: Arc<PlayLatencyStats>,
+    input_telemetry: Arc<Vec<(String, Arc<crate::audio::input::InputTelemetry>)>>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let state_broadcaster = Arc::new(LogBroadcaster::new());
@@ -258,6 +265,7 @@ pub async fn start_server(
         state_broadcaster: state_broadcaster.clone(),
         config_json,
         latency,
+        input_telemetry,
     };
 
     // State-event tick timer (~15 Hz, DW12): only does work when telemetry is on AND

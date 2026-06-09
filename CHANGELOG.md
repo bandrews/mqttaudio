@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The audio and capture threads no longer log or allocate on any steady-state path (Sprint 13).**
+  Remaining real-time residuals are closed: ducking states are pre-populated at startup so the FIRST duck of
+  a voice is allocation-free; pitch correction is built control-side and shipped to the audio thread inside
+  the Speed command (`SetSpeedWithCorrector` + `PitchBundle`), with the displaced corrector dropped off the
+  audio thread — toggling pitch mid-play is now Rust-side alloc/free-free; the capture path's
+  resample-error/overflow/ratio-reject logging became relaxed atomic counters surfaced on `/metrics`
+  (`input_capture.*`) and drained into off-thread log lines; conversion/pitch scratch buffers are pre-sized
+  to the stream's maximum block with counted (`scratch_regrows`, `pitch_scratch_regrows`) fallbacks.
+- **Hard voice cap (Sprint 13, D18, owner-approved).** Beyond 256 simultaneous voices a new play now steals
+  the oldest non-looping voice (or is rejected if every voice loops) instead of growing the pool on the audio
+  thread. Unreachable in normal use; changelogged because >256-voice behavior changes.
+- **Speed-command validation moved to dispatch (Sprint 13, D57).** A negative speed with pitch correction now
+  warns at the control plane and is not sent (it was previously ignored per-voice on the audio thread); pitch
+  correction targeting a still-loading cold play warns that it engages when the load completes.
+
 - **Cold plays start instantly (Sprint 12, D51).** Local files and disk-cached HTTP downloads in
   full-load mode now decode progressively, exactly as uncached HTTP always did: the play returns a
   playable buffer immediately (measured ~0.2 ms for a 5-minute WAV that previously waited ~210 ms —

@@ -193,6 +193,8 @@ Operational telemetry for monitoring. Every field is real — no placeholders.
 | `latency.play_to_first_mix_ns.last` | integer | The most recent play's enqueue-to-first-mix latency in nanoseconds (0 until a play is measured) |
 | `latency.play_to_first_mix_ns.max` | integer | The largest first-mix latency measured since startup |
 | `latency.plays_measured` | integer | How many plays have been measured |
+| `input_capture.<voice>` | object | Per-input capture-path counters: `resample_errors`, `overflow_dropped_samples`, `ratio_rejects`, `scratch_regrows` (Sprint 13, D57/D58) |
+| `pitch_scratch_regrows` | integer | Audio-thread pitch-scratch regrows past the pre-size (0 in normal operation) |
 
 ### `/status/voices` Response
 

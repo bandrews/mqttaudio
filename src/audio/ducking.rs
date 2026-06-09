@@ -484,17 +484,40 @@ pub struct DuckingApplier {
 }
 
 impl DuckingApplier {
-    /// Create an applier with no ducked voices.
+    /// Create an applier with no ducked voices. Targets for voices it does not
+    /// know are ignored (see [`apply_target`](Self::apply_target)); the running
+    /// daemon uses [`with_ducked_voices`](Self::with_ducked_voices), so this is
+    /// exercised only by the lib's unit tests and is dead in the bin target.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Apply a resolved target change, starting a duck or restore fade for the voice.
+    /// Create an applier pre-populated with every voice the configured ducking
+    /// rules can target (the union of the rules' `ducked_voices`). Pre-populating
+    /// off-RT means [`apply_target`](Self::apply_target) never inserts — and so
+    /// never allocates — on the audio thread, even for the FIRST duck of a voice.
+    pub fn with_ducked_voices<I, S>(voices: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let duck_states: HashMap<String, DuckState> = voices
+            .into_iter()
+            .map(|v| (v.into(), DuckState::new()))
+            .collect();
+        Self { duck_states }
+    }
+
+    /// Apply a resolved target change, starting a duck or restore fade for the
+    /// voice. Runs on the audio thread: `get_mut` only — the voice set was
+    /// pre-populated at construction, so this never inserts or allocates. A voice
+    /// outside that set cannot arrive here (the control-side engine only emits
+    /// voices named by the configured rules); if one does, it is ignored.
     pub fn apply_target(&mut self, change: &DuckTargetChange) {
-        let state = self
-            .duck_states
-            .entry(change.voice.clone())
-            .or_insert_with(DuckState::new);
+        let Some(state) = self.duck_states.get_mut(&change.voice) else {
+            return;
+        };
         if change.target_volume >= 1.0 {
             state.begin_restore(change.fade_frames);
         } else {
@@ -982,7 +1005,7 @@ mod tests {
         // once per buffer. advance_buffer advances once; frame_multiplier only reads,
         // so two "samples" reading the same voice see the SAME per-frame multiplier
         // and the fade does not race ahead.
-        let mut applier = DuckingApplier::new();
+        let mut applier = DuckingApplier::with_ducked_voices(["music"]);
         applier.apply_target(&DuckTargetChange {
             voice: "music".to_string(),
             target_volume: 0.0,
@@ -1050,7 +1073,7 @@ mod tests {
 
     #[test]
     fn applier_ducks_then_restores() {
-        let mut applier = DuckingApplier::new();
+        let mut applier = DuckingApplier::with_ducked_voices(["music"]);
 
         // Duck "music" to 0.2 over 1000ms (48000 frames).
         applier.apply_target(&DuckTargetChange {
@@ -1217,7 +1240,7 @@ mod tests {
 
         let mut legacy = DuckingEngine::new(vec![rule.clone()], 48000);
         let mut control = DuckingEngine::new(vec![rule], 48000);
-        let mut applier = DuckingApplier::new();
+        let mut applier = DuckingApplier::with_ducked_voices(["music"]);
 
         // Activate the primary on both paths.
         legacy.notify_voice_active("narration", true);
