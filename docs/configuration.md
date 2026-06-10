@@ -38,8 +38,18 @@ config-level defaults, not clap defaults, so `--help` does not display them. `--
 ## Interactive Editor
 
 `mqttaudio --configure` opens a full-screen terminal editor covering every setting documented on this page,
-with per-field help, the same validation the daemon applies at startup, and live device testing:
+with built-in guidance, the same validation the daemon applies at startup, and live device testing:
 
+- A **help pane** at the top of the screen explains the selected section or setting as you move: what the
+  feature does, what the values mean, and the allowed ranges. Lists such as ducking rules and live inputs
+  describe themselves and summarize each entry (e.g. `"narration" ducks music → 20% over 500ms`).
+- **Pickers instead of typing** wherever a setting references something defined elsewhere: channel fields
+  offer your `channel_aliases` (plus plain channel numbers), voice fields offer the voice ids named
+  elsewhere in the config (free text still allowed — voices are created at runtime), and enums list their
+  options. Free-text entry remains one keystroke away for anything not listed.
+- **Macros are edited as guided forms**: each macro opens as a list of its parameters, with a picker of the
+  Play command's parameters (volume, voice, fade_in, loop, …) when adding one. Unknown parameters remain
+  editable as raw JSON, so macros for other commands still work.
 - The **output device picker** lists real devices and can play a test tone on any single output channel
   through the actual playback pathway — channel volumes, master gain, the limiter, and bass management from
   the in-progress config all apply, with live per-channel peak meters. A 50 Hz bass tone option makes an

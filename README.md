@@ -54,10 +54,23 @@ cargo build --release
 # Binary is at target/release/mqttaudio
 ```
 
-### 2. Run mqttaudio
+### 2. Create Your Configuration
 
 ```bash
-# Basic usage
+./mqttaudio --configure
+```
+
+The built-in interactive editor walks you through every setting with explanations, pickers, and live
+device testing — you can play a test tone through each speaker before committing to a device. See
+[Configuration](#configuration) below for details. It saves a config file you then run with `--config`.
+
+### 3. Run mqttaudio
+
+```bash
+# With the config file you just created
+./mqttaudio --config mqttaudio.json
+
+# Or skip the config file entirely and use flags
 ./mqttaudio --server localhost --topic audio/commands
 
 # List available audio devices
@@ -67,7 +80,7 @@ cargo build --release
 ./mqttaudio --server localhost --topic audio/commands --device "USB Audio"
 ```
 
-### 3. Play Your First Sound
+### 4. Play Your First Sound
 
 ```bash
 mosquitto_pub -t audio/commands -m '{"command": "play", "file": "/path/to/sound.wav"}'
@@ -147,18 +160,21 @@ mosquitto_pub -t audio/commands -m '{
 
 ## Configuration
 
-The easiest way to create or edit a config file is the built-in interactive editor:
+The recommended way to create or edit a config file is the built-in interactive editor:
 
 ```bash
 ./mqttaudio --configure
 ```
 
-It walks every config section with inline help and validation, includes a device picker that can play a
-test tone per speaker **through the real playback pathway** (so you hear exactly what the daemon will do,
-including channel volumes, the limiter, and bass management), and a live level meter for microphone inputs.
-Only the settings you explicitly change are written to the file — everything else stays on the daemon's
-built-in defaults — and any existing file is backed up to `<name>.bak` before saving. Hand-written comments
-and unknown keys in an existing file are preserved.
+It explains every section and setting as you go — what ducking does, how channel aliases work, what each
+threshold means — and walks every config section with validation. Settings that reference other parts of
+the config are picked from lists instead of typed: channel fields offer your defined aliases, voice fields
+offer the voices named elsewhere in the config, and macros are edited as guided parameter forms rather than
+raw JSON. The device picker can play a test tone per speaker **through the real playback pathway** (so you
+hear exactly what the daemon will do, including channel volumes, the limiter, and bass management), and
+microphone inputs get a live level meter. Only the settings you explicitly change are written to the file —
+everything else stays on the daemon's built-in defaults — and any existing file is backed up to `<name>.bak`
+before saving. Hand-written comments and unknown keys in an existing file are preserved.
 
 Alternatively, create a config file by hand:
 

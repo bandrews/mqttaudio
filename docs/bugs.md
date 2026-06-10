@@ -313,6 +313,13 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 
 ## Noticed while building the config editor (Sprint: config editor)
 
+- **One binary unit test failed once under full-suite parallel load (name not captured).** During a full
+  `cargo test`, the `--bin mqttaudio` unit suite reported `605 passed; 1 failed` exactly once; the same
+  suite passed on the immediate rerun and on five consecutive isolated runs (606/606), and two further full
+  runs were clean. The suite contains timing-sensitive audio/ramp tests, so a load-dependent flake is the
+  likely shape. Nothing in the config-editor work touches those paths. If it recurs, capture the test name
+  (`cargo test 2>&1 | tee` …) and pin it down.
+
 - **`config.example.json` still documents the removed `audio.channel_names` field (RESOLVED).** The field
   was removed in Sprint 14 (D60); the live alias mechanism is `audio.channel_aliases`. The example parsed
   fine (unknown keys are tolerated) but taught a dead field. Both occurrences (top-level example and the

@@ -1,6 +1,7 @@
 {
   "_comment": "mqttaudio Example Configuration File",
   "_usage": "Copy this file to config.json or ~/.config/mqttaudio/config.json and customize for your setup",
+  "_editor": "Prefer a guided setup? Run 'mqttaudio --configure' to build or edit a config interactively, with explanations, pickers, and live device testing",
 
   "mqtt": {
     "server": "localhost",

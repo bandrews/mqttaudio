@@ -286,7 +286,7 @@ fn leaf_paths(value: &Value, prefix: Vec<String>, out: &mut Vec<Vec<String>>) {
 /// Whether `kind` covers the path `rest` below a spec's own path.
 fn kind_covers(kind: &FieldKind, rest: &[String]) -> bool {
     match kind {
-        FieldKind::StringList | FieldKind::ChannelRefList => {
+        FieldKind::StringList | FieldKind::ChannelRefList | FieldKind::VoiceRefList => {
             rest.is_empty() || (rest.len() == 1 && rest[0].parse::<usize>().is_ok())
         }
         FieldKind::MapToUInt | FieldKind::MapToFloat { .. } => rest.len() <= 1,
@@ -299,7 +299,7 @@ fn kind_covers(kind: &FieldKind, rest: &[String]) -> bool {
                         .contains(&rest[0].as_str()))
         }
         FieldKind::Flag => rest.is_empty(),
-        FieldKind::StructList(specs) => {
+        FieldKind::StructList(meta) => {
             if rest.is_empty() {
                 return true;
             }
@@ -311,7 +311,7 @@ fn kind_covers(kind: &FieldKind, rest: &[String]) -> bool {
             if rest.is_empty() {
                 return true;
             }
-            struct_covers(specs, rest)
+            struct_covers(meta.specs, rest)
         }
         // Scalar kinds cover exactly their own path.
         _ => rest.is_empty(),
@@ -439,15 +439,27 @@ fn toggling_a_bool_sets_the_inverse_of_the_default() {
 }
 
 #[test]
-fn cycling_an_enum_walks_its_options() {
+fn enum_enter_opens_picker_preselecting_current_value() {
     let mut app = new_app();
     goto_section(&mut app, Section::Logging);
-    // logging.level: info -> debug (next after the default).
+    // logging.level: Enter opens a picker with every option, cursor on the
+    // effective value (the default, "info").
+    app.handle_key(key(KeyCode::Enter));
+    let Some(Modal::ChoicePicker { items, cursor, .. }) = &app.modal else {
+        panic!("expected a choice picker");
+    };
+    let labels: Vec<&str> = items.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(labels, ["error", "warn", "info", "debug", "trace"]);
+    assert_eq!(items[*cursor].label, "info");
+    // Down + Enter selects "debug".
+    app.handle_key(key(KeyCode::Down));
     app.handle_key(key(KeyCode::Enter));
     assert_eq!(
         app.doc.get(&path_of(&["logging", "level"])),
         Some(&json!("debug"))
     );
+    assert!(app.modal.is_none());
+    assert!(app.dirty);
 }
 
 #[test]
@@ -545,6 +557,328 @@ fn adding_a_ducking_rule_creates_a_deserializable_skeleton() {
     app.doc.to_config().unwrap();
 }
 
+// --- Choice pickers and the macro editor ---
+
+/// Move the picker cursor onto the item with `label` and press Enter.
+fn choose(app: &mut App, label: &str) {
+    let (labels, cursor) = match &app.modal {
+        Some(Modal::ChoicePicker { items, cursor, .. }) => (
+            items.iter().map(|c| c.label.clone()).collect::<Vec<_>>(),
+            *cursor,
+        ),
+        other => panic!("expected a choice picker, modal is {:?}", other.is_some()),
+    };
+    let idx = labels
+        .iter()
+        .position(|l| l == label)
+        .unwrap_or_else(|| panic!("no picker item '{label}' in {labels:?}"));
+    let (moves, code) = if idx >= cursor {
+        (idx - cursor, KeyCode::Down)
+    } else {
+        (cursor - idx, KeyCode::Up)
+    };
+    for _ in 0..moves {
+        app.handle_key(key(code));
+    }
+    app.handle_key(key(KeyCode::Enter));
+}
+
+fn type_text(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c)));
+    }
+}
+
+/// Move the form cursor onto the row with `label`.
+fn goto_row(app: &mut App, label: &str) {
+    let idx = app
+        .rows()
+        .iter()
+        .position(|r| r.label == label)
+        .unwrap_or_else(|| panic!("no row '{label}'"));
+    let cur = app.levels.last().unwrap().cursor;
+    let (moves, code) = if idx >= cur {
+        (idx - cur, KeyCode::Down)
+    } else {
+        (cur - idx, KeyCode::Up)
+    };
+    for _ in 0..moves {
+        app.handle_key(key(code));
+    }
+}
+
+fn app_with(doc: Value) -> App {
+    App::new(ConfigDocument::from_value(doc).unwrap(), None)
+}
+
+#[test]
+fn channel_ref_picker_offers_aliases_then_numbers() {
+    let mut app = app_with(json!({
+        "audio": { "channel_aliases": { "lfe": 3 } }
+    }));
+    goto_section(&mut app, Section::BassManagement);
+    goto_row(&mut app, "lfe_channel");
+    app.handle_key(key(KeyCode::Enter));
+    let Some(Modal::ChoicePicker { items, .. }) = &app.modal else {
+        panic!("expected a choice picker");
+    };
+    // Aliases first, then the unaliased channel numbers, then free entry.
+    let labels: Vec<&str> = items.iter().map(|c| c.label.as_str()).collect();
+    assert_eq!(labels[0], "lfe");
+    assert!(labels.contains(&"channel 0"));
+    assert!(
+        !labels.contains(&"channel 3"),
+        "aliased channel not repeated"
+    );
+    assert!(items.last().unwrap().custom);
+    choose(&mut app, "lfe");
+    assert_eq!(
+        app.doc.get(&path_of(&["bass_management", "lfe_channel"])),
+        Some(&json!("lfe"))
+    );
+    // Numeric choices store numbers.
+    app.handle_key(key(KeyCode::Enter));
+    choose(&mut app, "channel 0");
+    assert_eq!(
+        app.doc.get(&path_of(&["bass_management", "lfe_channel"])),
+        Some(&json!(0))
+    );
+}
+
+#[test]
+fn channel_ref_picker_custom_falls_back_to_text_edit() {
+    let mut app = app_with(json!({
+        "audio": { "channel_aliases": { "lfe": 3 } }
+    }));
+    goto_section(&mut app, Section::BassManagement);
+    goto_row(&mut app, "lfe_channel");
+    app.handle_key(key(KeyCode::Enter));
+    let custom_label = match &app.modal {
+        Some(Modal::ChoicePicker { items, .. }) => items.last().unwrap().label.clone(),
+        _ => panic!("expected a choice picker"),
+    };
+    choose(&mut app, &custom_label);
+    assert!(app.modal.is_none());
+    assert!(app.edit.is_some(), "custom choice opens a text edit");
+    type_text(&mut app, "5");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.doc.get(&path_of(&["bass_management", "lfe_channel"])),
+        Some(&json!(5))
+    );
+}
+
+#[test]
+fn known_voice_ids_collects_inputs_and_rules() {
+    let doc = ConfigDocument::from_value(json!({
+        "inputs": [ { "routes": [] }, { "voice_id": "announcer" } ],
+        "ducking_rules": [
+            { "primary_voice": "narration", "ducked_voices": ["music", "ambience"],
+              "target_volume": 0.2, "fade_duration_ms": 300 }
+        ]
+    }))
+    .unwrap();
+    let ids = mqttaudio::config_editor::app::known_voice_ids(&doc);
+    // Sorted, deduped; the input without a voice_id contributes the default "mic".
+    assert_eq!(ids, ["ambience", "announcer", "mic", "music", "narration"]);
+}
+
+#[test]
+fn voice_picker_lists_known_voices_with_free_text_fallback() {
+    let mut app = app_with(json!({
+        "inputs": [ { "voice_id": "mic", "routes": [{ "source_channel": 0, "dest_channel": 0 }] } ],
+        "ducking_rules": [
+            { "primary_voice": "", "ducked_voices": [], "target_volume": 0.5, "fade_duration_ms": 500 }
+        ]
+    }));
+    goto_section(&mut app, Section::Ducking);
+    app.handle_key(key(KeyCode::Enter)); // open the rule list
+    app.handle_key(key(KeyCode::Enter)); // open rule 1's sub-form
+    goto_row(&mut app, "primary_voice");
+    app.handle_key(key(KeyCode::Enter));
+    let Some(Modal::ChoicePicker { items, .. }) = &app.modal else {
+        panic!("expected a voice picker");
+    };
+    let labels: Vec<&str> = items.iter().map(|c| c.label.as_str()).collect();
+    assert!(labels.contains(&"mic"), "known voice offered: {labels:?}");
+    assert!(items.last().unwrap().custom);
+    choose(&mut app, "mic");
+    let mut path = path_of(&["ducking_rules"]);
+    path.push(Seg::Idx(0));
+    path.push(Seg::Key("primary_voice".to_string()));
+    assert_eq!(app.doc.get(&path), Some(&json!("mic")));
+}
+
+#[test]
+fn ducked_voices_add_uses_voice_picker() {
+    let mut app = app_with(json!({
+        "inputs": [ { "voice_id": "mic", "routes": [{ "source_channel": 0, "dest_channel": 0 }] } ],
+        "ducking_rules": [
+            { "primary_voice": "narration", "ducked_voices": [], "target_volume": 0.5, "fade_duration_ms": 500 }
+        ]
+    }));
+    goto_section(&mut app, Section::Ducking);
+    app.handle_key(key(KeyCode::Enter)); // rule list
+    app.handle_key(key(KeyCode::Enter)); // rule 1 sub-form
+    goto_row(&mut app, "ducked_voices");
+    app.handle_key(key(KeyCode::Enter)); // open the list
+    app.handle_key(key(KeyCode::Char('a')));
+    assert!(
+        matches!(app.modal, Some(Modal::ChoicePicker { .. })),
+        "adding a ducked voice opens the voice picker"
+    );
+    choose(&mut app, "mic");
+    let mut path = path_of(&["ducking_rules"]);
+    path.push(Seg::Idx(0));
+    path.push(Seg::Key("ducked_voices".to_string()));
+    path.push(Seg::Idx(0));
+    assert_eq!(app.doc.get(&path), Some(&json!("mic")));
+}
+
+#[test]
+fn channel_volumes_add_key_uses_channel_picker_then_value_prompt() {
+    let mut app = app_with(json!({
+        "audio": { "channel_aliases": { "lfe": 3 } }
+    }));
+    goto_section(&mut app, Section::Audio);
+    goto_row(&mut app, "channel_volumes");
+    app.handle_key(key(KeyCode::Enter)); // open the map
+    app.handle_key(key(KeyCode::Char('a')));
+    assert!(
+        matches!(app.modal, Some(Modal::ChoicePicker { .. })),
+        "adding a channel volume key opens the channel picker"
+    );
+    choose(&mut app, "lfe");
+    assert!(
+        app.edit.is_some(),
+        "key choice chains into the value prompt"
+    );
+    type_text(&mut app, "0.5");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.doc.get(&path_of(&["audio", "channel_volumes", "lfe"])),
+        Some(&json!(0.5))
+    );
+}
+
+#[test]
+fn struct_list_items_show_meaningful_summaries() {
+    use mqttaudio::config_editor::fields::{DUCKING_RULE_META, INPUT_META, INPUT_ROUTE_META};
+    let rule = json!({
+        "primary_voice": "alerts", "ducked_voices": ["music", "ambient"],
+        "target_volume": 0.2, "fade_duration_ms": 300
+    });
+    assert_eq!(
+        (DUCKING_RULE_META.summarize)(&rule),
+        "\"alerts\" ducks music, ambient → 20% over 300ms"
+    );
+    let blank = json!({ "primary_voice": "", "ducked_voices": [] });
+    assert!((DUCKING_RULE_META.summarize)(&blank).contains("unconfigured"));
+
+    let input = json!({ "voice_id": "mic", "routes": [] });
+    let summary = (INPUT_META.summarize)(&input);
+    assert!(summary.contains("(default device)"), "{summary}");
+    assert!(summary.contains("no routes!"), "{summary}");
+
+    let route = json!({ "source_channel": 0, "dest_channel": "lfe" });
+    assert_eq!((INPUT_ROUTE_META.summarize)(&route), "in 0 → out lfe");
+
+    // The list view uses these summaries.
+    let mut app = app_with(json!({ "ducking_rules": [rule] }));
+    goto_section(&mut app, Section::Ducking);
+    app.handle_key(key(KeyCode::Enter));
+    let rows = app.rows();
+    assert_eq!(rows[0].label, "rule 1");
+    assert!(
+        rows[0].display.contains("\"alerts\" ducks"),
+        "{}",
+        rows[0].display
+    );
+}
+
+#[test]
+fn macro_opens_guided_form_with_typed_params() {
+    let mut app = app_with(json!({
+        "macros": { "quiet": { "volume": 0.1, "weird": [1, 2] } }
+    }));
+    goto_section(&mut app, Section::Macros);
+    app.handle_key(key(KeyCode::Enter)); // open the macros map
+    goto_row(&mut app, "quiet");
+    app.handle_key(key(KeyCode::Enter)); // open the macro's form
+    let rows = app.rows();
+    let volume = rows.iter().find(|r| r.label == "volume").unwrap();
+    assert!(matches!(volume.kind, FieldKind::Float { .. }));
+    assert_eq!(volume.display, "0.1");
+    // Unknown params stay editable as raw JSON.
+    let weird = rows.iter().find(|r| r.label == "weird").unwrap();
+    assert_eq!(weird.kind, FieldKind::MapToJson);
+    assert_eq!(weird.display, "[1,2]");
+
+    // A typed edit applies the param's bounds.
+    goto_row(&mut app, "volume");
+    app.handle_key(key(KeyCode::Enter));
+    assert!(app.edit.is_some());
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Backspace));
+    }
+    type_text(&mut app, "9");
+    app.handle_key(key(KeyCode::Enter));
+    assert!(
+        app.edit.as_ref().and_then(|e| e.error.as_ref()).is_some(),
+        "volume 9 is out of bounds, the edit should stay open with an error"
+    );
+}
+
+#[test]
+fn macro_add_param_uses_picker_with_typed_value() {
+    let mut app = app_with(json!({
+        "macros": { "quiet": { "volume": 0.1 } }
+    }));
+    goto_section(&mut app, Section::Macros);
+    app.handle_key(key(KeyCode::Enter));
+    goto_row(&mut app, "quiet");
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Char('a')));
+    let Some(Modal::ChoicePicker { items, .. }) = &app.modal else {
+        panic!("expected the parameter picker");
+    };
+    let labels: Vec<&str> = items.iter().map(|c| c.label.as_str()).collect();
+    assert!(labels.contains(&"fade_in"), "{labels:?}");
+    assert!(items.last().unwrap().custom);
+    choose(&mut app, "fade_in");
+    assert!(app.edit.is_some(), "param choice prompts for its value");
+    type_text(&mut app, "250");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.doc.get(&path_of(&["macros", "quiet", "fade_in"])),
+        Some(&json!(250))
+    );
+}
+
+#[test]
+fn new_macro_prompts_name_then_opens_empty_form() {
+    let mut app = new_app();
+    goto_section(&mut app, Section::Macros);
+    app.handle_key(key(KeyCode::Enter)); // open the (empty) macros map
+    app.handle_key(key(KeyCode::Char('a')));
+    type_text(&mut app, "quiet");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.doc.get(&path_of(&["macros", "quiet"])),
+        Some(&json!({}))
+    );
+    assert!(app.breadcrumb().contains("quiet"), "{}", app.breadcrumb());
+    // 'a' in the new form adds a first parameter; bools get a true/false picker.
+    app.handle_key(key(KeyCode::Char('a')));
+    assert!(matches!(app.modal, Some(Modal::ChoicePicker { .. })));
+    choose(&mut app, "loop");
+    choose(&mut app, "true");
+    assert_eq!(
+        app.doc.get(&path_of(&["macros", "quiet", "loop"])),
+        Some(&json!(true))
+    );
+}
+
 #[test]
 fn quit_with_unsaved_changes_asks_for_confirmation() {
     let mut app = new_app();
@@ -559,12 +893,28 @@ fn quit_with_unsaved_changes_asks_for_confirmation() {
     assert!(app.quit);
 }
 
-// --- Rendering smoke tests ---
+// --- Rendering tests ---
 
-fn render(app: &App) {
-    let backend = TestBackend::new(100, 30);
+/// Render the app at the given size and return the screen as text.
+fn render_at(app: &App, width: u16, height: u16) -> String {
+    let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).unwrap();
     terminal.draw(|frame| form::draw(frame, app)).unwrap();
+    let buffer = terminal.backend().buffer().clone();
+    let mut text = String::new();
+    for y in 0..buffer.area.height {
+        for x in 0..buffer.area.width {
+            text.push_str(buffer[(x, y)].symbol());
+        }
+        text.push('\n');
+    }
+    text
+}
+
+fn render(app: &App) {
+    // Both a roomy and a minimal (80x24) terminal must render without panics.
+    render_at(app, 100, 30);
+    render_at(app, 80, 24);
 }
 
 #[test]
@@ -575,6 +925,53 @@ fn every_section_renders() {
         app.handle_key(key(KeyCode::Down));
         render(&app);
     }
+}
+
+#[test]
+fn help_frame_shows_section_intro_then_field_help() {
+    let mut app = new_app();
+    // Sidebar focus: the framed help pane explains the selected section.
+    let screen = render_at(&app, 80, 24);
+    assert!(screen.contains("Help — MQTT"), "{screen}");
+    assert!(screen.contains("MQTT broker"), "{screen}");
+    // Form focus: the pane explains the highlighted field.
+    goto_section(&mut app, Section::Mqtt);
+    let screen = render_at(&app, 80, 24);
+    assert!(screen.contains("Help — server"), "{screen}");
+    assert!(screen.contains("hostname"), "{screen}");
+}
+
+#[test]
+fn empty_collection_renders_explainer() {
+    let mut app = new_app();
+    goto_section(&mut app, Section::Ducking);
+    app.handle_key(key(KeyCode::Enter)); // open the empty rule list
+    let screen = render_at(&app, 80, 24);
+    assert!(
+        screen.contains("Press 'a' to add your first rule"),
+        "{screen}"
+    );
+    // The feature explainer stays visible above the (empty) list.
+    assert!(screen.contains("volume reduction"), "{screen}");
+}
+
+#[test]
+fn choice_picker_renders_options_and_hint() {
+    let mut app = new_app();
+    goto_section(&mut app, Section::Logging);
+    app.handle_key(key(KeyCode::Enter)); // open the level picker
+    let screen = render_at(&app, 80, 24);
+    assert!(screen.contains("level — Enter: choose"), "{screen}");
+    for option in ["error", "warn", "info", "debug", "trace"] {
+        assert!(screen.contains(option), "missing {option}: {screen}");
+    }
+    let mut app2 = new_app();
+    goto_section(&mut app2, Section::BassManagement);
+    goto_row(&mut app2, "lfe_channel");
+    app2.handle_key(key(KeyCode::Enter));
+    let screen = render_at(&app2, 80, 24);
+    assert!(screen.contains("Select channel"), "{screen}");
+    assert!(screen.contains("channel_aliases"), "{screen}");
 }
 
 #[test]

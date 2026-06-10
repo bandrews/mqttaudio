@@ -245,10 +245,14 @@ pub enum FieldKind {
     ChannelRef,
     /// A list of channel references.
     ChannelRefList,
+    /// A voice name; the picker offers voice ids already in the config, free text allowed.
+    VoiceRef,
+    /// A list of voice names.
+    VoiceRefList,
     /// The cache memory budget (tagged mode: auto/explicit/unlimited).
     MemoryBudget,
     /// A list of structs edited via nested sub-forms.
-    StructList(&'static [SubFieldSpec]),
+    StructList(&'static StructListMeta),
 }
 
 /// A field of a struct inside a list (ducking rules, inputs, routes).
@@ -258,6 +262,28 @@ pub struct SubFieldSpec {
     pub label: &'static str,
     pub kind: FieldKind,
     pub help: &'static str,
+}
+
+/// A list-of-structs field: its sub-fields plus how items are named, created,
+/// and summarized in the list view.
+#[derive(Debug)]
+pub struct StructListMeta {
+    pub specs: &'static [SubFieldSpec],
+    /// Noun for one item ("rule", "input", "route").
+    pub item_noun: &'static str,
+    /// One-line summary of an item for the list view.
+    pub summarize: fn(&Value) -> String,
+    /// A new item that deserializes: required fields get placeholder values.
+    pub skeleton: fn() -> Value,
+    /// Default values shown for unset sub-form fields.
+    pub item_defaults: fn() -> Value,
+}
+
+/// The metas are statics, so two are equal exactly when they are the same one.
+impl PartialEq for StructListMeta {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
 }
 
 /// The editor's sections, in sidebar order.
@@ -306,6 +332,65 @@ impl Section {
             Section::Macros => "Macros",
         }
     }
+
+    /// A short explanation of the section, shown in the help pane and above
+    /// the section's form.
+    pub fn intro(&self) -> &'static str {
+        match self {
+            Section::Mqtt => {
+                "How mqttaudio connects to your MQTT broker and which topic it listens on \
+                 for commands. If you only use the HTTP API, the topic can stay unset."
+            }
+            Section::Audio => {
+                "The output device and how sound leaves it: sample rate, channel count, \
+                 per-channel names and calibration, and the output limiter. The device \
+                 picker can play test tones through each speaker."
+            }
+            Section::Cache => {
+                "How decoded audio is kept ready to play: the on-disk cache for remote \
+                 files, what to preload at startup, memory limits, and when large files \
+                 are streamed instead of fully loaded."
+            }
+            Section::Security => {
+                "Limits which local files MQTT/HTTP commands are allowed to play. With no \
+                 entries, any readable path on the machine can be played."
+            }
+            Section::Logging => {
+                "What mqttaudio writes to its console log, in which format, and whether \
+                 log records are also published to an MQTT topic."
+            }
+            Section::Http => {
+                "The optional HTTP server: REST endpoints mirroring every MQTT command, \
+                 plus a WebSocket for live logs. Useful for web UIs and testing without \
+                 a broker."
+            }
+            Section::Ducking => {
+                "Ducking automatically lowers some sounds while another plays — for \
+                 example, quiet the background music while an announcement is speaking. \
+                 Sounds are grouped by voice name: the \"voice\" parameter of a Play \
+                 command, or an input's voice_id."
+            }
+            Section::BassManagement => {
+                "Extracts low frequencies from your main channels and routes them to a \
+                 subwoofer (LFE) channel using a proper crossover. Use this when your \
+                 main speakers are small and a subwoofer handles the bass."
+            }
+            Section::Inputs => {
+                "Live inputs (microphones, line-in) mixed into the output in real time, \
+                 with channel routing and a voice name so ducking rules can react to \
+                 them. The device picker shows a live level meter."
+            }
+            Section::Advanced => {
+                "Settings that rarely need changing: resampling quality and the config \
+                 schema version marker."
+            }
+            Section::Macros => {
+                "Macros are named bundles of command parameters. A command that includes \
+                 \"macro\": \"name\" is merged with the bundle, so you can define \
+                 presets like \"quiet\" once and reuse them from every sender."
+            }
+        }
+    }
 }
 
 /// A top-level config field: where it lives in the JSON document, how it is
@@ -323,20 +408,24 @@ pub static DUCKING_RULE_FIELDS: [SubFieldSpec; 4] = [
     SubFieldSpec {
         key: "primary_voice",
         label: "primary_voice",
-        kind: FieldKind::Text,
-        help: "Voice that triggers ducking when it has active samples.",
+        kind: FieldKind::VoiceRef,
+        help: "The voice that triggers this rule: while any sound playing on this voice is \
+               active, the ducked voices are lowered. Voices are named by a Play command's \
+               \"voice\" parameter or an input's voice_id.",
     },
     SubFieldSpec {
         key: "ducked_voices",
         label: "ducked_voices",
-        kind: FieldKind::StringList,
-        help: "Voices to reduce in volume while the primary voice is active.",
+        kind: FieldKind::VoiceRefList,
+        help: "The voices to lower while the primary voice is active — typically background \
+               music or ambience.",
     },
     SubFieldSpec {
         key: "target_volume",
         label: "target_volume",
         kind: FieldKind::Float { min: 0.0, max: 1.0 },
-        help: "Volume the ducked voices fade to (0.0 - 1.0).",
+        help: "Volume the ducked voices fade to while the primary voice plays: 0.0 silences \
+               them, 0.2 leaves them quietly audible, 1.0 does nothing.",
     },
     SubFieldSpec {
         key: "fade_duration_ms",
@@ -345,9 +434,71 @@ pub static DUCKING_RULE_FIELDS: [SubFieldSpec; 4] = [
             min: 0,
             max: u32::MAX as u64,
         },
-        help: "Fade duration in milliseconds for ducking transitions.",
+        help: "How long the fade down (and back up) takes, in milliseconds. 500 is a gentle \
+               dip; 0 is instant.",
     },
 ];
+
+/// One-line summary of a ducking rule for the list view.
+fn summarize_ducking_rule(value: &Value) -> String {
+    let Some(obj) = value.as_object() else {
+        return "(invalid)".to_string();
+    };
+    let primary = obj
+        .get("primary_voice")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if primary.is_empty() {
+        return "(unconfigured — set primary_voice)".to_string();
+    }
+    let ducked: Vec<&str> = obj
+        .get("ducked_voices")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let ducked_text = if ducked.is_empty() {
+        "(no voices)".to_string()
+    } else {
+        ducked.join(", ")
+    };
+    let target = obj
+        .get("target_volume")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.5);
+    let fade = obj
+        .get("fade_duration_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(500);
+    format!(
+        "\"{}\" ducks {} → {:.0}% over {}ms",
+        primary,
+        ducked_text,
+        target * 100.0,
+        fade
+    )
+}
+
+fn ducking_rule_skeleton() -> Value {
+    serde_json::json!({
+        "primary_voice": "",
+        "ducked_voices": [],
+        "target_volume": 0.5,
+        "fade_duration_ms": 500
+    })
+}
+
+fn no_item_defaults() -> Value {
+    Value::Null
+}
+
+/// Ducking-rule list metadata.
+pub static DUCKING_RULE_META: StructListMeta = StructListMeta {
+    specs: &DUCKING_RULE_FIELDS,
+    item_noun: "rule",
+    summarize: summarize_ducking_rule,
+    skeleton: ducking_rule_skeleton,
+    item_defaults: no_item_defaults,
+};
 
 /// Fields of one input route (input channel -> output channel).
 pub static INPUT_ROUTE_FIELDS: [SubFieldSpec; 2] = [
@@ -355,15 +506,47 @@ pub static INPUT_ROUTE_FIELDS: [SubFieldSpec; 2] = [
         key: "source_channel",
         label: "source_channel",
         kind: FieldKind::ChannelRef,
-        help: "Source channel on the input device (0-indexed number or alias).",
+        help: "Which channel of the input device to take audio from: a 0-indexed number \
+               or an alias from audio.channel_aliases.",
     },
     SubFieldSpec {
         key: "dest_channel",
         label: "dest_channel",
         kind: FieldKind::ChannelRef,
-        help: "Destination channel on the output device (0-indexed number or alias).",
+        help: "Which output channel to mix that audio into: a 0-indexed number or an \
+               alias from audio.channel_aliases.",
     },
 ];
+
+/// One-line summary of an input route for the list view.
+fn summarize_route(value: &Value) -> String {
+    let Some(obj) = value.as_object() else {
+        return "(invalid)".to_string();
+    };
+    let chan = |v: Option<&Value>| match v {
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        _ => "?".to_string(),
+    };
+    format!(
+        "in {} → out {}",
+        chan(obj.get("source_channel")),
+        chan(obj.get("dest_channel"))
+    )
+}
+
+fn route_skeleton() -> Value {
+    serde_json::json!({ "source_channel": 0, "dest_channel": 0 })
+}
+
+/// Input-route list metadata.
+pub static INPUT_ROUTE_META: StructListMeta = StructListMeta {
+    specs: &INPUT_ROUTE_FIELDS,
+    item_noun: "route",
+    summarize: summarize_route,
+    skeleton: route_skeleton,
+    item_defaults: no_item_defaults,
+};
 
 /// Fields of one microphone input.
 pub static INPUT_FIELDS: [SubFieldSpec; 5] = [
@@ -371,7 +554,8 @@ pub static INPUT_FIELDS: [SubFieldSpec; 5] = [
         key: "device",
         label: "device",
         kind: FieldKind::InputDevice,
-        help: "Input device name. Unset uses the default input device.",
+        help: "Input device to capture from. Unset uses the system default input. Enter \
+               opens the device picker with a live level meter.",
     },
     SubFieldSpec {
         key: "volume",
@@ -382,22 +566,177 @@ pub static INPUT_FIELDS: [SubFieldSpec; 5] = [
     SubFieldSpec {
         key: "voice_id",
         label: "voice_id",
-        kind: FieldKind::Text,
-        help: "Voice name for ducking integration and status. Default \"mic\".",
+        kind: FieldKind::VoiceRef,
+        help: "The voice name this input plays under, so ducking rules can react to it \
+               (e.g. a rule with primary_voice \"mic\" ducks music while you talk). \
+               Default \"mic\".",
     },
     SubFieldSpec {
         key: "routes",
         label: "routes",
-        kind: FieldKind::StructList(&INPUT_ROUTE_FIELDS),
-        help: "Channel routing from input to output. Must not be empty.",
+        kind: FieldKind::StructList(&INPUT_ROUTE_META),
+        help: "Which input channels feed which output channels. At least one route is \
+               required for the input to be audible.",
     },
     SubFieldSpec {
         key: "latency_ms",
         label: "latency_ms",
         kind: FieldKind::UInt { min: 5, max: 500 },
-        help: "Buffer latency in milliseconds (5 - 500). Default 20.",
+        help: "Buffer latency in milliseconds (5 - 500). Lower is more immediate but \
+               risks dropouts. Default 20.",
     },
 ];
+
+/// One-line summary of a live input for the list view.
+fn summarize_input(value: &Value) -> String {
+    let Some(obj) = value.as_object() else {
+        return "(invalid)".to_string();
+    };
+    let device = obj
+        .get("device")
+        .and_then(|v| v.as_str())
+        .map(|d| format!("\"{}\"", d))
+        .unwrap_or_else(|| "(default device)".to_string());
+    let voice = obj
+        .get("voice_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("mic");
+    let routes = obj
+        .get("routes")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let routes_text = match routes {
+        0 => "no routes!".to_string(),
+        1 => "1 route".to_string(),
+        n => format!("{} routes", n),
+    };
+    format!("{} → voice \"{}\", {}", device, voice, routes_text)
+}
+
+fn input_skeleton() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
+fn input_item_defaults() -> Value {
+    serde_json::to_value(crate::config::InputConfig::default()).unwrap_or(Value::Null)
+}
+
+/// Live-input list metadata.
+pub static INPUT_META: StructListMeta = StructListMeta {
+    specs: &INPUT_FIELDS,
+    item_noun: "input",
+    summarize: summarize_input,
+    skeleton: input_skeleton,
+    item_defaults: input_item_defaults,
+};
+
+/// Command parameters offered when adding a field to a macro. Keys and kinds
+/// mirror the Play command's parameters (src/mqtt/commands.rs, PlayMessage);
+/// macros may also carry parameters of any other command, added as raw JSON.
+pub static MACRO_PARAM_FIELDS: [SubFieldSpec; 14] = [
+    SubFieldSpec {
+        key: "volume",
+        label: "volume",
+        kind: FieldKind::Float { min: 0.0, max: 1.0 },
+        help: "Playback volume (0.0 - 1.0).",
+    },
+    SubFieldSpec {
+        key: "voice",
+        label: "voice",
+        kind: FieldKind::VoiceRef,
+        help: "Voice name the sound plays under, for grouped control and ducking.",
+    },
+    SubFieldSpec {
+        key: "fade_in",
+        label: "fade_in",
+        kind: FieldKind::UInt {
+            min: 0,
+            max: u32::MAX as u64,
+        },
+        help: "Fade-in duration in milliseconds.",
+    },
+    SubFieldSpec {
+        key: "loop",
+        label: "loop",
+        kind: FieldKind::Bool,
+        help: "Loop playback continuously.",
+    },
+    SubFieldSpec {
+        key: "crossfade_ms",
+        label: "crossfade_ms",
+        kind: FieldKind::UInt {
+            min: 0,
+            max: u32::MAX as u64,
+        },
+        help: "Crossfade duration at loop boundaries in milliseconds (0 = none).",
+    },
+    SubFieldSpec {
+        key: "start_position_ms",
+        label: "start_position_ms",
+        kind: FieldKind::UInt {
+            min: 0,
+            max: u64::MAX,
+        },
+        help: "Start playback at this offset in milliseconds.",
+    },
+    SubFieldSpec {
+        key: "channel_map",
+        label: "channel_map",
+        kind: FieldKind::MapToJson,
+        help: "Channel routing as JSON, e.g. [{\"src\": 0, \"dest\": 2, \"gain\": 0.5}].",
+    },
+    SubFieldSpec {
+        key: "mode",
+        label: "mode",
+        kind: FieldKind::Enum(&["auto", "full", "stream"]),
+        help: "Load strategy override: auto, full (in-memory), or stream.",
+    },
+    SubFieldSpec {
+        key: "freshness",
+        label: "freshness",
+        kind: FieldKind::Enum(&["trusting", "dev", "pinned"]),
+        help: "Cache freshness override: trusting, dev, or pinned.",
+    },
+    SubFieldSpec {
+        key: "window_ms",
+        label: "window_ms",
+        kind: FieldKind::UInt {
+            min: 100,
+            max: 60000,
+        },
+        help: "Streamed-source ring depth override in milliseconds.",
+    },
+    SubFieldSpec {
+        key: "prebuffer_ms",
+        label: "prebuffer_ms",
+        kind: FieldKind::UInt { min: 0, max: 60000 },
+        help: "Streamed-source prebuffer override in milliseconds.",
+    },
+    SubFieldSpec {
+        key: "cacheable",
+        label: "cacheable",
+        kind: FieldKind::Bool,
+        help: "Whether streamed HTTP plays persist to the disk cache.",
+    },
+    SubFieldSpec {
+        key: "file",
+        label: "file",
+        kind: FieldKind::Text,
+        help: "Audio file path or URL to play.",
+    },
+    SubFieldSpec {
+        key: "id",
+        label: "id",
+        kind: FieldKind::Text,
+        help: "Sample identifier for targeting later commands at this sound.",
+    },
+];
+
+/// The macro-parameter spec for `key`, when it is a known command parameter.
+pub fn macro_param_spec(key: &str) -> Option<&'static SubFieldSpec> {
+    MACRO_PARAM_FIELDS.iter().find(|s| s.key == key)
+}
 
 /// Every config field the editor can set, in display order. The coverage test
 /// in tests/config_editor_test.rs asserts this stays complete as the config
@@ -507,7 +846,7 @@ pub static REGISTRY: [FieldSpec; 54] = [
         label: "channel_aliases",
         path: &["audio", "channel_aliases"],
         kind: FieldKind::MapToUInt,
-        help: "Friendly names for channel numbers (e.g. front_left = 0), usable wherever a channel is referenced.",
+        help: "Friendly names for output channel numbers (e.g. front_left = 0, lfe = 3). Once defined, every channel field — bass management, input routes, channel volumes — can use the name instead of the number, and the channel pickers offer them.",
     },
     FieldSpec {
         section: Section::Audio,
@@ -742,8 +1081,8 @@ pub static REGISTRY: [FieldSpec; 54] = [
         section: Section::Ducking,
         label: "ducking_rules",
         path: &["ducking_rules"],
-        kind: FieldKind::StructList(&DUCKING_RULE_FIELDS),
-        help: "Automatic volume reduction: while a primary voice plays, listed voices duck to a target volume.",
+        kind: FieldKind::StructList(&DUCKING_RULE_META),
+        help: "Automatic volume reduction: while a primary voice has sound playing, the listed voices fade to a target volume, then fade back when it stops. Example: duck \"music\" to 20% while \"announcements\" plays.",
     },
     // --- Bass management ---
     FieldSpec {
@@ -796,8 +1135,8 @@ pub static REGISTRY: [FieldSpec; 54] = [
         section: Section::Inputs,
         label: "inputs",
         path: &["inputs"],
-        kind: FieldKind::StructList(&INPUT_FIELDS),
-        help: "Live microphone inputs mixed into the output with channel routing.",
+        kind: FieldKind::StructList(&INPUT_META),
+        help: "Live inputs (microphone, line-in) mixed into the output in real time. Each input picks a capture device, routes its channels to output channels, and plays under a voice name that ducking rules can react to.",
     },
     // --- Advanced ---
     FieldSpec {
@@ -823,7 +1162,7 @@ pub static REGISTRY: [FieldSpec; 54] = [
         label: "macros",
         path: &["macros"],
         kind: FieldKind::MapToJson,
-        help: "Command parameter presets: each macro name maps to a JSON object merged into commands that reference it.",
+        help: "Named bundles of command parameters. A command that includes \"macro\": \"quiet\" is merged with the bundle named \"quiet\"; the command's own parameters win on conflict. Enter opens the list of macros.",
     },
 ];
 
@@ -844,7 +1183,7 @@ pub fn default_config_value() -> Value {
 pub fn parse_field_value(kind: &FieldKind, input: &str) -> Result<Option<Value>, String> {
     let trimmed = input.trim();
     match kind {
-        FieldKind::Text => {
+        FieldKind::Text | FieldKind::VoiceRef => {
             if trimmed.is_empty() {
                 Err("a value is required".to_string())
             } else {
@@ -920,12 +1259,17 @@ pub fn parse_field_value(kind: &FieldKind, input: &str) -> Result<Option<Value>,
                 serde_json::from_str(trimmed).map_err(|e| format!("invalid JSON: {}", e))?;
             Ok(Some(v))
         }
-        FieldKind::Bool
-        | FieldKind::Flag
+        FieldKind::Bool => match trimmed.to_lowercase().as_str() {
+            "true" => Ok(Some(Value::Bool(true))),
+            "false" => Ok(Some(Value::Bool(false))),
+            _ => Err("must be true or false".to_string()),
+        },
+        FieldKind::Flag
         | FieldKind::StringList
         | FieldKind::MapToUInt
         | FieldKind::MapToFloat { .. }
         | FieldKind::ChannelRefList
+        | FieldKind::VoiceRefList
         | FieldKind::MemoryBudget
         | FieldKind::StructList(_) => Err("not a text-editable field".to_string()),
     }
@@ -949,14 +1293,16 @@ pub fn display_value(kind: &FieldKind, value: &Value) -> String {
                 "on".to_string()
             }
         }
-        FieldKind::StringList | FieldKind::ChannelRefList => match value {
-            Value::Array(arr) => format!(
-                "[{} item{}]",
-                arr.len(),
-                if arr.len() == 1 { "" } else { "s" }
-            ),
-            _ => "[0 items]".to_string(),
-        },
+        FieldKind::StringList | FieldKind::ChannelRefList | FieldKind::VoiceRefList => {
+            match value {
+                Value::Array(arr) => format!(
+                    "[{} item{}]",
+                    arr.len(),
+                    if arr.len() == 1 { "" } else { "s" }
+                ),
+                _ => "[0 items]".to_string(),
+            }
+        }
         FieldKind::MapToUInt | FieldKind::MapToFloat { .. } | FieldKind::MapToJson => match value {
             Value::Object(map) => format!(
                 "{{{} entr{}}}",

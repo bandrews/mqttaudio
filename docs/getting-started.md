@@ -204,7 +204,15 @@ mosquitto_pub -t $TOPIC -m '{"command": "stopall"}'
 
 ## Using a Configuration File
 
-For production deployments, use a config file instead of command-line arguments:
+For production deployments, use a config file instead of command-line arguments. The easiest way to
+create one is the interactive editor:
+
+```bash
+./mqttaudio --configure
+```
+
+It explains every setting, offers pickers for devices, channels, and voices, validates before saving,
+and can play test tones through each speaker. Alternatively, write the file by hand:
 
 **config.json:**
 ```json

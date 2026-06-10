@@ -7,10 +7,10 @@ use super::device_test::{
 };
 use super::fields::{
     default_config_value, display_value, parse_field_value, path_of, section_fields,
-    ConfigDocument, FieldKind, Section, Seg, SubFieldSpec,
+    ConfigDocument, FieldKind, Section, Seg, StructListMeta, SubFieldSpec,
 };
 use super::save::{save_document, save_path_candidates};
-use crate::config::{Config, InputConfig, MemoryBudget};
+use crate::config::{Config, MemoryBudget};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -32,17 +32,16 @@ pub enum LevelKind {
         specs: &'static [SubFieldSpec],
         defaults: Value,
     },
-    /// A list of strings (precache, allowed_directories, ducked_voices).
-    StringList,
-    /// A list of channel references (bass_management.source_channels).
-    ChannelRefList,
-    /// A map with values of `value_kind` (aliases, volumes, macros).
+    /// A list of scalar values: strings (precache), channel refs
+    /// (bass_management.source_channels), or voice names (ducked_voices).
+    ScalarList { elem: FieldKind },
+    /// A map with values of `value_kind` (aliases, volumes).
     Map { value_kind: FieldKind },
+    /// One macro's parameters: known command parameters edit with their real
+    /// kinds, anything else as raw JSON.
+    MacroForm,
     /// A list of structs (ducking_rules, inputs, routes).
-    StructList {
-        specs: &'static [SubFieldSpec],
-        item_label: &'static str,
-    },
+    StructList { meta: &'static StructListMeta },
 }
 
 /// One level of the editing stack: a form or collection at a JSON path.
@@ -51,6 +50,8 @@ pub struct Level {
     pub path: Vec<Seg>,
     pub kind: LevelKind,
     pub cursor: usize,
+    /// Explains the feature this level edits; shown above its rows.
+    pub intro: String,
 }
 
 /// One selectable row of the current level.
@@ -64,6 +65,7 @@ pub struct Row {
 }
 
 /// What an in-progress text edit will do when committed.
+#[derive(Clone)]
 pub enum EditTarget {
     /// Set (or unset, for optional kinds) the field at `path`.
     Field { path: Vec<Seg>, kind: FieldKind },
@@ -92,6 +94,41 @@ pub struct PickerItem {
     /// Device name to store in the config; None = system default.
     pub name: Option<String>,
     pub detail: String,
+}
+
+/// One entry in a choice picker.
+pub struct Choice {
+    /// Text committed through the normal field-parsing path when chosen.
+    pub insert_text: String,
+    pub label: String,
+    pub detail: String,
+    /// A "type it yourself" entry: choosing it opens a free-text edit.
+    pub custom: bool,
+    /// For key pickers: the kind of value this key takes (overrides the
+    /// target's value kind).
+    pub value_kind: Option<FieldKind>,
+}
+
+impl Choice {
+    fn new(insert_text: &str, label: &str, detail: &str) -> Self {
+        Self {
+            insert_text: insert_text.to_string(),
+            label: label.to_string(),
+            detail: detail.to_string(),
+            custom: false,
+            value_kind: None,
+        }
+    }
+
+    fn custom(label: &str, detail: &str) -> Self {
+        Self {
+            insert_text: String::new(),
+            label: label.to_string(),
+            detail: detail.to_string(),
+            custom: true,
+            value_kind: None,
+        }
+    }
 }
 
 /// Live output test screen state.
@@ -123,6 +160,17 @@ pub enum Modal {
         items: Vec<PickerItem>,
         cursor: usize,
         target: Vec<Seg>,
+    },
+    /// A list of values to pick from; commits through the edit pipeline.
+    ChoicePicker {
+        title: String,
+        /// One dimmed context line under the list ("" = none).
+        hint: String,
+        /// Label of the free-text edit a custom choice opens.
+        edit_label: String,
+        items: Vec<Choice>,
+        cursor: usize,
+        target: EditTarget,
     },
     OutputTest(OutputTestState),
     InputTest(InputTestState),
@@ -175,6 +223,7 @@ impl App {
                 path: Vec::new(),
                 kind: LevelKind::Section(Section::ALL[0]),
                 cursor: 0,
+                intro: Section::ALL[0].intro().to_string(),
             }],
             edit: None,
             modal: None,
@@ -194,6 +243,7 @@ impl App {
             path: Vec::new(),
             kind: LevelKind::Section(section),
             cursor: 0,
+            intro: section.intro().to_string(),
         }];
     }
 
@@ -289,29 +339,23 @@ impl App {
                     }
                 })
                 .collect(),
-            LevelKind::StringList | LevelKind::ChannelRefList => {
-                let kind = if matches!(level.kind, LevelKind::StringList) {
-                    FieldKind::Text
-                } else {
-                    FieldKind::ChannelRef
-                };
-                self.list_values(&level.path)
-                    .iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        let mut path = level.path.clone();
-                        path.push(Seg::Idx(i));
-                        Row {
-                            label: format!("{}", i + 1),
-                            display: display_value(&kind, v),
-                            path,
-                            kind,
-                            help: "Enter: edit   a: add   d/Del: remove".to_string(),
-                            is_set: true,
-                        }
-                    })
-                    .collect()
-            }
+            LevelKind::ScalarList { elem } => self
+                .list_values(&level.path)
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let mut path = level.path.clone();
+                    path.push(Seg::Idx(i));
+                    Row {
+                        label: format!("{}", i + 1),
+                        display: display_value(elem, v),
+                        path,
+                        kind: *elem,
+                        help: scalar_item_help(elem).to_string(),
+                        is_set: true,
+                    }
+                })
+                .collect(),
             LevelKind::Map { value_kind } => {
                 let mut rows: Vec<Row> = Vec::new();
                 if let Some(Value::Object(map)) = self.doc.get(&level.path) {
@@ -332,14 +376,48 @@ impl App {
                             display,
                             path,
                             kind: *value_kind,
-                            help: "Enter: edit value   a: add entry   d/Del: remove".to_string(),
+                            help: map_item_help(value_kind).to_string(),
                             is_set: true,
                         });
                     }
                 }
                 rows
             }
-            LevelKind::StructList { specs, item_label } => self
+            LevelKind::MacroForm => {
+                let mut rows: Vec<Row> = Vec::new();
+                if let Some(Value::Object(map)) = self.doc.get(&level.path) {
+                    let mut keys: Vec<&String> = map.keys().collect();
+                    keys.sort();
+                    for key in keys {
+                        let mut path = level.path.clone();
+                        path.push(Seg::Key(key.clone()));
+                        let value = &map[key];
+                        let (kind, help) = match super::fields::macro_param_spec(key) {
+                            Some(spec) => (spec.kind, spec.help.to_string()),
+                            None => (
+                                FieldKind::MapToJson,
+                                "Custom parameter; the value is raw JSON.".to_string(),
+                            ),
+                        };
+                        let display = match kind {
+                            FieldKind::MapToJson => {
+                                serde_json::to_string(value).unwrap_or_default()
+                            }
+                            _ => display_value(&kind, value),
+                        };
+                        rows.push(Row {
+                            label: key.clone(),
+                            display,
+                            path,
+                            kind,
+                            help,
+                            is_set: true,
+                        });
+                    }
+                }
+                rows
+            }
+            LevelKind::StructList { meta } => self
                 .list_values(&level.path)
                 .iter()
                 .enumerate()
@@ -347,11 +425,14 @@ impl App {
                     let mut path = level.path.clone();
                     path.push(Seg::Idx(i));
                     Row {
-                        label: format!("{} {}", item_label, i + 1),
-                        display: summarize_struct(v, specs),
+                        label: format!("{} {}", meta.item_noun, i + 1),
+                        display: (meta.summarize)(v),
                         path,
-                        kind: FieldKind::StructList(specs),
-                        help: "Enter: edit   a: add   d/Del: remove".to_string(),
+                        kind: FieldKind::StructList(meta),
+                        help: format!(
+                            "One {} in this list. Enter opens its fields.",
+                            meta.item_noun
+                        ),
                         is_set: true,
                     }
                 })
@@ -529,12 +610,12 @@ impl App {
         }
     }
 
-    fn level_is_collection(&self) -> bool {
+    pub fn level_is_collection(&self) -> bool {
         matches!(
             self.level().kind,
-            LevelKind::StringList
-                | LevelKind::ChannelRefList
+            LevelKind::ScalarList { .. }
                 | LevelKind::Map { .. }
+                | LevelKind::MacroForm
                 | LevelKind::StructList { .. }
         )
     }
@@ -569,11 +650,43 @@ impl App {
             }
             FieldKind::Enum(options) => {
                 let (value, _) = self.effective(&row.path);
-                let current = value.as_str().unwrap_or("");
-                let idx = options.iter().position(|o| *o == current);
-                let next = options[(idx.map(|i| i + 1).unwrap_or(0)) % options.len()];
-                self.doc.set(&row.path, Value::String(next.to_string()));
-                self.dirty = true;
+                let current = value.as_str().map(|s| s.to_string());
+                self.open_choice_picker(
+                    row.label.clone(),
+                    String::new(),
+                    row.label.clone(),
+                    enum_choices(options),
+                    current,
+                    self.row_target(row),
+                );
+            }
+            FieldKind::ChannelRef => {
+                let current = match self.effective(&row.path).0 {
+                    Value::String(s) => Some(s),
+                    Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                };
+                let items = self.channel_choices();
+                self.open_choice_picker(
+                    "Select channel".to_string(),
+                    CHANNEL_PICKER_HINT.to_string(),
+                    "channel (number or alias)".to_string(),
+                    items,
+                    current,
+                    self.row_target(row),
+                );
+            }
+            FieldKind::VoiceRef => {
+                let current = self.effective(&row.path).0.as_str().map(|s| s.to_string());
+                let items = self.voice_choices();
+                self.open_choice_picker(
+                    "Select voice".to_string(),
+                    VOICE_PICKER_HINT.to_string(),
+                    "voice name".to_string(),
+                    items,
+                    current,
+                    self.row_target(row),
+                );
             }
             FieldKind::MemoryBudget => {
                 self.cycle_memory_budget(&row.path);
@@ -583,14 +696,29 @@ impl App {
             FieldKind::StringList => self.push_level(Level {
                 title: row.label.clone(),
                 path: row.path.clone(),
-                kind: LevelKind::StringList,
+                kind: LevelKind::ScalarList {
+                    elem: FieldKind::Text,
+                },
                 cursor: 0,
+                intro: row.help.clone(),
             }),
             FieldKind::ChannelRefList => self.push_level(Level {
                 title: row.label.clone(),
                 path: row.path.clone(),
-                kind: LevelKind::ChannelRefList,
+                kind: LevelKind::ScalarList {
+                    elem: FieldKind::ChannelRef,
+                },
                 cursor: 0,
+                intro: row.help.clone(),
+            }),
+            FieldKind::VoiceRefList => self.push_level(Level {
+                title: row.label.clone(),
+                path: row.path.clone(),
+                kind: LevelKind::ScalarList {
+                    elem: FieldKind::VoiceRef,
+                },
+                cursor: 0,
+                intro: row.help.clone(),
             }),
             FieldKind::MapToUInt => self.push_level(Level {
                 title: row.label.clone(),
@@ -599,6 +727,7 @@ impl App {
                     value_kind: FieldKind::UInt { min: 0, max: 65535 },
                 },
                 cursor: 0,
+                intro: row.help.clone(),
             }),
             FieldKind::MapToFloat { min, max } => self.push_level(Level {
                 title: row.label.clone(),
@@ -607,27 +736,46 @@ impl App {
                     value_kind: FieldKind::Float { min, max },
                 },
                 cursor: 0,
+                intro: row.help.clone(),
             }),
-            FieldKind::MapToJson if !in_map => self.push_level(Level {
+            // A macro entry inside the macros map: open its guided form.
+            FieldKind::MapToJson if in_map => self.push_level(Level {
+                title: row.label.clone(),
+                path: row.path.clone(),
+                kind: LevelKind::MacroForm,
+                cursor: 0,
+                intro: format!(
+                    "Parameters merged into commands that use \"macro\": \"{}\". \
+                     Command parameters override macro parameters.",
+                    row.label
+                ),
+            }),
+            // A raw-JSON macro parameter: edit the value as text.
+            FieldKind::MapToJson if matches!(self.level().kind, LevelKind::MacroForm) => {
+                self.start_field_edit(row)
+            }
+            // The macros field itself: open the map of macros.
+            FieldKind::MapToJson => self.push_level(Level {
                 title: row.label.clone(),
                 path: row.path.clone(),
                 kind: LevelKind::Map {
                     value_kind: FieldKind::MapToJson,
                 },
                 cursor: 0,
+                intro: row.help.clone(),
             }),
-            FieldKind::StructList(specs) => {
+            FieldKind::StructList(meta) => {
                 if matches!(self.level().kind, LevelKind::StructList { .. }) {
                     // A list item row: open its sub-form.
-                    self.open_subform(row.path.clone(), specs, row.label.clone());
+                    self.open_subform(row.path.clone(), meta, row.label.clone());
                 } else {
                     // A field row pointing at a struct list: open the list.
-                    let item_label = struct_item_label(specs);
                     self.push_level(Level {
                         title: row.label.clone(),
                         path: row.path.clone(),
-                        kind: LevelKind::StructList { specs, item_label },
+                        kind: LevelKind::StructList { meta },
                         cursor: 0,
+                        intro: row.help.clone(),
                     });
                 }
             }
@@ -651,14 +799,6 @@ impl App {
         };
         let target = if matches!(self.level().kind, LevelKind::Map { .. }) {
             EditTarget::MapValue {
-                path: row.path.clone(),
-                kind: row.kind,
-            }
-        } else if matches!(
-            self.level().kind,
-            LevelKind::StringList | LevelKind::ChannelRefList
-        ) {
-            EditTarget::Field {
                 path: row.path.clone(),
                 kind: row.kind,
             }
@@ -705,17 +845,16 @@ impl App {
         self.levels.push(level);
     }
 
-    fn open_subform(&mut self, path: Vec<Seg>, specs: &'static [SubFieldSpec], title: String) {
-        let defaults = if std::ptr::eq(specs.as_ptr(), super::fields::INPUT_FIELDS.as_ptr()) {
-            serde_json::to_value(InputConfig::default()).unwrap_or(Value::Null)
-        } else {
-            Value::Null
-        };
+    fn open_subform(&mut self, path: Vec<Seg>, meta: &'static StructListMeta, title: String) {
         self.push_level(Level {
             title,
             path,
-            kind: LevelKind::SubForm { specs, defaults },
+            kind: LevelKind::SubForm {
+                specs: meta.specs,
+                defaults: (meta.item_defaults)(),
+            },
             cursor: 0,
+            intro: String::new(),
         });
     }
 
@@ -740,20 +879,54 @@ impl App {
         enum Add {
             Item(FieldKind, &'static str),
             MapEntry(FieldKind),
-            Struct(&'static [SubFieldSpec], &'static str),
+            MacroParam,
+            Struct(&'static StructListMeta),
             None,
         }
         let path = self.level().path.clone();
         let action = match &self.level().kind {
-            LevelKind::StringList => Add::Item(FieldKind::Text, "new entry"),
-            LevelKind::ChannelRefList => {
-                Add::Item(FieldKind::ChannelRef, "new channel (number or alias)")
-            }
+            LevelKind::ScalarList { elem } => Add::Item(
+                *elem,
+                match elem {
+                    FieldKind::ChannelRef => "new channel (number or alias)",
+                    FieldKind::VoiceRef => "new voice name",
+                    _ => "new entry",
+                },
+            ),
             LevelKind::Map { value_kind } => Add::MapEntry(*value_kind),
-            LevelKind::StructList { specs, item_label } => Add::Struct(specs, item_label),
+            LevelKind::MacroForm => Add::MacroParam,
+            LevelKind::StructList { meta } => Add::Struct(meta),
             _ => Add::None,
         };
         match action {
+            Add::Item(FieldKind::ChannelRef, label) => {
+                let items = self.channel_choices();
+                self.open_choice_picker(
+                    "Add channel".to_string(),
+                    CHANNEL_PICKER_HINT.to_string(),
+                    label.to_string(),
+                    items,
+                    None,
+                    EditTarget::NewListItem {
+                        base: path,
+                        kind: FieldKind::ChannelRef,
+                    },
+                );
+            }
+            Add::Item(FieldKind::VoiceRef, label) => {
+                let items = self.voice_choices();
+                self.open_choice_picker(
+                    "Add voice".to_string(),
+                    VOICE_PICKER_HINT.to_string(),
+                    label.to_string(),
+                    items,
+                    None,
+                    EditTarget::NewListItem {
+                        base: path,
+                        kind: FieldKind::VoiceRef,
+                    },
+                );
+            }
             Add::Item(kind, label) => {
                 self.edit = Some(EditState {
                     label: label.to_string(),
@@ -762,6 +935,21 @@ impl App {
                     target: EditTarget::NewListItem { base: path, kind },
                     error: None,
                 });
+            }
+            // Channel-volume keys are channel references: offer the picker.
+            Add::MapEntry(value_kind) if path == path_of(&["audio", "channel_volumes"]) => {
+                let items = self.channel_choices();
+                self.open_choice_picker(
+                    "Add channel".to_string(),
+                    CHANNEL_PICKER_HINT.to_string(),
+                    "channel (number or alias)".to_string(),
+                    items,
+                    None,
+                    EditTarget::MapKey {
+                        base: path,
+                        value_kind,
+                    },
+                );
             }
             Add::MapEntry(value_kind) => {
                 self.edit = Some(EditState {
@@ -775,15 +963,29 @@ impl App {
                     error: None,
                 });
             }
-            Add::Struct(specs, item_label) => {
-                let skeleton = struct_skeleton(specs);
-                self.doc.push(&path, skeleton);
+            Add::MacroParam => {
+                let existing = self.doc.get(&path).cloned().unwrap_or(Value::Null);
+                self.open_choice_picker(
+                    "Add parameter".to_string(),
+                    "Play-command parameters; macros may also carry parameters of other commands."
+                        .to_string(),
+                    "new parameter name".to_string(),
+                    macro_param_choices(&existing),
+                    None,
+                    EditTarget::MapKey {
+                        base: path,
+                        value_kind: FieldKind::MapToJson,
+                    },
+                );
+            }
+            Add::Struct(meta) => {
+                self.doc.push(&path, (meta.skeleton)());
                 self.dirty = true;
                 let idx = self.doc.list_len(&path) - 1;
-                let title = format!("{} {}", item_label, idx + 1);
+                let title = format!("{} {}", meta.item_noun, idx + 1);
                 let mut item_path = path;
                 item_path.push(Seg::Idx(idx));
-                self.open_subform(item_path, specs, title);
+                self.open_subform(item_path, meta, title);
             }
             Add::None => {}
         }
@@ -884,6 +1086,25 @@ impl App {
                     self.edit = Some(EditState {
                         error: Some(format!("'{}' already exists", key)),
                         ..edit
+                    });
+                    return;
+                }
+                // A new name in the macros map creates an empty macro and
+                // opens its parameter form instead of asking for raw JSON.
+                if *base == path_of(&["macros"]) {
+                    self.doc.set(&path, Value::Object(serde_json::Map::new()));
+                    self.dirty = true;
+                    let intro = format!(
+                        "Parameters merged into commands that use \"macro\": \"{}\". \
+                         Command parameters override macro parameters.",
+                        key
+                    );
+                    self.push_level(Level {
+                        title: key,
+                        path,
+                        kind: LevelKind::MacroForm,
+                        cursor: 0,
+                        intro,
                     });
                     return;
                 }
@@ -995,6 +1216,147 @@ impl App {
             cursor: 0,
             target,
         });
+    }
+
+    /// Where committing the given row's edit writes its value.
+    fn row_target(&self, row: &Row) -> EditTarget {
+        if matches!(self.level().kind, LevelKind::Map { .. }) {
+            EditTarget::MapValue {
+                path: row.path.clone(),
+                kind: row.kind,
+            }
+        } else {
+            EditTarget::Field {
+                path: row.path.clone(),
+                kind: row.kind,
+            }
+        }
+    }
+
+    /// Open a choice picker, pre-selecting the item matching `current`.
+    fn open_choice_picker(
+        &mut self,
+        title: String,
+        hint: String,
+        edit_label: String,
+        items: Vec<Choice>,
+        current: Option<String>,
+        target: EditTarget,
+    ) {
+        let cursor = current
+            .and_then(|cur| items.iter().position(|c| !c.custom && c.insert_text == cur))
+            .unwrap_or(0);
+        self.modal = Some(Modal::ChoicePicker {
+            title,
+            hint,
+            edit_label,
+            items,
+            cursor,
+            target,
+        });
+    }
+
+    /// Channel choices: aliases first (sorted by channel), then unaliased
+    /// channel numbers, then free entry.
+    fn channel_choices(&self) -> Vec<Choice> {
+        let mut aliases: Vec<(String, u64)> = Vec::new();
+        if let Some(Value::Object(map)) = self.doc.get(&path_of(&["audio", "channel_aliases"])) {
+            for (name, idx) in map {
+                if let Some(idx) = idx.as_u64() {
+                    aliases.push((name.clone(), idx));
+                }
+            }
+        }
+        aliases.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let mut choices: Vec<Choice> = aliases
+            .iter()
+            .map(|(name, idx)| Choice::new(name, name, &format!("channel {}", idx)))
+            .collect();
+        let channels = self
+            .effective(&path_of(&["audio", "channels"]))
+            .0
+            .as_u64()
+            .or_else(|| aliases.iter().map(|(_, idx)| idx + 1).max())
+            .unwrap_or(8);
+        for ch in 0..channels {
+            if !aliases.iter().any(|(_, idx)| *idx == ch) {
+                choices.push(Choice::new(&ch.to_string(), &format!("channel {}", ch), ""));
+            }
+        }
+        choices.push(Choice::custom("other…", "type a channel number or alias"));
+        choices
+    }
+
+    /// Voice choices: every voice id named in the document, then free entry.
+    fn voice_choices(&self) -> Vec<Choice> {
+        let mut choices: Vec<Choice> = known_voice_ids(&self.doc)
+            .iter()
+            .map(|id| Choice::new(id, id, ""))
+            .collect();
+        choices.push(Choice::custom("other…", "type a new voice name"));
+        choices
+    }
+
+    /// Prompt for the value at `path`: a picker for choice-like kinds, a text
+    /// edit otherwise.
+    fn open_value_editor(&mut self, path: Vec<Seg>, kind: FieldKind, label: String) {
+        let target = EditTarget::MapValue {
+            path: path.clone(),
+            kind,
+        };
+        match kind {
+            FieldKind::Enum(options) => {
+                self.open_choice_picker(
+                    label.clone(),
+                    String::new(),
+                    label,
+                    enum_choices(options),
+                    None,
+                    target,
+                );
+            }
+            FieldKind::Bool => {
+                self.open_choice_picker(
+                    label.clone(),
+                    String::new(),
+                    label,
+                    bool_choices(),
+                    None,
+                    target,
+                );
+            }
+            FieldKind::ChannelRef => {
+                let items = self.channel_choices();
+                self.open_choice_picker(
+                    "Select channel".to_string(),
+                    CHANNEL_PICKER_HINT.to_string(),
+                    label,
+                    items,
+                    None,
+                    target,
+                );
+            }
+            FieldKind::VoiceRef => {
+                let items = self.voice_choices();
+                self.open_choice_picker(
+                    "Select voice".to_string(),
+                    VOICE_PICKER_HINT.to_string(),
+                    label,
+                    items,
+                    None,
+                    target,
+                );
+            }
+            _ => {
+                self.edit = Some(EditState {
+                    label,
+                    buffer: String::new(),
+                    cursor: 0,
+                    target,
+                    error: None,
+                });
+            }
+        }
     }
 
     /// The config the device test should run with: the in-progress document if
@@ -1126,6 +1488,79 @@ impl App {
                 _ => {
                     self.modal = Some(Modal::DevicePicker {
                         output,
+                        items,
+                        cursor,
+                        target,
+                    });
+                }
+            },
+            Some(Modal::ChoicePicker {
+                title,
+                hint,
+                edit_label,
+                items,
+                mut cursor,
+                target,
+            }) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {}
+                KeyCode::Up | KeyCode::Down => {
+                    if key.code == KeyCode::Up {
+                        cursor = cursor.saturating_sub(1);
+                    } else if cursor + 1 < items.len() {
+                        cursor += 1;
+                    }
+                    self.modal = Some(Modal::ChoicePicker {
+                        title,
+                        hint,
+                        edit_label,
+                        items,
+                        cursor,
+                        target,
+                    });
+                }
+                KeyCode::Enter => {
+                    let Some(item) = items.get(cursor) else {
+                        return;
+                    };
+                    if item.custom {
+                        // Fall back to the normal free-text edit.
+                        self.edit = Some(EditState {
+                            label: edit_label,
+                            buffer: String::new(),
+                            cursor: 0,
+                            target,
+                            error: None,
+                        });
+                    } else if let EditTarget::MapKey { base, value_kind } = target {
+                        // A picked key chains into a prompt for its value,
+                        // typed by the key when the picker says so.
+                        let key_name = item.insert_text.clone();
+                        let mut path = base;
+                        path.push(Seg::Key(key_name.clone()));
+                        if self.doc.get(&path).is_some() {
+                            self.status = format!("'{}' already exists", key_name);
+                        } else {
+                            let kind = item.value_kind.unwrap_or(value_kind);
+                            self.open_value_editor(path, kind, format!("value for {}", key_name));
+                        }
+                    } else {
+                        // Commit through the edit pipeline so parsing,
+                        // dirty-tracking, and cursor placement all apply.
+                        self.edit = Some(EditState {
+                            label: edit_label,
+                            cursor: item.insert_text.chars().count(),
+                            buffer: item.insert_text.clone(),
+                            target,
+                            error: None,
+                        });
+                        self.commit_edit();
+                    }
+                }
+                _ => {
+                    self.modal = Some(Modal::ChoicePicker {
+                        title,
+                        hint,
+                        edit_label,
                         items,
                         cursor,
                         target,
@@ -1349,53 +1784,103 @@ fn byte_index(s: &str, cursor: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-/// Display label for one item of a struct list.
-fn struct_item_label(specs: &'static [SubFieldSpec]) -> &'static str {
-    if std::ptr::eq(specs.as_ptr(), super::fields::INPUT_FIELDS.as_ptr()) {
-        "input"
-    } else if std::ptr::eq(specs.as_ptr(), super::fields::INPUT_ROUTE_FIELDS.as_ptr()) {
-        "route"
-    } else {
-        "rule"
-    }
-}
+/// Context line shown under channel pickers.
+const CHANNEL_PICKER_HINT: &str =
+    "Aliases are defined in Audio > channel_aliases; numbers are 0-indexed.";
 
-/// A new list item that deserializes: structs whose fields are all required get
-/// placeholder values the user then edits.
-fn struct_skeleton(specs: &'static [SubFieldSpec]) -> Value {
-    if std::ptr::eq(specs.as_ptr(), super::fields::DUCKING_RULE_FIELDS.as_ptr()) {
-        serde_json::json!({
-            "primary_voice": "",
-            "ducked_voices": [],
-            "target_volume": 0.5,
-            "fade_duration_ms": 500
-        })
-    } else if std::ptr::eq(specs.as_ptr(), super::fields::INPUT_ROUTE_FIELDS.as_ptr()) {
-        serde_json::json!({ "source_channel": 0, "dest_channel": 0 })
-    } else {
-        Value::Object(serde_json::Map::new())
-    }
-}
+/// Context line shown under voice pickers.
+const VOICE_PICKER_HINT: &str =
+    "Voices are created at runtime by Play commands; any name is valid.";
 
-/// One-line summary of a struct-list item from its first few fields.
-fn summarize_struct(value: &Value, specs: &'static [SubFieldSpec]) -> String {
-    let Some(obj) = value.as_object() else {
-        return "(invalid)".to_string();
-    };
-    let mut parts = Vec::new();
-    for spec in specs.iter().take(3) {
-        if let Some(v) = obj.get(spec.key) {
-            let text = match v {
-                Value::String(s) => s.clone(),
-                Value::Array(a) => format!("[{}]", a.len()),
-                other => other.to_string(),
-            };
-            parts.push(format!("{}={}", spec.key, text));
+/// Every voice id named in the document: input voice_ids (an input without
+/// one plays under the default "mic") and the voices in ducking rules.
+pub fn known_voice_ids(doc: &ConfigDocument) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(Value::Array(inputs)) = doc.get(&path_of(&["inputs"])) {
+        for input in inputs {
+            match input.get("voice_id").and_then(|v| v.as_str()) {
+                Some(v) if !v.is_empty() => ids.push(v.to_string()),
+                Some(_) => {}
+                None => ids.push("mic".to_string()),
+            }
         }
     }
-    if parts.is_empty() {
-        "(new)".to_string()
-    } else {
-        parts.join("  ")
+    if let Some(Value::Array(rules)) = doc.get(&path_of(&["ducking_rules"])) {
+        for rule in rules {
+            if let Some(p) = rule.get("primary_voice").and_then(|v| v.as_str()) {
+                if !p.is_empty() {
+                    ids.push(p.to_string());
+                }
+            }
+            if let Some(Value::Array(ducked)) = rule.get("ducked_voices") {
+                for d in ducked {
+                    if let Some(s) = d.as_str() {
+                        if !s.is_empty() {
+                            ids.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    ids.sort();
+    ids.dedup();
+    ids
+}
+
+/// Picker choices for an enum's options.
+fn enum_choices(options: &'static [&'static str]) -> Vec<Choice> {
+    options.iter().map(|o| Choice::new(o, o, "")).collect()
+}
+
+/// Picker choices for a boolean value.
+fn bool_choices() -> Vec<Choice> {
+    vec![
+        Choice::new("true", "true", ""),
+        Choice::new("false", "false", ""),
+    ]
+}
+
+/// Picker choices for adding a macro parameter: the known command parameters
+/// not already present, then a custom-key entry.
+fn macro_param_choices(existing: &Value) -> Vec<Choice> {
+    let mut choices: Vec<Choice> = super::fields::MACRO_PARAM_FIELDS
+        .iter()
+        .filter(|spec| existing.get(spec.key).is_none())
+        .map(|spec| {
+            let mut c = Choice::new(spec.key, spec.label, spec.help);
+            c.value_kind = Some(spec.kind);
+            c
+        })
+        .collect();
+    choices.push(Choice::custom(
+        "other…",
+        "type a parameter name; the value is raw JSON",
+    ));
+    choices
+}
+
+/// Help text for one element of a scalar list.
+fn scalar_item_help(elem: &FieldKind) -> &'static str {
+    match elem {
+        FieldKind::ChannelRef => {
+            "A channel number (0-indexed) or an alias defined in audio.channel_aliases."
+        }
+        FieldKind::VoiceRef => {
+            "A voice name, as used by a Play command's \"voice\" parameter or an input's voice_id."
+        }
+        _ => "One entry in this list.",
+    }
+}
+
+/// Help text for one entry of a map, by its value kind.
+fn map_item_help(value_kind: &FieldKind) -> &'static str {
+    match value_kind {
+        FieldKind::UInt { .. } => "The channel number (0-indexed) this alias refers to.",
+        FieldKind::Float { .. } => "Calibration gain for this channel (0.0 - 1.0).",
+        FieldKind::MapToJson => {
+            "A macro: command parameters merged into commands that reference it by name."
+        }
+        _ => "One entry in this map.",
     }
 }

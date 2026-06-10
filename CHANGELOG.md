@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Config editor guidance and pickers.** The interactive editor now leads with a framed help pane at the
+  top of the screen explaining the selected section or setting; every section carries an introduction and
+  collections explain their feature in place (including what to do when they are empty). Settings that
+  reference other parts of the config are chosen from pickers instead of typed: channel fields offer the
+  defined `channel_aliases` plus plain channel numbers, voice fields offer the voice ids named elsewhere in
+  the config (free text still allowed), enums list their options, and `channel_volumes` keys come from the
+  channel picker. Ducking rules, inputs, and routes show readable per-item summaries
+  (`"narration" ducks music → 20% over 500ms`) instead of bare indices, and macros are edited as guided
+  parameter forms — pick from the Play command's parameters with typed validation, with raw JSON still
+  available for custom keys.
 - **Interactive config editor: `mqttaudio --configure`.** A full-screen terminal UI (ratatui) that creates
   or edits the JSON config file with per-field help, the daemon's own validation before saving, and live
   device testing: the output device picker plays per-channel test tones through the real playback pathway

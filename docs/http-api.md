@@ -37,11 +37,12 @@ Config file example:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | bool | false | Enable HTTP server |
-| `port` | u16 | 8080 | Port number (0 = auto-select) |
+| `port` | u16 | 0 | Port number (0 = auto-select an available port) |
 | `bind_address` | string | "127.0.0.1" | Network interface to bind |
-| `auth_token` | string | null | Optional Bearer token for authentication |
+| `auth_token` | string | null | Optional Bearer token for authentication (min 8 characters) |
 | `websocket_enabled` | bool | true | Enable WebSocket endpoint |
 | `cors_permissive` | bool | false | Allow CORS from any origin |
+| `require_auth` | bool | false | Require the token on all routes, including status and `/ws` |
 
 ## REST Endpoints
 
