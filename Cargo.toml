@@ -29,6 +29,9 @@ serde_json = "1.0"
 # CLI parsing
 clap = { version = "4.5", features = ["derive"] }
 
+# Terminal UI for the interactive config editor
+ratatui = "0.30"
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 

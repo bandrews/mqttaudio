@@ -4,6 +4,7 @@
 mod audio;
 mod cache;
 mod config;
+mod config_editor;
 mod http;
 mod mqtt;
 mod rt_engine;
@@ -49,6 +50,10 @@ struct Args {
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
+
+    /// Launch the interactive configuration editor and exit
+    #[arg(long)]
+    configure: bool,
 
     /// List available audio output devices and exit
     #[arg(long)]
@@ -120,6 +125,16 @@ where
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+
+    // Handle --configure before logging init: a tracing subscriber writing to
+    // stdout would corrupt the editor's raw-mode alternate screen.
+    if args.configure {
+        if let Err(e) = config_editor::run(args.config.as_deref()) {
+            eprintln!("Configuration editor error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
 
     // Load configuration
     let mut config = match config::Config::load_from_path_or_default(args.config.as_deref()) {

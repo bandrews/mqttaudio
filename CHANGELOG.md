@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Interactive config editor: `mqttaudio --configure`.** A full-screen terminal UI (ratatui) that creates
+  or edits the JSON config file with per-field help, the daemon's own validation before saving, and live
+  device testing: the output device picker plays per-channel test tones through the real playback pathway
+  (channel volumes, master gain, limiter, and bass management all apply, with live peak meters and a
+  channel sweep for speaker identification), and input devices get a live capture level meter. Every config
+  field is editable — a coverage test fails the build if a future config field lacks an editor binding.
+  Saves are sparse (only explicitly-set keys are written, so built-in defaults can evolve), atomic, preceded
+  by a `.bak` backup, and preserve unknown keys/comments in existing files.
+
 ### Changed
 
 - **`/ws` now actually streams the daemon's log lines (Sprint 14, D62).** The WebSocket log layer existed

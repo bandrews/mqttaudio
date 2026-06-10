@@ -147,7 +147,20 @@ mosquitto_pub -t audio/commands -m '{
 
 ## Configuration
 
-For production use, create a config file:
+The easiest way to create or edit a config file is the built-in interactive editor:
+
+```bash
+./mqttaudio --configure
+```
+
+It walks every config section with inline help and validation, includes a device picker that can play a
+test tone per speaker **through the real playback pathway** (so you hear exactly what the daemon will do,
+including channel volumes, the limiter, and bass management), and a live level meter for microphone inputs.
+Only the settings you explicitly change are written to the file — everything else stays on the daemon's
+built-in defaults — and any existing file is backed up to `<name>.bak` before saving. Hand-written comments
+and unknown keys in an existing file are preserved.
+
+Alternatively, create a config file by hand:
 
 ```json
 {

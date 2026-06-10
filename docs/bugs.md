@@ -311,6 +311,14 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   emitting discrete events from the control-thread mutation points is an optimization. The web meters render the
   output bars live; per-input meters show nothing until (1) lands.
 
+## Noticed while building the config editor (Sprint: config editor)
+
+- **`config.example.json` still documents the removed `audio.channel_names` field (RESOLVED).** The field
+  was removed in Sprint 14 (D60); the live alias mechanism is `audio.channel_aliases`. The example parsed
+  fine (unknown keys are tolerated) but taught a dead field. Both occurrences (top-level example and the
+  nested production example) plus the `_notes` line now use `channel_aliases` with the correct
+  name-to-index direction.
+
 ## Implementation notes
 
 - **Auto voice-id format: `_auto_<millis>_<n>` shipped, reconciling DECISIONS.md D24 vs D41/Sprint-9 F5.**

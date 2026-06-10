@@ -36,5 +36,6 @@ pub mod mqtt {
 pub mod http;
 
 pub mod config;
+pub mod config_editor;
 pub mod rt_engine;
 pub mod voice;

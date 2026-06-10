@@ -7,69 +7,153 @@ use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-/// List available audio input devices
-pub fn list_input_devices() {
+/// Capabilities of an input device, as far as they could be determined.
+pub enum InputCaps {
+    /// Capabilities probed from the device's supported configurations.
+    Probed {
+        max_channels: u16,
+        /// Unique (min, max) sample-rate ranges across the supported configurations.
+        sample_rates: Vec<(u32, u32)>,
+    },
+    /// All supported configurations were implausible (ALSA plugin devices report
+    /// fake rates), so this reflects the default configuration instead.
+    PluginFallback { channels: u16, sample_rate: u32 },
+    /// Supported configurations could not be enumerated; this reflects the
+    /// default configuration.
+    DefaultOnly { channels: u16, sample_rate: u32 },
+    /// No capability information could be obtained.
+    Unknown,
+}
+
+/// An input device discovered by enumeration.
+pub struct InputDeviceInfo {
+    /// Device name (used for the `inputs[].device` config field)
+    pub name: String,
+    pub caps: InputCaps,
+}
+
+impl InputDeviceInfo {
+    /// Channel count from whichever capability source was available, if any.
+    pub fn channels(&self) -> Option<u16> {
+        match self.caps {
+            InputCaps::Probed { max_channels, .. } => Some(max_channels),
+            InputCaps::PluginFallback { channels, .. } => Some(channels),
+            InputCaps::DefaultOnly { channels, .. } => Some(channels),
+            InputCaps::Unknown => None,
+        }
+    }
+}
+
+/// Enumerate available audio input devices with their capabilities.
+/// Errors during enumeration are returned as Err with a description.
+pub fn input_device_list() -> Result<Vec<InputDeviceInfo>, String> {
     let host = cpal::default_host();
 
+    let devices = host.input_devices().map_err(|e| e.to_string())?;
+    let mut list = Vec::new();
+    for device in devices {
+        let Ok(name) = device.description().map(|d| d.name().to_string()) else {
+            continue;
+        };
+
+        // Query all supported configs to find max channels
+        let caps = if let Ok(configs) = device.supported_input_configs() {
+            let mut max_channels = 0u16;
+            let mut sample_rates: Vec<(u32, u32)> = Vec::new();
+
+            // Filter configs: ignore those with absurd sample rates
+            // (ALSA plugins report 4294967295 Hz which is clearly fake)
+            const MAX_REASONABLE_SAMPLE_RATE: u32 = 384000;
+
+            for config in configs {
+                let max_rate = config.max_sample_rate();
+                // Skip configs from ALSA plugins that claim unrealistic capabilities
+                if max_rate > MAX_REASONABLE_SAMPLE_RATE {
+                    continue;
+                }
+
+                max_channels = max_channels.max(config.channels());
+                let min_rate = config.min_sample_rate();
+                // Collect unique sample rate ranges
+                if !sample_rates
+                    .iter()
+                    .any(|(min, max)| *min == min_rate && *max == max_rate)
+                {
+                    sample_rates.push((min_rate, max_rate));
+                }
+            }
+
+            if max_channels > 0 {
+                InputCaps::Probed {
+                    max_channels,
+                    sample_rates,
+                }
+            } else if let Ok(config) = device.default_input_config() {
+                // All configs were filtered out - fall back to default
+                // This happens with ALSA plugin devices
+                InputCaps::PluginFallback {
+                    channels: config.channels(),
+                    sample_rate: config.sample_rate(),
+                }
+            } else {
+                InputCaps::Unknown
+            }
+        } else if let Ok(config) = device.default_input_config() {
+            // Fallback to default config if supported_input_configs fails
+            InputCaps::DefaultOnly {
+                channels: config.channels(),
+                sample_rate: config.sample_rate(),
+            }
+        } else {
+            InputCaps::Unknown
+        };
+
+        list.push(InputDeviceInfo { name, caps });
+    }
+    Ok(list)
+}
+
+/// List available audio input devices
+pub fn list_input_devices() {
     println!("Available audio input devices:");
-    match host.input_devices() {
+    match input_device_list() {
         Ok(devices) => {
-            for (i, device) in devices.enumerate() {
-                if let Ok(name) = device.description().map(|d| d.name().to_string()) {
-                    println!("  {}. {}", i, name);
-
-                    // Query all supported configs to find max channels
-                    if let Ok(configs) = device.supported_input_configs() {
-                        let mut max_channels = 0u16;
-                        let mut sample_rates: Vec<(u32, u32)> = Vec::new();
-
-                        // Filter configs: ignore those with absurd sample rates
-                        // (ALSA plugins report 4294967295 Hz which is clearly fake)
-                        const MAX_REASONABLE_SAMPLE_RATE: u32 = 384000;
-
-                        for config in configs {
-                            let max_rate = config.max_sample_rate();
-                            // Skip configs from ALSA plugins that claim unrealistic capabilities
-                            if max_rate > MAX_REASONABLE_SAMPLE_RATE {
-                                continue;
+            for (i, device) in devices.iter().enumerate() {
+                println!("  {}. {}", i, device.name);
+                match &device.caps {
+                    InputCaps::Probed {
+                        max_channels,
+                        sample_rates,
+                    } => {
+                        // Show sample rate range(s)
+                        if sample_rates.len() == 1 {
+                            let (min, max) = sample_rates[0];
+                            if min == max {
+                                println!("     Sample rate: {} Hz", min);
+                            } else {
+                                println!("     Sample rate: {}-{} Hz", min, max);
                             }
-
-                            max_channels = max_channels.max(config.channels());
-                            let min_rate = config.min_sample_rate();
-                            // Collect unique sample rate ranges
-                            if !sample_rates
-                                .iter()
-                                .any(|(min, max)| *min == min_rate && *max == max_rate)
-                            {
-                                sample_rates.push((min_rate, max_rate));
-                            }
+                        } else if !sample_rates.is_empty() {
+                            // Multiple ranges, just show common rates
+                            println!("     Sample rates: (multiple configurations)");
                         }
-
-                        if max_channels > 0 {
-                            // Show sample rate range(s)
-                            if sample_rates.len() == 1 {
-                                let (min, max) = sample_rates[0];
-                                if min == max {
-                                    println!("     Sample rate: {} Hz", min);
-                                } else {
-                                    println!("     Sample rate: {}-{} Hz", min, max);
-                                }
-                            } else if !sample_rates.is_empty() {
-                                // Multiple ranges, just show common rates
-                                println!("     Sample rates: (multiple configurations)");
-                            }
-                            println!("     Max channels: {}", max_channels);
-                        } else if let Ok(config) = device.default_input_config() {
-                            // All configs were filtered out - fall back to default
-                            // This happens with ALSA plugin devices
-                            println!("     Sample rate: {} Hz (plugin)", config.sample_rate());
-                            println!("     Channels: {} (plugin)", config.channels());
-                        }
-                    } else if let Ok(config) = device.default_input_config() {
-                        // Fallback to default config if supported_input_configs fails
-                        println!("     Sample rate: {} Hz", config.sample_rate());
-                        println!("     Channels: {}", config.channels());
+                        println!("     Max channels: {}", max_channels);
                     }
+                    InputCaps::PluginFallback {
+                        channels,
+                        sample_rate,
+                    } => {
+                        println!("     Sample rate: {} Hz (plugin)", sample_rate);
+                        println!("     Channels: {} (plugin)", channels);
+                    }
+                    InputCaps::DefaultOnly {
+                        channels,
+                        sample_rate,
+                    } => {
+                        println!("     Sample rate: {} Hz", sample_rate);
+                        println!("     Channels: {}", channels);
+                    }
+                    InputCaps::Unknown => {}
                 }
             }
         }
