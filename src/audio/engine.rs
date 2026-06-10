@@ -10,31 +10,23 @@ use std::sync::Arc;
 
 /// List available audio output devices
 pub fn list_devices() {
-    #[cfg(target_os = "linux")]
-    {
-        list_devices_linux();
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        list_devices_cpal_only();
-    }
-}
-
-/// Linux-specific device listing with ALSA probing
-#[cfg(target_os = "linux")]
-fn list_devices_linux() {
-    use super::alsa_probe::probe_alsa_devices;
     use super::device::format_device_list;
 
-    let list = probe_alsa_devices();
-    print!("{}", format_device_list(&list));
+    print!("{}", format_device_list(&output_device_list()));
 }
 
-/// Fallback device listing using only cpal (for macOS, Windows, etc.)
+/// Enumerate output devices with their capabilities. On Linux this probes ALSA
+/// directly for native hardware capabilities; elsewhere it queries cpal.
+#[cfg(target_os = "linux")]
+pub fn output_device_list() -> super::device::DeviceList {
+    super::alsa_probe::probe_alsa_devices()
+}
+
+/// Enumerate output devices with their capabilities. On Linux this probes ALSA
+/// directly for native hardware capabilities; elsewhere it queries cpal.
 #[cfg(not(target_os = "linux"))]
-fn list_devices_cpal_only() {
-    use super::device::{format_device_list, DeviceCategory, DeviceInfo, DeviceList};
+pub fn output_device_list() -> super::device::DeviceList {
+    use super::device::{DeviceCategory, DeviceInfo, DeviceList};
 
     let host = cpal::default_host();
     let mut list = DeviceList::new();
@@ -90,7 +82,7 @@ fn list_devices_cpal_only() {
         }
     }
 
-    print!("{}", format_device_list(&list));
+    list
 }
 
 /// Get default device configuration

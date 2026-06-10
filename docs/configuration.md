@@ -23,6 +23,7 @@ OPTIONS:
   --http-port <PORT>           Enable the HTTP REST/WebSocket server on this port
   --max-cache-mb <MB>          Override the memory cache cap in MiB (0 = auto-detect a bounded cap)
   -v, --verbose                Enable verbose logging (debug level)
+  --configure                  Launch the interactive configuration editor and exit
   --list-devices               List available audio output devices and exit
   --list-inputs                List available audio input devices and exit
   --help                       Print help information
@@ -33,6 +34,25 @@ The value-taking flags are optional overrides: when omitted they fall back to th
 "config default" shown is the built-in value applied when neither the flag nor the config sets it. These are
 config-level defaults, not clap defaults, so `--help` does not display them. `--max-cache-mb 0` (and leaving
 `cache.max_memory_mb` at `0`) selects an auto-detected **bounded** cap — not an unlimited cache.
+
+## Interactive Editor
+
+`mqttaudio --configure` opens a full-screen terminal editor covering every setting documented on this page,
+with per-field help, the same validation the daemon applies at startup, and live device testing:
+
+- The **output device picker** lists real devices and can play a test tone on any single output channel
+  through the actual playback pathway — channel volumes, master gain, the limiter, and bass management from
+  the in-progress config all apply, with live per-channel peak meters. A 50 Hz bass tone option makes an
+  enabled bass-management crossover audible, and a sweep mode steps through all channels for speaker
+  identification.
+- The **input device picker** shows a live per-channel level meter through the daemon's real capture path.
+- Saves are sparse: only settings you explicitly changed are written, so future default changes still reach
+  your installation. Unset fields display their built-in default. An existing file is backed up to
+  `<name>.bak` first, and unknown keys (such as `_comment` annotations) are preserved.
+- `--configure --config <path>` edits (or creates) a specific file; without `--config` the daemon's normal
+  search locations are used.
+
+After saving, restart mqttaudio to apply the changes.
 
 ## Configuration File
 
