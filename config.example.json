@@ -22,15 +22,15 @@
     "device": null,
     "sample_rate": 48000,
     "buffer_size": 512,
-    "channel_names": {
-      "0": "front_left",
-      "1": "front_right",
-      "2": "center",
-      "3": "lfe",
-      "4": "rear_left",
-      "5": "rear_right",
-      "6": "side_left",
-      "7": "side_right"
+    "channel_aliases": {
+      "front_left": 0,
+      "front_right": 1,
+      "center": 2,
+      "lfe": 3,
+      "rear_left": 4,
+      "rear_right": 5,
+      "side_left": 6,
+      "side_right": 7
     },
     "channel_volumes": {
       "lfe": 0.7,
@@ -43,7 +43,7 @@
       "sample_rate: Output sample rate in Hz. Common values: 44100, 48000, 96000",
       "buffer_size: Audio buffer size in frames. Smaller = lower latency but higher CPU",
       "  Common values: 256 (low latency), 512 (balanced), 1024 (high compatibility)",
-      "channel_names: Optional mapping of channel numbers to human-readable names",
+      "channel_aliases: Optional mapping of friendly channel names to channel indices",
       "channel_volumes: Per-channel calibration (0.0-1.0) to compensate for hardware differences"
     ]
   },
@@ -114,15 +114,15 @@
         "device": "USB Audio Interface",
         "sample_rate": 48000,
         "buffer_size": 512,
-        "channel_names": {
-          "0": "zone1_left",
-          "1": "zone1_right",
-          "2": "zone2_left",
-          "3": "zone2_right",
-          "4": "zone3_left",
-          "5": "zone3_right",
-          "6": "zone4_left",
-          "7": "zone4_right"
+        "channel_aliases": {
+          "zone1_left": 0,
+          "zone1_right": 1,
+          "zone2_left": 2,
+          "zone2_right": 3,
+          "zone3_left": 4,
+          "zone3_right": 5,
+          "zone4_left": 6,
+          "zone4_right": 7
         }
       },
       "cache": {

@@ -313,10 +313,11 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 
 ## Noticed while building the config editor (Sprint: config editor)
 
-- **`config.example.json` still documents the removed `audio.channel_names` field** (top-level example,
-  `_notes`, and the nested production example). The field was removed in Sprint 14 (D60); the live alias
-  mechanism is `audio.channel_aliases`. The example parses fine (unknown keys are tolerated) but teaches a
-  dead field. Out of scope for the config-editor change; the example should be updated to `channel_aliases`.
+- **`config.example.json` still documents the removed `audio.channel_names` field (RESOLVED).** The field
+  was removed in Sprint 14 (D60); the live alias mechanism is `audio.channel_aliases`. The example parsed
+  fine (unknown keys are tolerated) but taught a dead field. Both occurrences (top-level example and the
+  nested production example) plus the `_notes` line now use `channel_aliases` with the correct
+  name-to-index direction.
 
 ## Implementation notes
 
