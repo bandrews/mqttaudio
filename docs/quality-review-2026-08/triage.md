@@ -98,13 +98,16 @@ implemented in the four sprints of `sprint-plan.md`:
 
 ## Deferred — needs a decision or a design
 
-Everything below is retained as the original triage record; per the two
-sections above, the only items still open are **D20** (should
-`--lfe-channel`/`--crossover-frequency` be able to activate bass management
-alone? they remain overrides on top of a configured setup, as documented)
-and the limitations listed in `docs/bugs.md` (one capture device per input
-entry, `fadeall` not affecting live inputs, the audio callback's mixer
-mutex).
+Everything below is retained as the original triage record. All items are
+now resolved: D20 was decided on 2026-08-19 — the
+`--lfe-channel`/`--crossover-frequency` flags were **removed**, since they
+could never activate bass management alone, the natural self-activation
+default (all channels feed the sub) is wrong for multi-zone installs, and
+overriding an existing config from the CLI is not a real workflow. Bass
+management lives entirely in the `bass_management` config section. What
+remains known-but-accepted is listed in `docs/bugs.md` (one capture device
+per input entry, `fadeall` not affecting live inputs, the audio callback's
+mixer mutex).
 
 | # | Issue | Why deferred |
 |---|---|---|

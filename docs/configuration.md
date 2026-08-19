@@ -24,8 +24,6 @@ OPTIONS:
   -d, --device <NAME>          Audio output device name
   -r, --sample-rate <RATE>     Output sample rate [default: 48000]
   -n, --channels <COUNT>       Number of output channels [default: use max available]
-  --lfe-channel <INDEX>        LFE (subwoofer) channel override for bass management
-  --crossover-frequency <HZ>   Crossover frequency override for bass management
   --log-topic <TOPIC>          MQTT topic to publish log messages to
   --http-port <PORT>           Enable the HTTP server on this port
   --max-cache-mb <MB>          Memory cache limit in MB (0 = unlimited)

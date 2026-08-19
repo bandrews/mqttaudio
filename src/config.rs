@@ -606,8 +606,6 @@ impl Config {
         sample_rate: Option<u32>,
         channels: Option<usize>,
         verbose: bool,
-        lfe_channel: Option<usize>,
-        crossover_frequency: Option<f32>,
         log_topic: Option<String>,
         mqtt_username: Option<String>,
         mqtt_password: Option<String>,
@@ -649,14 +647,6 @@ impl Config {
         }
         if let Some(lt) = log_topic {
             self.logging.mqtt_topic = Some(lt);
-        }
-
-        // Override bass management settings
-        if let Some(ch) = lfe_channel {
-            self.bass_management.lfe_channel = ChannelRef::Index(ch);
-        }
-        if let Some(freq) = crossover_frequency {
-            self.bass_management.crossover_frequency_hz = freq;
         }
 
         // Override HTTP settings
@@ -1040,7 +1030,7 @@ mod tests {
         assert!(config.mqtt.password.is_none());
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None, None,
+            None, None, None, None, None, None, false, None,
             Some("cli_user".to_string()),
             Some("cli_pass".to_string()),
             None,
@@ -1064,7 +1054,7 @@ mod tests {
         let mut config: Config = serde_json::from_str(json).unwrap();
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None, None,
+            None, None, None, None, None, None, false, None,
             Some("cli_user".to_string()),
             Some("cli_pass".to_string()),
             None,
@@ -1321,8 +1311,6 @@ mod tests {
             None,
             None, // channels
             false,
-            None,
-            None,
             None, // log_topic
             None, // mqtt_username
             None, // mqtt_password
@@ -1345,8 +1333,6 @@ mod tests {
             Some(96000),
             Some(8), // channels
             true,
-            Some(5),
-            Some(120.0),
             Some("audio/logs".to_string()), // log_topic
             Some("testuser".to_string()),   // mqtt_username
             Some("testpass".to_string()),   // mqtt_password
@@ -1365,8 +1351,6 @@ mod tests {
         assert_eq!(config.logging.verbose, true);
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
-        assert_eq!(config.bass_management.lfe_channel, ChannelRef::Index(5));
-        assert_eq!(config.bass_management.crossover_frequency_hz, 120.0);
     }
 
     #[test]
@@ -1384,8 +1368,6 @@ mod tests {
             None,
             None, // channels
             false,
-            None,
-            None,
             None, // log_topic
             None, // mqtt_username
             None, // mqtt_password
@@ -1404,7 +1386,7 @@ mod tests {
         assert_eq!(config.logging.level, "info");
         assert_eq!(config.logging.verbose, false);
 
-        config.merge_cli_args(None, None, None, None, None, None, true, None, None, None, None, None, None, None);
+        config.merge_cli_args(None, None, None, None, None, None, true, None, None, None, None, None);
 
         assert_eq!(config.logging.verbose, true);
         assert_eq!(config.logging.level, "debug");
@@ -1992,7 +1974,7 @@ mod tests {
         assert!(config.logging.mqtt_topic.is_none());
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None,
+            None, None, None, None, None, None, false,
             Some("audio/logs".to_string()),
             None, None, None, None,
         );
@@ -2416,7 +2398,7 @@ mod tests {
         assert_eq!(config.http.port, 0);
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None, None, None, None,
+            None, None, None, None, None, None, false, None, None, None,
             Some(9000),
             None,
         );
@@ -2432,7 +2414,7 @@ mod tests {
         assert_eq!(config.cache.max_memory_mb, 512); // default
 
         config.merge_cli_args(
-            None, None, None, None, None, None, false, None, None, None, None, None,
+            None, None, None, None, None, None, false, None, None, None,
             None,
             Some(1024),
         );

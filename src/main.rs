@@ -65,14 +65,6 @@ struct Args {
     #[arg(long)]
     test_mixer: bool,
 
-    /// LFE (subwoofer) channel number for bass management
-    #[arg(long)]
-    lfe_channel: Option<usize>,
-
-    /// Crossover frequency (Hz) for bass management
-    #[arg(long)]
-    crossover_frequency: Option<f32>,
-
     /// MQTT topic to publish log messages to
     #[arg(long)]
     log_topic: Option<String>,
@@ -185,8 +177,6 @@ async fn main() {
         args.sample_rate,
         args.channels,
         args.verbose,
-        args.lfe_channel,
-        args.crossover_frequency,
         args.log_topic.clone(),
         args.mqtt_username.clone(),
         args.mqtt_password.clone(),

@@ -95,11 +95,13 @@ ramps, bass warnings, IPv6/auth hardening, streamed disk writes with
 download cancellation, honest progress estimates, channel_map over HTTP,
 the lib/bin module unification, dev-tool paths, and route warnings.
 
-Still open: **D20** - whether the `--lfe-channel`/`--crossover-frequency`
-CLI flags should be able to activate bass management on their own (today
-they are overrides on top of a configured setup, as documented) - and the
-known limitations in `docs/bugs.md`. D1's empty-list semantics stay as
-decided (empty = unrestricted, documented).
+D20 closed the list: the `--lfe-channel`/`--crossover-frequency` CLI flags
+were removed (they could never activate bass management alone, and a
+self-activation default would wrongly feed every zone into the sub); bass
+management is configured entirely in the `bass_management` config section.
+Nothing from the review remains open beyond the known limitations recorded
+in `docs/bugs.md`. D1's empty-list semantics stay as decided (empty =
+unrestricted, documented).
 
 ## Verification
 
