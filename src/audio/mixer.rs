@@ -143,6 +143,10 @@ pub struct ActiveSample {
     /// Scratch buffer for the pitch-corrected mix path, sized when pitch
     /// correction is enabled so the audio callback does not allocate
     pitch_scratch: Vec<f32>,
+
+    /// Scratch for the stretcher's input when looping (the input is built
+    /// with wrap-around and crossfade blending rather than sliced directly)
+    pitch_input_scratch: Vec<f32>,
 }
 
 impl ActiveSample {
@@ -183,6 +187,7 @@ impl ActiveSample {
             loop_mode: false,
             crossfade_samples: 0,
             pitch_scratch: Vec::new(),
+            pitch_input_scratch: Vec::new(),
         }
     }
 
@@ -226,6 +231,7 @@ impl ActiveSample {
             loop_mode,
             crossfade_samples,
             pitch_scratch: Vec::new(),
+            pitch_input_scratch: Vec::new(),
         }
     }
 
@@ -261,6 +267,7 @@ impl ActiveSample {
             loop_mode,
             crossfade_samples,
             pitch_scratch: Vec::new(),
+            pitch_input_scratch: Vec::new(),
         }
     }
 
@@ -313,10 +320,13 @@ impl ActiveSample {
             );
             pc.set_speed(self.speed);
             self.pitch_corrector = Some(pc);
-            // Size the mix scratch here, on the command thread, so the audio
-            // callback does not allocate; 8192 frames covers any sane device
-            // buffer (a larger one grows it once, then stays)
+            // Size the mix scratches here, on the command thread, so the
+            // audio callback does not allocate; 8192 output frames covers any
+            // sane device buffer, and the input side is that times the
+            // fastest pitch-corrected speed (a larger need grows once, then
+            // stays)
             self.pitch_scratch.resize(8192 * channels, 0.0);
+            self.pitch_input_scratch.resize(8192 * 8 * channels, 0.0);
         }
     }
 
@@ -427,21 +437,9 @@ impl ActiveSample {
         let buffer_frames = self.buffer.frames();
 
         if self.loop_mode && buffer_frames > 0 {
-            // Handle looping
-            if new_pos < 0.0 {
-                // Reverse playback wrapped past start - loop to end
-                let wrapped = new_pos % buffer_frames as f64 + buffer_frames as f64;
-                self.position = wrapped as usize % buffer_frames;
-                self.fractional_position = wrapped.fract();
-            } else if new_pos >= buffer_frames as f64 {
-                // Forward playback wrapped past end - loop to start
-                let wrapped = new_pos % buffer_frames as f64;
-                self.position = wrapped as usize;
-                self.fractional_position = wrapped.fract();
-            } else {
-                self.position = new_pos as usize;
-                self.fractional_position = new_pos.fract();
-            }
+            let wrapped = wrap_loop_position(new_pos, buffer_frames, self.crossfade_samples);
+            self.position = wrapped as usize;
+            self.fractional_position = wrapped.fract();
         } else {
             // Non-looping behavior
             if new_pos < 0.0 {
@@ -461,6 +459,42 @@ impl ActiveSample {
     /// Get the current precise position as a float for interpolation
     fn precise_position(&self) -> f64 {
         self.position as f64 + self.fractional_position
+    }
+}
+
+/// Map a playback position into a looping buffer's active region.
+///
+/// With a crossfade, the last crossfade_samples frames are blended with the
+/// head frames [0, cf), so the loop's period is buffer_frames - cf: a forward
+/// wrap lands at cf (the head was already heard inside the blend, landing at
+/// 0 would play it twice) and a reverse wrap lands just before the tail.
+/// Without a crossfade this is a plain modulo wrap.
+fn wrap_loop_position(pos: f64, buffer_frames: usize, crossfade_samples: usize) -> f64 {
+    if buffer_frames == 0 {
+        return 0.0;
+    }
+    let cf = if crossfade_samples > 0 && buffer_frames > crossfade_samples * 2 {
+        crossfade_samples
+    } else {
+        0
+    };
+    let n = buffer_frames as f64;
+    let period = (buffer_frames - cf) as f64;
+
+    let wrapped = if pos >= n {
+        cf as f64 + (pos - n) % period
+    } else if pos < 0.0 {
+        (n - cf as f64) + pos % period
+    } else {
+        return pos;
+    };
+
+    if wrapped < 0.0 {
+        wrapped + period
+    } else if wrapped >= n {
+        wrapped - period
+    } else {
+        wrapped
     }
 }
 
@@ -765,14 +799,11 @@ fn mix_sample_into_output(
         // Advance voice volume toward target (smooth ramping to avoid pops)
         sample.advance_volumes();
 
-        // Handle looping wrap-around
+        // Handle looping wrap-around (crossfade shortens the loop period so
+        // the blended head is not played twice)
         if loop_mode && buffer_frames > 0 {
-            if src_pos < 0.0 {
-                // Wrap from start to end
-                src_pos = src_pos % buffer_frames as f64 + buffer_frames as f64;
-            } else if src_pos >= buffer_frames as f64 {
-                // Wrap from end to start
-                src_pos = src_pos % buffer_frames as f64;
+            if src_pos < 0.0 || src_pos >= buffer_frames as f64 {
+                src_pos = wrap_loop_position(src_pos, buffer_frames, sample.crossfade_samples);
             }
         } else {
             // Check bounds based on direction (non-looping)
@@ -911,18 +942,56 @@ fn mix_sample_with_pitch_correction(
     // Calculate how many input frames we need (scaled by speed)
     let input_frames_needed = ((frames as f32 * speed).ceil() as usize).max(1);
 
-    // Calculate how many input frames are available
-    let available_frames = decoded_buffer.frames.saturating_sub(sample.position);
-    let input_frames = input_frames_needed.min(available_frames);
+    let buffer_frames = decoded_buffer.frames;
+    let loop_mode = sample.loop_mode && buffer_frames > 0;
+
+    // For a looping sample, build the stretcher's input with wrap-around and
+    // the crossfade blend baked in, so the stretcher is never starved at the
+    // loop seam. A non-looping sample feeds the contiguous remainder directly.
+    let mut wrapped_input: Option<Vec<f32>> = None;
+    let input_frames = if loop_mode {
+        let needed_samples = input_frames_needed * src_channels;
+        if sample.pitch_input_scratch.len() < needed_samples {
+            sample.pitch_input_scratch.resize(needed_samples, 0.0);
+        }
+        let mut input = std::mem::take(&mut sample.pitch_input_scratch);
+
+        let cf = if sample.crossfade_samples > 0 && buffer_frames > sample.crossfade_samples * 2 {
+            sample.crossfade_samples
+        } else {
+            0
+        };
+        let period = buffer_frames - cf;
+        let crossfade_start = buffer_frames - cf;
+
+        for i in 0..input_frames_needed {
+            let mut frame = sample.position + i;
+            if frame >= buffer_frames {
+                frame = cf + (frame - buffer_frames) % period;
+            }
+            for ch in 0..src_channels {
+                let mut value = decoded_buffer.data[frame * src_channels + ch];
+                if cf > 0 && frame >= crossfade_start {
+                    let frames_into_crossfade = frame - crossfade_start;
+                    let progress = frames_into_crossfade as f32 / cf as f32;
+                    let blend = decoded_buffer.data[frames_into_crossfade * src_channels + ch];
+                    value = value * (1.0 - progress) + blend * progress;
+                }
+                input[i * src_channels + ch] = value;
+            }
+        }
+
+        wrapped_input = Some(input);
+        input_frames_needed
+    } else {
+        // Calculate how many input frames are available
+        let available_frames = buffer_frames.saturating_sub(sample.position);
+        input_frames_needed.min(available_frames)
+    };
 
     if input_frames == 0 {
         return;
     }
-
-    // Extract input samples from the buffer (interleaved)
-    let input_start = sample.position * src_channels;
-    let input_end = (sample.position + input_frames) * src_channels;
-    let input_slice = &decoded_buffer.data[input_start..input_end];
 
     // Reuse the preallocated stretcher scratch (interleaved, same channel
     // count as the source); growing it here is a rare one-time event for
@@ -935,6 +1004,14 @@ fn mix_sample_with_pitch_correction(
     stretched[..output_samples].fill(0.0);
 
     // Process through the pitch corrector
+    let input_slice: &[f32] = match &wrapped_input {
+        Some(input) => &input[..input_frames * src_channels],
+        None => {
+            let input_start = sample.position * src_channels;
+            let input_end = (sample.position + input_frames) * src_channels;
+            &decoded_buffer.data[input_start..input_end]
+        }
+    };
     if let Some(ref mut pc) = sample.pitch_corrector {
         pc.process(input_slice, &mut stretched[..output_samples]);
     }
@@ -968,7 +1045,10 @@ fn mix_sample_with_pitch_correction(
         sample.fade_state.advance();
     }
 
-    // Return the scratch for the next callback
+    // Return the scratches for the next callback
+    if let Some(input) = wrapped_input {
+        sample.pitch_input_scratch = input;
+    }
     sample.pitch_scratch = stretched;
 
     // Note: position is advanced by advance_position() in mix_audio
@@ -1328,6 +1408,96 @@ mod tests {
 
         // Sample should not be finished
         assert!(!state.active_samples[0].is_finished());
+    }
+
+    #[test]
+    fn test_wrap_loop_position_without_crossfade_wraps_to_start() {
+        assert_eq!(wrap_loop_position(1050.0, 1000, 0), 50.0);
+        assert_eq!(wrap_loop_position(-30.0, 1000, 0), 970.0);
+        assert_eq!(wrap_loop_position(500.0, 1000, 0), 500.0);
+    }
+
+    #[test]
+    fn test_wrap_loop_position_with_crossfade_skips_the_blended_head() {
+        // The last cf frames were blended with head frames [0, cf), so the
+        // loop resumes at cf - replaying [0, cf) would double the head
+        assert_eq!(wrap_loop_position(1050.0, 1000, 100), 150.0);
+        // Reverse: the head blend covered the tail, so wrap to just before it
+        assert_eq!(wrap_loop_position(-30.0, 1000, 100), 870.0);
+    }
+
+    #[test]
+    fn test_crossfade_loop_plays_head_only_once_per_loop() {
+        // Head frames [0, 3) are 0.9 markers, the rest 0.1. With a 3-frame
+        // crossfade, the head is heard only inside the blend at the tail -
+        // hearing 0.9 at full level right after the wrap is the double-play.
+        let mut data = Vec::new();
+        for frame in 0..10 {
+            let v = if frame < 3 { 0.9 } else { 0.1 };
+            data.extend([v, v]);
+        }
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        sample.loop_mode = true;
+        sample.crossfade_samples = 3;
+        sample.position = 5;
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Positions played: 5, 6 (plain 0.1), 7, 8, 9 (tail blended with
+        // head), then the wrap - which must land at frame 3 (0.1), not 0 (0.9)
+        let mut output = vec![0.0f32; 8 * 2];
+        mix_audio(&mut output, &mut state);
+
+        for frame in 5..8 {
+            let v = output[frame * 2];
+            assert!(
+                (v - 0.1).abs() < 0.05,
+                "frame {} after the wrap should be past the blended head (0.1), got {}",
+                frame, v
+            );
+        }
+    }
+
+    #[test]
+    fn test_looping_pitch_corrected_sample_has_no_gap_at_the_seam() {
+        // The stretcher's input must wrap across the loop boundary; an
+        // underfed stretcher renders the boundary callback (partly) silent.
+        // A sine keeps the phase-vocoder stretcher fed with real content.
+        let frames = 4800;
+        let mut data = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let v = (i as f32 / 48000.0 * 440.0 * std::f32::consts::TAU).sin() * 0.8;
+            data.extend([v, v]);
+        }
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        sample.loop_mode = true;
+        sample.set_speed_with_mode(8.0, true);
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Warm the stretcher up past its own latency, then check every
+        // callback: at 8x the input wraps within every callback, so an
+        // input feed that fails to wrap starves the stretcher constantly
+        let mut quiet_callbacks = Vec::new();
+        for callback in 0..40 {
+            let mut output = vec![0.0f32; 512 * 2];
+            mix_audio(&mut output, &mut state);
+            let mean: f32 = output.iter().map(|s| s.abs()).sum::<f32>() / output.len() as f32;
+            if callback >= 10 && mean < 0.4 {
+                quiet_callbacks.push((callback, mean));
+            }
+        }
+        assert!(
+            quiet_callbacks.is_empty(),
+            "looping pitch-corrected playback dropped out at the seam: {:?}",
+            quiet_callbacks
+        );
     }
 
     #[test]
