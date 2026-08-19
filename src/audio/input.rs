@@ -4,7 +4,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SampleRate, Stream, SupportedStreamConfig};
 use ringbuf::{HeapRb, HeapConsumer, HeapProducer};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// ALSA plugin devices advertise absurd rates (4294967295 Hz); anything above
@@ -316,6 +316,24 @@ pub struct ActiveInput {
     /// Frames the capture callback could not hand over because the ring buffer
     /// was full. Shared with the mixer so input health can be reported.
     pub dropped_frames: Arc<AtomicU64>,
+    /// Peak absolute sample level (as f32 bits) seen since the last reader
+    /// reset it. Written lock-free by the capture callback; the activity
+    /// detector swaps it back to zero on each poll.
+    pub peak_level: Arc<AtomicU32>,
+}
+
+/// Fold a chunk's peak absolute level into the shared atomic.
+/// Non-negative f32 bit patterns order like the floats themselves, so
+/// fetch_max on the bits is a lock-free running maximum.
+fn update_peak_level(peak_level: &AtomicU32, data: &[f32]) {
+    let mut max = 0.0f32;
+    for sample in data {
+        let a = sample.abs();
+        if a > max {
+            max = a;
+        }
+    }
+    peak_level.fetch_max(max.to_bits(), Ordering::Relaxed);
 }
 
 impl ActiveInput {
@@ -364,6 +382,7 @@ pub fn create_input_stream(
     let buffer_size = calculate_ring_buffer_size(target_sample_rate, channels, config.latency_ms);
     let (producer, consumer) = create_ring_buffer(buffer_size);
     let dropped_frames = Arc::new(AtomicU64::new(0));
+    let peak_level = Arc::new(AtomicU32::new(0));
 
     // Check if we need resampling
     let needs_resampling = input_sample_rate != target_sample_rate;
@@ -395,6 +414,7 @@ pub fn create_input_stream(
             target_sample_rate,
             channels,
             dropped_frames.clone(),
+            peak_level.clone(),
         )?
     } else {
         // Direct passthrough - no resampling needed
@@ -404,6 +424,7 @@ pub fn create_input_stream(
             producer,
             channels,
             dropped_frames.clone(),
+            peak_level.clone(),
         )?
     };
 
@@ -415,6 +436,7 @@ pub fn create_input_stream(
         channels,
         sample_rate: input_sample_rate,
         dropped_frames,
+        peak_level,
     })
 }
 
@@ -429,10 +451,12 @@ fn create_passthrough_input_stream(
     mut producer: HeapProducer<f32>,
     channels: usize,
     dropped_frames: Arc<AtomicU64>,
+    peak_level: Arc<AtomicU32>,
 ) -> Result<Stream, InputError> {
     let stream = device.build_input_stream(
         &config.into(),
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            update_peak_level(&peak_level, data);
             push_frames(&mut producer, data, channels, &dropped_frames);
         },
         move |err| {
@@ -449,6 +473,7 @@ fn create_passthrough_input_stream(
 /// All working buffers are allocated up front: the callback runs on the capture
 /// thread, where an allocation or a log write costs capture periods and causes
 /// overruns.
+#[allow(clippy::too_many_arguments)]
 fn create_resampling_input_stream(
     device: &Device,
     config: SupportedStreamConfig,
@@ -457,6 +482,7 @@ fn create_resampling_input_stream(
     output_rate: u32,
     channels: usize,
     dropped_frames: Arc<AtomicU64>,
+    peak_level: Arc<AtomicU32>,
 ) -> Result<Stream, InputError> {
     use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction, Resampler};
 
@@ -495,6 +521,7 @@ fn create_resampling_input_stream(
     let stream = device.build_input_stream(
         &config.into(),
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            update_peak_level(&peak_level, data);
             for (i, sample) in data.iter().enumerate() {
                 pending[i % channels].push(*sample);
             }

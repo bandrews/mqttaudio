@@ -360,6 +360,8 @@ Microphone/input device configuration.
 | `voice_id` | string | — | Voice name for ducking integration |
 | `routes` | array | *required* | Channel routing (source → dest, can use aliases) |
 | `latency_ms` | integer | `20` | Buffer latency (5-500ms) |
+| `activity_threshold` | float | `null` | Peak level (0.0-1.0) above which this input counts as speaking for ducking rules; `null` disables activity detection |
+| `activity_hold_ms` | integer | `750` | How long activity persists after the level drops (0-10000ms) |
 | `channels` | integer | *auto* | Capture channels to open (1-64). Defaults to the smallest count that covers every `source_channel` |
 | `sample_rate` | integer | *auto* | Capture rate to request (8000-192000). Defaults to the output rate, which avoids resampling |
 
@@ -384,7 +386,7 @@ Automatic volume ducking configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `primary_voice` | string | *required* | Voice that triggers ducking. Must be a playback voice; a live input's `voice_id` here never triggers (inputs have no activity detection) |
+| `primary_voice` | string | *required* | Voice that triggers ducking. A live input's `voice_id` works here when the input has an `activity_threshold` configured |
 | `ducked_voices` | array | *required* | Voices to reduce in volume. May include live input `voice_id`s |
 | `target_volume` | float | *required* | Volume to duck to (0.0 to 1.0) |
 | `fade_duration_ms` | integer | *required* | Fade duration in milliseconds; restore uses the same duration |
@@ -574,6 +576,7 @@ When audio files have a different sample rate than the output device (e.g., a 44
       "device": "Gamemaster Headset",
       "volume": 0.9,
       "voice_id": "gm_mic",
+      "activity_threshold": 0.05,
       "routes": [
         {"source_channel": 0, "dest_channel": 4},
         {"source_channel": 0, "dest_channel": 5},
@@ -585,8 +588,8 @@ When audio files have a different sample rate than the output device (e.g., a 44
   ],
   "ducking_rules": [
     {
-      "primary_voice": "narration",
-      "ducked_voices": ["ambient", "effects", "gm_mic"],
+      "primary_voice": "gm_mic",
+      "ducked_voices": ["ambient", "effects"],
       "target_volume": 0.1,
       "fade_duration_ms": 500
     }
@@ -597,11 +600,9 @@ When audio files have a different sample rate than the output device (e.g., a 44
 }
 ```
 
-Prerecorded narration on the `narration` voice ducks the room ambience,
-effects, and the gamemaster microphone. (A microphone cannot itself be a
-`primary_voice` - live inputs have no activity detection - so to lower
-playback while the gamemaster speaks, send `voice_volume` commands from the
-show-control system.)
+When the gamemaster speaks (capture level above `activity_threshold`), the
+room ambience and effects duck to 10% and recover 750 ms after the mic goes
+quiet.
 
 ### 5.1 Surround with Bass Management
 

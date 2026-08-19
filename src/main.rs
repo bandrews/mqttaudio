@@ -521,6 +521,8 @@ async fn main() {
     // Initialize audio inputs from config
     // Keep active input streams alive - they will be kept alive until the app exits
     let mut _active_inputs: Vec<audio::input::ActiveInput> = Vec::new();
+    // Inputs with an activity_threshold feed ducking as (voice, peak, detector)
+    let mut activity_watchers: Vec<(String, std::sync::Arc<std::sync::atomic::AtomicU32>, audio::activity::ActivityDetector)> = Vec::new();
     for (idx, input_config) in config.inputs.iter().enumerate() {
         // Resolve routing first: it determines how many capture channels the
         // stream has to be opened with.
@@ -568,6 +570,23 @@ async fn main() {
                     mixer_state.lock().unwrap().live_inputs.push(live_input);
                 }
 
+                // Watch this input's level for ducking if configured
+                if let Some(threshold) = input_config.activity_threshold {
+                    activity_watchers.push((
+                        input_config.voice_id.clone(),
+                        active_input.peak_level.clone(),
+                        audio::activity::ActivityDetector::new(
+                            threshold,
+                            input_config.activity_hold_ms,
+                            std::time::Instant::now(),
+                        ),
+                    ));
+                    tracing::info!(
+                        "Voice activity detection on input '{}' (threshold {:.3}, hold {}ms)",
+                        input_config.voice_id, threshold, input_config.activity_hold_ms
+                    );
+                }
+
                 // Keep the stream alive by storing it
                 _active_inputs.push(active_input);
             }
@@ -583,6 +602,44 @@ async fn main() {
 
     if !mixer_state.lock().unwrap().live_inputs.is_empty() {
         spawn_input_health_monitor(mixer_state.clone());
+    }
+
+    // Bridge microphone activity into the ducking engine: poll the peak
+    // levels the capture callbacks publish, run them through the per-input
+    // threshold/hold detectors, and notify the engine on transitions. This
+    // is what makes a rule with a mic's voice_id as primary_voice fire.
+    if !activity_watchers.is_empty() {
+        if config.ducking_rules.is_empty() {
+            tracing::warn!(
+                "activity_threshold is set on an input but no ducking_rules are configured; \
+                 activity detection will have no effect"
+            );
+        }
+        let mixer_state = mixer_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                let now = std::time::Instant::now();
+                for (voice_id, peak_level, detector) in activity_watchers.iter_mut() {
+                    let level = f32::from_bits(
+                        peak_level.swap(0, std::sync::atomic::Ordering::Relaxed),
+                    );
+                    if let Some(active) = detector.update(level, now) {
+                        tracing::debug!(
+                            "Input voice '{}' {}",
+                            voice_id,
+                            if active { "went active" } else { "went quiet" }
+                        );
+                        let mut state = mixer_state.lock().unwrap();
+                        if let Some(ref mut engine) = state.ducking_engine {
+                            engine.notify_voice_active(voice_id, active);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));

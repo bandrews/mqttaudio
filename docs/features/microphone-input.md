@@ -236,10 +236,36 @@ playback (say, a narration voice) can duck the microphone:
 }
 ```
 
-A microphone cannot be a rule's `primary_voice`: voice activity comes from
-samples starting and finishing, and live inputs have no signal-level
-detection, so such a rule never fires. To duck playback while someone
-speaks, send `voice_volume` commands from your show-control system.
+A microphone can also be a rule's `primary_voice` when it has activity
+detection configured. Set `activity_threshold` on the input (peak level
+0.0-1.0 that counts as speaking; try 0.02-0.1) and optionally
+`activity_hold_ms` (default 750 - how long activity persists through
+pauses):
+
+```json
+{
+  "inputs": [
+    {
+      "device": "Gamemaster Headset",
+      "voice_id": "gm_mic",
+      "activity_threshold": 0.05,
+      "routes": [{"source_channel": 0, "dest_channel": 4}]
+    }
+  ],
+  "ducking_rules": [
+    {
+      "primary_voice": "gm_mic",
+      "ducked_voices": ["ambient", "music"],
+      "target_volume": 0.1,
+      "fade_duration_ms": 500
+    }
+  ]
+}
+```
+
+Now when the gamemaster speaks, ambient audio and music duck automatically.
+Without an `activity_threshold`, an input never triggers rules (it can
+still be ducked by them).
 
 ## Example: Escape Room
 

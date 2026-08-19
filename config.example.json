@@ -111,6 +111,8 @@
       "latency_ms": 25,
       "channels": null,
       "sample_rate": null,
+      "activity_threshold": null,
+      "activity_hold_ms": 750,
       "routes": [
         { "source_channel": 0, "dest_channel": 4 },
         { "source_channel": 1, "dest_channel": 4 },
@@ -124,6 +126,9 @@
         "  and plughw: converts from the card's native format",
         "volume: Input volume gain (0.0-4.0, 1.0 = unity)",
         "voice_id: Voice name, used by input_volume/input_mute commands and ducking rules",
+        "activity_threshold: Peak level (0.0-1.0) above which this input counts as speaking,",
+        "  letting its voice_id trigger ducking rules as primary_voice. null = detection off",
+        "activity_hold_ms: How long activity persists after the level drops (rides out pauses)",
         "latency_ms: Buffer latency (5-500). 20-30 is a good starting point for live mics",
         "channels: Capture channels to open. null = smallest count covering every source_channel",
         "sample_rate: Capture rate to request. null = match the output rate and skip resampling",

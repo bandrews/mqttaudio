@@ -145,12 +145,40 @@ A microphone input's `voice_id` can appear in `ducked_voices`: playing a
 sample on the rule's `primary_voice` lowers the microphone along with any
 other ducked voices.
 
-The reverse is not supported: a microphone cannot be a `primary_voice`.
-Voice activity is derived from samples starting and finishing, and there is
-no signal-level detection on live inputs, so a rule triggered by a
-microphone's `voice_id` never fires. To lower playback while someone
-speaks, send a `voice_volume` (or `volume`) command from your show-control
-system and restore it afterwards.
+A microphone can also trigger ducking. Give the input an
+`activity_threshold` - the peak capture level (0.0-1.0) above which the
+input counts as speaking - and its `voice_id` works as a `primary_voice`:
+
+```json
+{
+  "inputs": [
+    {
+      "device": "USB Microphone",
+      "voice_id": "presenter_mic",
+      "activity_threshold": 0.05,
+      "activity_hold_ms": 750,
+      "routes": [{"source_channel": 0, "dest_channel": 0}]
+    }
+  ],
+  "ducking_rules": [
+    {
+      "primary_voice": "presenter_mic",
+      "ducked_voices": ["music"],
+      "target_volume": 0.1,
+      "fade_duration_ms": 500
+    }
+  ]
+}
+```
+
+Now whenever the presenter speaks, music ducks, and it recovers once the
+microphone has been quiet for `activity_hold_ms` (default 750 ms - long
+enough to ride out pauses between words). Without an `activity_threshold`
+the input never triggers rules; it can still be ducked by them.
+
+Picking a threshold: watch the daemon logs at debug level while speaking at
+show volume ("Input voice '...' went active/quiet") and pick a value above
+the room's noise floor but below speech peaks. 0.02-0.1 is a typical range.
 
 ## Tips
 
