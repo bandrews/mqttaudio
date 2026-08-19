@@ -3,6 +3,11 @@
 Issues noticed while working on other things. Each entry says what is wrong and
 why it was left alone, so a later change can pick it up deliberately.
 
+A full quality review lives in `docs/quality-review-2026-08/`: its
+`findings-*.md` files hold the verified issues, `triage.md` splits them into
+fixed-vs-deferred, and `summary.md` is the short version. The deferred items
+there (D1-D30) are the current backlog of known issues beyond this file.
+
 ## Two input entries cannot share one capture device
 
 Each `inputs` entry opens its own capture stream. Two entries naming the same

@@ -213,7 +213,8 @@ The `input` field can be the `voice_id` or the input index (0, 1, 2...).
 
 ## Ducking Integration
 
-Microphone inputs work with audio ducking. Set a `voice_id` and use it in ducking rules:
+A microphone's `voice_id` can be listed in a rule's `ducked_voices`, so
+playback (say, a narration voice) can duck the microphone:
 
 ```json
 {
@@ -226,16 +227,19 @@ Microphone inputs work with audio ducking. Set a `voice_id` and use it in duckin
   ],
   "ducking_rules": [
     {
-      "primary_voice": "gm_mic",
-      "ducked_voices": ["ambient", "music"],
-      "target_volume": 0.1,
+      "primary_voice": "narration",
+      "ducked_voices": ["gm_mic"],
+      "target_volume": 0.2,
       "fade_duration_ms": 500
     }
   ]
 }
 ```
 
-Now when the gamemaster speaks, ambient audio and music automatically duck.
+A microphone cannot be a rule's `primary_voice`: voice activity comes from
+samples starting and finishing, and live inputs have no signal-level
+detection, so such a rule never fires. To duck playback while someone
+speaks, send `voice_volume` commands from your show-control system.
 
 ## Example: Escape Room
 

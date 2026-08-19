@@ -1,14 +1,35 @@
-Quality review: record findings for cache/HTTP subsystem
+Correct documentation to match actual behavior; add review summary
 
-Start of a full product quality review. This commit records the first
-batch of verified findings (cache and HTTP subsystems) under
-docs/quality-review-2026-08/. Highlights: security.allowed_directories
-is parsed and documented but never enforced; a stalled HTTP download can
-wedge the command loop and silence audio via lock chaining; the
-WebSocket log stream is never wired into tracing; disk-cache
-revalidation and cache.enabled are unimplemented. Further findings
-(audio engine, commands/config, docs consistency), triage, and fixes
-follow in subsequent commits on this branch.
+Documentation pass from the quality review, aligning every checked doc
+claim with what the code does:
+
+- Remove the nonexistent --buffer-size CLI flag, the nonexistent
+  environment variables (MQTTAUDIO_CONFIG, MQTTAUDIO_CACHE_DIR,
+  RUST_LOG), and the wrong issue-tracker link.
+- Correct defaults: http.port (0 = auto-select, not 8080), input
+  latency_ms (20, not 25), stop fade_out_ms (10, not 0), volume ranges
+  (0.0-4.0 gains).
+- Rewrite the caching docs to actual behavior: no server revalidation
+  (cache_invalidate refreshes), streamed URL plays are not persisted to
+  disk, eviction does not protect playing files; mark cache.enabled and
+  revalidate_after_seconds as reserved.
+- Rework the microphone-ducking examples in three docs: a mic's voice
+  can be ducked but cannot trigger ducking, so the old examples silently
+  did nothing.
+- Update security docs to the enforcement just implemented (non-empty
+  allowed_directories enforced with canonicalization; empty list leaves
+  local access unrestricted).
+- Document previously unsurfaced features: /input/volume and
+  /input/mute endpoints, the internal_id selector, the
+  soundFadeAll/fadeout/soundFadeOut aliases, --http-port and
+  --max-cache-mb, mqtt.client_id and reconnect_delay_seconds, and the
+  fire-and-forget nature of HTTP command responses.
+- Describe /ws honestly (connects but streams no logs) and drop the
+  WebSocket claims from the README until the feature is wired up.
+- Fix broken install steps (stale -b refactor clone, placeholder repo
+  URL, Windows prerequisites contradiction) and example-config notes.
+- Add docs/quality-review-2026-08/summary.md and point docs/bugs.md at
+  the review folder as the current backlog of known issues.
 
 Prompts that led to this work:
 - Please do a thorough quality review of mqttaudio looking for buggy

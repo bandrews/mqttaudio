@@ -139,31 +139,18 @@ When multiple rules apply simultaneously:
 
 For example, if both narration (15%, 2000ms) and dialog (10%, 1500ms) are playing, music ducks to 10% with a 1500ms fade.
 
-## Microphone Input Ducking
+## Microphone Inputs and Ducking
 
-Ducking works with microphone inputs too. Configure the microphone with a `voice_id`:
+A microphone input's `voice_id` can appear in `ducked_voices`: playing a
+sample on the rule's `primary_voice` lowers the microphone along with any
+other ducked voices.
 
-```json
-{
-  "inputs": [
-    {
-      "device": "USB Microphone",
-      "voice_id": "presenter_mic",
-      "routes": [{"source_channel": 0, "dest_channel": 0}]
-    }
-  ],
-  "ducking_rules": [
-    {
-      "primary_voice": "presenter_mic",
-      "ducked_voices": ["music"],
-      "target_volume": 0.1,
-      "fade_duration_ms": 500
-    }
-  ]
-}
-```
-
-Now whenever the presenter speaks, music automatically ducks.
+The reverse is not supported: a microphone cannot be a `primary_voice`.
+Voice activity is derived from samples starting and finishing, and there is
+no signal-level detection on live inputs, so a rule triggered by a
+microphone's `voice_id` never fires. To lower playback while someone
+speaks, send a `voice_volume` (or `volume`) command from your show-control
+system and restore it afterwards.
 
 ## Tips
 

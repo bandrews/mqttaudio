@@ -14,10 +14,13 @@ Decoded audio (PCM) is kept in RAM for instant playback:
 
 ### Disk Cache
 
-Downloaded files are stored on disk:
-- HTTP files are saved to the cache directory
-- Persists across restarts
-- Validated against the server using ETag/Last-Modified headers
+Downloaded files can be stored on disk:
+- HTTP files fetched by blocking startup precache are saved to the cache
+  directory and persist across restarts
+- Files played (or precached at runtime) through the streaming path are
+  held in memory only and are re-downloaded after a restart
+- Cached files are served as-is; they are not revalidated against the
+  server (see HTTP Validation below)
 
 ## Streaming Playback
 
@@ -116,8 +119,9 @@ You can also set the memory limit via command line:
 
 When the memory cache reaches its limit, least-recently-used entries are evicted:
 - Recently accessed files stay in cache
-- Currently playing files are never evicted
 - New files trigger eviction of old entries
+- An evicted file that is still playing keeps playing (playback holds its
+  own reference); the next play of it pays a fresh decode
 
 ## Disk Cache Location
 
@@ -134,17 +138,10 @@ Override in your config file:
 
 ## HTTP Validation
 
-For HTTP files, mqttaudio checks if cached files are still current:
-
-1. On first download, stores ETag and Last-Modified headers
-2. On subsequent access, sends conditional request
-3. Server returns 304 (not modified) or new content
-4. If file changed, re-downloads automatically
-
-This means:
-- If you update a file on your server, mqttaudio will detect it
-- You don't need to manually invalidate the cache
-- Validation adds minimal overhead (HEAD request)
+Disk-cached files are served without contacting the server again. ETag and
+Last-Modified headers are stored with each entry, but conditional
+revalidation is not implemented: if you update a file on your server, send
+`cache_invalidate` for that URL (or `cache_clear`) to force a re-download.
 
 ## Local Files
 
@@ -169,7 +166,7 @@ The default 512 MB limit allows for approximately:
 - ~22 minutes of stereo 48kHz audio
 - ~44 minutes of mono 48kHz audio
 
-With LRU eviction, least-recently-used files are automatically removed when the limit is reached. Currently-playing files are protected from eviction.
+With LRU eviction, least-recently-used files are automatically removed when the limit is reached.
 
 ## Tips
 

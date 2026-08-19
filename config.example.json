@@ -1,6 +1,6 @@
 {
   "_comment": "mqttaudio Example Configuration File",
-  "_usage": "Copy this file to config.json or ~/.config/mqttaudio/config.json and customize for your setup",
+  "_usage": "Copy this file to ./mqttaudio.json or ~/.config/mqttaudio/config.json (or pass it with --config) and customize for your setup",
 
   "mqtt": {
     "server": "localhost",
@@ -13,7 +13,7 @@
       "server: MQTT broker hostname or IP address",
       "port: MQTT broker port (default: 1883)",
       "topic: MQTT topic to subscribe to (required). Supports wildcards like 'audio/#'",
-      "client_id: MQTT client ID. If null, auto-generates 'mqttaudio_<pid>'",
+      "client_id: MQTT client ID. If null, auto-generates a random 'mqttaudio_<hex>' id",
       "reconnect_delay_seconds: Wait time before reconnecting after disconnect"
     ]
   },
@@ -68,10 +68,10 @@
     "revalidate_after_seconds": 300,
 
     "_notes": [
-      "enabled: Enable disk caching of downloaded HTTP files",
+      "enabled: Reserved. Caching is currently always on; this flag has no effect",
       "directory: Directory for cache storage. ~ expands to user home",
-      "revalidate_after_seconds: Time before checking if cached file is stale",
-      "  0 = always check server, 300 = check every 5 minutes, high value = rarely check"
+      "revalidate_after_seconds: Reserved. Cached files are currently never revalidated",
+      "  against the server; use the cache_invalidate or cache_clear commands to refresh"
     ]
   },
 
@@ -83,9 +83,10 @@
 
     "_notes": [
       "allowed_directories: Whitelist of directories for local file access",
-      "Empty array = no local files allowed (HTTP/HTTPS URLs only)",
-      "Paths can use ~ for user home directory",
-      "All paths are validated and path traversal attempts are blocked"
+      "When non-empty, play/precache paths must resolve inside one of these",
+      "directories (symlinks followed, ../ traversal blocked)",
+      "Empty array = local file access is unrestricted",
+      "Paths can use ~ for user home directory"
     ]
   },
 
@@ -118,7 +119,7 @@
         "  Example: 'plughw:CARD=UMC1820,DEV=0'",
         "  On Linux prefer the 'plughw:' alias of a card: capture is read as 32-bit float",
         "  and plughw: converts from the card's native format",
-        "volume: Input volume (0.0-1.0)",
+        "volume: Input volume gain (0.0-4.0, 1.0 = unity)",
         "voice_id: Voice name, used by input_volume/input_mute commands and ducking rules",
         "latency_ms: Buffer latency (5-500). 20-30 is a good starting point for live mics",
         "channels: Capture channels to open. null = smallest count covering every source_channel",

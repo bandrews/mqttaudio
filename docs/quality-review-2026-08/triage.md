@@ -23,7 +23,7 @@ review-scoped change). The summary of outcomes lives in `summary.md`.
 | F12 | Streaming samples killed by lock contention / loader stalls | audio/streaming.rs, audio/mixer.rs |
 | F13 | Sample created during loader lock contention permanently silent | audio/mixer.rs, audio/streaming.rs |
 | F14 | Ducking fades advance N× too fast with N samples on a voice | audio/mixer.rs, audio/ducking.rs |
-| F15 | Ducking restore time hardcoded 2000 ms, ignores rule's fade duration | audio/ducking.rs |
+| F15 | Ducking restore time hardcoded 2000 ms; duck fade restarted on every activity notification | audio/ducking.rs |
 | F16 | `audio.buffer_size` never applied to the output stream | audio/engine.rs, main.rs |
 | F17 | `logging.verbose` in config file has no effect | main.rs |
 | F18 | HTTP `/input/mute` with omitted `mute` field silently unmutes | http/handlers.rs |
@@ -59,7 +59,7 @@ allow all local paths, docs updated to say so, decision deferred (D1).
 | D15 | One corrupt packet aborts whole decode (Symphonia DecodeError is recoverable) | Behavior change; needs corrupt-file fixtures |
 | D16 | `speed: 0` coerced to 0.01; reverse-from-start instantly finishes | Semantics decision (pause? error?) |
 | D17 | Pops on `input_volume`/`input_mute`/per-sample `volume` (no ramp) | Needs ramp plumbing like `voice_volume` |
-| D18 | Ducking rules not validated; `begin_duck` restarts fade on every notification | Validation easy but semantics (boost allowed?) need a call; restart fix interacts with F14 |
+| D18 | Ducking rules not validated (`target_volume` range, unmatched voice names) | Validation easy but semantics (boost allowed?) need a call. The fade-restart half was fixed with F15 |
 | D19 | Env vars (`MQTTAUDIO_CONFIG`, `MQTTAUDIO_CACHE_DIR`, `RUST_LOG`) unimplemented | Decide: implement or drop permanently (docs corrected meanwhile) |
 | D20 | `--lfe-channel`/`--crossover-frequency` can't activate bass management alone | Decide intended CLI story |
 | D21 | Bass management silently no-ops when `lfe_channel` >= device channels; duplicate source entries corrupt filter state | Startup warning easy; wants validation design with D18 |

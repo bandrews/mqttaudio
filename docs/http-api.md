@@ -37,7 +37,7 @@ Config file example:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | bool | false | Enable HTTP server |
-| `port` | u16 | 8080 | Port number (0 = auto-select) |
+| `port` | u16 | 0 | Port number (0 = auto-select an available port; set explicitly for a stable URL) |
 | `bind_address` | string | "127.0.0.1" | Network interface to bind |
 | `auth_token` | string | null | Optional Bearer token for authentication |
 | `websocket_enabled` | bool | true | Enable WebSocket endpoint |
@@ -74,6 +74,13 @@ Config file example:
 | `/cache/clear` | POST | Clear all caches |
 | `/cache/invalidate` | POST | Invalidate specific cache entry |
 | `/precache` | POST | Pre-cache an audio file |
+| `/input/volume` | POST | Set a live input's volume (`{"input": "mic", "volume": 0.8}`) |
+| `/input/mute` | POST | Mute/unmute a live input (`{"input": "mic", "mute": true}`) |
+
+Command endpoints acknowledge that the command was accepted for
+processing; they do not report whether it ultimately succeeded. A `play`
+with a missing file still returns `{"success": true}` - check the daemon
+logs (or `/status/samples`) to confirm the outcome.
 
 ## Authentication
 
@@ -130,23 +137,18 @@ Returns active samples with playback position and timing information:
 | `total_frames` | integer | Total audio length in frames |
 | `total_ms` | integer | Total audio length in milliseconds |
 | `sample_rate` | integer | Sample rate in Hz |
-| `volume` | float | Sample volume (0.0-1.0) |
-| `voice_volume` | float | Voice group volume (0.0-1.0) |
+| `volume` | float | Sample volume (0.0-4.0, 1.0 = unity) |
+| `voice_volume` | float | Voice group volume (0.0-4.0, 1.0 = unity) |
 | `speed` | float | Playback speed multiplier |
 | `loop_mode` | boolean | Whether looping is enabled |
 | `progress_percent` | float | Playback progress (0-100) |
 
 ## WebSocket Log Streaming
 
-Connect to `/ws` for real-time log streaming:
-
-```javascript
-const ws = new WebSocket('ws://localhost:8080/ws');
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  console.log(data.message);
-};
-```
+The `/ws` endpoint accepts connections and sends a welcome message, but
+log streaming is not wired up: no log lines are delivered over it. Use
+`logging.mqtt_topic` to receive logs remotely instead. (Tracked in
+docs/quality-review-2026-08/triage.md, D8.)
 
 ## Example Usage
 
