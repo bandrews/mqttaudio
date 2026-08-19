@@ -149,10 +149,21 @@ Returns active samples with playback position and timing information:
 
 ## WebSocket Log Streaming
 
-The `/ws` endpoint accepts connections and sends a welcome message, but
-log streaming is not wired up: no log lines are delivered over it. Use
-`logging.mqtt_topic` to receive logs remotely instead. (Tracked in
-docs/quality-review-2026-08/triage.md, D8.)
+Connect to `/ws` for real-time log streaming (every line the daemon logs
+at its configured level):
+
+```javascript
+const ws = new WebSocket('ws://localhost:8080/ws?token=your-secret-token');
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log(data.message); // {type: "connected"|"log", message: ...}
+};
+```
+
+When `auth_token` is set, `/ws` requires it like the command endpoints.
+Browsers cannot send an Authorization header on a WebSocket, so pass the
+token as the `token` query parameter; omit it entirely when no auth token
+is configured.
 
 ## Example Usage
 

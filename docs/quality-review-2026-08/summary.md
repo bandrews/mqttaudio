@@ -75,6 +75,17 @@ is in the `findings-*.md` files; the fix/defer split with rationale is in
   in the CLI reference, a note that HTTP command responses are
   fire-and-forget acknowledgments, and an honest description of `/ws`.
 
+## Update: decisions made and implemented
+
+After this review, the deferred items below were resolved with Ben and the
+big ones implemented in a four-sprint program (see `sprint-plan.md` and the
+"Resolved after the review" section of `triage.md`): real `cache.enabled`,
+HTTP revalidation, stream write-through + memory budgeting, the command-loop
+restructure with real HTTP outcomes and load cancellation, mic-triggered
+ducking, WebSocket log streaming with auth, env vars, mic resampler quality,
+the voice/ducking leak cleanup, `speed: 0` rejection, and in-place CHANGELOG
+corrections. The remainder below stays deferred as originally written.
+
 ## Deferred — needs a decision (30 items, see triage.md for detail)
 
 The ones most worth a decision soon:

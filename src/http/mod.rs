@@ -6,7 +6,7 @@ mod routes;
 mod websocket;
 
 pub use routes::create_router;
-pub use websocket::LogBroadcaster;
+pub use websocket::{LogBroadcaster, WebSocketLogLayer};
 
 use crate::audio::mixer::MixerState;
 use crate::cache::CacheManager;
@@ -43,9 +43,8 @@ pub async fn start_server(
     mixer_state: Arc<Mutex<MixerState>>,
     voice_manager: Arc<Mutex<VoiceManager>>,
     cache_manager: Arc<tokio::sync::Mutex<CacheManager>>,
+    log_broadcaster: Arc<LogBroadcaster>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
-    let log_broadcaster = Arc::new(LogBroadcaster::new());
-
     let state = AppState {
         cmd_tx,
         mixer_state,

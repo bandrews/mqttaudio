@@ -38,6 +38,32 @@ a product decision (docs promised "HTTP-only", but the README quick start and
 every existing default-config setup plays local files) — empty continues to
 allow all local paths, docs updated to say so, decision deferred (D1).
 
+## Resolved after the review (sprint program)
+
+The decisions for the items below were made with Ben on 2026-08-19 and
+implemented in the four sprints of `sprint-plan.md`:
+
+- D1: empty `allowed_directories` = unrestricted local playback (documented).
+- D2: `cache.enabled` implemented (false = no disk cache at all).
+- D3: revalidation implemented (conditional requests, `revalidate_after_seconds`).
+- D4/D5: streamed downloads write through to disk and are promoted into the
+  budgeted memory cache; `cleanup_completed_loads` wired (periodic + on use);
+  D29's double-subtract fixed with it.
+- D6: loads run as their own tasks; stopall cancels in-flight loads; cache
+  manager behind an async mutex (no more std-lock across await).
+- D7: mic-triggered ducking built (activity_threshold/hold per input).
+- D8: WebSocket log streaming wired and `/ws` put behind the auth token.
+- D9: HTTP command endpoints report real outcomes with status codes.
+- D10: voice-manager/ducking-map leaks fixed via finished-sample cleanup.
+- D14: capture resampling obeys `advanced.resampler_quality`.
+- D16: `speed: 0` rejected with an error.
+- D18: ducking rules validated; the fade-restart half was fixed with F15.
+- D19: `MQTTAUDIO_CONFIG` and `RUST_LOG` implemented.
+- D23 (partially): atomic cache writes, SHA-256 filenames, query-string
+  handling. Still open from D23: unbounded RAM buffering of whole-file
+  downloads, reader drop not cancelling its download.
+- D30: CHANGELOG corrected in place.
+
 ## Deferred — needs a decision or a design
 
 | # | Issue | Why deferred |

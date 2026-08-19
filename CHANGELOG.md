@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **MQTT reconnect deafness**: the daemon subscribed only once at startup, so
+  any broker restart or network blip left it connected but ignoring every
+  command until restarted. It now resubscribes on every reconnect.
+- **Macros with the nested `message` format**: macro parameters were merged
+  where the nested format never reads them, silently doing nothing. They now
+  merge into `message`. Unknown macro names are logged instead of ignored.
+- **Pitch-corrected playback of streamed files**: a sample went silent the
+  moment its download completed. It keeps playing now.
+- **Reverse playback at fractional speeds** interpolated against the wrong
+  neighbor and sounded garbled; the math is fixed.
+- **Streaming sample lifetime**: samples could be killed mid-playback by a
+  momentary lock collision with the loader, truncated when playback caught up
+  with a slow download, or created permanently silent. A failed download now
+  ends its sample cleanly and the URL can be retried immediately (it used to
+  stay poisoned until restart).
+- **Ducking fade rates**: fades ran N times too fast when a voice had N
+  samples; restore now uses the rule's own fade duration instead of a
+  hardcoded 2 seconds; unrelated voice activity no longer restarts fades.
+- **Settings that did nothing now work**: `audio.buffer_size`,
+  `mqtt.client_id`, `mqtt.reconnect_delay_seconds`, `cache.enabled`,
+  `cache.revalidate_after_seconds`, `logging.verbose` (config-file form), and
+  `security.allowed_directories` (enforced when non-empty, with symlink and
+  `../` traversal resolution; an empty list leaves local playback
+  unrestricted).
+- **HTTP robustness**: downloads have connect/response/stall timeouts, disk
+  cache writes are atomic, cache filenames use a stable hash (SHA-256) that
+  survives toolchain upgrades, and query strings no longer break format
+  detection.
+- **Memory growth on long uptimes**: finished sounds no longer leave permanent
+  entries in the voice manager and ducking engine, streamed downloads now
+  count against `max_memory_mb`, and `/status/voices` stops reporting ghosts.
+- **`seek`** clamps to the track length instead of the downloaded-so-far
+  frontier; HTTP `/input/mute` requires the `mute` field instead of silently
+  unmuting when it is omitted.
+
 - **Microphone capture on multichannel interfaces**: input devices with more
   than 16 channels lost part of every frame, which rotated the channel routing
   and grew a residue in the ring buffer until it overflowed continuously. All
@@ -33,6 +68,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Microphone-triggered ducking**: give an input an `activity_threshold`
+  (peak capture level 0.0-1.0, plus `activity_hold_ms`, default 750) and its
+  `voice_id` triggers ducking rules as a `primary_voice` - the mic goes hot,
+  the room audio ducks, and it recovers after the hold time.
+- **Real command outcomes over HTTP**: command endpoints wait for processing
+  and report what actually happened (404 for a missing file or unmatched
+  selector, 403 for a rejected path, 400 for malformed requests) instead of a
+  blanket "accepted".
+- **Responsive command loop**: file loads run as their own tasks, so
+  `stopall` and other control commands are never queued behind a slow
+  download - and a stop cancels loads still in flight.
+- **HTTP cache revalidation**: cached URLs are checked against the server
+  with conditional requests after `cache.revalidate_after_seconds` (0 = every
+  access); changed files re-download automatically, unreachable servers fall
+  back to the cached copy. Streamed plays and runtime precache now persist
+  to the disk cache too.
+- **WebSocket log streaming**: `/ws` now actually streams the daemon's log
+  lines, and honors `auth_token` (via the `token` query parameter).
+- **Environment variables**: `MQTTAUDIO_CONFIG` selects the config file when
+  `--config` is absent; `RUST_LOG` enables per-module log filtering.
+- `fadeout` and `soundFadeOut` accepted as aliases of `fadeall`, completing
+  the legacy command set.
+- `speed: 0` is rejected with a clear error instead of playing an
+  unintelligible 100x-slowed drone.
+- `advanced.resampler_quality` now also governs live-input capture
+  conversion, which previously always ran at maximum quality regardless.
 - `fadeall` command, fading every playing sample out over a given time and
   stopping it, alongside the existing `stopall`. Available over MQTT
   (`{"command": "fadeall", "time": 2000}`, defaulting to 1000 ms) and as
@@ -82,8 +143,8 @@ Complete rewrite of mqttaudio in Rust for improved stability, performance, and m
 
 #### HTTP and Caching
 - **HTTP download support**: Play audio files from http:// and https:// URLs
-- **Intelligent disk caching**: Cache downloaded files with configurable revalidation
-- **ETag/Last-Modified validation**: Smart cache validation using HTTP standards
+- **Disk caching**: Downloaded files cached on disk across restarts
+- **ETag/Last-Modified capture**: Validation headers stored with each cache entry
 - **Precaching command**: Pre-download files for instant playback
 
 #### Configuration
@@ -99,7 +160,6 @@ Complete rewrite of mqttaudio in Rust for improved stability, performance, and m
 - `voice_stop`: Stop all samples in a specific voice
 - `voice_fade_out`: Fade out a voice over specified duration
 - `voice_volume`: Adjust volume for all samples in a voice
-- `fadeout`: Global fade out (legacy compatibility)
 - `precache`: Pre-download and decode files
 - `cache_clear`: Clear entire cache
 - `cache_invalidate`: Invalidate specific cached file
@@ -114,10 +174,6 @@ Complete rewrite of mqttaudio in Rust for improved stability, performance, and m
 - Complete architecture documentation in `docs/`
 - Command reference with examples
 - Configuration guide
-- Quick reference cheat sheet
-- Implementation roadmap
-- Performance tuning guide
-- Testing strategy documentation
 
 ### Changed
 
@@ -125,7 +181,7 @@ Complete rewrite of mqttaudio in Rust for improved stability, performance, and m
 - **Audio engine**: Custom mixer implementation for precise channel control
 - **MQTT client**: paho-mqtt → rumqttc for native Rust async integration
 - **Threading model**: Async/await with tokio for efficient I/O
-- **Cache strategy**: Simple disk cache with HTTP validation
+- **Cache strategy**: Simple disk cache for downloaded files
 - **Command format**: Backwards compatible with legacy mqttaudio v0.1.x commands
 
 ### Performance Improvements
@@ -133,8 +189,7 @@ Complete rewrite of mqttaudio in Rust for improved stability, performance, and m
 - Audio callback execution time: < 1% of buffer duration (~20 μs typical)
 - Cached file playback latency: < 10 ms
 - HTTP file first play: 100-300 ms (network dependent)
-- Zero allocations in audio callback (real-time safe)
-- Lock-free communication between threads
+- Lock-free ring buffers between capture and mixing threads
 
 ### Technical Details
 
@@ -155,17 +210,17 @@ Complete rewrite of mqttaudio in Rust for improved stability, performance, and m
 - Windows (WASAPI)
 
 #### Security
-- Path traversal protection for local files
-- Directory whitelist for file access
-- Canonical path resolution with symlink handling
+- `security.allowed_directories` setting introduced (enforcement landed
+  in a later release)
 
 ### Backwards Compatibility
 
-Legacy mqttaudio v0.1.x command formats are fully supported:
+Legacy mqttaudio v0.1.x command formats are supported:
 - `soundPlay` → `play`
 - `soundStopAll` → `stopall`
-- `soundFadeOut` → `fadeout`
 - `soundPrecache` → `precache`
+
+(`soundFadeOut`/`fadeout` support arrived in a later release.)
 
 ### Known Limitations
 

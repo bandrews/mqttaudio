@@ -103,9 +103,15 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
 
     app = app.merge(authenticated_commands);
 
-    // Add WebSocket endpoint if enabled
+    // Add WebSocket endpoint if enabled. It goes behind the same auth as the
+    // command endpoints: logs leak file paths and topics. Browsers cannot set
+    // an Authorization header on a WebSocket, so the query form
+    // (ws://host/ws?token=...) is the way in for web clients.
     if websocket_enabled {
-        app = app.route("/ws", get(websocket::handle_websocket));
+        let ws_route = Router::new()
+            .route("/ws", get(websocket::handle_websocket))
+            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        app = app.merge(ws_route);
     }
 
     // Add CORS layer if permissive mode is enabled

@@ -170,8 +170,10 @@ fn spawn_input_health_monitor(
 async fn main() {
     let args = Args::parse();
 
-    // Load configuration
-    let mut config = match config::Config::load_from_path_or_default(args.config.as_deref()) {
+    // Load configuration: --config wins, then MQTTAUDIO_CONFIG, then the
+    // default search paths
+    let config_path = args.config.clone().or_else(|| std::env::var("MQTTAUDIO_CONFIG").ok());
+    let mut config = match config::Config::load_from_path_or_default(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to load configuration: {}", e);
@@ -214,29 +216,44 @@ async fn main() {
         log_level
     };
 
+    // The WebSocket log broadcaster is created before logging is initialized
+    // so its tracing layer can stream every log line to /ws clients
+    let log_broadcaster = std::sync::Arc::new(http::LogBroadcaster::new());
+
     // Create log channel for MQTT publishing (if configured)
-    let mqtt_log_receiver = if config.logging.mqtt_topic.is_some() {
-        let (sender, receiver) = mqtt::logger::create_log_channel(100);
+    let (mqtt_layer, mqtt_log_receiver): (Option<mqtt::logger::MqttLogLayer>, Option<mqtt::logger::LogReceiver>) =
+        if config.logging.mqtt_topic.is_some() {
+            let (sender, receiver) = mqtt::logger::create_log_channel(100);
+            (Some(mqtt::logger::MqttLogLayer::new(sender, log_level)), Some(receiver))
+        } else {
+            (None, None)
+        };
+
+    {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
         use tracing_subscriber::Layer;
 
-        let mqtt_layer = mqtt::logger::MqttLogLayer::new(sender, log_level);
-        let fmt_layer = tracing_subscriber::fmt::layer()
-            .with_filter(tracing_subscriber::filter::LevelFilter::from_level(log_level));
+        // Console output honors RUST_LOG (per-module filtering) when set,
+        // falling back to the configured level
+        let fmt_layer = tracing_subscriber::fmt::layer();
+        let fmt_layer = match std::env::var("RUST_LOG") {
+            Ok(env) => fmt_layer
+                .with_filter(tracing_subscriber::EnvFilter::new(env))
+                .boxed(),
+            Err(_) => fmt_layer
+                .with_filter(tracing_subscriber::filter::LevelFilter::from_level(log_level))
+                .boxed(),
+        };
+
+        let ws_layer = http::WebSocketLogLayer::new(log_broadcaster.clone(), log_level);
 
         tracing_subscriber::registry()
             .with(fmt_layer)
+            .with(ws_layer)
             .with(mqtt_layer)
             .init();
-
-        Some(receiver)
-    } else {
-        tracing_subscriber::fmt()
-            .with_max_level(log_level)
-            .init();
-        None
-    };
+    }
 
     tracing::info!("mqttaudio {} starting", env!("CARGO_PKG_VERSION"));
     tracing::info!("Copyright © 2016-2025 Mo Fang Heavy Industries LLC");
@@ -535,6 +552,7 @@ async fn main() {
             channels: input_config.channels,
             min_channels: audio::input::required_channels(&channel_map),
             sample_rate: input_config.sample_rate,
+            resampler_quality: config.advanced.resampler_quality,
         };
 
         match audio::input::create_input_stream(stream_config, output_sample_rate) {
@@ -825,6 +843,7 @@ async fn main() {
                 mixer_state.clone(),
                 voice_manager.clone(),
                 cache_manager.clone(),
+                log_broadcaster.clone(),
             ).await {
                 Ok(addr) => {
                     tracing::info!("HTTP REST API available at http://{}", addr);

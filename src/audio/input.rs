@@ -4,6 +4,7 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SampleRate, Stream, SupportedStreamConfig};
 use ringbuf::{HeapRb, HeapConsumer, HeapProducer};
+use crate::config::ResamplerQuality;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -292,6 +293,8 @@ pub struct InputStreamConfig {
     pub min_channels: usize,
     /// Capture rate to request (None = match the output rate when supported)
     pub sample_rate: Option<u32>,
+    /// Quality preset for capture-rate conversion, from advanced.resampler_quality
+    pub resampler_quality: ResamplerQuality,
 }
 
 impl Default for InputStreamConfig {
@@ -302,6 +305,7 @@ impl Default for InputStreamConfig {
             channels: None,
             min_channels: 1,
             sample_rate: None,
+            resampler_quality: ResamplerQuality::default(),
         }
     }
 }
@@ -413,6 +417,7 @@ pub fn create_input_stream(
             input_sample_rate,
             target_sample_rate,
             channels,
+            config.resampler_quality,
             dropped_frames.clone(),
             peak_level.clone(),
         )?
@@ -481,16 +486,19 @@ fn create_resampling_input_stream(
     input_rate: u32,
     output_rate: u32,
     channels: usize,
+    quality: ResamplerQuality,
     dropped_frames: Arc<AtomicU64>,
     peak_level: Arc<AtomicU32>,
 ) -> Result<Stream, InputError> {
     use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction, Resampler};
 
+    // The conversion runs per capture callback, so the configured quality
+    // preset decides the CPU cost here just as it does for file decoding
     let params = SincInterpolationParameters {
-        sinc_len: 256,
+        sinc_len: quality.sinc_len(),
         f_cutoff: 0.95,
         interpolation: SincInterpolationType::Linear,
-        oversampling_factor: 256,
+        oversampling_factor: quality.oversampling_factor(),
         window: WindowFunction::BlackmanHarris2,
     };
 

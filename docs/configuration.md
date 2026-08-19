@@ -2,6 +2,13 @@
 
 mqttaudio can be configured via a JSON file, command-line arguments, or both. Command-line arguments override config file settings.
 
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `MQTTAUDIO_CONFIG` | Path to the config file, used when `--config` is not given |
+| `RUST_LOG` | Per-module log filtering (e.g. `mqttaudio=debug,mqttaudio::cache=trace`); overrides `logging.level` for console output |
+
 ## Command-Line Options
 
 ```
@@ -478,7 +485,7 @@ Performance tuning and advanced settings. Most users won't need to change these.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `resampler_quality` | string | `"fast"` | Sample rate conversion quality preset |
+| `resampler_quality` | string | `"fast"` | Sample rate conversion quality preset, used for file decoding and live-input capture alike |
 
 #### Resampler Quality
 
