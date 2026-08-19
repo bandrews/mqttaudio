@@ -1,12 +1,7 @@
 // ABOUTME: Entry point for mqttaudio MQTT-controlled audio daemon.
 // ABOUTME: Handles CLI parsing, initialization, and main event loop.
 
-mod audio;
-mod cache;
-mod config;
-mod http;
-mod mqtt;
-mod voice;
+use mqttaudio::{audio, cache, config, http, mqtt, voice};
 
 use clap::Parser;
 use cpal::traits::{DeviceTrait, StreamTrait};
