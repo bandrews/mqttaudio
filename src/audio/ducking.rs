@@ -40,6 +40,10 @@ struct DuckState {
 
     /// Is currently ducking (vs. restoring)
     is_ducking: bool,
+
+    /// Fade duration of the rule that last ducked this voice, reused as the
+    /// restore duration so recovery matches the configured fade
+    last_duck_fade_frames: usize,
 }
 
 impl DuckState {
@@ -52,6 +56,7 @@ impl DuckState {
             fade_duration_frames: 0,
             fade_elapsed_frames: 0,
             is_ducking: false,
+            last_duck_fade_frames: 0,
         }
     }
 
@@ -62,6 +67,7 @@ impl DuckState {
         self.fade_duration_frames = fade_duration_frames;
         self.fade_elapsed_frames = 0;
         self.is_ducking = true;
+        self.last_duck_fade_frames = fade_duration_frames;
     }
 
     /// Begin restoring to full volume
@@ -151,15 +157,23 @@ impl DuckingEngine {
         self.update_duck_states();
     }
 
-    /// Get ducking multiplier for a voice and advance its fade state
-    /// This is called from the mixer callback for each sample
-    pub fn get_multiplier(&mut self, voice_id: &str, frames: usize) -> f32 {
-        if let Some(state) = self.duck_states.get_mut(voice_id) {
-            state.advance_and_get_multiplier(frames)
-        } else {
-            // No ducking state = full volume
-            1.0
+    /// Advance every voice's fade state by one callback's worth of frames.
+    /// Called exactly once per audio callback; get_multiplier then reads the
+    /// resulting values. Advancing per-sample instead would make a fade run
+    /// N times too fast for a voice with N samples.
+    pub fn advance(&mut self, frames: usize) {
+        for state in self.duck_states.values_mut() {
+            state.advance_and_get_multiplier(frames);
         }
+    }
+
+    /// Get the current ducking multiplier for a voice.
+    /// This is called from the mixer callback for each sample.
+    pub fn get_multiplier(&self, voice_id: &str) -> f32 {
+        self.duck_states
+            .get(voice_id)
+            .map(|s| s.current_multiplier)
+            .unwrap_or(1.0)
     }
 
     /// Get ducking multiplier without advancing (for testing)
@@ -196,10 +210,14 @@ impl DuckingEngine {
                     .unwrap_or(false);
 
                 if should_restore {
-                    // Use the longest fade duration from previous rules
-                    let fade_duration_ms = 2000; // Default restore time
-                    let fade_frames = self.ms_to_frames(fade_duration_ms);
-                    tracing::debug!("Voice '{}' restoring to full volume over {}ms", voice_id, fade_duration_ms);
+                    // Restore over the same duration the ducking rule faded in
+                    // with, so recovery speed matches the configured fade
+                    let fade_frames = self.duck_states
+                        .get(&voice_id)
+                        .map(|s| s.last_duck_fade_frames)
+                        .filter(|f| *f > 0)
+                        .unwrap_or_else(|| self.ms_to_frames(2000));
+                    tracing::debug!("Voice '{}' restoring to full volume over {} frames", voice_id, fade_frames);
 
                     let state = self.duck_states
                         .entry(voice_id.clone())
@@ -242,10 +260,15 @@ impl DuckingEngine {
                     );
                 }
 
-                let state = self.duck_states
-                    .entry(voice_id.clone())
-                    .or_insert_with(DuckState::new);
-                state.begin_duck(target_volume, fade_frames);
+                // Only restart the fade when the target actually changed;
+                // restarting on every unrelated activity notification would
+                // turn a linear fade into an asymptotic crawl
+                if params_changed {
+                    let state = self.duck_states
+                        .entry(voice_id.clone())
+                        .or_insert_with(DuckState::new);
+                    state.begin_duck(target_volume, fade_frames);
+                }
             }
         }
     }
@@ -310,7 +333,7 @@ mod tests {
 
         // Advance partway through fade
         let half_fade_frames = 24000; // 0.5s at 48kHz
-        engine.get_multiplier("music", half_fade_frames);
+        engine.advance(half_fade_frames);
 
         // Should be somewhere between 0.1 and 1.0
         let multiplier = engine.peek_multiplier("music");
@@ -320,7 +343,7 @@ mod tests {
         engine.notify_voice_active("narration", false);
 
         // Advance through restore
-        engine.get_multiplier("music", half_fade_frames);
+        engine.advance(half_fade_frames);
 
         // Should be restoring toward 1.0
         let restored = engine.peek_multiplier("music");
@@ -452,7 +475,8 @@ mod tests {
         engine.notify_voice_active("narration", true);
 
         // With 0ms fade, should immediately be at target
-        let multiplier = engine.get_multiplier("music", 1);
+        engine.advance(1);
+        let multiplier = engine.get_multiplier("music");
         assert!((multiplier - 0.1).abs() < 0.01, "Expected ~0.1, got {}", multiplier);
     }
 
@@ -469,16 +493,16 @@ mod tests {
         // Advance in steps and verify gradual change
         let step_frames = 12000; // 0.25s at 48kHz
 
-        engine.get_multiplier("music", step_frames);
+        engine.advance(step_frames);
         let m1 = engine.peek_multiplier("music");
 
-        engine.get_multiplier("music", step_frames);
+        engine.advance(step_frames);
         let m2 = engine.peek_multiplier("music");
 
-        engine.get_multiplier("music", step_frames);
+        engine.advance(step_frames);
         let m3 = engine.peek_multiplier("music");
 
-        engine.get_multiplier("music", step_frames);
+        engine.advance(step_frames);
         let m4 = engine.peek_multiplier("music");
 
         // Should be gradually decreasing
@@ -562,7 +586,7 @@ mod tests {
         engine.notify_voice_active("narration", true);
 
         // Advance halfway through the narration duck (500ms = 24000 frames)
-        engine.get_multiplier("music", 24000);
+        engine.advance(24000);
         let halfway_to_02 = engine.peek_multiplier("music");
 
         // Should be halfway between 1.0 and 0.2 = 0.6
@@ -587,7 +611,7 @@ mod tests {
         );
 
         // Advance halfway through the new duck (250ms = 12000 frames)
-        engine.get_multiplier("music", 12000);
+        engine.advance(12000);
         let halfway_to_01 = engine.peek_multiplier("music");
 
         // Should be halfway between 0.6 and 0.1 = 0.35
@@ -598,7 +622,7 @@ mod tests {
         );
 
         // Complete the fade to 0.1
-        engine.get_multiplier("music", 12000);
+        engine.advance(12000);
         let final_ducked = engine.peek_multiplier("music");
 
         assert!(
@@ -611,7 +635,7 @@ mod tests {
         engine.notify_voice_active("dialog", false);
 
         // Advance partway through restore
-        engine.get_multiplier("music", 24000);
+        engine.advance(24000);
         let restoring = engine.peek_multiplier("music");
 
         // Should be between 0.1 and 0.2
