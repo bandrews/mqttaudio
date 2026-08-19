@@ -165,6 +165,8 @@ Audio output settings.
 | `buffer_size` | integer | `512` | Buffer size in frames (lower = less latency, more CPU) |
 | `channels` | integer | auto-detect | Number of output channels |
 | `channel_aliases` | object | `{}` | Named aliases for channel numbers |
+| `channel_names` | object | `{}` | Display labels for channel numbers |
+| `channel_volumes` | object | `{}` | Per-channel output gain |
 
 #### Channel Aliases
 
@@ -194,6 +196,56 @@ The `channel_aliases` field lets you define meaningful names for channel numbers
 ```
 
 This makes configurations more readable and less error-prone. Channel aliases can also be used in MQTT play commands (see [Commands](commands.md)).
+
+#### Channel Names vs Channel Aliases
+
+Two fields name channels and they are not interchangeable:
+
+| Field | Direction | Used for |
+|-------|-----------|----------|
+| `channel_aliases` | name → number | Resolving channels in routes, bass management and play commands |
+| `channel_names` | number → name | Labelling channels for display |
+
+```json
+"audio": {
+  "channel_aliases": { "booth": 6 },
+  "channel_names": { "6": "booth" }
+}
+```
+
+Routing resolves against `channel_aliases` only. A name defined in
+`channel_names` and then used as a `dest_channel` fails validation with the
+entry you need to add:
+
+```
+inputs[0].routes[0].dest_channel: Unknown channel 'booth': audio.channel_names
+labels channel 6 as 'booth', but routing resolves against audio.channel_aliases
+- add "booth": 6 there
+```
+
+#### Channel Volumes
+
+`channel_volumes` sets a per-channel output gain, applied to the finished mix.
+Use it to level speakers against each other, or to lift an underpowered
+subwoofer:
+
+```json
+"audio": {
+  "channel_aliases": { "lfe": 3, "surround_left": 4 },
+  "channel_volumes": {
+    "lfe": 1.6,
+    "surround_left": 0.85,
+    "7": 0.9
+  }
+}
+```
+
+Keys may be a channel number, a `channel_aliases` name, or a `channel_names`
+label. Unity is 1.0, the maximum is 4.0 (+12 dB), and entries beyond the
+device's channel count are ignored. Gain is applied after bass management, so
+boosting the LFE channel raises the crossed-over bass along with anything
+routed there directly. The mixer saturates its output, so an over-enthusiastic
+boost clips rather than wrapping.
 
 ### cache
 
@@ -298,7 +350,7 @@ Microphone/input device configuration.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `device` | string | *required* | Input device name (use `--list-inputs`) |
-| `volume` | float | `1.0` | Input volume (0.0 to 1.0) |
+| `volume` | float | `1.0` | Input volume (0.0 to 4.0, unity is 1.0) |
 | `voice_id` | string | — | Voice name for ducking integration |
 | `routes` | array | *required* | Channel routing (source → dest, can use aliases) |
 | `latency_ms` | integer | `25` | Buffer latency (5-500ms) |

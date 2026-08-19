@@ -368,7 +368,7 @@ impl ActiveSample {
 
     /// Set target voice volume for smooth ramping
     pub fn set_target_voice_volume(&mut self, target: f32) {
-        self.target_voice_volume = target.clamp(0.0, 1.0);
+        self.target_voice_volume = target.clamp(0.0, crate::config::MAX_GAIN);
     }
 
     /// Advance voice volume toward target by one frame.
@@ -535,7 +535,7 @@ impl LiveInput {
     /// Set target voice volume for smooth ramping
     #[allow(dead_code)]
     pub fn set_target_voice_volume(&mut self, target: f32) {
-        self.target_voice_volume = target.clamp(0.0, 1.0);
+        self.target_voice_volume = target.clamp(0.0, crate::config::MAX_GAIN);
     }
 
     /// Advance voice volume toward target by one frame.
@@ -564,6 +564,10 @@ pub struct MixerState {
     /// Number of output channels
     pub output_channels: usize,
 
+    /// Per-channel output gain, indexed by channel. Unity is 1.0.
+    /// Applied last, so it levels the finished mix including bass management.
+    pub channel_gains: Vec<f32>,
+
     /// Ducking engine for automatic voice volume reduction
     pub ducking_engine: Option<DuckingEngine>,
 
@@ -578,6 +582,7 @@ impl MixerState {
             active_samples: Vec::new(),
             live_inputs: Vec::new(),
             output_channels,
+            channel_gains: vec![1.0; output_channels],
             ducking_engine: None,
             bass_management: None,
         }
@@ -627,6 +632,17 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
     // Apply bass management (LFE extraction and crossover filtering)
     if let Some(ref mut bm) = state.bass_management {
         bm.process(output, state.output_channels);
+    }
+
+    // Apply per-channel calibration to the finished mix
+    if state.channel_gains.iter().any(|g| *g != 1.0) {
+        for frame in output.chunks_mut(state.output_channels) {
+            for (ch, sample) in frame.iter_mut().enumerate() {
+                if let Some(gain) = state.channel_gains.get(ch) {
+                    *sample *= gain;
+                }
+            }
+        }
     }
 
     // Apply saturation to prevent clipping
@@ -2047,6 +2063,119 @@ mod tests {
         // 0.4 * 0.5 + 0.6 * 0.5 = 0.5 on the shared destination
         for f in 0..8 {
             assert!((output[f * 4 + 2] - 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_channel_gains_applied() {
+        let buffer = create_test_buffer(4, 2, 0.4);
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        let mut state = MixerState::new(2);
+        state.channel_gains = vec![0.5, 1.0];
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 8];
+        mix_audio(&mut output, &mut state);
+
+        for f in 0..4 {
+            assert!((output[f * 2] - 0.2).abs() < 1e-6, "channel 0 attenuated");
+            assert!((output[f * 2 + 1] - 0.4).abs() < 1e-6, "channel 1 left alone");
+        }
+    }
+
+    #[test]
+    fn test_channel_gains_can_boost() {
+        // Lifting an underpowered subwoofer channel above unity
+        let buffer = create_test_buffer(4, 2, 0.3);
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        let mut state = MixerState::new(2);
+        state.channel_gains = vec![1.0, 2.0];
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 8];
+        mix_audio(&mut output, &mut state);
+
+        for f in 0..4 {
+            assert!((output[f * 2 + 1] - 0.6).abs() < 1e-6, "channel 1 boosted");
+        }
+    }
+
+    #[test]
+    fn test_channel_gains_still_saturate() {
+        // A boost cannot push the output past full scale
+        let buffer = create_test_buffer(4, 1, 0.8);
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        let mut state = MixerState::new(1);
+        state.channel_gains = vec![4.0];
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 4];
+        mix_audio(&mut output, &mut state);
+
+        for &s in &output {
+            assert_eq!(s, 1.0);
+        }
+    }
+
+    #[test]
+    fn test_boosted_sample_volume_saturates() {
+        let buffer = create_test_buffer(4, 1, 0.6);
+        let sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 3.0, TEST_FILE.to_string());
+
+        let mut state = MixerState::new(1);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 4];
+        mix_audio(&mut output, &mut state);
+
+        for &s in &output {
+            assert_eq!(s, 1.0);
+        }
+    }
+
+    #[test]
+    fn test_set_target_voice_volume_allows_boost() {
+        let buffer = create_test_buffer(4, 1, 0.1);
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+
+        sample.set_target_voice_volume(2.5);
+        assert_eq!(sample.target_voice_volume, 2.5);
+
+        sample.set_target_voice_volume(100.0);
+        assert_eq!(sample.target_voice_volume, crate::config::MAX_GAIN);
+    }
+
+    #[test]
+    fn test_live_input_target_voice_volume_allows_boost() {
+        let consumer = create_test_ring_buffer_with_data(&[0.1f32; 4]);
+        let mut input = LiveInput::new("mic".to_string(), consumer, 1, 1.0, vec![(0, 0)]);
+
+        input.set_target_voice_volume(2.5);
+        assert_eq!(input.target_voice_volume, 2.5);
+
+        input.set_target_voice_volume(100.0);
+        assert_eq!(input.target_voice_volume, crate::config::MAX_GAIN);
+    }
+
+    #[test]
+    fn test_live_input_volume_can_boost() {
+        // A quiet microphone lifted above unity
+        let consumer = create_test_ring_buffer_with_data(&[0.2f32; 4]);
+        let mut input = LiveInput::new("mic".to_string(), consumer, 1, 3.0, vec![(0, 0)]);
+        input.voice_volume = 1.0;
+        input.target_voice_volume = 1.0;
+
+        let mut state = MixerState::new(1);
+        state.live_inputs.push(input);
+
+        let mut output = vec![0.0f32; 4];
+        mix_audio(&mut output, &mut state);
+
+        for &s in &output {
+            assert!((s - 0.6).abs() < 1e-6);
         }
     }
 

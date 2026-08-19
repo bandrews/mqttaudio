@@ -465,6 +465,7 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
         active_samples,
         live_inputs: Vec::new(),
         output_channels,
+        channel_gains: vec![1.0; output_channels],
         ducking_engine: None,
         bass_management: None,
     }));

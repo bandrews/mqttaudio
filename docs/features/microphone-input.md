@@ -33,7 +33,7 @@ Add inputs to your config file:
 | Field | Description |
 |-------|-------------|
 | `device` | Input device name (use `--list-inputs` to see options) |
-| `volume` | Input volume (0.0 to 1.0) |
+| `volume` | Input volume (0.0 to 4.0, unity is 1.0) |
 | `voice_id` | Voice name for ducking integration |
 | `routes` | Channel routing (source → destination) |
 | `latency_ms` | Buffer latency (5-500ms) |
@@ -49,6 +49,13 @@ to reach it, while a single-mic route stays narrow.
 
 Set it explicitly when a device misreports its capabilities, or when you want a
 fixed layout regardless of routing.
+
+### Volume
+
+`volume` is a gain: 1.0 passes the microphone through untouched, below that
+attenuates and above that boosts, up to 4.0 (+12 dB). Boosting is how you lift
+a quiet lavalier or a preamp that will not go loud enough; the mixer saturates
+its output, so too much gain clips rather than wrapping.
 
 ### Sample rate
 
@@ -345,6 +352,11 @@ A handful of `underrun_frames` at startup is normal while the buffer primes.
 - Check routes are configured correctly
 - Check volume is not 0
 - Check the device isn't muted via `input_mute`
+
+**Microphone is too quiet:**
+- Raise `volume` above 1.0, or send `input_volume` with a value above 1.0
+- Check `underrun_frames` is not climbing, which sounds like dropouts rather
+  than low level
 
 **Startup fails with "device offers no f32 capture format":**
 - Use the `plughw:` alias of the same card instead of `hw:`

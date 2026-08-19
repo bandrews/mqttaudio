@@ -220,6 +220,36 @@ pub async fn handle_stopall(State(state): State<AppState>) -> impl IntoResponse 
 }
 
 #[derive(Deserialize, Default)]
+pub struct FadeAllParams {
+    /// Fade duration in milliseconds. Omitted means the daemon's default.
+    #[serde(default)]
+    time: Option<u32>,
+}
+
+pub async fn handle_fadeall(
+    State(state): State<AppState>,
+    Json(params): Json<FadeAllParams>,
+) -> impl IntoResponse {
+    let mut message = json!({});
+    if let Some(time) = params.time {
+        message["time"] = json!(time);
+    }
+
+    let command = json!({
+        "command": "fadeall",
+        "message": message
+    });
+
+    match send_command(&state, &command.to_string()).await {
+        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CommandResponse::error(&e)),
+        ),
+    }
+}
+
+#[derive(Deserialize, Default)]
 pub struct VolumeParams {
     #[serde(default)]
     internal_id: Option<String>,

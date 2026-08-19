@@ -27,9 +27,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   device.
 - **Voice volume ramping on live inputs**: a fade no longer stalls while the
   input is starved.
+- **`audio.channel_volumes` had no effect**: the per-channel calibration was
+  parsed and validated but never applied to the output. It is now applied to
+  the finished mix, after bass management.
 
 ### Added
 
+- `fadeall` command, fading every playing sample out over a given time and
+  stopping it, alongside the existing `stopall`. Available over MQTT
+  (`{"command": "fadeall", "time": 2000}`, defaulting to 1000 ms) and as
+  `POST /fadeall`.
+- Gains above unity. Volume controls now accept up to 4.0 (+12 dB) instead of
+  stopping at 1.0, so a quiet microphone, a voice, an individual sample or an
+  underpowered subwoofer channel can be lifted rather than only attenuated.
+  Applies to `inputs[].volume`, `audio.channel_volumes`, the `play`, `volume`,
+  `voice_volume` and `input_volume` commands. The mixer still saturates its
+  output, so a boost clips rather than wrapping.
+- `audio.channel_volumes` keys may be a channel number, an
+  `audio.channel_aliases` name, or an `audio.channel_names` label, and an
+  unresolvable key is now a validation error rather than being ignored.
 - `inputs[].channels` and `inputs[].sample_rate` to control how a capture
   stream is opened. By default the stream opens with the smallest channel count
   the routes need, at the output sample rate so no resampling is required.
@@ -38,6 +54,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A clear startup error when a device offers no f32 capture format, naming the
   `plughw:` alias as the fix, and when routing references a channel the device
   cannot reach.
+
+### Changed
+
+- Unknown channel names in routing now explain the `audio.channel_names` /
+  `audio.channel_aliases` split. A name defined only in `channel_names` is
+  reported with the `channel_aliases` entry needed to fix it, instead of a bare
+  "Unknown channel alias".
+- `play` volume is clamped to the gain limit; previously it was passed through
+  unbounded while every other volume control clamped at 1.0.
 
 ## [2.0.0] - 2025-10-19
 

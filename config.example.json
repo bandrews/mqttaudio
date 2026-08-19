@@ -32,8 +32,18 @@
       "6": "side_left",
       "7": "side_right"
     },
+    "channel_aliases": {
+      "front_left": 0,
+      "front_right": 1,
+      "center": 2,
+      "lfe": 3,
+      "rear_left": 4,
+      "rear_right": 5,
+      "side_left": 6,
+      "side_right": 7
+    },
     "channel_volumes": {
-      "lfe": 0.7,
+      "lfe": 1.4,
       "side_left": 0.85,
       "side_right": 0.85
     },
@@ -43,8 +53,12 @@
       "sample_rate: Output sample rate in Hz. Common values: 44100, 48000, 96000",
       "buffer_size: Audio buffer size in frames. Smaller = lower latency but higher CPU",
       "  Common values: 256 (low latency), 512 (balanced), 1024 (high compatibility)",
-      "channel_names: Optional mapping of channel numbers to human-readable names",
-      "channel_volumes: Per-channel calibration (0.0-1.0) to compensate for hardware differences"
+      "channel_names: Optional mapping of channel number to display name. Labels only",
+      "channel_aliases: Mapping of name to channel number. This is what routing resolves",
+      "  against - dest_channel, bass_management and play commands all use these names",
+      "channel_volumes: Per-channel output gain to compensate for hardware differences",
+      "  1.0 is unity, below attenuates, above boosts, up to 4.0 (+12 dB)",
+      "  Keys may be a channel number, a channel_aliases name, or a channel_names label"
     ]
   },
 

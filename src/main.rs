@@ -491,10 +491,19 @@ async fn main() {
         None
     };
 
+    let channel_gains = config.resolve_channel_gains(output_channels)
+        .expect("Channel volume resolution failed (should have been caught during validation)");
+    for (channel, gain) in channel_gains.iter().enumerate() {
+        if *gain != 1.0 {
+            tracing::info!("Channel {} gain: {:.2}", channel, gain);
+        }
+    }
+
     let mixer_state = Arc::new(Mutex::new(MixerState {
         active_samples: Vec::new(),
         live_inputs: Vec::new(),
         output_channels,
+        channel_gains,
         ducking_engine,
         bass_management,
     }));
@@ -896,6 +905,19 @@ async fn main() {
 
                             tracing::info!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS);
                         }
+                        mqtt::commands::AudioCommand::FadeAll { time_ms } => {
+                            let mut state = mixer_state.lock().unwrap();
+                            let count = state.active_samples.len();
+
+                            for sample in state.active_samples.iter_mut() {
+                                sample.set_fade(audio::mixer::FadeState::fade_out(time_ms, output_sample_rate));
+                            }
+                            drop(state);
+
+                            // Samples are removed by the audio callback once the
+                            // fade completes, and voice cleanup follows from that.
+                            tracing::info!("Fading out {} samples over {}ms", count, time_ms);
+                        }
                         mqtt::commands::AudioCommand::VoiceStop { voice } => {
                             // Apply quick 10ms fade-out to prevent clicks/pops
                             const STOP_FADE_MS: u32 = 10;
@@ -1046,7 +1068,7 @@ async fn main() {
                             // Try to find by index first
                             if let Ok(idx) = input.parse::<usize>() {
                                 if idx < state.live_inputs.len() {
-                                    state.live_inputs[idx].volume = new_volume.clamp(0.0, 1.0);
+                                    state.live_inputs[idx].volume = new_volume.clamp(0.0, config::MAX_GAIN);
                                     tracing::info!(
                                         "Set input {} volume to {:.2}",
                                         idx, state.live_inputs[idx].volume
@@ -1059,7 +1081,7 @@ async fn main() {
                             if !found {
                                 for live_input in state.live_inputs.iter_mut() {
                                     if live_input.voice_id == input {
-                                        live_input.volume = new_volume.clamp(0.0, 1.0);
+                                        live_input.volume = new_volume.clamp(0.0, config::MAX_GAIN);
                                         tracing::info!(
                                             "Set input '{}' volume to {:.2}",
                                             input, live_input.volume
@@ -1223,7 +1245,7 @@ async fn main() {
                                         &sample.file_path,
                                         &sample.voice_id,
                                     ) {
-                                        sample.volume = volume.clamp(0.0, 1.0);
+                                        sample.volume = volume.clamp(0.0, config::MAX_GAIN);
                                         updated_count += 1;
                                     }
                                 }

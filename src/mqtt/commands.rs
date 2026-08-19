@@ -4,6 +4,9 @@
 use serde::{Deserialize, Serialize};
 use crate::config::ChannelRef;
 
+/// Fade duration used when a fadeall command does not name one
+pub const DEFAULT_FADE_ALL_MS: u32 = 1000;
+
 /// MQTT command envelope supporting both flattened and nested formats.
 /// Flattened: {"command": "play", "file": "test.wav", "volume": 0.8}
 /// Nested (legacy): {"command": "play", "message": {"file": "test.wav", "volume": 0.8}}
@@ -144,6 +147,15 @@ pub struct VoiceFadeOutMessage {
     pub time: u32, // milliseconds
 }
 
+/// Fade-all command parameters
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FadeAllMessage {
+    /// Fade duration in milliseconds. Also accepted as "fade_out_ms",
+    /// matching the field name the stop command uses.
+    #[serde(alias = "fade_out_ms")]
+    pub time: Option<u32>,
+}
+
 /// Voice volume command parameters
 #[derive(Debug, Deserialize, Serialize)]
 pub struct VoiceVolumeMessage {
@@ -274,6 +286,9 @@ pub enum AudioCommand {
         crossfade_ms: u32, // Crossfade duration at loop boundaries (0 = disabled)
     },
     StopAll,
+    FadeAll {
+        time_ms: u32,
+    },
     VoiceStop {
         voice: String,
     },
@@ -429,7 +444,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             Ok(AudioCommand::Play {
                 file: play_msg.file,
                 id: play_msg.id,
-                volume: play_msg.volume.unwrap_or(1.0),
+                volume: play_msg.volume.unwrap_or(1.0).clamp(0.0, crate::config::MAX_GAIN),
                 voice: play_msg.voice,
                 channel_map: play_msg.channel_map,
                 fade_in: play_msg.fade_in,
@@ -440,6 +455,16 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
         }
         "stopall" | "soundStopAll" => {
             Ok(AudioCommand::StopAll)
+        }
+        "fadeall" | "soundFadeAll" => {
+            let time_ms = if mqtt_cmd.has_params() {
+                let msg: FadeAllMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+                msg.time.unwrap_or(DEFAULT_FADE_ALL_MS)
+            } else {
+                DEFAULT_FADE_ALL_MS
+            };
+
+            Ok(AudioCommand::FadeAll { time_ms })
         }
         "voice_stop" => {
             if !mqtt_cmd.has_params() {
@@ -779,6 +804,87 @@ mod tests {
         match cmd {
             AudioCommand::StopAll => {}, // OK
             _ => panic!("Expected StopAll command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_allows_boost() {
+        let json = r#"{"command": "play", "file": "quiet.wav", "volume": 2.5}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { volume, .. } => assert_eq!(volume, 2.5),
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_clamps_excessive_volume() {
+        let json = r#"{"command": "play", "file": "quiet.wav", "volume": 100.0}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { volume, .. } => {
+                assert_eq!(volume, crate::config::MAX_GAIN)
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fadeall_command() {
+        let json = r#"{"command": "fadeall", "time": 2000}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, 2000),
+            _ => panic!("Expected FadeAll command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fadeall_nested() {
+        let json = r#"{"command": "fadeall", "message": {"time": 1500}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, 1500),
+            _ => panic!("Expected FadeAll command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fadeall_without_time() {
+        // "fade everything out" should work as a bare command, the way stopall does
+        let json = r#"{"command": "fadeall"}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, DEFAULT_FADE_ALL_MS),
+            _ => panic!("Expected FadeAll command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sound_fadeall_alias() {
+        let json = r#"{"command": "soundFadeAll"}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, DEFAULT_FADE_ALL_MS),
+            _ => panic!("Expected FadeAll command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fadeall_accepts_fade_out_ms() {
+        // "fade_out_ms" is what stop uses for the same idea
+        let json = r#"{"command": "fadeall", "fade_out_ms": 750}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, 750),
+            _ => panic!("Expected FadeAll command"),
         }
     }
 

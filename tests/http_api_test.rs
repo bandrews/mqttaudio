@@ -20,6 +20,7 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         active_samples: Vec::new(),
         live_inputs: Vec::new(),
         output_channels: 2,
+        channel_gains: vec![1.0; 2],
         ducking_engine: None,
         bass_management: None,
     }));
@@ -177,6 +178,75 @@ async fn test_stopall_endpoint() {
     let received = rx.try_recv().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&received).unwrap();
     assert_eq!(parsed["command"], "stopall");
+}
+
+#[tokio::test]
+async fn test_fadeall_endpoint() {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/fadeall")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"time": 2500}"#))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = rx.try_recv().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&received).unwrap();
+    assert_eq!(parsed["command"], "fadeall");
+    assert_eq!(parsed["message"]["time"], 2500);
+}
+
+#[tokio::test]
+async fn test_fadeall_endpoint_without_time() {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/fadeall")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = rx.try_recv().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&received).unwrap();
+    assert_eq!(parsed["command"], "fadeall");
+}
+
+#[tokio::test]
+async fn test_fadeall_endpoint_emits_a_parseable_command() {
+    // The endpoint and the parser have to agree on the JSON shape, which is
+    // the seam neither side's own tests cover.
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/fadeall")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"time": 3000}"#))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = rx.try_recv().unwrap();
+    match mqttaudio::mqtt::commands::parse_command(&received).unwrap() {
+        mqttaudio::mqtt::commands::AudioCommand::FadeAll { time_ms } => {
+            assert_eq!(time_ms, 3000)
+        }
+        other => panic!("Expected FadeAll, got {:?}", other),
+    }
 }
 
 #[tokio::test]
