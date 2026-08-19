@@ -5,6 +5,65 @@ All notable changes to mqttaudio will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Microphone capture on multichannel interfaces**: input devices with more
+  than 16 channels lost part of every frame, which rotated the channel routing
+  and grew a residue in the ring buffer until it overflowed continuously. All
+  capture channels are now readable and routable.
+- **Channel alignment under load**: an overrun could write a partial frame into
+  the capture ring buffer, permanently shifting which microphone reached which
+  speaker. Only whole frames are transferred now, so an overrun costs audio
+  rather than correctness.
+- **Capture latency drift**: a capture clock faster than the output clock built
+  an unbounded backlog. Excess backlog is now trimmed in whole frames.
+- **Realtime safety of capture callbacks**: the callbacks no longer allocate,
+  resample into freshly allocated buffers, or write log lines, all of which
+  stalled the capture thread and caused the overruns they reported.
+- **Input device naming**: input devices are now resolved by ALSA card the same
+  way output devices are, so `"hw:CARD=UMC1820, DEV=0"` matches the enumerated
+  device.
+- **Voice volume ramping on live inputs**: a fade no longer stalls while the
+  input is starved.
+- **`audio.channel_volumes` had no effect**: the per-channel calibration was
+  parsed and validated but never applied to the output. It is now applied to
+  the finished mix, after bass management.
+
+### Added
+
+- `fadeall` command, fading every playing sample out over a given time and
+  stopping it, alongside the existing `stopall`. Available over MQTT
+  (`{"command": "fadeall", "time": 2000}`, defaulting to 1000 ms) and as
+  `POST /fadeall`.
+- Gains above unity. Volume controls now accept up to 4.0 (+12 dB) instead of
+  stopping at 1.0, so a quiet microphone, a voice, an individual sample or an
+  underpowered subwoofer channel can be lifted rather than only attenuated.
+  Applies to `inputs[].volume`, `audio.channel_volumes`, the `play`, `volume`,
+  `voice_volume` and `input_volume` commands. The mixer still saturates its
+  output, so a boost clips rather than wrapping.
+- `audio.channel_volumes` keys may be a channel number, an
+  `audio.channel_aliases` name, or an `audio.channel_names` label, and an
+  unresolvable key is now a validation error rather than being ignored.
+- `inputs[].channels` and `inputs[].sample_rate` to control how a capture
+  stream is opened. By default the stream opens with the smallest channel count
+  the routes need, at the output sample rate so no resampling is required.
+- Input health counters (backlog, overruns, trims, starvation) reported through
+  `GET /status/inputs` and logged every 10 seconds when non-zero.
+- A clear startup error when a device offers no f32 capture format, naming the
+  `plughw:` alias as the fix, and when routing references a channel the device
+  cannot reach.
+
+### Changed
+
+- Unknown channel names in routing now explain the `audio.channel_names` /
+  `audio.channel_aliases` split. A name defined only in `channel_names` is
+  reported with the `channel_aliases` entry needed to fix it, instead of a bare
+  "Unknown channel alias".
+- `play` volume is clamped to the gain limit; previously it was passed through
+  unbounded while every other volume control clamped at 1.0.
+
 ## [2.0.0] - 2025-10-19
 
 ### Overview

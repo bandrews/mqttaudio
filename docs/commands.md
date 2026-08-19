@@ -42,12 +42,16 @@ Play an audio file.
 | `file` | string | *required* | File path or HTTP/HTTPS URL |
 | `id` | string | auto | Unique ID for targeting this sound later |
 | `voice` | string | auto | Voice group name |
-| `volume` | float | 1.0 | Volume (0.0 to 1.0) |
+| `volume` | float | 1.0 | Volume (0.0 to 4.0, unity is 1.0) |
 | `loop` | boolean | false | Loop playback continuously |
 | `crossfade_ms` | integer | 0 | Crossfade duration at loop boundaries (0 = disabled) |
 | `fade_in` | integer | 0 | Fade-in duration (milliseconds) |
 | `start_position_ms` | integer | 0 | Start position (milliseconds) |
 | `channel_map` | array | auto | Channel routing (see below) |
+
+Volumes are gains: 1.0 is unity, below that attenuates and above that boosts, up
+to 4.0 (+12 dB). The mixer saturates its output, so a boost loud enough to
+exceed full scale clips rather than wrapping around.
 
 **Channel Mapping:**
 
@@ -98,6 +102,28 @@ Stop all playing audio immediately.
 ```json
 {"command": "stopall"}
 ```
+
+### fadeall
+
+Fade all playing audio out, then stop it. Samples are removed once their fade
+completes.
+
+```json
+{"command": "fadeall", "time": 2000}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `time` | integer | `1000` | Fade duration in milliseconds. Also accepted as `fade_out_ms` |
+
+Sent without a `time`, it fades everything over one second:
+
+```json
+{"command": "fadeall"}
+```
+
+Live inputs are not affected, the same as with `stopall`. Use `input_mute` for
+a microphone.
 
 ---
 
@@ -187,7 +213,7 @@ Adjust volume of specific samples.
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target samples playing this file |
 | `voice` | string | — | Target samples in this voice |
-| `volume` | float | *required* | New volume (0.0 to 1.0) |
+| `volume` | float | *required* | New volume (0.0 to 4.0, unity is 1.0) |
 
 ---
 
@@ -236,7 +262,7 @@ Adjust volume for all samples in a voice.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `voice` | string | *required* | Voice name |
-| `volume` | float | *required* | New volume (0.0 to 1.0) |
+| `volume` | float | *required* | New volume (0.0 to 4.0, unity is 1.0) |
 
 ---
 
@@ -293,7 +319,7 @@ Adjust volume for a microphone/input device.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `input` | string | *required* | Input name (voice_id) or index |
-| `volume` | float | *required* | Volume (0.0 to 1.0) |
+| `volume` | float | *required* | Volume (0.0 to 4.0, unity is 1.0) |
 
 ### input_mute
 

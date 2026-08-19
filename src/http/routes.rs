@@ -68,6 +68,7 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         .route("/play", post(handlers::handle_play))
         .route("/stop", post(handlers::handle_stop))
         .route("/stopall", post(handlers::handle_stopall))
+        .route("/fadeall", post(handlers::handle_fadeall))
         .route("/volume", post(handlers::handle_volume))
         .route("/seek", post(handlers::handle_seek))
         .route("/speed", post(handlers::handle_speed))

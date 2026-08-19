@@ -33,10 +33,35 @@ Add inputs to your config file:
 | Field | Description |
 |-------|-------------|
 | `device` | Input device name (use `--list-inputs` to see options) |
-| `volume` | Input volume (0.0 to 1.0) |
+| `volume` | Input volume (0.0 to 4.0, unity is 1.0) |
 | `voice_id` | Voice name for ducking integration |
 | `routes` | Channel routing (source → destination) |
 | `latency_ms` | Buffer latency (5-500ms) |
+| `channels` | Capture channels to open. Omit to let the routes decide |
+| `sample_rate` | Capture rate to request. Omit to match the output rate |
+
+### Channel count
+
+`channels` is normally left out. The stream is opened with the smallest count
+the device supports that still covers every `source_channel` in `routes`, so
+routing `source_channel: 8` on an 18-in interface opens all the channels needed
+to reach it, while a single-mic route stays narrow.
+
+Set it explicitly when a device misreports its capabilities, or when you want a
+fixed layout regardless of routing.
+
+### Volume
+
+`volume` is a gain: 1.0 passes the microphone through untouched, below that
+attenuates and above that boosts, up to 4.0 (+12 dB). Boosting is how you lift
+a quiet lavalier or a preamp that will not go loud enough; the mixer saturates
+its output, so too much gain clips rather than wrapping.
+
+### Sample rate
+
+`sample_rate` is normally left out. The capture stream is opened at the output
+rate whenever the device supports it, which keeps the resampler out of the
+signal path entirely.
 
 ## Finding Input Devices
 
@@ -56,6 +81,22 @@ Available audio input devices:
      Sample rate: 44100 Hz
      Channels: 2
 ```
+
+### ALSA Device Names
+
+On Linux, prefer the `plughw:` alias of a card over `hw:`:
+
+```json
+"device": "plughw:CARD=UMC1820,DEV=0"
+```
+
+Capture is read as 32-bit float. `plughw:` converts from the card's native
+format; a bare `hw:` device that only offers integer formats is rejected at
+startup with the format it does offer. `hw:` works where the card exposes a
+float format natively.
+
+Names are matched exactly first, then by ALSA card, so `"hw:CARD=UMC1820, DEV=0"`
+and `"hw:1,0"` both resolve to the same enumerated device.
 
 ## Routing
 
@@ -93,6 +134,58 @@ Route a microphone to all player earpiece channels:
   {"source_channel": 0, "dest_channel": 7}
 ]
 ```
+
+### Several Microphones on One Interface
+
+A multichannel interface exposes each of its microphone preamps as a source
+channel, so one `inputs` entry can carry several microphones at once. Routing
+two source channels to the same destination sums them:
+
+```json
+{
+  "device": "plughw:CARD=UMC1820,DEV=0",
+  "voice_id": "room_mics",
+  "routes": [
+    {"source_channel": 0, "dest_channel": 4},
+    {"source_channel": 1, "dest_channel": 4},
+    {"source_channel": 2, "dest_channel": 5}
+  ]
+}
+```
+
+Microphones 1 and 2 are mixed together onto output 4; microphone 3 goes to
+output 5 on its own. There is no limit on how many source channels an interface
+can contribute.
+
+### Several Microphones with Independent Control
+
+Everything in one `inputs` entry shares a volume, a `voice_id` and therefore
+one ducking behaviour. For per-microphone control, give each microphone its own
+entry:
+
+```json
+"inputs": [
+  {
+    "device": "Gamemaster Headset",
+    "voice_id": "gm_mic",
+    "volume": 0.9,
+    "routes": [{"source_channel": 0, "dest_channel": 4}]
+  },
+  {
+    "device": "Handheld Mic",
+    "voice_id": "handheld",
+    "volume": 0.7,
+    "routes": [{"source_channel": 0, "dest_channel": 4}]
+  }
+]
+```
+
+Both feed output 4 and are summed there, but each can be levelled, muted and
+ducked on its own.
+
+Separate entries need separate devices. Two entries naming the same ALSA `hw:`
+device will not both open it; route the extra microphones as extra source
+channels of a single entry instead.
 
 ## MQTT Commands
 
@@ -211,6 +304,47 @@ WARN Input device 'USB Microphone' sample rate (44100 Hz) differs from output (4
 
 For lowest latency, use an input device that matches your output sample rate.
 
+## Monitoring Input Health
+
+Capture problems are counted per input and reported two ways.
+
+Every 10 seconds, any input that lost or starved audio logs a warning:
+
+```
+WARN Input 0 ('gm_mic'): 480 frames overran, 0 trimmed, 0 starved in 10s (backlog 960 frames)
+```
+
+`GET /status/inputs` reports the same counters as running totals:
+
+```json
+{
+  "inputs": [
+    {
+      "index": 0,
+      "voice_id": "gm_mic",
+      "volume": 0.9,
+      "channels": 2,
+      "muted": false,
+      "backlog_frames": 480,
+      "max_backlog_frames": 1920,
+      "dropped_frames": 0,
+      "trimmed_frames": 0,
+      "underrun_frames": 0
+    }
+  ]
+}
+```
+
+| Counter | Meaning |
+|---------|---------|
+| `backlog_frames` | Captured audio waiting to be mixed. Its steady-state value is your actual input latency |
+| `max_backlog_frames` | Ceiling before the backlog is trimmed |
+| `dropped_frames` | Capture could not hand audio over because the buffer was full |
+| `trimmed_frames` | Backlog discarded to keep latency bounded |
+| `underrun_frames` | Output frames with no captured audio available |
+
+A handful of `underrun_frames` at startup is normal while the buffer primes.
+
 ## Troubleshooting
 
 **No audio from microphone:**
@@ -219,9 +353,34 @@ For lowest latency, use an input device that matches your output sample rate.
 - Check volume is not 0
 - Check the device isn't muted via `input_mute`
 
+**Microphone is too quiet:**
+- Raise `volume` above 1.0, or send `input_volume` with a value above 1.0
+- Check `underrun_frames` is not climbing, which sounds like dropouts rather
+  than low level
+
+**Startup fails with "device offers no f32 capture format":**
+- Use the `plughw:` alias of the same card instead of `hw:`
+
+**Startup fails with "routing needs N capture channels":**
+- The device cannot be opened wide enough to reach a `source_channel` in your
+  routes. Check the channel count from `--list-inputs`, and remember source
+  channels are 0-indexed: input 1 on the front panel is `source_channel: 0`
+
+**Overruns (`dropped_frames` climbing):**
+- The capture thread is producing faster than the mixer consumes. Raise
+  `latency_ms` to give the buffer more headroom
+- Check CPU usage - a stalled audio callback shows up here first
+
+**Trims (`trimmed_frames` climbing steadily):**
+- Input and output clocks are drifting apart, which happens when the microphone
+  and the speakers are on different devices. Trimming keeps latency bounded, at
+  the cost of an occasional discontinuity. Putting capture and playback on the
+  same interface removes the drift
+
 **Audio is delayed:**
 - Reduce `latency_ms`
 - Use a device with matching sample rate
+- Check `backlog_frames` - a steadily large backlog is added latency
 
 **Audio glitches:**
 - Increase `latency_ms`

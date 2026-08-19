@@ -131,7 +131,7 @@ impl VoiceManager {
     /// Set voice volume
     pub fn set_voice_volume(&mut self, voice_id: &str, volume: f32) -> bool {
         if let Some(voice) = self.voices.get_mut(voice_id) {
-            voice.volume = volume.clamp(0.0, 1.0);
+            voice.volume = volume.clamp(0.0, crate::config::MAX_GAIN);
             true
         } else {
             false
@@ -326,9 +326,13 @@ mod tests {
         assert!(manager.set_voice_volume("ambience", 0.5));
         assert_eq!(manager.get_voice_volume("ambience"), Some(0.5));
 
-        // Volume should clamp
+        // Boosting above unity is allowed
         manager.set_voice_volume("ambience", 2.0);
-        assert_eq!(manager.get_voice_volume("ambience"), Some(1.0));
+        assert_eq!(manager.get_voice_volume("ambience"), Some(2.0));
+
+        // Volume should clamp at both ends
+        manager.set_voice_volume("ambience", 100.0);
+        assert_eq!(manager.get_voice_volume("ambience"), Some(crate::config::MAX_GAIN));
 
         manager.set_voice_volume("ambience", -0.5);
         assert_eq!(manager.get_voice_volume("ambience"), Some(0.0));

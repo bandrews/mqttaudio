@@ -54,6 +54,7 @@ Config file example:
 | `/status/samples` | GET | List of active samples |
 | `/status/voices` | GET | List of active voices |
 | `/status/cache` | GET | Cache statistics |
+| `/status/inputs` | GET | Live inputs and their capture health |
 
 ### Command Endpoints (Authentication Required if configured)
 
@@ -63,6 +64,7 @@ Config file example:
 | `/play` | POST | Play audio file |
 | `/stop` | POST | Stop samples by selector |
 | `/stopall` | POST | Stop all playback |
+| `/fadeall` | POST | Fade out all playback |
 | `/volume` | POST | Set sample volume |
 | `/seek` | POST | Seek to position |
 | `/speed` | POST | Change playback speed |
@@ -161,6 +163,11 @@ curl -X POST http://localhost:8080/play \
 
 # Stop all playback
 curl -X POST http://localhost:8080/stopall
+
+# Fade all playback out over 2 seconds
+curl -X POST http://localhost:8080/fadeall \
+  -H "Content-Type: application/json" \
+  -d '{"time": 2000}'
 
 # Get status
 curl http://localhost:8080/status

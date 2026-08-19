@@ -3,7 +3,7 @@
 
 use axum::body::Body;
 use axum::http::{header, Method, Request, StatusCode};
-use mqttaudio::audio::mixer::{ActiveSample, MixerState};
+use mqttaudio::audio::mixer::{ActiveSample, LiveInput, MixerState};
 use mqttaudio::audio::types::DecodedBuffer;
 use mqttaudio::cache::CacheManager;
 use mqttaudio::http::{create_router, AppState, LogBroadcaster};
@@ -20,6 +20,7 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         active_samples: Vec::new(),
         live_inputs: Vec::new(),
         output_channels: 2,
+        channel_gains: vec![1.0; 2],
         ducking_engine: None,
         bass_management: None,
     }));
@@ -177,6 +178,75 @@ async fn test_stopall_endpoint() {
     let received = rx.try_recv().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&received).unwrap();
     assert_eq!(parsed["command"], "stopall");
+}
+
+#[tokio::test]
+async fn test_fadeall_endpoint() {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/fadeall")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"time": 2500}"#))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = rx.try_recv().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&received).unwrap();
+    assert_eq!(parsed["command"], "fadeall");
+    assert_eq!(parsed["message"]["time"], 2500);
+}
+
+#[tokio::test]
+async fn test_fadeall_endpoint_without_time() {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/fadeall")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = rx.try_recv().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&received).unwrap();
+    assert_eq!(parsed["command"], "fadeall");
+}
+
+#[tokio::test]
+async fn test_fadeall_endpoint_emits_a_parseable_command() {
+    // The endpoint and the parser have to agree on the JSON shape, which is
+    // the seam neither side's own tests cover.
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/fadeall")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"time": 3000}"#))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = rx.try_recv().unwrap();
+    match mqttaudio::mqtt::commands::parse_command(&received).unwrap() {
+        mqttaudio::mqtt::commands::AudioCommand::FadeAll { time_ms } => {
+            assert_eq!(time_ms, 3000)
+        }
+        other => panic!("Expected FadeAll, got {:?}", other),
+    }
 }
 
 #[tokio::test]
@@ -351,6 +421,53 @@ async fn test_inputs_endpoint() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert!(json["inputs"].is_array());
+}
+
+#[tokio::test]
+async fn test_inputs_endpoint_reports_health() {
+    // Overruns, trims and starvation on a microphone are the first thing to
+    // check when routing sounds wrong, so they belong in the status payload.
+    let (state, _rx) = create_test_state();
+
+    let rb = ringbuf::HeapRb::<f32>::new(400);
+    let (mut producer, consumer) = rb.split();
+    producer.push_slice(&[0.5f32; 20]);
+
+    let mut input = LiveInput::new(
+        "mic".to_string(),
+        consumer,
+        2,
+        0.75,
+        vec![(0, 0), (1, 1)],
+    );
+    input.trimmed_frames = 3;
+    input.underrun_frames = 7;
+    input.dropped_frames.store(11, std::sync::atomic::Ordering::Relaxed);
+
+    state.mixer_state.lock().unwrap().live_inputs.push(input);
+
+    let app = create_router(state, false, false);
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/status/inputs")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let input = &json["inputs"][0];
+    assert_eq!(input["voice_id"], "mic");
+    assert_eq!(input["channels"], 2);
+    assert_eq!(input["backlog_frames"], 10);
+    assert_eq!(input["dropped_frames"], 11);
+    assert_eq!(input["trimmed_frames"], 3);
+    assert_eq!(input["underrun_frames"], 7);
 }
 
 #[tokio::test]

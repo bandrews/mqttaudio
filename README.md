@@ -192,7 +192,7 @@ curl -X POST http://localhost:8080/play \
 | [Voice Management](docs/features/voice-management.md) | Grouping and controlling sounds |
 | [Audio Ducking](docs/features/ducking.md)             | Automatic volume reduction      |
 | [Bass Management](docs/features/bass-management.md)   | LFE/subwoofer routing           |
-| [Microphone Input](docs/features/microphone-input.md) | Live audio input mixing         |
+| [Microphone Input](docs/features/microphone-input.md) | Live mic capture and routing    |
 | [Playback Control](docs/features/playback-control.md) | Seek, speed, reverse            |
 | [Caching](docs/features/caching.md)                   | HTTP caching and precaching     |
 

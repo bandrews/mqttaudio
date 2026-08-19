@@ -7,6 +7,14 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use crate::audio::ducking::DuckingRule;
 
+/// Highest gain any volume control accepts.
+///
+/// Unity is 1.0; 4.0 is +12 dB, enough to lift a quiet microphone or an
+/// underpowered subwoofer without letting a mistyped value destroy a speaker.
+/// The mixer saturates its output regardless, so boosted material clips rather
+/// than wrapping.
+pub const MAX_GAIN: f32 = 4.0;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MqttConfig {
@@ -70,7 +78,10 @@ impl ChannelRef {
             ChannelRef::Alias(name) => {
                 aliases.get(name)
                     .copied()
-                    .ok_or_else(|| format!("Unknown channel alias: '{}'", name))
+                    .ok_or_else(|| format!(
+                        "Unknown channel '{}': define it in audio.channel_aliases as \"{}\": <channel number>",
+                        name, name
+                    ))
             }
         }
     }
@@ -276,6 +287,10 @@ pub struct InputConfig {
     pub routes: Vec<InputRouteConfig>,
     /// Buffer latency in milliseconds
     pub latency_ms: u32,
+    /// Capture channel count to open (None = smallest count the routes need)
+    pub channels: Option<usize>,
+    /// Capture sample rate to request (None = match the output sample rate)
+    pub sample_rate: Option<u32>,
 }
 
 impl Default for InputConfig {
@@ -286,6 +301,8 @@ impl Default for InputConfig {
             voice_id: "mic".to_string(),
             routes: Vec::new(),
             latency_ms: 20,
+            channels: None,
+            sample_rate: None,
         }
     }
 }
@@ -605,8 +622,26 @@ impl Config {
     }
 
     /// Resolve a channel reference to a numeric index using this config's aliases
+    ///
+    /// `audio.channel_names` labels channels for display and `audio.channel_aliases`
+    /// is what routing resolves against. Naming a channel in the first and using it
+    /// in a route is the easiest mistake to make with this config, so a name found
+    /// only in `channel_names` is reported with the entry needed to fix it.
     pub fn resolve_channel(&self, channel: &ChannelRef) -> Result<usize, String> {
-        channel.resolve(&self.audio.channel_aliases)
+        channel.resolve(&self.audio.channel_aliases).map_err(|e| {
+            let ChannelRef::Alias(name) = channel else {
+                return e;
+            };
+
+            match self.audio.channel_names.iter().find(|(_, label)| *label == name) {
+                Some((index, _)) => format!(
+                    "Unknown channel '{}': audio.channel_names labels channel {} as '{}', \
+                     but routing resolves against audio.channel_aliases - add \"{}\": {} there",
+                    name, index, name, name, index
+                ),
+                None => e,
+            }
+        })
     }
 
     /// Resolve bass management channel references to numeric indices
@@ -623,6 +658,52 @@ impl Config {
             source_channels: sources?,
             remove_bass_from_sources: self.bass_management.remove_bass_from_sources,
         })
+    }
+
+    /// Resolve a channel_volumes key to a channel index.
+    ///
+    /// Keys may be a channel number, an alias from `audio.channel_aliases`, or
+    /// a name from `audio.channel_names`, so levelling works whichever way the
+    /// channels were labelled.
+    fn resolve_channel_volume_key(&self, key: &str) -> Result<usize, String> {
+        if let Ok(index) = key.parse::<usize>() {
+            return Ok(index);
+        }
+
+        if let Some(index) = self.audio.channel_aliases.get(key) {
+            return Ok(*index);
+        }
+
+        for (index, name) in &self.audio.channel_names {
+            if name == key {
+                return index.parse::<usize>().map_err(|_| {
+                    format!("channel_names key '{}' is not a channel number", index)
+                });
+            }
+        }
+
+        Err(format!(
+            "'{}' is not a channel number, an audio.channel_aliases entry, or an audio.channel_names value",
+            key
+        ))
+    }
+
+    /// Per-channel output gains, indexed by channel number.
+    ///
+    /// Channels with no entry in `audio.channel_volumes` are left at unity.
+    /// Entries beyond the output channel count are ignored, so a config shared
+    /// between a wide and a narrow device still loads.
+    pub fn resolve_channel_gains(&self, output_channels: usize) -> Result<Vec<f32>, String> {
+        let mut gains = vec![1.0; output_channels];
+
+        for (key, gain) in &self.audio.channel_volumes {
+            let index = self.resolve_channel_volume_key(key)?;
+            if index < output_channels {
+                gains[index] = *gain;
+            }
+        }
+
+        Ok(gains)
     }
 
     /// Resolve input route channel references to numeric indices
@@ -698,10 +779,16 @@ impl Config {
             errors.push("audio.buffer_size must be between 64 and 8192".to_string());
         }
 
-        // Channel volumes must be 0.0 to 1.0
+        // Channel volumes are gains: unity is 1.0, above that boosts
         for (ch, vol) in &self.audio.channel_volumes {
-            if *vol < 0.0 || *vol > 1.0 {
-                errors.push(format!("audio.channel_volumes.{} must be between 0.0 and 1.0", ch));
+            if *vol < 0.0 || *vol > MAX_GAIN {
+                errors.push(format!(
+                    "audio.channel_volumes.{} must be between 0.0 and {}",
+                    ch, MAX_GAIN
+                ));
+            }
+            if let Err(e) = self.resolve_channel_volume_key(ch) {
+                errors.push(format!("audio.channel_volumes.{}: {}", ch, e));
             }
         }
 
@@ -733,14 +820,27 @@ impl Config {
 
         // Input validation
         for (i, input) in self.inputs.iter().enumerate() {
-            if input.volume < 0.0 || input.volume > 1.0 {
-                errors.push(format!("inputs[{}].volume must be between 0.0 and 1.0", i));
+            if input.volume < 0.0 || input.volume > MAX_GAIN {
+                errors.push(format!(
+                    "inputs[{}].volume must be between 0.0 and {}",
+                    i, MAX_GAIN
+                ));
             }
             if input.routes.is_empty() {
                 errors.push(format!("inputs[{}].routes must not be empty", i));
             }
             if input.latency_ms < 5 || input.latency_ms > 500 {
                 errors.push(format!("inputs[{}].latency_ms must be between 5 and 500", i));
+            }
+            if let Some(channels) = input.channels {
+                if channels == 0 || channels > 64 {
+                    errors.push(format!("inputs[{}].channels must be between 1 and 64", i));
+                }
+            }
+            if let Some(rate) = input.sample_rate {
+                if !(8000..=192000).contains(&rate) {
+                    errors.push(format!("inputs[{}].sample_rate must be between 8000 and 192000", i));
+                }
             }
             // Validate channel aliases in routes
             for (j, route) in input.routes.iter().enumerate() {
@@ -1086,7 +1186,7 @@ mod tests {
     fn test_validate_invalid_channel_volume() {
         let mut config = Config::default();
         config.mqtt.topic = Some("test".to_string());
-        config.audio.channel_volumes.insert("0".to_string(), 1.5);
+        config.audio.channel_volumes.insert("0".to_string(), -0.5);
 
         let result = config.validate();
         assert!(result.is_err());
@@ -1334,11 +1434,157 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_alias_error_names_the_alias_map() {
+        let config = Config::default();
+        let err = config.resolve_channel(&ChannelRef::Alias("booth".to_string())).unwrap_err();
+
+        assert!(err.contains("booth"));
+        assert!(
+            err.contains("channel_aliases"),
+            "the error should say which map to add the name to, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_unknown_alias_error_points_at_channel_names() {
+        // channel_names is index -> name for display; routing resolves against
+        // channel_aliases. Naming a channel in the wrong map is the easiest
+        // mistake to make, so the error has to say so.
+        let mut config = Config::default();
+        config.audio.channel_names.insert("6".to_string(), "booth".to_string());
+
+        let err = config.resolve_channel(&ChannelRef::Alias("booth".to_string())).unwrap_err();
+
+        assert!(err.contains("channel_names"), "got: {}", err);
+        assert!(err.contains("channel_aliases"), "got: {}", err);
+        assert!(err.contains("6"), "the error should name the channel it found: {}", err);
+    }
+
+    #[test]
+    fn test_input_route_error_points_at_channel_names() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.audio.channel_names.insert("4".to_string(), "house".to_string());
+        config.inputs.push(InputConfig {
+            routes: vec![InputRouteConfig {
+                source_channel: ChannelRef::Index(0),
+                dest_channel: ChannelRef::Alias("house".to_string()),
+            }],
+            ..Default::default()
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("channel_names") && e.contains("channel_aliases")),
+            "validation should explain the two maps, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_channel_volumes_allow_boost() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.audio.channel_volumes.insert("3".to_string(), 1.5);
+
+        assert!(config.validate().is_ok(), "boosting a channel above unity is allowed");
+    }
+
+    #[test]
+    fn test_channel_volumes_reject_excessive_gain() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.audio.channel_volumes.insert("3".to_string(), MAX_GAIN + 1.0);
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("channel_volumes")));
+    }
+
+    #[test]
+    fn test_input_volume_allows_boost() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.inputs.push(InputConfig {
+            volume: 2.0,
+            routes: vec![InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) }],
+            ..Default::default()
+        });
+
+        assert!(config.validate().is_ok(), "a quiet microphone can be boosted");
+    }
+
+    #[test]
+    fn test_input_volume_rejects_excessive_gain() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.inputs.push(InputConfig {
+            volume: MAX_GAIN + 1.0,
+            routes: vec![InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) }],
+            ..Default::default()
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("volume")));
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_by_index() {
+        let mut config = Config::default();
+        config.audio.channel_volumes.insert("0".to_string(), 0.5);
+        config.audio.channel_volumes.insert("3".to_string(), 1.5);
+
+        let gains = config.resolve_channel_gains(4).unwrap();
+        assert_eq!(gains, vec![0.5, 1.0, 1.0, 1.5]);
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_by_alias() {
+        let mut config = Config::default();
+        config.audio.channel_aliases.insert("sub".to_string(), 3);
+        config.audio.channel_volumes.insert("sub".to_string(), 1.8);
+
+        let gains = config.resolve_channel_gains(4).unwrap();
+        assert_eq!(gains[3], 1.8);
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_by_channel_name() {
+        // channel_names is index -> name, and the example config levels
+        // channels using those names
+        let mut config = Config::default();
+        config.audio.channel_names.insert("3".to_string(), "lfe".to_string());
+        config.audio.channel_volumes.insert("lfe".to_string(), 1.2);
+
+        let gains = config.resolve_channel_gains(4).unwrap();
+        assert_eq!(gains[3], 1.2);
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_ignores_channels_beyond_output() {
+        let mut config = Config::default();
+        config.audio.channel_volumes.insert("9".to_string(), 0.5);
+
+        let gains = config.resolve_channel_gains(2).unwrap();
+        assert_eq!(gains, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_channel_volumes_unknown_name_is_an_error() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.audio.channel_volumes.insert("nowhere".to_string(), 0.5);
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("nowhere")));
+    }
+
+    #[test]
     fn test_input_validation_invalid_volume() {
         let mut config = Config::default();
         config.mqtt.topic = Some("test".to_string());
         config.inputs.push(InputConfig {
-            volume: 1.5, // Invalid
+            volume: -0.5, // Invalid
             routes: vec![InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) }],
             ..Default::default()
         });
@@ -1393,6 +1639,8 @@ mod tests {
                 InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(1) },
             ],
             latency_ms: 25,
+            channels: None,
+            sample_rate: None,
         });
 
         let result = config.validate();

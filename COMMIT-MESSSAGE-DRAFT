@@ -1,0 +1,109 @@
+Fix microphone capture, add fadeall, allow gains above unity
+
+Live input was unusable on a multichannel interface and would produce a
+steady stream of overruns. Four separate defects, all in the path between
+the capture callback and the mixer:
+
+Frames were read from the capture ring buffer through a fixed 16-element
+array. On a device with more than 16 channels - the UMC1820 presents 18 or
+20 - only the first 16 samples of each frame were consumed. The remainder
+stayed in the buffer, so every subsequent read started mid-frame, the
+channel routing rotated continuously, and the leftover samples accumulated
+until the buffer was permanently full. Channels above 16 were also skipped
+outright by the routing, so the upper inputs could never be reached at all.
+Frames are now read in bulk into a preallocated scratch buffer with no
+channel ceiling.
+
+On the producer side, a full ring buffer was filled with `push_slice`,
+which writes as many samples as fit. When the space remaining was not a
+whole number of frames, that wrote a partial frame and permanently shifted
+the interleaving the mixer saw - one overrun and every microphone came out
+of the wrong speaker, silently and for good. Transfers are whole frames
+only now, so an overrun costs audio rather than correctness.
+
+Nothing bounded the backlog. A capture clock running faster than the
+output clock - normal whenever the microphone and the speakers are not on
+the same interface - filled the buffer and left it saturated, adding
+latency until it stuck at the buffer size. The mixer now discards whole
+frames once the backlog passes a ceiling.
+
+Both capture callbacks ran work that does not belong on a realtime thread:
+per-chunk Vec allocations in the resampler path, and a log write on every
+overrun. Stalling the capture thread costs whole capture periods, so the
+logging was helping cause the overruns it reported. The resampler now uses
+preallocated buffers with `process_into_buffer`, and losses are counted in
+atomics reported from an ordinary task every 10 seconds and through
+`GET /status/inputs`.
+
+Two things also stood in the way of routing arbitrary microphones. Capture
+streams were opened with cpal's default input config, whose heuristic
+prefers stereo at 44.1 kHz - so a 20-in interface opened as two channels
+and went through the resampler needlessly. The stream is now opened with
+the smallest channel count that covers every routed source channel, at the
+output sample rate when the device supports it, with `inputs[].channels`
+and `inputs[].sample_rate` available to override. And input devices were
+matched by exact name only, while output devices already fell back to ALSA
+card matching; that helper is now shared, so "hw:CARD=UMC1820, DEV=0"
+resolves for inputs too.
+
+Devices offering no f32 capture format, and routing that references a
+channel a device cannot reach, now fail at startup with an error naming
+the fix instead of a cryptic ALSA failure or silence.
+
+Three things noticed alongside that work and asked for in the same change:
+
+A fadeall command, which did not exist - stopall had no fade-out
+counterpart, so bringing a room down gently meant one voice_fade_out per
+voice. It takes a time in milliseconds, defaults to one second when sent
+bare, and is reachable over MQTT and as POST /fadeall. Live inputs are
+untouched, matching what stopall stops.
+
+Gains above unity. Every volume control stopped at 1.0, so a quiet
+microphone or an underpowered subwoofer could only be attenuated, never
+lifted. The ceiling is now 4.0 (+12 dB) across inputs[].volume,
+audio.channel_volumes and the play, volume, voice_volume and input_volume
+commands. play was the odd one out in the other direction - its volume was
+passed through entirely unbounded - so it is clamped to the same limit now.
+The mixer already saturates its output, so a boost clips rather than
+wrapping.
+
+Raising that ceiling exposed that audio.channel_volumes did nothing at all:
+it was parsed and validated, and no code ever read it. Per-channel gain is
+now applied to the finished mix, after bass management, so boosting an LFE
+channel lifts the crossed-over bass with it. Its keys accept a channel
+number, an audio.channel_aliases name or an audio.channel_names label, and
+a key matching none of those is a validation error instead of being
+silently ignored.
+
+The channel naming error message. audio.channel_names maps number to name
+for display, audio.channel_aliases maps name to number and is what routing
+actually resolves against. Labelling a channel in the first and using that
+label in a route failed with a bare "Unknown channel alias", pointing at
+nothing. It now reads:
+
+  Unknown channel 'house_left': audio.channel_names labels channel 4 as
+  'house_left', but routing resolves against audio.channel_aliases - add
+  "house_left": 4 there
+
+Verified by unit tests over the ring buffer transfer, the mixer read loop,
+the config selection and the channel gain path, including the
+multi-microphone cases: several mics on one interface summed onto a shared
+endpoint, and mics on separate devices mixed with independent levels. The
+fadeall endpoint is tested through the real router and its emitted JSON fed
+back through the real parser, so the two halves are known to agree. Not
+verified against physical hardware - this machine has no sound device.
+
+Prompts:
+
+- I'm about to start using mqttaudio to route microphones to arbitrary
+  speaker endpoints, and I may need to route multiple microphones at once
+  all mixed together. Please verify this is possible and make any fixes
+  needed to make that path robust and reliable. A friend says he's getting
+  overflow errors. (Followed by a chat log covering device naming for the
+  UMC1820, the `input` config section being unreliable, and mic input
+  producing "a bunch of overflow errors".)
+- Address all the stuff from your last paragraph as part of this PR: add
+  fadeall, add the ability to have gains >1.0, and fix the error message to
+  clarify the distinction.
+
+Written by Claude.
