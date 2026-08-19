@@ -7,14 +7,27 @@ use mqttaudio::audio::mixer::{ActiveSample, LiveInput, MixerState};
 use mqttaudio::audio::types::DecodedBuffer;
 use mqttaudio::cache::CacheManager;
 use mqttaudio::http::{create_router, AppState, LogBroadcaster};
+use mqttaudio::mqtt::commands::CommandRequest;
 use mqttaudio::voice::VoiceManager;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tower::util::ServiceExt;
 
 /// Create a test AppState with mock components.
+/// A stand-in command loop acknowledges every request with success (so
+/// handlers that wait for an outcome get one) and forwards the raw payload
+/// to the returned receiver for the tests to assert on.
 fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<String>(100);
+    let (cmd_tx, mut request_rx) = mpsc::channel::<CommandRequest>(100);
+    let (payload_tx, cmd_rx) = mpsc::channel::<String>(100);
+    tokio::spawn(async move {
+        while let Some(request) = request_rx.recv().await {
+            let _ = payload_tx.send(request.payload.clone()).await;
+            if let Some(reply) = request.reply {
+                let _ = reply.send(Ok("accepted".to_string()));
+            }
+        }
+    });
 
     let mixer_state = Arc::new(Mutex::new(MixerState {
         active_samples: Vec::new(),
@@ -23,10 +36,11 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         channel_gains: vec![1.0; 2],
         ducking_engine: None,
         bass_management: None,
+        finished_samples: Vec::new(),
     }));
 
     let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));
-    let cache_manager = Arc::new(Mutex::new(
+    let cache_manager = Arc::new(tokio::sync::Mutex::new(
         CacheManager::new(std::env::temp_dir().join("mqttaudio_test_cache")).unwrap(),
     ));
 
@@ -311,6 +325,40 @@ async fn test_auth_with_query_param() {
     let received = rx.try_recv().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&received).unwrap();
     assert_eq!(parsed["command"], "stopall");
+}
+
+#[tokio::test]
+async fn test_websocket_requires_auth_token() {
+    let (state, _rx) = create_test_state_with_auth("secret_token_123");
+    let app = create_router(state, false, true);
+
+    // A bare GET without the token must be rejected before any upgrade
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/ws")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_websocket_route_exists_when_enabled() {
+    let (state, _rx) = create_test_state();
+    let app = create_router(state, false, true);
+
+    // Without upgrade headers the handshake fails, but the route must exist
+    // (anything but 404/401 proves it is reachable without auth configured)
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/ws")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]

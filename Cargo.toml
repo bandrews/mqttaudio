@@ -40,7 +40,7 @@ signalsmith-stretch = "0.1"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Lock-free structures
 ringbuf = "0.3"
@@ -64,6 +64,9 @@ rand = "0.8"
 
 # Date/time handling
 chrono = "0.4"
+
+# Stable cache filename hashing
+sha2 = "0.10"
 
 # Directory utilities
 dirs = "5.0"

@@ -139,9 +139,15 @@ When multiple rules apply simultaneously:
 
 For example, if both narration (15%, 2000ms) and dialog (10%, 1500ms) are playing, music ducks to 10% with a 1500ms fade.
 
-## Microphone Input Ducking
+## Microphone Inputs and Ducking
 
-Ducking works with microphone inputs too. Configure the microphone with a `voice_id`:
+A microphone input's `voice_id` can appear in `ducked_voices`: playing a
+sample on the rule's `primary_voice` lowers the microphone along with any
+other ducked voices.
+
+A microphone can also trigger ducking. Give the input an
+`activity_threshold` - the peak capture level (0.0-1.0) above which the
+input counts as speaking - and its `voice_id` works as a `primary_voice`:
 
 ```json
 {
@@ -149,6 +155,8 @@ Ducking works with microphone inputs too. Configure the microphone with a `voice
     {
       "device": "USB Microphone",
       "voice_id": "presenter_mic",
+      "activity_threshold": 0.05,
+      "activity_hold_ms": 750,
       "routes": [{"source_channel": 0, "dest_channel": 0}]
     }
   ],
@@ -163,7 +171,14 @@ Ducking works with microphone inputs too. Configure the microphone with a `voice
 }
 ```
 
-Now whenever the presenter speaks, music automatically ducks.
+Now whenever the presenter speaks, music ducks, and it recovers once the
+microphone has been quiet for `activity_hold_ms` (default 750 ms - long
+enough to ride out pauses between words). Without an `activity_threshold`
+the input never triggers rules; it can still be ducked by them.
+
+Picking a threshold: watch the daemon logs at debug level while speaking at
+show volume ("Input voice '...' went active/quiet") and pick a value above
+the room's noise floor but below speech peaks. 0.02-0.1 is a typical range.
 
 ## Tips
 

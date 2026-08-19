@@ -291,6 +291,13 @@ pub struct InputConfig {
     pub channels: Option<usize>,
     /// Capture sample rate to request (None = match the output sample rate)
     pub sample_rate: Option<u32>,
+    /// Peak capture level (0.0-1.0) above which this input counts as
+    /// actively speaking for ducking rules with its voice_id as
+    /// primary_voice. None disables activity detection.
+    pub activity_threshold: Option<f32>,
+    /// How long activity persists after the level drops below the threshold,
+    /// so ducking does not flutter between words
+    pub activity_hold_ms: u32,
 }
 
 impl Default for InputConfig {
@@ -303,6 +310,8 @@ impl Default for InputConfig {
             latency_ms: 20,
             channels: None,
             sample_rate: None,
+            activity_threshold: None,
+            activity_hold_ms: 750,
         }
     }
 }
@@ -543,6 +552,47 @@ impl Config {
             .iter()
             .map(|d| PathBuf::from(Self::expand_tilde(d)))
             .collect()
+    }
+
+    /// Check whether a file path may be played or precached.
+    ///
+    /// HTTP/HTTPS URLs are always allowed. When `security.allowed_directories`
+    /// is non-empty, a local path must resolve (symlinks followed) inside one
+    /// of the allowed directories, which also rejects `../` traversal. An
+    /// empty list leaves local playback unrestricted.
+    pub fn is_local_path_allowed(&self, path: &str) -> Result<(), String> {
+        if path.starts_with("http://") || path.starts_with("https://") {
+            return Ok(());
+        }
+        if self.security.allowed_directories.is_empty() {
+            return Ok(());
+        }
+
+        let expanded = Self::expand_tilde(path);
+        let canonical = fs::canonicalize(&expanded)
+            .map_err(|e| format!("Cannot resolve path '{}': {}", path, e))?;
+
+        for dir in &self.security.allowed_directories {
+            let dir_expanded = Self::expand_tilde(dir);
+            match fs::canonicalize(&dir_expanded) {
+                Ok(allowed) => {
+                    if canonical.starts_with(&allowed) {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "security.allowed_directories entry '{}' cannot be resolved: {}",
+                        dir, e
+                    );
+                }
+            }
+        }
+
+        Err(format!(
+            "'{}' is outside security.allowed_directories; add its directory there to permit it",
+            path
+        ))
     }
 
     /// Merge CLI arguments into this config (CLI args override config file)
@@ -842,6 +892,17 @@ impl Config {
                     errors.push(format!("inputs[{}].sample_rate must be between 8000 and 192000", i));
                 }
             }
+            if let Some(threshold) = input.activity_threshold {
+                if threshold <= 0.0 || threshold > 1.0 {
+                    errors.push(format!(
+                        "inputs[{}].activity_threshold must be above 0.0 and at most 1.0",
+                        i
+                    ));
+                }
+            }
+            if input.activity_hold_ms > 10000 {
+                errors.push(format!("inputs[{}].activity_hold_ms must be at most 10000", i));
+            }
             // Validate channel aliases in routes
             for (j, route) in input.routes.iter().enumerate() {
                 if let Err(e) = self.resolve_channel(&route.source_channel) {
@@ -850,6 +911,25 @@ impl Config {
                 if let Err(e) = self.resolve_channel(&route.dest_channel) {
                     errors.push(format!("inputs[{}].routes[{}].dest_channel: {}", i, j, e));
                 }
+            }
+        }
+
+        // Ducking rule validation
+        for (i, rule) in self.ducking_rules.iter().enumerate() {
+            if rule.target_volume < 0.0 || rule.target_volume > 1.0 {
+                errors.push(format!(
+                    "ducking_rules[{}].target_volume must be between 0.0 and 1.0",
+                    i
+                ));
+            }
+            if rule.fade_duration_ms > 60000 {
+                errors.push(format!(
+                    "ducking_rules[{}].fade_duration_ms must be at most 60000",
+                    i
+                ));
+            }
+            if rule.ducked_voices.is_empty() {
+                errors.push(format!("ducking_rules[{}].ducked_voices must not be empty", i));
             }
         }
 
@@ -1641,10 +1721,54 @@ mod tests {
             latency_ms: 25,
             channels: None,
             sample_rate: None,
+            activity_threshold: None,
+            activity_hold_ms: 750,
         });
 
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_input_activity_threshold_validation() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.inputs.push(InputConfig {
+            activity_threshold: Some(1.5), // Invalid - above 1.0
+            routes: vec![InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(0) }],
+            ..Default::default()
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("activity_threshold")));
+
+        config.inputs[0].activity_threshold = Some(0.05);
+        assert!(config.validate().is_ok(), "a sensible threshold validates");
+    }
+
+    #[test]
+    fn test_ducking_rule_validation() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.ducking_rules.push(DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec![],
+            target_volume: 1.5,
+            fade_duration_ms: 120000,
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("target_volume")));
+        assert!(errors.iter().any(|e| e.contains("fade_duration_ms")));
+        assert!(errors.iter().any(|e| e.contains("ducked_voices")));
+
+        config.ducking_rules[0] = DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.2,
+            fade_duration_ms: 1000,
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -1670,6 +1794,79 @@ mod tests {
         assert_eq!(config.cache.precache.len(), 2);
         assert_eq!(config.cache.precache[0], "/sounds/startup.wav");
         assert_eq!(config.cache.precache[1], "https://example.com/welcome.mp3");
+    }
+
+    #[test]
+    fn test_local_path_allowed_when_no_directories_configured() {
+        let config = Config::default();
+        // An empty list leaves local playback unrestricted
+        assert!(config.is_local_path_allowed("/etc/hostname").is_ok());
+    }
+
+    #[test]
+    fn test_local_path_allowed_inside_configured_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sound.wav");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut config = Config::default();
+        config.security.allowed_directories = vec![dir.path().to_string_lossy().to_string()];
+
+        assert!(config.is_local_path_allowed(file.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn test_local_path_denied_outside_configured_directory() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("secret.wav");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut config = Config::default();
+        config.security.allowed_directories = vec![allowed.path().to_string_lossy().to_string()];
+
+        let err = config.is_local_path_allowed(file.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("allowed_directories"), "error should name the setting: {}", err);
+    }
+
+    #[test]
+    fn test_local_path_denied_via_traversal() {
+        let parent = tempfile::tempdir().unwrap();
+        let allowed = parent.path().join("sounds");
+        std::fs::create_dir(&allowed).unwrap();
+        let secret = parent.path().join("secret.wav");
+        std::fs::write(&secret, b"x").unwrap();
+
+        let mut config = Config::default();
+        config.security.allowed_directories = vec![allowed.to_string_lossy().to_string()];
+
+        let sneaky = format!("{}/../secret.wav", allowed.to_string_lossy());
+        assert!(config.is_local_path_allowed(&sneaky).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_path_denied_via_symlink() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.wav");
+        std::fs::write(&secret, b"x").unwrap();
+        let link = allowed.path().join("link.wav");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let mut config = Config::default();
+        config.security.allowed_directories = vec![allowed.path().to_string_lossy().to_string()];
+
+        assert!(config.is_local_path_allowed(link.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_local_path_check_ignores_urls() {
+        let mut config = Config::default();
+        config.security.allowed_directories = vec!["/opt/sounds".to_string()];
+
+        assert!(config.is_local_path_allowed("https://example.com/a.mp3").is_ok());
+        assert!(config.is_local_path_allowed("http://example.com/a.mp3").is_ok());
     }
 
     #[test]

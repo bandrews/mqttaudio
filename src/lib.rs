@@ -2,6 +2,7 @@
 // ABOUTME: Provides public access to core audio processing and command structures.
 
 pub mod audio {
+    pub mod activity;
     pub mod bass_management;
     pub mod chunked_resampler;
     pub mod decoder;

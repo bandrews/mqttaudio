@@ -97,7 +97,6 @@ impl VoiceManager {
     }
 
     /// Remove a sample from its voice
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn remove_sample(&mut self, sample_id: u64) {
         // Find and remove from all voices
         for voice in self.voices.values_mut() {
@@ -169,7 +168,6 @@ impl VoiceManager {
     }
 
     /// Clean up empty voices
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn cleanup_empty_voices(&mut self) {
         self.voices.retain(|_, voice| !voice.is_empty());
     }

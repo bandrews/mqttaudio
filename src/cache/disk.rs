@@ -138,18 +138,20 @@ impl DiskCache {
         Ok(())
     }
 
-    /// Generate a cache filename for a given URL
-    /// Uses first 12 chars of SHA256 hash + extension
+    /// Generate a cache filename for a given URL.
+    /// Uses the first 8 bytes of the URL's SHA-256 (stable across Rust
+    /// releases, unlike DefaultHasher) plus the URL's audio extension.
+    /// The full URL including any query string is hashed - different query
+    /// strings are different resources - but the extension is taken from the
+    /// path alone so signed URLs keep their format hint.
     pub fn cache_filename_for_url(url: &str) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
+        use sha2::{Digest, Sha256};
 
-        let mut hasher = DefaultHasher::new();
-        url.hash(&mut hasher);
-        let hash = hasher.finish();
+        let digest = Sha256::digest(url.as_bytes());
+        let hash: String = digest.iter().take(8).map(|b| format!("{:02x}", b)).collect();
 
-        // Extract extension from URL
-        let extension = if let Some(last_part) = url.split('/').last() {
+        let path = url.split(['?', '#']).next().unwrap_or(url);
+        let extension = if let Some(last_part) = path.split('/').last() {
             if let Some(ext) = last_part.split('.').last() {
                 // Only use common audio extensions
                 match ext.to_lowercase().as_str() {
@@ -163,12 +165,17 @@ impl DiskCache {
             "dat".to_string()
         };
 
-        format!("{:016x}.{}", hash, extension)
+        format!("{}.{}", hash, extension)
     }
 
     /// Get the cache entry for a URL, if it exists
     pub fn get_entry(&self, url: &str) -> Option<&CacheEntry> {
         self.metadata.entries.get(url)
+    }
+
+    /// Directory that holds the cached files themselves
+    pub fn files_dir(&self) -> PathBuf {
+        self.cache_dir.join("files")
     }
 
     /// Get the full path to a cached file
@@ -247,9 +254,10 @@ impl DiskCache {
     pub async fn download_and_cache(&mut self, url: &str) -> Result<PathBuf, CacheError> {
         tracing::info!("Downloading {}", url);
 
-        // Make HTTP request
-        let response = reqwest::get(url).await
-            .map_err(|e| CacheError::HttpError(format!("Failed to download: {}", e)))?;
+        // Make HTTP request, bounded so an unresponsive server errors instead
+        // of stalling the caller indefinitely
+        let response = super::http_stream::get_with_timeout(url).await
+            .map_err(CacheError::HttpError)?;
 
         if !response.status().is_success() {
             return Err(CacheError::HttpError(format!(
@@ -285,8 +293,11 @@ impl DiskCache {
         let cache_filename = Self::cache_filename_for_url(url);
         let cache_path = self.cache_dir.join("files").join(&cache_filename);
 
-        // Write to disk
-        fs::write(&cache_path, &bytes)?;
+        // Write to a temp file and rename into place, so a crash or full disk
+        // mid-write can never leave a truncated file at the final path
+        let temp_path = cache_path.with_extension("part");
+        fs::write(&temp_path, &bytes)?;
+        fs::rename(&temp_path, &cache_path)?;
 
         tracing::info!("Downloaded {} bytes to {}", file_size, cache_filename);
 
@@ -322,6 +333,110 @@ impl DiskCache {
             .await
             .map_err(|e| CacheError::HttpError(format!("Streaming download failed: {}", e)))
     }
+
+    /// Ask the server whether a cached entry is still current, using the
+    /// stored ETag/Last-Modified as a conditional request. An entry without
+    /// validators is re-downloaded outright when a check is due.
+    pub async fn revalidate(&mut self, url: &str) -> Freshness {
+        let Some(entry) = self.get_entry(url) else {
+            return Freshness::Unknown;
+        };
+
+        let mut request = super::http_stream::http_client().get(url);
+        if let Some(etag) = &entry.etag {
+            request = request.header("If-None-Match", etag);
+        }
+        if let Some(last_modified) = &entry.last_modified {
+            request = request.header("If-Modified-Since", last_modified);
+        }
+
+        // A freshness check runs in the play path, so it gets a short bound:
+        // a slow server costs at most this once per revalidation interval
+        let response = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            request.send(),
+        ).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::debug!("Revalidation request for {} failed: {}", url, e);
+                return Freshness::Unknown;
+            }
+            Err(_) => {
+                tracing::debug!("Revalidation request for {} timed out", url);
+                return Freshness::Unknown;
+            }
+        };
+
+        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+            if let Some(entry) = self.metadata.entries.get_mut(url) {
+                entry.last_validated = chrono::Utc::now().to_rfc3339();
+            }
+            if let Err(e) = self.save_metadata() {
+                tracing::warn!("Failed to save cache metadata: {}", e);
+            }
+            return Freshness::Fresh;
+        }
+
+        if !response.status().is_success() {
+            tracing::debug!(
+                "Revalidation of {} got HTTP {}; serving the cached copy",
+                url, response.status()
+            );
+            return Freshness::Unknown;
+        }
+
+        // The server sent new content: replace the cached file
+        let etag = response.headers().get("etag")
+            .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+        let last_modified = response.headers().get("last-modified")
+            .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+        let content_type = response.headers().get("content-type")
+            .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
+
+        let bytes = match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            response.bytes(),
+        ).await {
+            Ok(Ok(b)) => b,
+            _ => {
+                tracing::warn!("Failed to download changed copy of {}; serving the cached copy", url);
+                return Freshness::Unknown;
+            }
+        };
+
+        let cache_filename = Self::cache_filename_for_url(url);
+        let cache_path = self.files_dir().join(&cache_filename);
+        let temp_path = cache_path.with_extension("part");
+        if let Err(e) = fs::write(&temp_path, &bytes).and_then(|_| fs::rename(&temp_path, &cache_path)) {
+            tracing::warn!("Failed to store changed copy of {}: {}; serving the cached copy", url, e);
+            let _ = fs::remove_file(&temp_path);
+            return Freshness::Unknown;
+        }
+
+        self.put_entry(url.to_string(), CacheEntry {
+            local_file: cache_filename,
+            etag,
+            last_modified,
+            last_validated: chrono::Utc::now().to_rfc3339(),
+            file_size: bytes.len() as u64,
+            content_type,
+        });
+        if let Err(e) = self.save_metadata() {
+            tracing::warn!("Failed to save cache metadata: {}", e);
+        }
+
+        Freshness::Replaced
+    }
+}
+
+/// Result of checking a cached URL against its server
+pub enum Freshness {
+    /// The cached copy is still current
+    Fresh,
+    /// The server had newer content and the cached file was replaced
+    Replaced,
+    /// The server could not be consulted; the cached copy stays in service
+    Unknown,
 }
 
 #[cfg(test)]
@@ -329,6 +444,38 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_cache_filename_ignores_query_for_extension() {
+        // A signed URL still names an mp3; the query string must not break
+        // extension detection
+        let name = DiskCache::cache_filename_for_url("http://example.com/sound.mp3?sig=abc.def");
+        assert!(name.ends_with(".mp3"), "got: {}", name);
+
+        // But different query strings are different resources
+        let a = DiskCache::cache_filename_for_url("http://example.com/sound.mp3?v=1");
+        let b = DiskCache::cache_filename_for_url("http://example.com/sound.mp3?v=2");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_cache_filename_is_stable_across_processes() {
+        // The filename hash must not depend on the process or toolchain:
+        // DefaultHasher is explicitly unstable across Rust releases, which
+        // would orphan every cached file on a compiler upgrade. Pin the
+        // expected SHA-256-derived name for a known URL.
+        let name = DiskCache::cache_filename_for_url("http://example.com/sound.wav");
+        let expected_prefix = {
+            use sha2::{Digest, Sha256};
+            let digest = Sha256::digest("http://example.com/sound.wav".as_bytes());
+            hex_prefix(&digest)
+        };
+        assert_eq!(name, format!("{}.wav", expected_prefix));
+    }
+
+    fn hex_prefix(digest: &[u8]) -> String {
+        digest.iter().take(8).map(|b| format!("{:02x}", b)).collect()
+    }
 
     #[test]
     fn test_cache_filename_generation() {

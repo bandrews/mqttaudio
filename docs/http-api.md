@@ -37,7 +37,7 @@ Config file example:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | bool | false | Enable HTTP server |
-| `port` | u16 | 8080 | Port number (0 = auto-select) |
+| `port` | u16 | 0 | Port number (0 = auto-select an available port; set explicitly for a stable URL) |
 | `bind_address` | string | "127.0.0.1" | Network interface to bind |
 | `auth_token` | string | null | Optional Bearer token for authentication |
 | `websocket_enabled` | bool | true | Enable WebSocket endpoint |
@@ -74,6 +74,17 @@ Config file example:
 | `/cache/clear` | POST | Clear all caches |
 | `/cache/invalidate` | POST | Invalidate specific cache entry |
 | `/precache` | POST | Pre-cache an audio file |
+| `/input/volume` | POST | Set a live input's volume (`{"input": "mic", "volume": 0.8}`) |
+| `/input/mute` | POST | Mute/unmute a live input (`{"input": "mic", "mute": true}`) |
+
+Command endpoints wait for the command to be processed and report the
+real outcome: `{"success": true, "message": ...}` on success, or an error
+with a matching status code - 400 for malformed requests, 404 when a
+file fails to load or a selector matches nothing, 403 when a path is
+outside `security.allowed_directories`, 409 when a pending play was
+cancelled by a stop, 504 if the result takes longer than 30 seconds.
+Loads run in the background, so a slow download never delays other
+commands (an emergency `stopall` also cancels any loads still in flight).
 
 ## Authentication
 
@@ -130,23 +141,29 @@ Returns active samples with playback position and timing information:
 | `total_frames` | integer | Total audio length in frames |
 | `total_ms` | integer | Total audio length in milliseconds |
 | `sample_rate` | integer | Sample rate in Hz |
-| `volume` | float | Sample volume (0.0-1.0) |
-| `voice_volume` | float | Voice group volume (0.0-1.0) |
+| `volume` | float | Sample volume (0.0-4.0, 1.0 = unity) |
+| `voice_volume` | float | Voice group volume (0.0-4.0, 1.0 = unity) |
 | `speed` | float | Playback speed multiplier |
 | `loop_mode` | boolean | Whether looping is enabled |
 | `progress_percent` | float | Playback progress (0-100) |
 
 ## WebSocket Log Streaming
 
-Connect to `/ws` for real-time log streaming:
+Connect to `/ws` for real-time log streaming (every line the daemon logs
+at its configured level):
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/ws');
+const ws = new WebSocket('ws://localhost:8080/ws?token=your-secret-token');
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
-  console.log(data.message);
+  console.log(data.message); // {type: "connected"|"log", message: ...}
 };
 ```
+
+When `auth_token` is set, `/ws` requires it like the command endpoints.
+Browsers cannot send an Authorization header on a WebSocket, so pass the
+token as the `token` query parameter; omit it entirely when no auth token
+is configured.
 
 ## Example Usage
 

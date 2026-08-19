@@ -131,14 +131,13 @@ async fn handle_socket(socket: WebSocket, broadcaster: Arc<LogBroadcaster>) {
 /// This integrates with the existing tracing infrastructure.
 pub struct WebSocketLogLayer {
     broadcaster: Arc<LogBroadcaster>,
+    min_level: tracing::Level,
 }
 
 impl WebSocketLogLayer {
     /// Create a new WebSocket log layer for tracing integration.
-    /// Note: This is designed for future integration with tracing-subscriber.
-    #[allow(dead_code)]
-    pub fn new(broadcaster: Arc<LogBroadcaster>) -> Self {
-        Self { broadcaster }
+    pub fn new(broadcaster: Arc<LogBroadcaster>, min_level: tracing::Level) -> Self {
+        Self { broadcaster, min_level }
     }
 }
 
@@ -151,6 +150,11 @@ where
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
+        // Check if we should log this level
+        if event.metadata().level() > &self.min_level {
+            return;
+        }
+
         // Format the event as a simple message
         let mut visitor = LogVisitor::default();
         event.record(&mut visitor);
@@ -202,6 +206,25 @@ mod tests {
         let broadcaster = LogBroadcaster::new();
         // Should not panic
         broadcaster.broadcast("test message".to_string());
+    }
+
+    #[test]
+    fn test_websocket_layer_broadcasts_events() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let broadcaster = Arc::new(LogBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let layer = WebSocketLogLayer::new(broadcaster.clone(), tracing::Level::INFO);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("hello ws clients");
+            tracing::debug!("too detailed for the configured level");
+        });
+
+        let msg = rx.try_recv().expect("info event should reach the broadcaster");
+        assert!(msg.contains("hello ws clients"), "got: {}", msg);
+        assert!(rx.try_recv().is_err(), "debug events are filtered at INFO");
     }
 
     #[test]

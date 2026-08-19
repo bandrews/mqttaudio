@@ -149,8 +149,11 @@ impl ActiveSample {
         file_path: String,
     ) -> Self {
         let buffer = buffer.into();
-        // Default channel mapping: 1:1 for available channels
-        let channel_map = (0..buffer.channels())
+        // Default channel mapping: 1:1 for available channels. The blocking
+        // read matters: the non-blocking channels() reports 0 under loader
+        // lock contention, which would leave the map empty and the sample
+        // permanently silent.
+        let channel_map = (0..buffer.channels_blocking())
             .map(|ch| (ch, ch))
             .collect();
 
@@ -187,8 +190,11 @@ impl ActiveSample {
         crossfade_samples: usize,
     ) -> Self {
         let buffer = buffer.into();
-        // Default channel mapping: 1:1 for available channels
-        let channel_map = (0..buffer.channels())
+        // Default channel mapping: 1:1 for available channels. The blocking
+        // read matters: the non-blocking channels() reports 0 under loader
+        // lock contention, which would leave the map empty and the sample
+        // permanently silent.
+        let channel_map = (0..buffer.channels_blocking())
             .map(|ch| (ch, ch))
             .collect();
 
@@ -338,15 +344,23 @@ impl ActiveSample {
             _ => {}
         }
 
+        // A streaming load that failed can never deliver more data
+        if self.buffer.has_failed() {
+            return true;
+        }
+
         // Looping samples never finish from buffer position
         if self.loop_mode {
             return false;
         }
 
-        // For forward playback, finished when position >= frames
-        // For reverse playback, finished when position is 0 (or we've gone negative)
+        // For forward playback, finished when position >= frames.
+        // A streaming buffer that is still loading never finishes this way:
+        // its frames() is only the count loaded so far (and 0 under loader
+        // lock contention), so ending on it would truncate or kill the sample
+        // whenever playback catches up with the decoder.
         if self.speed >= 0.0 {
-            if self.position >= self.buffer.frames() {
+            if self.buffer.is_complete() && self.position >= self.buffer.frames() {
                 return true;
             }
         } else {
@@ -573,6 +587,10 @@ pub struct MixerState {
 
     /// Bass management for LFE extraction and crossover filtering
     pub bass_management: Option<BassManagement>,
+
+    /// (id, voice_id) of samples the audio callback removed, awaiting
+    /// bookkeeping cleanup (voice manager, ducking maps) off the audio thread
+    pub finished_samples: Vec<(u64, String)>,
 }
 
 impl MixerState {
@@ -585,6 +603,7 @@ impl MixerState {
             channel_gains: vec![1.0; output_channels],
             ducking_engine: None,
             bass_management: None,
+            finished_samples: Vec::new(),
         }
     }
 }
@@ -602,14 +621,19 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
 
     let frames = output.len() / state.output_channels;
 
+    // Advance all ducking fades once for this callback; every sample and
+    // input on a voice then reads the same multiplier
+    if let Some(ref mut engine) = state.ducking_engine {
+        engine.advance(frames);
+    }
+
     // Mix each active sample into the output
     for sample in &mut state.active_samples {
         // Get ducking multiplier for this sample's voice
-        let ducking_multiplier = if let Some(ref mut engine) = state.ducking_engine {
-            engine.get_multiplier(&sample.voice_id, frames)
-        } else {
-            1.0  // No ducking
-        };
+        let ducking_multiplier = state.ducking_engine
+            .as_ref()
+            .map(|engine| engine.get_multiplier(&sample.voice_id))
+            .unwrap_or(1.0);
 
         mix_sample_into_output(sample, output, frames, state.output_channels, ducking_multiplier);
 
@@ -620,11 +644,10 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
     // Mix each live input into the output
     for input in &mut state.live_inputs {
         // Get ducking multiplier for this input's voice
-        let ducking_multiplier = if let Some(ref mut engine) = state.ducking_engine {
-            engine.get_multiplier(&input.voice_id, frames)
-        } else {
-            1.0  // No ducking
-        };
+        let ducking_multiplier = state.ducking_engine
+            .as_ref()
+            .map(|engine| engine.get_multiplier(&input.voice_id))
+            .unwrap_or(1.0);
 
         mix_live_input_into_output(input, output, frames, state.output_channels, ducking_multiplier);
     }
@@ -659,9 +682,12 @@ fn mix_sample_into_output(
     output_channels: usize,
     ducking_multiplier: f32,
 ) {
-    // Use pitch-corrected path if pitch corrector is enabled
-    // Note: pitch correction requires Complete buffers (direct data slice access)
-    if sample.pitch_corrector.is_some() && sample.buffer.is_complete() {
+    // Use pitch-corrected path if pitch corrector is enabled.
+    // Pitch correction needs direct slice access, which only the Complete
+    // variant provides: a Streaming buffer stays Streaming even once fully
+    // loaded, so it must take the plain (varispeed) path below - the
+    // pitch-corrected path would mix nothing at all for it.
+    if sample.pitch_corrector.is_some() && sample.buffer.as_complete().is_some() {
         mix_sample_with_pitch_correction(sample, output, frames, output_channels, ducking_multiplier);
         return;
     }
@@ -735,40 +761,23 @@ fn mix_sample_into_output(
             // Get current sample value (returns silence for streaming buffers if unavailable)
             let sample_val = sample.buffer.get_sample_or_silence(src_frame, src_ch);
 
-            // Interpolate with adjacent sample if available
+            // Interpolate with adjacent sample if available. The value at a
+            // fractional position lies between src_frame and the next frame
+            // regardless of playback direction; when looping, wrap to the
+            // start of the buffer.
             let interpolated_val = if frac > 0.001 {
-                if is_reverse {
-                    // For reverse, interpolate with previous sample (lower index)
-                    // When looping, wrap to end of buffer
-                    let prev_frame = if src_frame > 0 {
-                        src_frame - 1
-                    } else if loop_mode {
-                        buffer_frames - 1
-                    } else {
-                        src_frame // No interpolation possible
-                    };
-                    if prev_frame != src_frame {
-                        let prev_val = sample.buffer.get_sample_or_silence(prev_frame, src_ch);
-                        sample_val * (1.0 - frac) + prev_val * frac
-                    } else {
-                        sample_val
-                    }
+                let next_frame = if src_frame + 1 < buffer_frames {
+                    src_frame + 1
+                } else if loop_mode {
+                    0
                 } else {
-                    // For forward, interpolate with next sample (higher index)
-                    // When looping, wrap to start of buffer
-                    let next_frame = if src_frame + 1 < buffer_frames {
-                        src_frame + 1
-                    } else if loop_mode {
-                        0
-                    } else {
-                        src_frame // No interpolation possible
-                    };
-                    if next_frame != src_frame {
-                        let next_val = sample.buffer.get_sample_or_silence(next_frame, src_ch);
-                        sample_val * (1.0 - frac) + next_val * frac
-                    } else {
-                        sample_val
-                    }
+                    src_frame // No interpolation possible
+                };
+                if next_frame != src_frame {
+                    let next_val = sample.buffer.get_sample_or_silence(next_frame, src_ch);
+                    sample_val * (1.0 - frac) + next_val * frac
+                } else {
+                    sample_val
                 }
             } else {
                 sample_val

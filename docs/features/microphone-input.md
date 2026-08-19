@@ -213,7 +213,8 @@ The `input` field can be the `voice_id` or the input index (0, 1, 2...).
 
 ## Ducking Integration
 
-Microphone inputs work with audio ducking. Set a `voice_id` and use it in ducking rules:
+A microphone's `voice_id` can be listed in a rule's `ducked_voices`, so
+playback (say, a narration voice) can duck the microphone:
 
 ```json
 {
@@ -221,6 +222,33 @@ Microphone inputs work with audio ducking. Set a `voice_id` and use it in duckin
     {
       "device": "Gamemaster Headset",
       "voice_id": "gm_mic",
+      "routes": [{"source_channel": 0, "dest_channel": 4}]
+    }
+  ],
+  "ducking_rules": [
+    {
+      "primary_voice": "narration",
+      "ducked_voices": ["gm_mic"],
+      "target_volume": 0.2,
+      "fade_duration_ms": 500
+    }
+  ]
+}
+```
+
+A microphone can also be a rule's `primary_voice` when it has activity
+detection configured. Set `activity_threshold` on the input (peak level
+0.0-1.0 that counts as speaking; try 0.02-0.1) and optionally
+`activity_hold_ms` (default 750 - how long activity persists through
+pauses):
+
+```json
+{
+  "inputs": [
+    {
+      "device": "Gamemaster Headset",
+      "voice_id": "gm_mic",
+      "activity_threshold": 0.05,
       "routes": [{"source_channel": 0, "dest_channel": 4}]
     }
   ],
@@ -235,7 +263,9 @@ Microphone inputs work with audio ducking. Set a `voice_id` and use it in duckin
 }
 ```
 
-Now when the gamemaster speaks, ambient audio and music automatically duck.
+Now when the gamemaster speaks, ambient audio and music duck automatically.
+Without an `activity_threshold`, an input never triggers rules (it can
+still be ducked by them).
 
 ## Example: Escape Room
 

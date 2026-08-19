@@ -15,7 +15,7 @@ mqttaudio listens for JSON commands over MQTT or a REST endpoint, and plays audi
 - **HTTP caching** — Stream audio from URLs with automatic caching
 - **Variable speed** — Speed up, slow down, or reverse playback with optional pitch correction
 - **Software LFE** — Extract low frequencies with configurable crossover and route them to a designated channel, allowing fine grained control over subwoofer output
-- **REST API** — Optional HTTP server with REST endpoints mirroring MQTT commands, plus WebSocket for log streaming
+- **REST API** — Optional HTTP server with REST endpoints mirroring MQTT commands, plus a WebSocket log stream
 
 ## Quick Start
 
@@ -46,7 +46,7 @@ sudo pacman -S alsa-lib base-devel clang
 
 ```bash
 # From source (requires Rust 1.70+)
-git clone -b refactor https://github.com/bandrews/mqttaudio.git
+git clone https://github.com/bandrews/mqttaudio.git
 cd mqttaudio
 cargo build --release
 
@@ -181,7 +181,7 @@ curl -X POST http://localhost:8080/play \
 | [Getting Started](docs/getting-started.md) | Installation, first steps, basic concepts |
 | [Commands](docs/commands.md)               | Complete command reference                |
 | [Configuration](docs/configuration.md)     | Config file and CLI options               |
-| [HTTP API](docs/http-api.md)               | REST endpoints and WebSocket streaming    |
+| [HTTP API](docs/http-api.md)               | REST endpoints, auth, WebSocket logs      |
 | [Troubleshooting](docs/troubleshooting.md) | Common issues and solutions               |
 
 ### Feature Guides

@@ -15,9 +15,13 @@ Decoded audio (PCM) is kept in RAM for instant playback:
 ### Disk Cache
 
 Downloaded files are stored on disk:
-- HTTP files are saved to the cache directory
-- Persists across restarts
-- Validated against the server using ETag/Last-Modified headers
+- Every HTTP download - streamed plays, runtime precache, and startup
+  precache alike - is written through to the cache directory and persists
+  across restarts
+- Set `cache.enabled: false` to disable the disk cache entirely: downloads
+  then play from memory only and are re-fetched after a restart
+- Cached files are periodically revalidated against the server (see HTTP
+  Validation below)
 
 ## Streaming Playback
 
@@ -101,7 +105,9 @@ Force re-download of a specific file:
 
 | Field | Default | Description |
 |-------|---------|-------------|
+| `enabled` | `true` | Disk-cache downloaded files (`false` = memory only) |
 | `directory` | `~/.mqttaudio/cache` | Disk cache location |
+| `revalidate_after_seconds` | `300` | Seconds before a cached URL is checked against the server (0 = every access) |
 | `precache` | `[]` | Files to cache on startup |
 | `max_memory_mb` | `512` | Memory cache limit in MB (0 = unlimited) |
 
@@ -116,8 +122,9 @@ You can also set the memory limit via command line:
 
 When the memory cache reaches its limit, least-recently-used entries are evicted:
 - Recently accessed files stay in cache
-- Currently playing files are never evicted
 - New files trigger eviction of old entries
+- An evicted file that is still playing keeps playing (playback holds its
+  own reference); the next play of it pays a fresh decode
 
 ## Disk Cache Location
 
@@ -134,17 +141,19 @@ Override in your config file:
 
 ## HTTP Validation
 
-For HTTP files, mqttaudio checks if cached files are still current:
+Cached URLs are checked for freshness on a schedule set by
+`cache.revalidate_after_seconds` (default 300; 0 = check on every access):
 
-1. On first download, stores ETag and Last-Modified headers
-2. On subsequent access, sends conditional request
-3. Server returns 304 (not modified) or new content
-4. If file changed, re-downloads automatically
+1. On download, the ETag and Last-Modified headers are stored
+2. When a cached URL is played after the interval has elapsed, a
+   conditional request asks the server whether it changed
+3. Not modified (304) - the cached copy is served and the clock resets
+4. Changed (200) - the new content replaces the cache and plays instead
 
-This means:
-- If you update a file on your server, mqttaudio will detect it
-- You don't need to manually invalidate the cache
-- Validation adds minimal overhead (HEAD request)
+If the server cannot be reached, the cached copy keeps playing and the
+check retries after the next interval - a dead server never blocks
+playback for more than a few seconds, once per interval. `cache_invalidate`
+still forces an immediate re-download when you don't want to wait.
 
 ## Local Files
 
@@ -169,7 +178,7 @@ The default 512 MB limit allows for approximately:
 - ~22 minutes of stereo 48kHz audio
 - ~44 minutes of mono 48kHz audio
 
-With LRU eviction, least-recently-used files are automatically removed when the limit is reached. Currently-playing files are protected from eviction.
+With LRU eviction, least-recently-used files are automatically removed when the limit is reached.
 
 ## Tips
 

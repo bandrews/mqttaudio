@@ -90,7 +90,9 @@ Try connecting to localhost first to rule out network problems:
 
 ### Local Files: Check Permissions
 
-Verify the file path is in `allowed_directories`:
+If `security.allowed_directories` is configured, the file must live inside
+one of the listed directories - a rejected play logs "Play rejected" with
+the offending path:
 
 ```json
 {
@@ -100,7 +102,8 @@ Verify the file path is in `allowed_directories`:
 }
 ```
 
-Or if using command line only, all local files must be accessible.
+With no `security` section (or an empty list), any file the daemon can read
+is playable.
 
 ### HTTP Files: Check Network
 
@@ -143,11 +146,6 @@ Larger buffers reduce glitches at the cost of latency:
     "buffer_size": 1024
   }
 }
-```
-
-Or:
-```bash
-./mqttaudio --buffer-size 1024 --topic audio/commands
 ```
 
 Common values: 256 (low latency), 512 (default), 1024 (stable), 2048 (very stable)
@@ -366,6 +364,6 @@ mqttaudio logs to stderr by default. Capture logs:
 
 ### Report Issues
 
-File issues at: https://github.com/anthropics/claude-code/issues
+File issues at: https://github.com/bandrews/mqttaudio/issues
 
 Include the information above for faster resolution.

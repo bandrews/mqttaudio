@@ -161,10 +161,12 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
 /// Find a stream config for the device with the requested channel count
 /// If requested_channels is None, uses the maximum available (capped at 32 for sanity)
 /// If requested_sample_rate is None, uses the device's preferred sample rate
+/// If requested_buffer_size is None, uses the device's default buffer size
 pub fn find_output_config(
     device: &cpal::Device,
     requested_channels: Option<usize>,
     requested_sample_rate: Option<u32>,
+    requested_buffer_size: Option<u32>,
 ) -> Result<cpal::StreamConfig, Box<dyn std::error::Error>> {
     use cpal::SampleRate;
 
@@ -228,11 +230,12 @@ pub fn find_output_config(
 
     match best_config {
         Some(config_range) => {
+            let buffer_size = resolve_buffer_size(requested_buffer_size, config_range.buffer_size());
             let config = config_range.with_sample_rate(SampleRate(target_sample_rate));
             Ok(cpal::StreamConfig {
                 channels: config.channels(),
                 sample_rate: config.sample_rate(),
-                buffer_size: cpal::BufferSize::Default,
+                buffer_size,
             })
         }
         None => {
@@ -240,6 +243,7 @@ pub fn find_output_config(
             let config_range = matching_configs[0];
             let min_rate = config_range.min_sample_rate().0;
             let max_rate = config_range.max_sample_rate().0;
+            let buffer_size = resolve_buffer_size(requested_buffer_size, config_range.buffer_size());
             // Clamp target to valid range, but also cap max at 384kHz for sanity
             let capped_max = max_rate.min(384000);
             let sample_rate = target_sample_rate.max(min_rate).min(capped_max);
@@ -247,9 +251,34 @@ pub fn find_output_config(
             Ok(cpal::StreamConfig {
                 channels: config.channels(),
                 sample_rate: config.sample_rate(),
-                buffer_size: cpal::BufferSize::Default,
+                buffer_size,
             })
         }
+    }
+}
+
+/// Turn a requested buffer size into a cpal BufferSize, clamped to the range
+/// the device reports so an out-of-range value cannot make the stream fail.
+fn resolve_buffer_size(
+    requested: Option<u32>,
+    supported: &cpal::SupportedBufferSize,
+) -> cpal::BufferSize {
+    let Some(size) = requested else {
+        return cpal::BufferSize::Default;
+    };
+
+    match supported {
+        cpal::SupportedBufferSize::Range { min, max } => {
+            let clamped = size.clamp(*min, *max);
+            if clamped != size {
+                tracing::warn!(
+                    "Requested buffer size {} is outside the device's supported range {}-{}; using {}",
+                    size, min, max, clamped
+                );
+            }
+            cpal::BufferSize::Fixed(clamped)
+        }
+        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Fixed(size),
     }
 }
 
@@ -468,6 +497,7 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
         channel_gains: vec![1.0; output_channels],
         ducking_engine: None,
         bass_management: None,
+        finished_samples: Vec::new(),
     }));
 
     let mixer_state_clone = mixer_state.clone();

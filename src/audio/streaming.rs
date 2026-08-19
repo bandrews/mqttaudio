@@ -219,6 +219,28 @@ impl SampleBuffer {
         }
     }
 
+    /// Check if a streaming load has failed. Complete buffers never fail.
+    pub fn has_failed(&self) -> bool {
+        match self {
+            SampleBuffer::Complete(_) => false,
+            SampleBuffer::Streaming(buf) => {
+                buf.try_read().map(|b| b.has_error()).unwrap_or(false)
+            }
+        }
+    }
+
+    /// Get the channel count, waiting out loader lock contention.
+    /// For command-thread use at sample creation; the audio callback must use
+    /// channels(), which never blocks.
+    pub fn channels_blocking(&self) -> usize {
+        match self {
+            SampleBuffer::Complete(buf) => buf.channels,
+            SampleBuffer::Streaming(buf) => {
+                buf.read().map(|b| b.channels).unwrap_or(0)
+            }
+        }
+    }
+
     /// Check if a specific frame is loaded and ready for playback.
     /// For complete buffers, returns true if frame is within bounds.
     /// For streaming buffers, returns true if frame has been decoded.

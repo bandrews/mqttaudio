@@ -2,6 +2,13 @@
 
 mqttaudio can be configured via a JSON file, command-line arguments, or both. Command-line arguments override config file settings.
 
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `MQTTAUDIO_CONFIG` | Path to the config file, used when `--config` is not given |
+| `RUST_LOG` | Per-module log filtering (e.g. `mqttaudio=debug,mqttaudio::cache=trace`); overrides `logging.level` for console output |
+
 ## Command-Line Options
 
 ```
@@ -16,10 +23,12 @@ OPTIONS:
   --mqtt-password <PASS>       MQTT broker password for authentication
   -d, --device <NAME>          Audio output device name
   -r, --sample-rate <RATE>     Output sample rate [default: 48000]
-  -n, --channels <COUNT>       Number of output channels [default: auto-detect]
-  --lfe-channel <INDEX>        LFE (subwoofer) channel index for bass management
-  --crossover-frequency <HZ>   Crossover frequency for bass management [default: 80]
+  -n, --channels <COUNT>       Number of output channels [default: use max available]
+  --lfe-channel <INDEX>        LFE (subwoofer) channel override for bass management
+  --crossover-frequency <HZ>   Crossover frequency override for bass management
   --log-topic <TOPIC>          MQTT topic to publish log messages to
+  --http-port <PORT>           Enable the HTTP server on this port
+  --max-cache-mb <MB>          Memory cache limit in MB (0 = unlimited)
   -v, --verbose                Enable verbose logging (debug level)
   --list-devices               List available audio output devices and exit
   --list-inputs                List available audio input devices and exit
@@ -136,6 +145,8 @@ MQTT broker connection settings.
 | `topic` | string | *required* | Topic to subscribe to (supports `#` and `+` wildcards) |
 | `username` | string | — | Username for MQTT authentication |
 | `password` | string | — | Password for MQTT authentication |
+| `client_id` | string | auto | MQTT client id; when unset a random `mqttaudio_<hex>` id is generated |
+| `reconnect_delay_seconds` | integer | `10` | Wait between reconnect attempts after an MQTT error |
 
 **Authentication:** If your MQTT broker requires authentication, provide both `username` and `password`. These can also be passed via command line with `--mqtt-username` and `--mqtt-password`.
 
@@ -265,6 +276,8 @@ File caching settings.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `directory` | string | `~/.mqttaudio/cache` | Disk cache directory |
+| `enabled` | boolean | `true` | Disk-cache downloaded files. `false` = play from memory only, re-download after restart |
+| `revalidate_after_seconds` | integer | `300` | Seconds a cached URL is served before checking the server for changes (0 = every access) |
 | `precache` | array | `[]` | Files or directories to cache on startup |
 | `precache_blocking` | boolean | `true` | Block startup until precache completes |
 | `max_memory_mb` | integer | `512` | Maximum memory cache size in MB (0 = unlimited) |
@@ -353,7 +366,9 @@ Microphone/input device configuration.
 | `volume` | float | `1.0` | Input volume (0.0 to 4.0, unity is 1.0) |
 | `voice_id` | string | — | Voice name for ducking integration |
 | `routes` | array | *required* | Channel routing (source → dest, can use aliases) |
-| `latency_ms` | integer | `25` | Buffer latency (5-500ms) |
+| `latency_ms` | integer | `20` | Buffer latency (5-500ms) |
+| `activity_threshold` | float | `null` | Peak level (0.0-1.0) above which this input counts as speaking for ducking rules; `null` disables activity detection |
+| `activity_hold_ms` | integer | `750` | How long activity persists after the level drops (0-10000ms) |
 | `channels` | integer | *auto* | Capture channels to open (1-64). Defaults to the smallest count that covers every `source_channel` |
 | `sample_rate` | integer | *auto* | Capture rate to request (8000-192000). Defaults to the output rate, which avoids resampling |
 
@@ -378,10 +393,10 @@ Automatic volume ducking configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `primary_voice` | string | *required* | Voice that triggers ducking |
-| `ducked_voices` | array | *required* | Voices to reduce in volume |
+| `primary_voice` | string | *required* | Voice that triggers ducking. A live input's `voice_id` works here when the input has an `activity_threshold` configured |
+| `ducked_voices` | array | *required* | Voices to reduce in volume. May include live input `voice_id`s |
 | `target_volume` | float | *required* | Volume to duck to (0.0 to 1.0) |
-| `fade_duration_ms` | integer | *required* | Fade duration in milliseconds |
+| `fade_duration_ms` | integer | *required* | Fade duration in milliseconds; restore uses the same duration |
 
 See [Audio Ducking](features/ducking.md) for details.
 
@@ -403,9 +418,10 @@ File access restrictions.
 | `allowed_directories` | array | `[]` | Directories allowed for local file access |
 
 **Notes:**
-- If empty, only HTTP/HTTPS URLs can be played
+- When non-empty, `play`/`precache` paths must resolve inside one of the
+  listed directories (symlinks are followed; `../` traversal is blocked)
+- If empty, local file access is unrestricted
 - `~` expands to the user's home directory
-- Path traversal (`../`) is blocked
 
 ### logging
 
@@ -469,7 +485,7 @@ Performance tuning and advanced settings. Most users won't need to change these.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `resampler_quality` | string | `"fast"` | Sample rate conversion quality preset |
+| `resampler_quality` | string | `"fast"` | Sample rate conversion quality preset, used for file decoding and live-input capture alike |
 
 #### Resampler Quality
 
@@ -567,6 +583,7 @@ When audio files have a different sample rate than the output device (e.g., a 44
       "device": "Gamemaster Headset",
       "volume": 0.9,
       "voice_id": "gm_mic",
+      "activity_threshold": 0.05,
       "routes": [
         {"source_channel": 0, "dest_channel": 4},
         {"source_channel": 0, "dest_channel": 5},
@@ -590,6 +607,10 @@ When audio files have a different sample rate than the output device (e.g., a 44
 }
 ```
 
+When the gamemaster speaks (capture level above `activity_threshold`), the
+room ambience and effects duck to 10% and recover 750 ms after the mic goes
+quiet.
+
 ### 5.1 Surround with Bass Management
 
 ```json
@@ -611,12 +632,3 @@ When audio files have a different sample rate than the output device (e.g., a 44
 }
 ```
 
----
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `MQTTAUDIO_CONFIG` | Path to config file |
-| `MQTTAUDIO_CACHE_DIR` | Override cache directory |
-| `RUST_LOG` | Rust logging configuration (e.g., `mqttaudio=debug`) |

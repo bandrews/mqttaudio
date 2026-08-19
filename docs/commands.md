@@ -116,6 +116,9 @@ completes.
 |-----------|------|---------|-------------|
 | `time` | integer | `1000` | Fade duration in milliseconds. Also accepted as `fade_out_ms` |
 
+`soundFadeAll`, `fadeout`, and `soundFadeOut` are accepted as aliases for
+compatibility with the original app.
+
 Sent without a `time`, it fades everything over one second:
 
 ```json
@@ -148,9 +151,10 @@ Stop specific samples.
 | `id` | string | — | Stop sample with this ID |
 | `file` | string | — | Stop all samples playing this file |
 | `voice` | string | — | Stop all samples in this voice |
-| `fade_out_ms` | integer | 0 | Fade-out duration (milliseconds) |
+| `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
+| `fade_out_ms` | integer | 10 | Fade-out duration (milliseconds). The 10 ms default avoids clicks on abrupt stops |
 
-At least one of `id`, `file`, or `voice` is required. Multiple selectors use OR logic.
+At least one of `internal_id`, `id`, `file`, or `voice` is required. Multiple selectors use OR logic.
 
 ### seek
 
@@ -169,6 +173,7 @@ Jump to a position in a playing sample.
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target all samples playing this file |
 | `voice` | string | — | Target all samples in this voice |
+| `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
 | `position_ms` | integer | *required* | Position to seek to (milliseconds) |
 
 ### speed
@@ -189,12 +194,17 @@ Change playback speed.
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target samples playing this file |
 | `voice` | string | — | Target samples in this voice |
+| `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
 | `speed` | float | *required* | Playback speed multiplier |
 | `pitch_correction` | boolean | false | Maintain original pitch |
 
 **Speed ranges:**
 - Without pitch correction: -100.0 to 100.0 (negative = reverse)
 - With pitch correction: 0.05 to 8.0 (reverse not supported)
+- `speed: 0` is rejected with an error - use `stop` to end playback.
+  Reverse playback starts from the sample's current position, so a sample
+  still at its beginning finishes immediately; `seek` first to play backwards
+  from a point
 
 ### volume
 
@@ -213,6 +223,7 @@ Adjust volume of specific samples.
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target samples playing this file |
 | `voice` | string | — | Target samples in this voice |
+| `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
 | `volume` | float | *required* | New volume (0.0 to 4.0, unity is 1.0) |
 
 ---

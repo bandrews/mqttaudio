@@ -83,8 +83,9 @@ impl MemoryCache {
     pub fn put(&mut self, key: String, buffer: Arc<DecodedBuffer>) {
         let size = Self::buffer_size(&buffer);
 
-        // If we're replacing an existing entry, remove its size first
-        if let Some(old_entry) = self.entries.get(&key) {
+        // If we're replacing an existing entry, take it out entirely first so
+        // the eviction loop below can neither pick it nor double-subtract it
+        if let Some(old_entry) = self.entries.remove(&key) {
             self.current_size_bytes -= old_entry.size_bytes;
         }
 
@@ -207,6 +208,32 @@ impl Default for MemoryCache {
 mod tests {
     use super::*;
     use crate::audio::types::DecodedBuffer;
+
+    #[test]
+    fn test_put_replacing_existing_key_keeps_size_consistent() {
+        // Replacing a key must not let the eviction loop double-subtract the
+        // old entry's size (which would wrap current_size_bytes in release)
+        let mut cache = MemoryCache::with_max_size(10_000);
+
+        // 12000 bytes: larger than the limit, so every put runs the eviction
+        // loop, and on replacement the old same-key entry is the only
+        // eviction candidate
+        let big = Arc::new(create_test_buffer(2, 1500));
+        cache.put("a".to_string(), big.clone());
+        let size_after_first = cache.current_size_bytes();
+
+        cache.put("a".to_string(), big.clone());
+        assert_eq!(
+            cache.current_size_bytes(),
+            size_after_first,
+            "replacing a key with an identical buffer must not change the accounted size"
+        );
+        assert_eq!(cache.len(), 1);
+
+        // And the cache must still behave sanely afterwards
+        cache.put("b".to_string(), Arc::new(create_test_buffer(1, 100)));
+        assert!(cache.current_size_bytes() < 20_000);
+    }
 
     fn create_test_buffer(channels: usize, frames: usize) -> DecodedBuffer {
         let data = vec![0.0f32; channels * frames];
