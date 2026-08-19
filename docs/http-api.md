@@ -61,7 +61,7 @@ Config file example:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/command` | POST | Send any command (same JSON as MQTT) |
-| `/play` | POST | Play audio file |
+| `/play` | POST | Play audio file (same parameters as the MQTT `play` command, including `channel_map`) |
 | `/stop` | POST | Stop samples by selector |
 | `/stopall` | POST | Stop all playback |
 | `/fadeall` | POST | Fade out all playback |
@@ -139,7 +139,7 @@ Returns active samples with playback position and timing information:
 | `position` | integer | Current position in frames |
 | `position_ms` | integer | Current position in milliseconds |
 | `total_frames` | integer | Total audio length in frames |
-| `total_ms` | integer | Total audio length in milliseconds |
+| `total_ms` | integer | Total audio length in milliseconds (0 while a compressed HTTP stream's length is still unknown) |
 | `sample_rate` | integer | Sample rate in Hz |
 | `volume` | float | Sample volume (0.0-4.0, 1.0 = unity) |
 | `voice_volume` | float | Voice group volume (0.0-4.0, 1.0 = unity) |

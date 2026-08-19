@@ -445,9 +445,10 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
     tracing::info!("  Channels: {}", output_channels);
 
     // Load test files if they exist, otherwise generate test tones
+    // Paths are relative to the working directory (run from the repo root)
     let test_files = vec![
-        "/Users/bandrews/src/mqttaudio/tests/audio/test_440hz_2s.wav",
-        "/Users/bandrews/src/mqttaudio/tests/audio/test_880hz_48khz.wav",
+        "tests/audio/test_440hz_2s.wav",
+        "tests/audio/test_880hz_48khz.wav",
     ];
 
     let mut buffers = Vec::new();

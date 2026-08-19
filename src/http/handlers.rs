@@ -133,6 +133,10 @@ pub struct PlayParams {
     loop_mode: Option<bool>,
     #[serde(default)]
     crossfade_ms: Option<u32>,
+    /// Channel routing, same shape as the MQTT command:
+    /// [{"src": 0, "dest": "rear_left"}, ...]
+    #[serde(default)]
+    channel_map: Option<Value>,
 }
 
 pub async fn handle_play(
@@ -161,6 +165,9 @@ pub async fn handle_play(
     }
     if let Some(crossfade_ms) = params.crossfade_ms {
         message["crossfade_ms"] = json!(crossfade_ms);
+    }
+    if let Some(channel_map) = params.channel_map {
+        message["channel_map"] = channel_map;
     }
 
     let command = json!({

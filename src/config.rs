@@ -857,13 +857,26 @@ impl Config {
             if self.bass_management.source_channels.is_empty() {
                 errors.push("bass_management.source_channels must not be empty when enabled".to_string());
             }
-            // Validate channel aliases resolve
+            // Validate channel aliases resolve, and reject duplicates: the
+            // same source listed twice would run its crossover filter twice
+            // per frame, corrupting the filter state
             if let Err(e) = self.resolve_channel(&self.bass_management.lfe_channel) {
                 errors.push(format!("bass_management.lfe_channel: {}", e));
             }
+            let mut seen_sources = std::collections::HashSet::new();
             for (i, ch) in self.bass_management.source_channels.iter().enumerate() {
-                if let Err(e) = self.resolve_channel(ch) {
-                    errors.push(format!("bass_management.source_channels[{}]: {}", i, e));
+                match self.resolve_channel(ch) {
+                    Ok(index) => {
+                        if !seen_sources.insert(index) {
+                            errors.push(format!(
+                                "bass_management.source_channels lists channel {} twice",
+                                index
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        errors.push(format!("bass_management.source_channels[{}]: {}", i, e));
+                    }
                 }
             }
         }
@@ -1744,6 +1757,24 @@ mod tests {
 
         config.inputs[0].activity_threshold = Some(0.05);
         assert!(config.validate().is_ok(), "a sensible threshold validates");
+    }
+
+    #[test]
+    fn test_bass_management_rejects_duplicate_sources() {
+        // The same source channel listed twice runs its crossover filter
+        // twice per frame, corrupting the filter state
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.bass_management.enabled = true;
+        config.bass_management.source_channels =
+            vec![ChannelRef::Index(0), ChannelRef::Index(1), ChannelRef::Index(0)];
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("source_channels") && e.contains("twice")),
+            "got: {:?}",
+            errors
+        );
     }
 
     #[test]

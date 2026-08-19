@@ -512,6 +512,22 @@ async fn main() {
             bm_config.crossover_frequency_hz,
             bm_config.source_channels
         );
+        // Config validation cannot know the device width; say so now rather
+        // than processing silently with routes that can never sound
+        if bm_config.lfe_channel >= output_channels {
+            tracing::warn!(
+                "Bass management is inactive: lfe_channel {} but the device opened with {} channels",
+                bm_config.lfe_channel, output_channels
+            );
+        }
+        for src in &bm_config.source_channels {
+            if *src >= output_channels {
+                tracing::warn!(
+                    "Bass management source channel {} is beyond the device's {} channels and contributes nothing",
+                    src, output_channels
+                );
+            }
+        }
         Some(audio::bass_management::BassManagement::new(bm_config, output_sample_rate, output_channels))
     } else {
         None
@@ -853,7 +869,13 @@ async fn main() {
                 }
                 Err(e) => {
                     tracing::error!("Failed to start HTTP server: {}", e);
-                    // Continue without HTTP server - not fatal
+                    if !mqtt_enabled {
+                        // HTTP was the only control surface; a daemon that can
+                        // receive no commands should fail loudly, not idle
+                        tracing::error!("HTTP was the only enabled interface - exiting");
+                        std::process::exit(1);
+                    }
+                    tracing::warn!("Continuing with MQTT only");
                 }
             }
         }
@@ -928,7 +950,22 @@ async fn main() {
                                         })
                                         .collect();
                                     match mapping {
-                                        Ok(m) => Some(m),
+                                        Ok(m) => {
+                                            // Routes past the device width mix to nothing; say so
+                                            // once at command time instead of playing silence
+                                            if m.is_empty() {
+                                                tracing::warn!("channel_map for '{}' is empty - it will play silently", file);
+                                            }
+                                            for (_, dest) in &m {
+                                                if *dest >= output_channels {
+                                                    tracing::warn!(
+                                                        "channel_map for '{}' routes to channel {} but the device opened with {} channels - that route will be silent",
+                                                        file, dest, output_channels
+                                                    );
+                                                }
+                                            }
+                                            Some(m)
+                                        }
                                         Err(e) => {
                                             deliver(reply.take(), Err(CommandError::new(CommandErrorKind::InvalidRequest, format!("Failed to resolve channel alias: {}", e))));
                                             continue;

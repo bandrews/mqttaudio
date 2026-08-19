@@ -277,13 +277,16 @@ impl CacheManager {
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        // Get estimated frames from content length (rough estimate)
+        // Get estimated frames from content length. Encoded bytes only map
+        // to frames for uncompressed WAV (~4 bytes per 16-bit stereo frame);
+        // for compressed formats no estimate is better than a wildly wrong one.
         let (_bytes_so_far, content_length) = reader.progress();
-        let estimated_frames = content_length.map(|len| {
-            // Rough estimate: assume 16-bit stereo @ target rate
-            // This will be refined once the decoder starts
-            len / 4
-        });
+        let url_path = url.split(['?', '#']).next().unwrap_or(url);
+        let estimated_frames = if url_path.to_lowercase().ends_with(".wav") {
+            content_length.map(|len| len / 4)
+        } else {
+            None
+        };
 
         // Create streaming buffer (channels will be updated by decoder)
         let streaming_buffer = Arc::new(RwLock::new(StreamingBuffer::new(
@@ -310,7 +313,6 @@ impl CacheManager {
         // Create hint for format detection from the URL path (query strings
         // and non-audio suffixes would mislead the probe)
         let mut hint = Hint::new();
-        let url_path = url.split(['?', '#']).next().unwrap_or(url);
         if let Some(ext) = url_path.rsplit('/').next().and_then(|f| f.rsplit('.').next()) {
             let ext = ext.to_lowercase();
             if matches!(ext.as_str(), "wav" | "mp3" | "ogg" | "flac") {
