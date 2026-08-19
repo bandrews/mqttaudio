@@ -85,6 +85,37 @@
     ]
   },
 
+  "inputs": [
+    {
+      "device": null,
+      "volume": 0.9,
+      "voice_id": "gm_mic",
+      "latency_ms": 25,
+      "channels": null,
+      "sample_rate": null,
+      "routes": [
+        { "source_channel": 0, "dest_channel": 4 },
+        { "source_channel": 1, "dest_channel": 4 },
+        { "source_channel": 2, "dest_channel": 5 }
+      ],
+
+      "_notes": [
+        "device: Input device name. null = system default. Use --list-inputs to see options",
+        "  Example: 'plughw:CARD=UMC1820,DEV=0'",
+        "  On Linux prefer the 'plughw:' alias of a card: capture is read as 32-bit float",
+        "  and plughw: converts from the card's native format",
+        "volume: Input volume (0.0-1.0)",
+        "voice_id: Voice name, used by input_volume/input_mute commands and ducking rules",
+        "latency_ms: Buffer latency (5-500). 20-30 is a good starting point for live mics",
+        "channels: Capture channels to open. null = smallest count covering every source_channel",
+        "sample_rate: Capture rate to request. null = match the output rate and skip resampling",
+        "routes: source_channel (mic input, 0-indexed) to dest_channel (speaker output)",
+        "  Two source channels sharing a dest_channel are summed there",
+        "  dest_channel may use a name from audio.channel_aliases"
+      ]
+    }
+  ],
+
   "_example_configs": {
     "_minimal": {
       "mqtt": {

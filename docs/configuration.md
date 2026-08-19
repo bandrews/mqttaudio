@@ -302,6 +302,8 @@ Microphone/input device configuration.
 | `voice_id` | string | — | Voice name for ducking integration |
 | `routes` | array | *required* | Channel routing (source → dest, can use aliases) |
 | `latency_ms` | integer | `25` | Buffer latency (5-500ms) |
+| `channels` | integer | *auto* | Capture channels to open (1-64). Defaults to the smallest count that covers every `source_channel` |
+| `sample_rate` | integer | *auto* | Capture rate to request (8000-192000). Defaults to the output rate, which avoids resampling |
 
 The `dest_channel` in routes can use channel aliases defined in `audio.channel_aliases`.
 

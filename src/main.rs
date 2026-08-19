@@ -99,6 +99,73 @@ struct Args {
     max_cache_mb: Option<u32>,
 }
 
+/// Report capture health for live inputs on a fixed interval.
+///
+/// Overruns, backlog trims and starvation are counted inside the audio
+/// callbacks, which must not log or allocate; this reports the deltas from an
+/// ordinary task so problems are visible without stalling the audio threads.
+fn spawn_input_health_monitor(
+    mixer_state: std::sync::Arc<std::sync::Mutex<audio::mixer::MixerState>>,
+) {
+    const INTERVAL_SECS: u64 = 10;
+
+    tokio::spawn(async move {
+        let mut previous: Vec<(u64, u64, u64)> = Vec::new();
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(INTERVAL_SECS));
+        ticker.tick().await; // the first tick completes immediately
+
+        loop {
+            ticker.tick().await;
+
+            let snapshot: Vec<(String, usize, u64, u64, u64)> = {
+                let state = mixer_state.lock().unwrap();
+                state
+                    .live_inputs
+                    .iter()
+                    .map(|i| {
+                        (
+                            i.voice_id.clone(),
+                            i.backlog_frames(),
+                            i.dropped_frames(),
+                            i.trimmed_frames,
+                            i.underrun_frames,
+                        )
+                    })
+                    .collect()
+            };
+
+            previous.resize(snapshot.len(), (0, 0, 0));
+
+            for (idx, (voice_id, backlog, dropped, trimmed, underrun)) in
+                snapshot.iter().enumerate()
+            {
+                let (prev_dropped, prev_trimmed, prev_underrun) = previous[idx];
+                previous[idx] = (*dropped, *trimmed, *underrun);
+
+                let new_dropped = dropped.saturating_sub(prev_dropped);
+                let new_trimmed = trimmed.saturating_sub(prev_trimmed);
+                let new_underrun = underrun.saturating_sub(prev_underrun);
+
+                if new_dropped == 0 && new_trimmed == 0 && new_underrun == 0 {
+                    continue;
+                }
+
+                tracing::warn!(
+                    "Input {} ('{}'): {} frames overran, {} trimmed, {} starved in {}s (backlog {} frames)",
+                    idx,
+                    voice_id,
+                    new_dropped,
+                    new_trimmed,
+                    new_underrun,
+                    INTERVAL_SECS,
+                    backlog
+                );
+            }
+        }
+    });
+}
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
@@ -436,26 +503,31 @@ async fn main() {
     // Keep active input streams alive - they will be kept alive until the app exits
     let mut _active_inputs: Vec<audio::input::ActiveInput> = Vec::new();
     for (idx, input_config) in config.inputs.iter().enumerate() {
+        // Resolve routing first: it determines how many capture channels the
+        // stream has to be opened with.
+        let channel_map: Vec<(usize, usize)> = config.resolve_input_routes(&input_config.routes)
+            .expect("Channel alias resolution failed (should have been caught during validation)");
+
         let stream_config = audio::input::InputStreamConfig {
             device_name: input_config.device.clone(),
             latency_ms: input_config.latency_ms,
+            channels: input_config.channels,
+            min_channels: audio::input::required_channels(&channel_map),
+            sample_rate: input_config.sample_rate,
         };
 
         match audio::input::create_input_stream(stream_config, output_sample_rate) {
             Ok(mut active_input) => {
                 tracing::info!(
-                    "Opened input device: {} ({} channels, voice '{}')",
+                    "Opened input device: {} ({} channels, {} Hz, voice '{}')",
                     input_config.device.as_deref().unwrap_or("default"),
                     active_input.channels,
+                    active_input.sample_rate,
                     input_config.voice_id
                 );
 
                 // Take ownership of the consumer for the mixer
                 if let Some(consumer) = active_input.take_consumer() {
-                    // Build channel map from routes config (resolve aliases)
-                    let channel_map: Vec<(usize, usize)> = config.resolve_input_routes(&input_config.routes)
-                        .expect("Channel alias resolution failed (should have been caught during validation)");
-
                     tracing::info!(
                         "Input {} routed: {:?}",
                         idx,
@@ -471,7 +543,7 @@ async fn main() {
                         active_input.channels,
                         input_config.volume,
                         channel_map,
-                    );
+                    ).with_dropped_frames(active_input.dropped_frames.clone());
 
                     // Add to mixer state
                     mixer_state.lock().unwrap().live_inputs.push(live_input);
@@ -488,6 +560,10 @@ async fn main() {
                 );
             }
         }
+    }
+
+    if !mixer_state.lock().unwrap().live_inputs.is_empty() {
+        spawn_input_health_monitor(mixer_state.clone());
     }
 
     let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));

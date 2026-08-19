@@ -5,6 +5,40 @@ All notable changes to mqttaudio will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Microphone capture on multichannel interfaces**: input devices with more
+  than 16 channels lost part of every frame, which rotated the channel routing
+  and grew a residue in the ring buffer until it overflowed continuously. All
+  capture channels are now readable and routable.
+- **Channel alignment under load**: an overrun could write a partial frame into
+  the capture ring buffer, permanently shifting which microphone reached which
+  speaker. Only whole frames are transferred now, so an overrun costs audio
+  rather than correctness.
+- **Capture latency drift**: a capture clock faster than the output clock built
+  an unbounded backlog. Excess backlog is now trimmed in whole frames.
+- **Realtime safety of capture callbacks**: the callbacks no longer allocate,
+  resample into freshly allocated buffers, or write log lines, all of which
+  stalled the capture thread and caused the overruns they reported.
+- **Input device naming**: input devices are now resolved by ALSA card the same
+  way output devices are, so `"hw:CARD=UMC1820, DEV=0"` matches the enumerated
+  device.
+- **Voice volume ramping on live inputs**: a fade no longer stalls while the
+  input is starved.
+
+### Added
+
+- `inputs[].channels` and `inputs[].sample_rate` to control how a capture
+  stream is opened. By default the stream opens with the smallest channel count
+  the routes need, at the output sample rate so no resampling is required.
+- Input health counters (backlog, overruns, trims, starvation) reported through
+  `GET /status/inputs` and logged every 10 seconds when non-zero.
+- A clear startup error when a device offers no f32 capture format, naming the
+  `plughw:` alias as the fix, and when routing references a channel the device
+  cannot reach.
+
 ## [2.0.0] - 2025-10-19
 
 ### Overview

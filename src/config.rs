@@ -276,6 +276,10 @@ pub struct InputConfig {
     pub routes: Vec<InputRouteConfig>,
     /// Buffer latency in milliseconds
     pub latency_ms: u32,
+    /// Capture channel count to open (None = smallest count the routes need)
+    pub channels: Option<usize>,
+    /// Capture sample rate to request (None = match the output sample rate)
+    pub sample_rate: Option<u32>,
 }
 
 impl Default for InputConfig {
@@ -286,6 +290,8 @@ impl Default for InputConfig {
             voice_id: "mic".to_string(),
             routes: Vec::new(),
             latency_ms: 20,
+            channels: None,
+            sample_rate: None,
         }
     }
 }
@@ -741,6 +747,16 @@ impl Config {
             }
             if input.latency_ms < 5 || input.latency_ms > 500 {
                 errors.push(format!("inputs[{}].latency_ms must be between 5 and 500", i));
+            }
+            if let Some(channels) = input.channels {
+                if channels == 0 || channels > 64 {
+                    errors.push(format!("inputs[{}].channels must be between 1 and 64", i));
+                }
+            }
+            if let Some(rate) = input.sample_rate {
+                if !(8000..=192000).contains(&rate) {
+                    errors.push(format!("inputs[{}].sample_rate must be between 8000 and 192000", i));
+                }
             }
             // Validate channel aliases in routes
             for (j, route) in input.routes.iter().enumerate() {
@@ -1393,6 +1409,8 @@ mod tests {
                 InputRouteConfig { source_channel: ChannelRef::Index(0), dest_channel: ChannelRef::Index(1) },
             ],
             latency_ms: 25,
+            channels: None,
+            sample_rate: None,
         });
 
         let result = config.validate();

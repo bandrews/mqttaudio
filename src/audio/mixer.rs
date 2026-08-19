@@ -6,6 +6,8 @@ use crate::audio::ducking::DuckingEngine;
 use crate::audio::bass_management::BassManagement;
 use crate::audio::pitch_correction::PitchCorrector;
 use ringbuf::HeapConsumer;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Fade state for audio samples
 #[derive(Debug, Clone, PartialEq)]
@@ -456,6 +458,26 @@ pub struct LiveInput {
 
     /// Channel routing: vec![(src_channel, dest_channel), ...]
     pub channel_map: Vec<(usize, usize)>,
+
+    /// Interleaved frames read from the ring buffer during a callback.
+    /// Preallocated to the ring buffer's capacity so the audio callback
+    /// never allocates.
+    scratch: Vec<f32>,
+
+    /// Backlog ceiling in frames. Anything beyond this is discarded so that
+    /// capture latency stays bounded when the capture clock outruns the
+    /// output clock.
+    pub max_backlog_frames: usize,
+
+    /// Frames discarded to bring the backlog back under the ceiling
+    pub trimmed_frames: u64,
+
+    /// Frames of silence emitted because the ring buffer was empty
+    pub underrun_frames: u64,
+
+    /// Frames the capture callback could not hand over because the ring
+    /// buffer was full. Shared with the capture thread.
+    pub dropped_frames: Arc<AtomicU64>,
 }
 
 impl LiveInput {
@@ -467,6 +489,9 @@ impl LiveInput {
         volume: f32,
         channel_map: Vec<(usize, usize)>,
     ) -> Self {
+        let channels = input_channels.max(1);
+        let capacity_frames = consumer.capacity() / channels;
+
         Self {
             voice_id,
             consumer,
@@ -475,7 +500,30 @@ impl LiveInput {
             voice_volume: 1.0,
             target_voice_volume: 1.0,
             channel_map,
+            scratch: vec![0.0; capacity_frames * channels],
+            max_backlog_frames: capacity_frames / 2,
+            trimmed_frames: 0,
+            underrun_frames: 0,
+            dropped_frames: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Share the capture thread's dropped-frame counter so input health can be
+    /// reported from the mixer state
+    pub fn with_dropped_frames(mut self, dropped_frames: Arc<AtomicU64>) -> Self {
+        self.dropped_frames = dropped_frames;
+        self
+    }
+
+    /// Number of whole frames currently waiting in the ring buffer
+    pub fn backlog_frames(&self) -> usize {
+        self.consumer.len() / self.input_channels.max(1)
+    }
+
+    /// Frames the capture callback could not hand over because the ring buffer
+    /// was full
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped_frames.load(Ordering::Relaxed)
     }
 
     /// Get the combined volume (input volume * voice volume)
@@ -835,6 +883,11 @@ fn mix_sample_with_pitch_correction(
 }
 
 /// Mix a live input (microphone) into the output buffer
+///
+/// Samples are moved out of the ring buffer in whole frames only. A partially
+/// consumed frame would shift the interleaving for every later callback, which
+/// silently reroutes each microphone to the wrong output and leaves a residue
+/// that grows until the ring buffer overflows.
 fn mix_live_input_into_output(
     input: &mut LiveInput,
     output: &mut [f32],
@@ -843,43 +896,54 @@ fn mix_live_input_into_output(
     ducking_multiplier: f32,
 ) {
     let input_channels = input.input_channels;
+    if input_channels == 0 {
+        return;
+    }
     let base_volume = input.volume;
 
-    // Read available samples from the ring buffer
-    // Process frame by frame to handle underruns gracefully
+    // Bound capture latency: a capture clock faster than the output clock
+    // builds a backlog that would otherwise grow until the ring buffer is full.
+    let available_frames = input.consumer.len() / input_channels;
+    if available_frames > input.max_backlog_frames + frames {
+        let excess = available_frames - input.max_backlog_frames;
+        let skipped = input.consumer.skip(excess * input_channels);
+        input.trimmed_frames += (skipped / input_channels) as u64;
+    }
+
+    let mut frames_to_read = frames
+        .min(input.consumer.len() / input_channels)
+        .min(input.scratch.len() / input_channels);
+
+    if frames_to_read > 0 {
+        let samples = frames_to_read * input_channels;
+        let read = input.consumer.pop_slice(&mut input.scratch[..samples]);
+        frames_to_read = read / input_channels;
+    }
+    if frames_to_read < frames {
+        input.underrun_frames += (frames - frames_to_read) as u64;
+    }
+
     for frame_idx in 0..frames {
-        // Advance voice volume toward target (smooth ramping to avoid pops)
+        // Advance voice volume toward target (smooth ramping to avoid pops).
+        // This runs for every output frame, including starved ones, so a fade
+        // still completes on schedule while the input is silent.
         input.advance_voice_volume();
 
-        // Read one frame worth of samples
-        let samples_needed = input_channels;
-        let samples_available = input.consumer.len();
-
-        if samples_available < samples_needed {
-            // Underrun - not enough samples for a complete frame
-            // Leave remaining output as silence (already zeroed)
-            break;
+        if frame_idx >= frames_to_read {
+            // Underrun - leave the remaining output as silence (already zeroed)
+            continue;
         }
 
-        // Read the entire frame from the ring buffer
-        let mut frame_samples = [0.0f32; 16]; // Support up to 16 input channels
-        for ch in 0..input_channels.min(16) {
-            if let Some(sample) = input.consumer.pop() {
-                frame_samples[ch] = sample;
-            }
-        }
-
-        // Calculate volume per-frame to handle smooth ramping
         let final_volume = base_volume * input.voice_volume * ducking_multiplier;
+        let frame_start = frame_idx * input_channels;
 
-        // Apply channel mapping
         for &(src_ch, dest_ch) in &input.channel_map {
-            if src_ch >= input_channels || dest_ch >= output_channels || src_ch >= 16 {
+            if src_ch >= input_channels || dest_ch >= output_channels {
                 continue;
             }
 
             let dest_idx = frame_idx * output_channels + dest_ch;
-            output[dest_idx] += frame_samples[src_ch] * final_volume;
+            output[dest_idx] += input.scratch[frame_start + src_ch] * final_volume;
         }
     }
 }
@@ -1497,6 +1561,21 @@ mod tests {
         consumer
     }
 
+    fn create_test_ring_buffer_with_capacity(data: &[f32], capacity: usize) -> HeapConsumer<f32> {
+        use ringbuf::HeapRb;
+        let rb = HeapRb::<f32>::new(capacity);
+        let (mut producer, consumer) = rb.split();
+        producer.push_slice(data);
+        consumer
+    }
+
+    /// Interleaved test data where each sample's value identifies its channel
+    fn channel_marked_frames(frames: usize, channels: usize) -> Vec<f32> {
+        (0..frames * channels)
+            .map(|i| (i % channels) as f32 / 100.0)
+            .collect()
+    }
+
     #[test]
     fn test_live_input_basic_mixing() {
         // Create ring buffer with stereo data (10 frames)
@@ -1689,6 +1768,285 @@ mod tests {
         // Both inputs mix additively: 0.2 + 0.3 = 0.5
         for &s in &output {
             assert!((s - 0.5).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn test_live_input_high_channel_count() {
+        // Multichannel interfaces expose far more than 16 capture channels.
+        // Every channel must be routable and every sample must be consumed.
+        let channels = 20;
+        let frames = 4;
+        let data = channel_marked_frames(frames, channels);
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            channels,
+            1.0,
+            vec![(17, 0), (19, 1)],
+        );
+
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; frames * 2];
+        mix_audio(&mut output, &mut state);
+
+        for f in 0..frames {
+            assert!((output[f * 2] - 0.17).abs() < 1e-6, "input channel 17 routes to output 0");
+            assert!((output[f * 2 + 1] - 0.19).abs() < 1e-6, "input channel 19 routes to output 1");
+        }
+
+        assert_eq!(
+            state.live_inputs[0].consumer.len(), 0,
+            "every consumed frame must be fully drained"
+        );
+    }
+
+    #[test]
+    fn test_live_input_stays_frame_aligned_across_callbacks() {
+        // Leftover samples from a partially consumed frame would rotate the
+        // channel mapping on every subsequent callback.
+        let channels = 20;
+        let data = channel_marked_frames(6, channels);
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            channels,
+            1.0,
+            vec![(3, 0)],
+        );
+
+        let mut state = MixerState::new(1);
+        state.live_inputs.push(live_input);
+
+        for callback in 0..3 {
+            let mut output = vec![0.0f32; 2];
+            mix_audio(&mut output, &mut state);
+            for (i, &s) in output.iter().enumerate() {
+                assert!(
+                    (s - 0.03).abs() < 1e-6,
+                    "callback {} frame {} should still read channel 3, got {}",
+                    callback, i, s
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_live_input_trims_excess_backlog() {
+        // A capture clock running faster than the output clock builds a backlog.
+        // The mixer discards whole frames to bound latency instead of letting
+        // the ring buffer saturate and drop samples at the producer.
+        let channels = 2;
+        let capacity = 400; // 200 frames
+        let data = vec![0.5f32; 380]; // 190 frames queued
+        let consumer = create_test_ring_buffer_with_capacity(&data, capacity);
+
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            channels,
+            1.0,
+            vec![(0, 0), (1, 1)],
+        );
+        let max_backlog = live_input.max_backlog_frames;
+        assert!(max_backlog < 190, "test needs a backlog above the ceiling");
+
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 4]; // 2 frames
+        mix_audio(&mut output, &mut state);
+
+        let input = &state.live_inputs[0];
+        assert!(input.trimmed_frames > 0, "excess backlog should be trimmed");
+        assert!(
+            input.consumer.len() / channels <= max_backlog,
+            "backlog must be brought down to the ceiling"
+        );
+        assert_eq!(
+            input.consumer.len() % channels, 0,
+            "trimming must remove whole frames only"
+        );
+    }
+
+    #[test]
+    fn test_live_input_backlog_within_ceiling_is_kept() {
+        let channels = 2;
+        let data = vec![0.5f32; 20]; // 10 frames
+        let consumer = create_test_ring_buffer_with_capacity(&data, 400);
+
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            channels,
+            1.0,
+            vec![(0, 0), (1, 1)],
+        );
+
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 4];
+        mix_audio(&mut output, &mut state);
+
+        assert_eq!(state.live_inputs[0].trimmed_frames, 0);
+        assert_eq!(state.live_inputs[0].consumer.len(), 16, "8 frames left");
+    }
+
+    #[test]
+    fn test_live_input_counts_underrun_frames() {
+        let data = vec![0.8f32; 10]; // 5 stereo frames
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            2,
+            1.0,
+            vec![(0, 0), (1, 1)],
+        );
+
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 20]; // 10 frames requested
+        mix_audio(&mut output, &mut state);
+
+        assert_eq!(state.live_inputs[0].underrun_frames, 5);
+    }
+
+    #[test]
+    fn test_live_input_volume_ramp_advances_through_underrun() {
+        // The ramp is wall-clock based: it must keep moving while the input is
+        // starved, otherwise a mute applied during a dropout never completes.
+        let consumer = create_test_ring_buffer_with_data(&[]);
+
+        let mut live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            1,
+            1.0,
+            vec![(0, 0)],
+        );
+        live_input.set_target_voice_volume(0.0);
+        let before = live_input.voice_volume;
+
+        let mut state = MixerState::new(1);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 100];
+        mix_audio(&mut output, &mut state);
+
+        assert!(
+            state.live_inputs[0].voice_volume < before,
+            "voice volume ramp should advance even with no input samples"
+        );
+    }
+
+    #[test]
+    fn test_live_input_ignores_out_of_range_routes() {
+        let data = vec![0.5f32; 8]; // 4 stereo frames
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        // Source channel 7 does not exist on a stereo input; destination 9
+        // does not exist on a stereo output. Both routes must be skipped
+        // without disturbing the valid one.
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            2,
+            1.0,
+            vec![(7, 0), (0, 9), (1, 1)],
+        );
+
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 8];
+        mix_audio(&mut output, &mut state);
+
+        for f in 0..4 {
+            assert_eq!(output[f * 2], 0.0);
+            assert_eq!(output[f * 2 + 1], 0.5);
+        }
+    }
+
+    #[test]
+    fn test_multiple_mics_on_one_interface() {
+        // Four microphones on an 18-channel interface: two summed onto a shared
+        // house speaker, two sent to their own endpoints, each at its own level.
+        let channels = 18;
+        let frames = 8;
+        let data = channel_marked_frames(frames, channels);
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let mut mics = LiveInput::new(
+            "gamemaster".to_string(),
+            consumer,
+            channels,
+            0.5,
+            vec![
+                (0, 4),  // mic 1 -> house speaker
+                (1, 4),  // mic 2 -> house speaker (summed with mic 1)
+                (8, 5),  // mic 3 -> its own endpoint
+                (17, 6), // mic 4 -> its own endpoint
+            ],
+        );
+        mics.voice_volume = 1.0;
+        mics.target_voice_volume = 1.0;
+
+        let mut state = MixerState::new(8);
+        state.live_inputs.push(mics);
+
+        let mut output = vec![0.0f32; frames * 8];
+        mix_audio(&mut output, &mut state);
+
+        for f in 0..frames {
+            let base = f * 8;
+            // 0.00 + 0.01 summed, then halved by the input volume
+            assert!((output[base + 4] - 0.005).abs() < 1e-6, "mics 1 and 2 sum on channel 4");
+            assert!((output[base + 5] - 0.04).abs() < 1e-6, "mic 3 on channel 5");
+            assert!((output[base + 6] - 0.085).abs() < 1e-6, "mic 4 on channel 6");
+            assert_eq!(output[base], 0.0, "unrouted channels stay silent");
+            assert_eq!(output[base + 7], 0.0, "unrouted channels stay silent");
+        }
+
+        assert_eq!(state.live_inputs[0].underrun_frames, 0);
+        assert_eq!(state.live_inputs[0].trimmed_frames, 0);
+    }
+
+    #[test]
+    fn test_separate_mic_devices_mix_and_duck_independently() {
+        // Two microphones on separate capture devices, each its own voice, so
+        // they can be levelled and ducked independently while summing to the
+        // same speaker.
+        let consumer1 = create_test_ring_buffer_with_data(&vec![0.4f32; 8]);
+        let consumer2 = create_test_ring_buffer_with_data(&vec![0.6f32; 8]);
+
+        let mut mic1 = LiveInput::new("mic_north".to_string(), consumer1, 1, 0.5, vec![(0, 2)]);
+        mic1.voice_volume = 1.0;
+        mic1.target_voice_volume = 1.0;
+
+        let mut mic2 = LiveInput::new("mic_south".to_string(), consumer2, 1, 1.0, vec![(0, 2)]);
+        mic2.voice_volume = 0.5;
+        mic2.target_voice_volume = 0.5;
+
+        let mut state = MixerState::new(4);
+        state.live_inputs.push(mic1);
+        state.live_inputs.push(mic2);
+
+        let mut output = vec![0.0f32; 8 * 4];
+        mix_audio(&mut output, &mut state);
+
+        // 0.4 * 0.5 + 0.6 * 0.5 = 0.5 on the shared destination
+        for f in 0..8 {
+            assert!((output[f * 4 + 2] - 0.5).abs() < 1e-6);
         }
     }
 
