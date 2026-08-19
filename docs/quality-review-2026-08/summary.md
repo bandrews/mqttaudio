@@ -84,42 +84,23 @@ HTTP revalidation, stream write-through + memory budgeting, the command-loop
 restructure with real HTTP outcomes and load cancellation, mic-triggered
 ducking, WebSocket log streaming with auth, env vars, mic resampler quality,
 the voice/ducking leak cleanup, `speed: 0` rejection, and in-place CHANGELOG
-corrections. The remainder below stays deferred as originally written.
+corrections.
 
-## Deferred — needs a decision (30 items, see triage.md for detail)
+## Still deferred (see triage.md for detail)
 
-The ones most worth a decision soon:
-
-1. **Empty `allowed_directories` semantics (D1).** Docs used to promise
-   "empty = HTTP-only", but the README quick start and every default-config
-   setup relies on local playback. Enforcement now applies only to non-empty
-   lists; docs say so. Decide whether empty should eventually mean deny-local.
-2. **`cache.enabled` and `revalidate_after_seconds` (D2, D3)** are still
-   accepted-but-inert (docs now say "reserved"). Implement or remove.
-3. **Streamed HTTP audio is never written to disk cache and never enters the
-   memory-cache budget (D4, D5).** Every URL play re-downloads after restart,
-   `max_memory_mb` doesn't bound streamed loads, and completed loads live in
-   `active_loads` forever — the real memory-growth story on long-running
-   installs, together with the VoiceManager/DuckingEngine per-playback leaks
-   (D10).
-4. **Command-loop serialization (D6).** A slow load delays `stopall`; the
-   cache mutex is held across awaits (a `/status` poll during a stall can
-   even block the audio callback). Timeouts now bound the damage; the
-   architecture fix (async mutex / per-load tasks) is real work.
-5. **WebSocket log streaming (D8)** was advertised but never wired into
-   tracing — no client ever received a log line. Docs now say so. Wire it up
-   (and add auth to `/ws`) or drop the endpoint.
-6. **Mic-triggered ducking (D7)** needs signal-level detection to exist; docs
-   no longer claim it.
-7. **HTTP responses are fire-and-forget (D9)** — clients can't learn a
-   command failed. Needs an API design pass.
-
-The rest (D11–D30) are audio-quality subtleties (loop-crossfade double-play,
-resampler tail loss, RT-safety violations in the callback, decode aborts on
-one corrupt packet, volume-change pops), cache-layer hardening (unstable
-filename hashing, non-atomic writes, progress estimates), and smaller polish
-(IPv6 bind, constant-time token compare, `speed: 0` semantics, dev-tool
-paths, lib.rs duplication).
+What remains open after the sprint program is engineering backlog, not
+product decisions: audio-quality subtleties (loop-crossfade double-play
+D12, resampler tail loss D13, remaining RT allocations in the callback D11,
+decode aborts on one corrupt packet D15, volume-change pops D17), the
+`--lfe-channel` CLI activation story (D20), bass-management runtime
+warnings (D21), IPv6 bind + constant-time token compare (D22), the
+remaining cache hardening from D23 (whole-file downloads buffer in RAM,
+dropping a reader does not cancel its download), encoded-bytes progress
+estimates (D24), `channel_map` over `POST /play` (D25), lib.rs's duplicated
+module tree (D26), dev-tool paths (D27), and command-time channel-width
+warnings (D28). D1's empty-list semantics stay as decided (empty =
+unrestricted, documented), with deny-local available as a future opt-in if
+ever wanted.
 
 ## Verification
 
