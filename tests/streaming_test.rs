@@ -272,6 +272,60 @@ async fn test_cache_manager_streaming_load() {
 }
 
 #[tokio::test]
+async fn test_failed_streaming_load_retries_on_next_play() {
+    // A URL whose decode fails must not poison later plays of the same URL:
+    // once the content is fixed on the server, the next play should succeed.
+    let temp_dir = TempDir::new().unwrap();
+    let bad_path = temp_dir.path().join("retry_test.wav");
+    std::fs::write(&bad_path, b"this is not audio data at all, just text").unwrap();
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/retry_test.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
+
+    // Wait for the decode to fail
+    let errored = |buffer: &SampleBuffer| match buffer {
+        SampleBuffer::Streaming(buf) => buf.read().unwrap().has_error(),
+        SampleBuffer::Complete(_) => false,
+    };
+    let mut attempts = 0;
+    while !errored(&buffer) && attempts < 100 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        attempts += 1;
+    }
+    assert!(errored(&buffer), "Decode of garbage data should have failed");
+
+    // Fix the file on the server, then play the same URL again
+    generate_test_wav(&bad_path, 0.3);
+
+    let buffer2 = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
+
+    let mut attempts = 0;
+    while !buffer2.is_complete() && attempts < 100 {
+        assert!(
+            !errored(&buffer2),
+            "Second play should not have joined the failed load"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        attempts += 1;
+    }
+    assert!(buffer2.is_complete(), "Second play should load successfully");
+    assert!(buffer2.frames() > 0);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
 async fn test_cache_manager_memory_cache_hit() {
     let temp_dir = TempDir::new().unwrap();
     let wav_path = temp_dir.path().join("cache_test.wav");

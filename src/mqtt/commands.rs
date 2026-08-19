@@ -401,29 +401,46 @@ pub fn expand_macros(
         Some(_) => return serde_json::to_string(&value).map_err(ParseError::from),
     };
 
-    // Build merged parameters: process macros in forward order, earlier macros take precedence
-    let mut merged = serde_json::Map::new();
+    // Build merged macro parameters: process macros in forward order, earlier macros take precedence
+    let mut macro_params = serde_json::Map::new();
 
     for macro_name in macro_names.iter() {
-        if let Some(macro_params) = macros.get(macro_name) {
-            if let Some(macro_obj) = macro_params.as_object() {
-                for (k, v) in macro_obj {
-                    // Only set if not already present (earlier macros take precedence)
-                    if !merged.contains_key(k) {
-                        merged.insert(k.clone(), v.clone());
+        match macros.get(macro_name) {
+            Some(params) => {
+                if let Some(macro_obj) = params.as_object() {
+                    for (k, v) in macro_obj {
+                        // Only set if not already present (earlier macros take precedence)
+                        if !macro_params.contains_key(k) {
+                            macro_params.insert(k.clone(), v.clone());
+                        }
                     }
                 }
+            }
+            None => {
+                tracing::warn!("Unknown macro '{}' referenced by command; ignoring it", macro_name);
             }
         }
     }
 
-    // Finally merge command parameters (highest priority)
-    for (k, v) in obj.iter() {
-        merged.insert(k.clone(), v.clone());
-    }
+    // Command parameters always win over macro parameters. For the nested
+    // format, parameters are read from the "message" object, so macro
+    // parameters must be merged there to take effect.
+    if let Some(serde_json::Value::Object(message)) = obj.get_mut("message") {
+        for (k, v) in macro_params {
+            if !message.contains_key(&k) {
+                message.insert(k, v);
+            }
+        }
+        serde_json::to_string(&value).map_err(ParseError::from)
+    } else {
+        let mut merged = macro_params;
+        for (k, v) in obj.iter() {
+            merged.insert(k.clone(), v.clone());
+        }
 
-    let result = serde_json::Value::Object(merged);
-    serde_json::to_string(&result).map_err(ParseError::from)
+        let result = serde_json::Value::Object(merged);
+        serde_json::to_string(&result).map_err(ParseError::from)
+    }
 }
 
 /// Parse MQTT JSON payload into an audio command.
@@ -456,7 +473,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
         "stopall" | "soundStopAll" => {
             Ok(AudioCommand::StopAll)
         }
-        "fadeall" | "soundFadeAll" => {
+        "fadeall" | "soundFadeAll" | "fadeout" | "soundFadeOut" => {
             let time_ms = if mqtt_cmd.has_params() {
                 let msg: FadeAllMessage = serde_json::from_value(mqtt_cmd.get_params())?;
                 msg.time.unwrap_or(DEFAULT_FADE_ALL_MS)
@@ -839,6 +856,20 @@ mod tests {
         match cmd {
             AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, 2000),
             _ => panic!("Expected FadeAll command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fadeout_aliases() {
+        // The legacy app called global fade "fadeout" / "soundFadeOut"
+        for command in ["fadeout", "soundFadeOut"] {
+            let json = format!(r#"{{"command": "{}", "time": 800}}"#, command);
+            let cmd = parse_command(&json).unwrap();
+
+            match cmd {
+                AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, 800),
+                _ => panic!("Expected FadeAll command for {}", command),
+            }
         }
     }
 
@@ -2219,7 +2250,35 @@ mod tests {
 
         assert_eq!(value["command"], "play");
         assert!(value["message"].is_object());
-        assert_eq!(value["volume"], 0.1); // Macro param added at top level
+        // Parameters for the nested format are read from "message", so macro
+        // params must land there to take effect
+        assert_eq!(value["message"]["volume"], 0.1);
+        assert_eq!(value["message"]["file"], "test.mp3");
+    }
+
+    #[test]
+    fn test_expand_macros_nested_message_params_win_over_macro() {
+        let macros = make_macros();
+        let json = r#"{"command": "play", "message": {"file": "test.mp3", "volume": 0.9}, "macro": "quiet"}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+
+        assert_eq!(value["message"]["volume"], 0.9); // Explicit param beats macro
+    }
+
+    #[test]
+    fn test_expand_macros_nested_message_integration_with_parse() {
+        let macros = make_macros();
+        let json = r#"{"command": "play", "message": {"file": "test.mp3"}, "macro": "quiet"}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let cmd = parse_command(&expanded).unwrap();
+
+        match cmd {
+            AudioCommand::Play { volume, .. } => assert_eq!(volume, 0.1),
+            _ => panic!("Expected Play command"),
+        }
     }
 
     #[test]

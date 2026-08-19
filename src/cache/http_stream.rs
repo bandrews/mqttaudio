@@ -279,14 +279,50 @@ impl DownloadHandles {
     }
 }
 
+/// Seconds allowed for TCP connect plus TLS setup.
+const CONNECT_TIMEOUT_SECS: u64 = 10;
+/// Seconds allowed for the server to send response headers.
+const RESPONSE_TIMEOUT_SECS: u64 = 30;
+/// Seconds a body download may stall (no bytes arriving) before it fails.
+const BODY_STALL_TIMEOUT_SECS: u64 = 60;
+
+/// Shared HTTP client with a connect timeout, so an unreachable or
+/// unresponsive server produces an error instead of hanging a load forever.
+pub(crate) fn http_client() -> &'static reqwest::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS))
+            .build()
+            .expect("HTTP client construction only fails on invalid builder options")
+    })
+}
+
+/// Send a GET request, bounding connect and header time so a wedged server
+/// cannot stall the caller indefinitely. The body is not bounded here.
+pub(crate) async fn get_with_timeout(url: &str) -> Result<reqwest::Response, String> {
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(RESPONSE_TIMEOUT_SECS),
+        http_client().get(url).send(),
+    ).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(e)) => Err(format!("Failed to connect: {}", e)),
+        Err(_) => Err(format!(
+            "No response from server within {} seconds",
+            RESPONSE_TIMEOUT_SECS
+        )),
+    }
+}
+
 /// Start an HTTP download in the background and return a reader.
 /// The reader implements MediaSource and can be used with StreamingDecoder.
 pub async fn start_http_stream(url: &str) -> Result<HttpStreamReader, HttpStreamError> {
     use futures_util::StreamExt;
 
-    let response = reqwest::get(url)
+    let response = get_with_timeout(url)
         .await
-        .map_err(|e| HttpStreamError::Request(format!("Failed to connect: {}", e)))?;
+        .map_err(HttpStreamError::Request)?;
 
     if !response.status().is_success() {
         return Err(HttpStreamError::Request(format!(
@@ -306,7 +342,22 @@ pub async fn start_http_stream(url: &str) -> Result<HttpStreamReader, HttpStream
 
     // Spawn background download task
     tokio::spawn(async move {
-        while let Some(chunk_result) = stream.next().await {
+        loop {
+            let chunk_result = match tokio::time::timeout(
+                std::time::Duration::from_secs(BODY_STALL_TIMEOUT_SECS),
+                stream.next(),
+            ).await {
+                Ok(Some(r)) => r,
+                Ok(None) => break,
+                Err(_) => {
+                    handles.fail(format!(
+                        "Download stalled: no data for {} seconds",
+                        BODY_STALL_TIMEOUT_SECS
+                    ));
+                    return;
+                }
+            };
+
             if handles.is_cancelled() {
                 handles.fail("Download cancelled".to_string());
                 return;

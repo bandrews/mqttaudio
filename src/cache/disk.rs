@@ -247,9 +247,10 @@ impl DiskCache {
     pub async fn download_and_cache(&mut self, url: &str) -> Result<PathBuf, CacheError> {
         tracing::info!("Downloading {}", url);
 
-        // Make HTTP request
-        let response = reqwest::get(url).await
-            .map_err(|e| CacheError::HttpError(format!("Failed to download: {}", e)))?;
+        // Make HTTP request, bounded so an unresponsive server errors instead
+        // of stalling the caller indefinitely
+        let response = super::http_stream::get_with_timeout(url).await
+            .map_err(CacheError::HttpError)?;
 
         if !response.status().is_success() {
             return Err(CacheError::HttpError(format!(

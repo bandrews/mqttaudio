@@ -96,10 +96,18 @@ impl CacheManager {
             return Ok(SampleBuffer::Complete(buffer));
         }
 
-        // Check if already loading - return existing streaming buffer
+        // Check if already loading - return existing streaming buffer.
+        // A load that already failed is evicted instead of joined, so one
+        // transient network or decode error does not poison the URL until restart.
         if let Some(active) = self.active_loads.get(file_path) {
-            tracing::debug!("Joining existing streaming load for: {}", file_path);
-            return Ok(SampleBuffer::Streaming(Arc::clone(&active.buffer)));
+            let failed = active.buffer.read().map(|b| b.has_error()).unwrap_or(false);
+            if failed {
+                tracing::warn!("Previous streaming load of {} failed; retrying", file_path);
+                self.active_loads.remove(file_path);
+            } else {
+                tracing::debug!("Joining existing streaming load for: {}", file_path);
+                return Ok(SampleBuffer::Streaming(Arc::clone(&active.buffer)));
+            }
         }
 
         // For HTTP URLs, use streaming approach

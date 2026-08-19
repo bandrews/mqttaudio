@@ -379,6 +379,7 @@ async fn main() {
             &config.mqtt.server,
             config.mqtt.port,
             topic,
+            config.mqtt.client_id.as_deref(),
             config.mqtt.username.as_deref(),
             config.mqtt.password.as_deref(),
         ).await {
@@ -701,10 +702,12 @@ async fn main() {
         }
 
         // Spawn MQTT event processor if connected
-        if let Some((_, eventloop)) = mqtt_connection {
+        if let Some((client, eventloop)) = mqtt_connection {
             let mqtt_cmd_tx = cmd_tx.clone();
+            let mqtt_topic = config.mqtt.topic.as_ref().unwrap().clone();
+            let reconnect_delay = std::time::Duration::from_secs(config.mqtt.reconnect_delay_seconds.max(1));
             tokio::spawn(async move {
-                mqtt::client::process_mqtt_events(eventloop, mqtt_cmd_tx).await;
+                mqtt::client::process_mqtt_events(client, eventloop, mqtt_topic, reconnect_delay, mqtt_cmd_tx).await;
             });
             tracing::info!("Ready to receive MQTT commands on topic: {}", config.mqtt.topic.as_ref().unwrap());
         }
