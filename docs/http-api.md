@@ -77,10 +77,14 @@ Config file example:
 | `/input/volume` | POST | Set a live input's volume (`{"input": "mic", "volume": 0.8}`) |
 | `/input/mute` | POST | Mute/unmute a live input (`{"input": "mic", "mute": true}`) |
 
-Command endpoints acknowledge that the command was accepted for
-processing; they do not report whether it ultimately succeeded. A `play`
-with a missing file still returns `{"success": true}` - check the daemon
-logs (or `/status/samples`) to confirm the outcome.
+Command endpoints wait for the command to be processed and report the
+real outcome: `{"success": true, "message": ...}` on success, or an error
+with a matching status code - 400 for malformed requests, 404 when a
+file fails to load or a selector matches nothing, 403 when a path is
+outside `security.allowed_directories`, 409 when a pending play was
+cancelled by a stop, 504 if the result takes longer than 30 seconds.
+Loads run in the background, so a slow download never delays other
+commands (an emergency `stopall` also cancels any loads still in flight).
 
 ## Authentication
 

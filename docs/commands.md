@@ -201,6 +201,10 @@ Change playback speed.
 **Speed ranges:**
 - Without pitch correction: -100.0 to 100.0 (negative = reverse)
 - With pitch correction: 0.05 to 8.0 (reverse not supported)
+- `speed: 0` is rejected with an error - use `stop` to end playback.
+  Reverse playback starts from the sample's current position, so a sample
+  still at its beginning finishes immediately; `seek` first to play backwards
+  from a point
 
 ### volume
 

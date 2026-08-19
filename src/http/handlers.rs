@@ -2,6 +2,7 @@
 // ABOUTME: Each handler maps HTTP requests to internal commands or status queries.
 
 use super::AppState;
+use crate::mqtt::commands::{CommandErrorKind, CommandRequest};
 use axum::{
     extract::State,
     http::StatusCode,
@@ -22,10 +23,10 @@ struct CommandResponse {
 }
 
 impl CommandResponse {
-    fn ok() -> Self {
+    fn success(message: String) -> Self {
         Self {
             success: true,
-            message: Some("Command accepted".to_string()),
+            message: Some(message),
             error: None,
         }
     }
@@ -39,13 +40,41 @@ impl CommandResponse {
     }
 }
 
-/// Send a command JSON to the command channel.
-async fn send_command(state: &AppState, command_json: &str) -> Result<(), String> {
-    state
-        .cmd_tx
-        .send(command_json.to_string())
-        .await
-        .map_err(|e| format!("Failed to send command: {}", e))
+fn status_for(kind: CommandErrorKind) -> StatusCode {
+    match kind {
+        CommandErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
+        CommandErrorKind::NotFound => StatusCode::NOT_FOUND,
+        CommandErrorKind::Forbidden => StatusCode::FORBIDDEN,
+        CommandErrorKind::Cancelled => StatusCode::CONFLICT,
+        CommandErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Send a command to the processing loop and wait for its actual outcome,
+/// so HTTP clients learn whether the command worked rather than a blanket
+/// "accepted". The wait is bounded; a load that takes absurdly long reports
+/// a timeout instead of hanging the request.
+async fn send_command(state: &AppState, command_json: &str) -> (StatusCode, Json<CommandResponse>) {
+    let (request, reply_rx) = CommandRequest::with_reply(command_json.to_string());
+    if state.cmd_tx.send(request).await.is_err() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CommandResponse::error("Command channel closed")),
+        );
+    }
+
+    match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
+        Ok(Ok(Ok(message))) => (StatusCode::OK, Json(CommandResponse::success(message))),
+        Ok(Ok(Err(err))) => (status_for(err.kind), Json(CommandResponse::error(&err.message))),
+        Ok(Err(_)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CommandResponse::error("Command was dropped before completion")),
+        ),
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(CommandResponse::error("Timed out waiting for the command result")),
+        ),
+    }
 }
 
 // =============================================================================
@@ -80,13 +109,7 @@ pub async fn handle_command(
         }
     };
 
-    match send_command(&state, &command_json).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command_json).await
 }
 
 // =============================================================================
@@ -145,13 +168,7 @@ pub async fn handle_play(
         "message": message
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize, Default)]
@@ -195,13 +212,7 @@ pub async fn handle_stop(
         "message": message
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 pub async fn handle_stopall(State(state): State<AppState>) -> impl IntoResponse {
@@ -210,13 +221,7 @@ pub async fn handle_stopall(State(state): State<AppState>) -> impl IntoResponse 
         "message": {}
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize, Default)]
@@ -240,13 +245,7 @@ pub async fn handle_fadeall(
         "message": message
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize, Default)]
@@ -286,13 +285,7 @@ pub async fn handle_volume(
         "message": message
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize, Default)]
@@ -332,13 +325,7 @@ pub async fn handle_seek(
         "message": message
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize, Default)]
@@ -383,13 +370,7 @@ pub async fn handle_speed(
         "message": message
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize)]
@@ -407,13 +388,7 @@ pub async fn handle_precache(
         "message": { "file": params.file }
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 pub async fn handle_cache_clear(State(state): State<AppState>) -> impl IntoResponse {
@@ -422,13 +397,7 @@ pub async fn handle_cache_clear(State(state): State<AppState>) -> impl IntoRespo
         "message": {}
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize)]
@@ -446,13 +415,7 @@ pub async fn handle_cache_invalidate(
         "message": { "file": params.file }
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize)]
@@ -470,13 +433,7 @@ pub async fn handle_voice_stop(
         "message": { "voice": params.voice }
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize)]
@@ -498,13 +455,7 @@ pub async fn handle_voice_fade_out(
         }
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize)]
@@ -526,13 +477,7 @@ pub async fn handle_voice_volume(
         }
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize)]
@@ -554,13 +499,7 @@ pub async fn handle_input_volume(
         }
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize)]
@@ -584,13 +523,7 @@ pub async fn handle_input_mute(
         }
     });
 
-    match send_command(&state, &command.to_string()).await {
-        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(CommandResponse::error(&e)),
-        ),
-    }
+    send_command(&state, &command.to_string()).await
 }
 
 // =============================================================================
@@ -598,15 +531,20 @@ pub async fn handle_input_mute(
 // =============================================================================
 
 pub async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
+    // Take the async cache lock first and release it before touching the
+    // std mutexes: a status poll must never pin the mixer lock while
+    // waiting on cache work (that would starve the audio callback)
+    let (mem_stats, disk_stats) = {
+        let cache_mgr = state.cache_manager.lock().await;
+        (cache_mgr.memory_stats(), cache_mgr.disk_stats())
+    };
+
     let mixer = state.mixer_state.lock().unwrap();
     let voice_mgr = state.voice_manager.lock().unwrap();
-    let cache_mgr = state.cache_manager.lock().unwrap();
 
     let sample_count = mixer.active_samples.len();
     let input_count = mixer.live_inputs.len();
     let voice_count = voice_mgr.voice_count();
-    let mem_stats = cache_mgr.memory_stats();
-    let disk_stats = cache_mgr.disk_stats();
 
     Json(json!({
         "status": "running",
@@ -680,7 +618,7 @@ pub async fn handle_voices(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub async fn handle_cache_status(State(state): State<AppState>) -> impl IntoResponse {
-    let cache_mgr = state.cache_manager.lock().unwrap();
+    let cache_mgr = state.cache_manager.lock().await;
     let mem_stats = cache_mgr.memory_stats();
     let disk_stats = cache_mgr.disk_stats();
 

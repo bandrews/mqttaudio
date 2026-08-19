@@ -497,6 +497,7 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
         channel_gains: vec![1.0; output_channels],
         ducking_engine: None,
         bass_management: None,
+        finished_samples: Vec::new(),
     }));
 
     let mixer_state_clone = mixer_state.clone();

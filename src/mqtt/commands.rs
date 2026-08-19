@@ -7,6 +7,65 @@ use crate::config::ChannelRef;
 /// Fade duration used when a fadeall command does not name one
 pub const DEFAULT_FADE_ALL_MS: u32 = 1000;
 
+/// Why a command failed, coarse enough for an HTTP status mapping
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandErrorKind {
+    /// The request itself was malformed (bad JSON, unknown command, bad parameter)
+    InvalidRequest,
+    /// The named file, sample, voice, or input does not exist
+    NotFound,
+    /// The request was valid but not permitted (e.g. path outside allowed_directories)
+    Forbidden,
+    /// Superseded by a later stopall/fadeall before it could take effect
+    Cancelled,
+    /// Something failed on our side
+    Internal,
+}
+
+/// A command failure with a human-readable explanation
+#[derive(Debug, Clone)]
+pub struct CommandError {
+    pub kind: CommandErrorKind,
+    pub message: String,
+}
+
+impl CommandError {
+    pub fn new(kind: CommandErrorKind, message: impl Into<String>) -> Self {
+        Self { kind, message: message.into() }
+    }
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+/// What actually happened when a command was processed
+pub type CommandOutcome = Result<String, CommandError>;
+
+/// A command traveling to the processing loop, with an optional reply slot.
+/// MQTT publishes send no reply; HTTP requests wait on one so clients learn
+/// whether the command actually worked.
+#[derive(Debug)]
+pub struct CommandRequest {
+    pub payload: String,
+    pub reply: Option<tokio::sync::oneshot::Sender<CommandOutcome>>,
+}
+
+impl CommandRequest {
+    /// A fire-and-forget request (MQTT publishes)
+    pub fn fire_and_forget(payload: String) -> Self {
+        Self { payload, reply: None }
+    }
+
+    /// A request paired with a receiver for its outcome
+    pub fn with_reply(payload: String) -> (Self, tokio::sync::oneshot::Receiver<CommandOutcome>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Self { payload, reply: Some(tx) }, rx)
+    }
+}
+
 /// MQTT command envelope supporting both flattened and nested formats.
 /// Flattened: {"command": "play", "file": "test.wav", "volume": 0.8}
 /// Nested (legacy): {"command": "play", "message": {"file": "test.wav", "volume": 0.8}}
@@ -339,6 +398,7 @@ pub enum ParseError {
     JsonError(serde_json::Error),
     MissingMessage,
     UnknownCommand(String),
+    InvalidParameter(String),
 }
 
 impl std::fmt::Display for ParseError {
@@ -347,6 +407,7 @@ impl std::fmt::Display for ParseError {
             ParseError::JsonError(e) => write!(f, "JSON parse error: {}", e),
             ParseError::MissingMessage => write!(f, "Command missing 'message' field"),
             ParseError::UnknownCommand(cmd) => write!(f, "Unknown command: {}", cmd),
+            ParseError::InvalidParameter(msg) => write!(f, "Invalid parameter: {}", msg),
         }
     }
 }
@@ -581,6 +642,12 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 return Err(ParseError::MissingMessage);
             }
             let speed_msg: SpeedMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+
+            if speed_msg.speed == 0.0 {
+                return Err(ParseError::InvalidParameter(
+                    "speed 0 is not supported - use stop to end playback, or a small value like 0.05 to crawl".to_string(),
+                ));
+            }
 
             Ok(AudioCommand::Speed {
                 selector: SampleSelector {
@@ -857,6 +924,19 @@ mod tests {
             AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, 2000),
             _ => panic!("Expected FadeAll command"),
         }
+    }
+
+    #[test]
+    fn test_parse_speed_zero_is_rejected() {
+        // speed 0 would otherwise be coerced to an unintelligible 0.01x
+        // drone; someone sending 0 almost certainly wanted stop or pause
+        let json = r#"{"command": "speed", "id": "x", "speed": 0}"#;
+        let err = parse_command(json).unwrap_err();
+        assert!(
+            err.to_string().contains("speed"),
+            "the error should explain the speed problem, got: {}",
+            err
+        );
     }
 
     #[test]

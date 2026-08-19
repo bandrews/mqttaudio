@@ -5,6 +5,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 use mqttaudio::mqtt::client::{connect_mqtt, process_mqtt_events};
+use mqttaudio::mqtt::commands::CommandRequest;
 use rumqttc::{AsyncClient, MqttOptions, QoS};
 use tokio::sync::mpsc;
 
@@ -29,7 +30,7 @@ async fn publish_until_received(
     port: u16,
     topic: &str,
     payload: &str,
-    rx: &mut mpsc::Receiver<String>,
+    rx: &mut mpsc::Receiver<CommandRequest>,
 ) -> Option<String> {
     // Publish repeatedly so the test does not race the subscriber's
     // (re)subscription, and poll the receiving channel between attempts.
@@ -52,7 +53,7 @@ async fn publish_until_received(
             tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
         {
             pub_driver.abort();
-            return Some(received);
+            return Some(received.payload);
         }
         pub_driver.abort();
     }

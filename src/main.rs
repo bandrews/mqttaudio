@@ -515,6 +515,7 @@ async fn main() {
         channel_gains,
         ducking_engine,
         bass_management,
+        finished_samples: Vec::new(),
     }));
 
     // Initialize audio inputs from config
@@ -601,7 +602,7 @@ async fn main() {
     tracing::info!("Resampler quality: {:?}", cache_options.resampler_quality);
 
     let cache_manager = match cache::CacheManager::with_options(cache_dir, cache_options) {
-        Ok(cm) => Arc::new(Mutex::new(cm)),
+        Ok(cm) => Arc::new(tokio::sync::Mutex::new(cm)),
         Err(e) => {
             tracing::error!("Failed to initialize cache: {}", e);
             std::process::exit(1);
@@ -614,7 +615,7 @@ async fn main() {
         if config.cache.precache_blocking {
             tracing::info!("Precaching {} files (blocking)...", precache_files.len());
             for file_path in &precache_files {
-                let mut cache_mgr = cache_manager.lock().unwrap();
+                let mut cache_mgr = cache_manager.lock().await;
                 match cache_mgr.precache(file_path, output_sample_rate).await {
                     Ok(()) => {
                         if config.logging.verbose {
@@ -631,7 +632,7 @@ async fn main() {
         } else {
             tracing::info!("Starting background precache for {} files (non-blocking)...", precache_files.len());
             for file_path in &precache_files {
-                let mut cache_mgr = cache_manager.lock().unwrap();
+                let mut cache_mgr = cache_manager.lock().await;
                 match cache_mgr.precache_streaming(file_path, output_sample_rate).await {
                     Ok(()) => {}
                     Err(e) => {
@@ -662,7 +663,13 @@ async fn main() {
                     .map(|s| s.voice_id.clone())
                     .collect();
 
-                // Remove finished samples
+                // Record finished samples for off-thread bookkeeping cleanup
+                // (voice manager, ducking maps), then remove them
+                let mut finished: Vec<(u64, String)> = state.active_samples.iter()
+                    .filter(|s| s.is_finished())
+                    .map(|s| (s.id, s.voice_id.clone()))
+                    .collect();
+                state.finished_samples.append(&mut finished);
                 state.active_samples.retain(|s| !s.is_finished());
 
                 // Track which voices have samples after cleanup
@@ -715,7 +722,42 @@ async fn main() {
         tracing::info!("Audio stream started");
 
         // Create command channel
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(100);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<mqtt::commands::CommandRequest>(100);
+
+        // Generation counter for cancelling in-flight loads: stopall/fadeall
+        // bump it, and a play whose load finishes under an older generation
+        // is discarded instead of starting after the stop
+        let stop_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        // Periodic bookkeeping: prune finished samples from the voice
+        // manager, drop empty voices, and fold finished streaming loads into
+        // the caches. Each lock is held only briefly.
+        {
+            let mixer_state = mixer_state.clone();
+            let voice_manager = voice_manager.clone();
+            let cache_manager = cache_manager.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    interval.tick().await;
+
+                    let finished = {
+                        let mut state = mixer_state.lock().unwrap();
+                        std::mem::take(&mut state.finished_samples)
+                    };
+                    if !finished.is_empty() {
+                        let mut voice_mgr = voice_manager.lock().unwrap();
+                        for (sample_id, _voice_id) in &finished {
+                            voice_mgr.remove_sample(*sample_id);
+                        }
+                        voice_mgr.cleanup_empty_voices();
+                    }
+
+                    cache_manager.lock().await.cleanup_completed_loads();
+                }
+            });
+        }
 
         // Start HTTP server if enabled
         if config.http.enabled {
@@ -759,12 +801,30 @@ async fn main() {
             tracing::info!("Command processing loop started");
         }
 
-        while let Some(payload) = cmd_rx.recv().await {
+        use mqtt::commands::{CommandError, CommandErrorKind, CommandOutcome};
+
+        /// Hand the outcome back to a waiting HTTP client (when there is
+        /// one) and log failures so MQTT senders can find them too.
+        fn deliver(reply: Option<tokio::sync::oneshot::Sender<CommandOutcome>>, outcome: CommandOutcome) {
+            if let Err(e) = &outcome {
+                tracing::error!("Command failed: {}", e.message);
+            }
+            if let Some(tx) = reply {
+                let _ = tx.send(outcome);
+            }
+        }
+
+        while let Some(request) = cmd_rx.recv().await {
+            let mqtt::commands::CommandRequest { payload, mut reply } = request;
+
             // Expand macros before parsing
             let expanded = match mqtt::commands::expand_macros(&payload, &config.macros) {
                 Ok(e) => e,
                 Err(e) => {
-                    tracing::error!("Macro expansion error: {}", e);
+                    deliver(reply, Err(CommandError::new(
+                        CommandErrorKind::InvalidRequest,
+                        format!("Macro expansion error: {}", e),
+                    )));
                     continue;
                 }
             };
@@ -773,20 +833,58 @@ async fn main() {
                 Ok(cmd) => {
                     tracing::info!("Processing command: {:?}", cmd);
 
-                    match cmd {
+                    // None = the arm handed the reply to a spawned task
+                    let outcome: Option<CommandOutcome> = match cmd {
                         mqtt::commands::AudioCommand::Play { file, id, volume, voice, channel_map, fade_in, start_position_ms, loop_mode, crossfade_ms } => {
                             if let Err(e) = config.is_local_path_allowed(&file) {
-                                tracing::error!("Play rejected: {}", e);
+                                deliver(reply.take(), Err(CommandError::new(CommandErrorKind::Forbidden, format!("Play rejected: {}", e))));
                                 continue;
                             }
 
-                            // Load file (with streaming support for faster startup)
-                            let mut cache_mgr = cache_manager.lock().unwrap();
-                            let buffer_result = cache_mgr.get_or_load_streaming(&file, output_sample_rate).await;
-                            drop(cache_mgr);
+                            // Resolve channel aliases now, while the config is at hand
+                            let resolved_mapping: Option<Vec<(usize, usize)>> = match &channel_map {
+                                Some(map) => {
+                                    let mapping: Result<Vec<(usize, usize)>, String> = map.iter()
+                                        .map(|m| {
+                                            let src = config.resolve_channel(&m.src)?;
+                                            let dest = config.resolve_channel(&m.dest)?;
+                                            Ok((src, dest))
+                                        })
+                                        .collect();
+                                    match mapping {
+                                        Ok(m) => Some(m),
+                                        Err(e) => {
+                                            deliver(reply.take(), Err(CommandError::new(CommandErrorKind::InvalidRequest, format!("Failed to resolve channel alias: {}", e))));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                None => None,
+                            };
 
-                            match buffer_result {
-                                Ok(buffer) => {
+                            // The load (possibly a slow download or decode) runs as
+                            // its own task so stopall/volume/status commands are
+                            // never queued behind it
+                            let cache_manager = cache_manager.clone();
+                            let mixer_state = mixer_state.clone();
+                            let voice_manager = voice_manager.clone();
+                            let active_voices = active_voices.clone();
+                            let stop_generation = stop_generation.clone();
+                            let generation = stop_generation.load(std::sync::atomic::Ordering::SeqCst);
+                            let task_reply = reply.take();
+
+                            tokio::spawn(async move {
+                                let buffer_result = {
+                                    let mut cache_mgr = cache_manager.lock().await;
+                                    cache_mgr.get_or_load_streaming(&file, output_sample_rate).await
+                                };
+
+                                let outcome = match buffer_result {
+                                    Ok(buffer) => {
+                                        if stop_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                                            tracing::info!("Discarding load of {}: a stop arrived while it was loading", file);
+                                            Err(CommandError::new(CommandErrorKind::Cancelled, format!("Play of {} cancelled by a stop command", file)))
+                                        } else {
                                     // Use provided voice or auto-generate one
                                     let voice_id = voice.unwrap_or_else(|| {
                                         format!("_auto_{}", std::time::SystemTime::now()
@@ -837,24 +935,8 @@ async fn main() {
                                     // Convert crossfade_ms to samples
                                     let crossfade_samples = (crossfade_ms as usize * output_sample_rate as usize) / 1000;
 
-                                    // Convert channel_map to mixer format (resolve any aliases)
-                                    let mut sample = if let Some(map) = channel_map {
-                                        // Custom channel mapping - resolve aliases
-                                        let mapping_result: Result<Vec<(usize, usize)>, String> = map.iter()
-                                            .map(|m| {
-                                                let src = config.resolve_channel(&m.src)?;
-                                                let dest = config.resolve_channel(&m.dest)?;
-                                                Ok((src, dest))
-                                            })
-                                            .collect();
-
-                                        let mapping = match mapping_result {
-                                            Ok(m) => m,
-                                            Err(e) => {
-                                                tracing::error!("Failed to resolve channel alias: {}", e);
-                                                continue;
-                                            }
-                                        };
+                                    // Build the sample with the pre-resolved mapping
+                                    let mut sample = if let Some(mapping) = resolved_mapping {
                                         tracing::debug!("Using custom channel mapping: {:?}", mapping);
                                         ActiveSample::new_with_mapping(
                                             sample_id,
@@ -928,15 +1010,28 @@ async fn main() {
                                         state.active_samples.push(sample);
                                         tracing::info!("Now playing {} active samples", state.active_samples.len());
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to load {}: {}", file, e);
-                                }
-                            }
+
+                                    Ok(format!("Playing {} [voice: {}]", file, voice_id))
+                                        }
+                                    }
+                                    Err(e) => Err(CommandError::new(
+                                        CommandErrorKind::NotFound,
+                                        format!("Failed to load {}: {}", file, e),
+                                    )),
+                                };
+
+                                deliver(task_reply, outcome);
+                            });
+
+                            None
                         }
                         mqtt::commands::AudioCommand::StopAll => {
                             // Apply quick 10ms fade-out to prevent clicks/pops
                             const STOP_FADE_MS: u32 = 10;
+
+                            // Cancel any loads still in flight so nothing starts
+                            // playing after the stop
+                            stop_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
                             let mut state = mixer_state.lock().unwrap();
                             let count = state.active_samples.len();
@@ -951,8 +1046,12 @@ async fn main() {
                             // Voice cleanup also happens automatically.
 
                             tracing::info!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS);
+                            Some(Ok(format!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS)))
                         }
                         mqtt::commands::AudioCommand::FadeAll { time_ms } => {
+                            // Cancel any loads still in flight, matching stopall
+                            stop_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
                             let mut state = mixer_state.lock().unwrap();
                             let count = state.active_samples.len();
 
@@ -964,6 +1063,7 @@ async fn main() {
                             // Samples are removed by the audio callback once the
                             // fade completes, and voice cleanup follows from that.
                             tracing::info!("Fading out {} samples over {}ms", count, time_ms);
+                            Some(Ok(format!("Fading out {} samples over {}ms", count, time_ms)))
                         }
                         mqtt::commands::AudioCommand::VoiceStop { voice } => {
                             // Apply quick 10ms fade-out to prevent clicks/pops
@@ -976,6 +1076,7 @@ async fn main() {
 
                             if sample_ids.is_empty() {
                                 tracing::warn!("Voice '{}' not found or already empty", voice);
+                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Voice '{}' not found or already empty", voice))))
                             } else {
                                 // Apply fade-out to all samples in the voice
                                 let mut state = mixer_state.lock().unwrap();
@@ -992,6 +1093,7 @@ async fn main() {
                                     "Stopping voice '{}': {} samples ({}ms fade-out)",
                                     voice, updated_count, STOP_FADE_MS
                                 );
+                                Some(Ok(format!("Stopping voice '{}': {} samples", voice, updated_count)))
                             }
                         }
                         mqtt::commands::AudioCommand::VoiceFadeOut { voice, time_ms } => {
@@ -1002,6 +1104,7 @@ async fn main() {
 
                             if sample_ids.is_empty() {
                                 tracing::warn!("Voice '{}' not found or already empty", voice);
+                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Voice '{}' not found or already empty", voice))))
                             } else {
                                 // Apply fade out to all samples in the voice
                                 let mut state = mixer_state.lock().unwrap();
@@ -1018,6 +1121,7 @@ async fn main() {
                                     "Applied {}ms fade out to voice '{}' ({} samples)",
                                     time_ms, voice, updated_count
                                 );
+                                Some(Ok(format!("Fading out voice '{}' over {}ms ({} samples)", voice, time_ms, updated_count)))
                             }
                         }
                         mqtt::commands::AudioCommand::VoiceVolume { voice, volume: new_volume } => {
@@ -1054,31 +1158,45 @@ async fn main() {
                                     "Set voice '{}' volume to {:.2} (updated {} samples, {} inputs)",
                                     voice, actual_volume, sample_count, input_count
                                 );
+                                Some(Ok(format!("Set voice '{}' volume to {:.2} ({} samples, {} inputs)", voice, actual_volume, sample_count, input_count)))
                             } else {
                                 tracing::warn!("Voice '{}' not found", voice);
+                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Voice '{}' not found", voice))))
                             }
                         }
                         mqtt::commands::AudioCommand::Precache { file } => {
                             if let Err(e) = config.is_local_path_allowed(&file) {
-                                tracing::error!("Precache rejected: {}", e);
+                                deliver(reply.take(), Err(CommandError::new(CommandErrorKind::Forbidden, format!("Precache rejected: {}", e))));
                                 continue;
                             }
 
-                            // Non-blocking precache - starts loading and returns immediately
-                            let mut cache_mgr = cache_manager.lock().unwrap();
-                            match cache_mgr.precache_streaming(&file, output_sample_rate).await {
-                                Ok(()) => {
-                                    if config.logging.verbose {
-                                        cache_mgr.log_stats();
+                            // The load starts as its own task so it never delays
+                            // the command loop
+                            let cache_manager = cache_manager.clone();
+                            let verbose = config.logging.verbose;
+                            let task_reply = reply.take();
+                            tokio::spawn(async move {
+                                let mut cache_mgr = cache_manager.lock().await;
+                                let outcome = match cache_mgr.precache_streaming(&file, output_sample_rate).await {
+                                    Ok(()) => {
+                                        if verbose {
+                                            cache_mgr.log_stats();
+                                        }
+                                        Ok(format!("Precache started for {}", file))
                                     }
-                                }
-                                Err(e) => {
-                                    tracing::error!("Failed to start precache for {}: {}", file, e);
-                                }
-                            }
+                                    Err(e) => Err(CommandError::new(
+                                        CommandErrorKind::NotFound,
+                                        format!("Failed to start precache for {}: {}", file, e),
+                                    )),
+                                };
+                                drop(cache_mgr);
+                                deliver(task_reply, outcome);
+                            });
+
+                            None
                         }
                         mqtt::commands::AudioCommand::CacheClear => {
-                            let mut cache_mgr = cache_manager.lock().unwrap();
+                            let mut cache_mgr = cache_manager.lock().await;
                             if config.logging.verbose {
                                 let mem = cache_mgr.memory_stats();
                                 let disk = cache_mgr.disk_stats();
@@ -1093,24 +1211,22 @@ async fn main() {
                             match cache_mgr.clear_all() {
                                 Ok(()) => {
                                     tracing::info!("Cache cleared successfully");
+                                    Some(Ok("Cache cleared".to_string()))
                                 }
-                                Err(e) => {
-                                    tracing::error!("Failed to clear cache: {}", e);
-                                }
+                                Err(e) => Some(Err(CommandError::new(CommandErrorKind::Internal, format!("Failed to clear cache: {}", e)))),
                             }
                         }
                         mqtt::commands::AudioCommand::CacheInvalidate { file } => {
-                            let mut cache_mgr = cache_manager.lock().unwrap();
+                            let mut cache_mgr = cache_manager.lock().await;
                             match cache_mgr.invalidate(&file) {
                                 Ok(()) => {
                                     tracing::info!("Invalidated cache for: {}", file);
                                     if config.logging.verbose {
                                         cache_mgr.log_stats();
                                     }
+                                    Some(Ok(format!("Invalidated cache for {}", file)))
                                 }
-                                Err(e) => {
-                                    tracing::error!("Failed to invalidate {}: {}", file, e);
-                                }
+                                Err(e) => Some(Err(CommandError::new(CommandErrorKind::Internal, format!("Failed to invalidate {}: {}", file, e)))),
                             }
                         }
                         mqtt::commands::AudioCommand::InputVolume { input, volume: new_volume } => {
@@ -1144,8 +1260,11 @@ async fn main() {
                                 }
                             }
 
-                            if !found {
+                            if found {
+                                Some(Ok(format!("Set input '{}' volume", input)))
+                            } else {
                                 tracing::warn!("Input '{}' not found", input);
+                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Input '{}' not found", input))))
                             }
                         }
                         mqtt::commands::AudioCommand::InputMute { input, mute } => {
@@ -1182,13 +1301,16 @@ async fn main() {
                                 }
                             }
 
-                            if !found {
+                            if found {
+                                Some(Ok(format!("Input '{}' {}", input, if mute { "muted" } else { "unmuted" })))
+                            } else {
                                 tracing::warn!("Input '{}' not found", input);
+                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Input '{}' not found", input))))
                             }
                         }
                         mqtt::commands::AudioCommand::Seek { selector, position_ms } => {
                             if selector.is_empty() {
-                                tracing::warn!("Seek command with empty selector - no samples targeted");
+                                Some(Err(CommandError::new(CommandErrorKind::InvalidRequest, "Seek command with empty selector - no samples targeted".to_string())))
                             } else {
                                 let mut state = mixer_state.lock().unwrap();
                                 let mut updated_count = 0;
@@ -1226,14 +1348,15 @@ async fn main() {
                                         "Seeked {} samples to {}ms",
                                         updated_count, position_ms
                                     );
+                                    Some(Ok(format!("Seeked {} samples to {}ms", updated_count, position_ms)))
                                 } else {
-                                    tracing::warn!("Seek command matched no active samples");
+                                    Some(Err(CommandError::new(CommandErrorKind::NotFound, "Seek command matched no active samples".to_string())))
                                 }
                             }
                         }
                         mqtt::commands::AudioCommand::Speed { selector, speed, pitch_correction } => {
                             if selector.is_empty() {
-                                tracing::warn!("Speed command with empty selector - no samples targeted");
+                                Some(Err(CommandError::new(CommandErrorKind::InvalidRequest, "Speed command with empty selector - no samples targeted".to_string())))
                             } else {
                                 let mut state = mixer_state.lock().unwrap();
                                 let mut updated_count = 0;
@@ -1257,14 +1380,15 @@ async fn main() {
                                         "Set speed to {}x ({}) for {} samples",
                                         speed, mode, updated_count
                                     );
+                                    Some(Ok(format!("Set speed to {}x ({}) for {} samples", speed, mode, updated_count)))
                                 } else {
-                                    tracing::warn!("Speed command matched no active samples");
+                                    Some(Err(CommandError::new(CommandErrorKind::NotFound, "Speed command matched no active samples".to_string())))
                                 }
                             }
                         }
                         mqtt::commands::AudioCommand::Stop { selector, fade_out_ms } => {
                             if selector.is_empty() {
-                                tracing::warn!("Stop command with empty selector - no samples targeted");
+                                Some(Err(CommandError::new(CommandErrorKind::InvalidRequest, "Stop command with empty selector - no samples targeted".to_string())))
                             } else {
                                 // Default to 10ms fade for smooth stop if not specified
                                 let fade_ms = fade_out_ms.unwrap_or(10);
@@ -1290,14 +1414,15 @@ async fn main() {
                                         "Stopping {} samples ({}ms fade-out)",
                                         updated_count, fade_ms
                                     );
+                                    Some(Ok(format!("Stopping {} samples ({}ms fade-out)", updated_count, fade_ms)))
                                 } else {
-                                    tracing::warn!("Stop command matched no active samples");
+                                    Some(Err(CommandError::new(CommandErrorKind::NotFound, "Stop command matched no active samples".to_string())))
                                 }
                             }
                         }
                         mqtt::commands::AudioCommand::Volume { selector, volume } => {
                             if selector.is_empty() {
-                                tracing::warn!("Volume command with empty selector - no samples targeted");
+                                Some(Err(CommandError::new(CommandErrorKind::InvalidRequest, "Volume command with empty selector - no samples targeted".to_string())))
                             } else {
                                 let mut state = mixer_state.lock().unwrap();
                                 let mut updated_count = 0;
@@ -1320,15 +1445,23 @@ async fn main() {
                                         "Set volume to {:.2} for {} samples",
                                         volume, updated_count
                                     );
+                                    Some(Ok(format!("Set volume to {:.2} for {} samples", volume, updated_count)))
                                 } else {
-                                    tracing::warn!("Volume command matched no active samples");
+                                    Some(Err(CommandError::new(CommandErrorKind::NotFound, "Volume command matched no active samples".to_string())))
                                 }
                             }
                         }
+                    };
+
+                    if let Some(outcome) = outcome {
+                        deliver(reply.take(), outcome);
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Failed to parse command: {}", e);
+                    deliver(reply, Err(CommandError::new(
+                        CommandErrorKind::InvalidRequest,
+                        format!("Failed to parse command: {}", e),
+                    )));
                 }
             }
         }

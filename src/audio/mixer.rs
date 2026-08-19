@@ -587,6 +587,10 @@ pub struct MixerState {
 
     /// Bass management for LFE extraction and crossover filtering
     pub bass_management: Option<BassManagement>,
+
+    /// (id, voice_id) of samples the audio callback removed, awaiting
+    /// bookkeeping cleanup (voice manager, ducking maps) off the audio thread
+    pub finished_samples: Vec<(u64, String)>,
 }
 
 impl MixerState {
@@ -599,6 +603,7 @@ impl MixerState {
             channel_gains: vec![1.0; output_channels],
             ducking_engine: None,
             bass_management: None,
+            finished_samples: Vec::new(),
         }
     }
 }

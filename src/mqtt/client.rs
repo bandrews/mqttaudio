@@ -84,7 +84,7 @@ pub async fn process_mqtt_events(
     mut eventloop: EventLoop,
     topic: String,
     reconnect_delay: Duration,
-    command_tx: mpsc::Sender<String>,
+    command_tx: mpsc::Sender<super::commands::CommandRequest>,
 ) {
     tracing::info!("Starting MQTT event loop");
 
@@ -94,8 +94,9 @@ pub async fn process_mqtt_events(
                 let payload = String::from_utf8_lossy(&p.payload).to_string();
                 tracing::debug!("Received MQTT message on topic {}: {}", p.topic, payload);
 
-                // Forward to command handler
-                if let Err(e) = command_tx.send(payload).await {
+                // Forward to command handler (MQTT has no reply path)
+                let request = super::commands::CommandRequest::fire_and_forget(payload);
+                if let Err(e) = command_tx.send(request).await {
                     tracing::error!("Failed to send command to handler: {}", e);
                 }
             }

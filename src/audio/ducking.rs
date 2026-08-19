@@ -146,11 +146,12 @@ impl DuckingEngine {
     pub fn notify_voice_active(&mut self, voice_id: &str, is_active: bool) {
         tracing::debug!("Voice '{}' activity changed: {}", voice_id, is_active);
 
-        // Update active voices map
+        // Update active voices map. Inactive voices are removed rather than
+        // stored as false, so one-shot auto voices do not accumulate forever.
         if is_active {
             self.active_voices.insert(voice_id.to_string(), true);
         } else {
-            self.active_voices.insert(voice_id.to_string(), false);
+            self.active_voices.remove(voice_id);
         }
 
         // Recalculate all duck states
