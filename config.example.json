@@ -68,10 +68,13 @@
     "revalidate_after_seconds": 300,
 
     "_notes": [
-      "enabled: Reserved. Caching is currently always on; this flag has no effect",
+      "enabled: Enable the disk cache for downloaded files. false = downloads",
+      "  play from memory only and are re-fetched after a restart",
       "directory: Directory for cache storage. ~ expands to user home",
-      "revalidate_after_seconds: Reserved. Cached files are currently never revalidated",
-      "  against the server; use the cache_invalidate or cache_clear commands to refresh"
+      "revalidate_after_seconds: How long a cached URL is served before asking the",
+      "  server whether it changed (conditional request via ETag/Last-Modified).",
+      "  0 = check on every access; higher = fewer checks. A changed file is",
+      "  re-downloaded automatically; an unreachable server falls back to the cache"
     ]
   },
 

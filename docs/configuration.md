@@ -269,8 +269,8 @@ File caching settings.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `directory` | string | `~/.mqttaudio/cache` | Disk cache directory |
-| `enabled` | boolean | `true` | Reserved; caching is currently always on |
-| `revalidate_after_seconds` | integer | `300` | Reserved; cached files are never revalidated against the server (use `cache_invalidate`) |
+| `enabled` | boolean | `true` | Disk-cache downloaded files. `false` = play from memory only, re-download after restart |
+| `revalidate_after_seconds` | integer | `300` | Seconds a cached URL is served before checking the server for changes (0 = every access) |
 | `precache` | array | `[]` | Files or directories to cache on startup |
 | `precache_blocking` | boolean | `true` | Block startup until precache completes |
 | `max_memory_mb` | integer | `512` | Maximum memory cache size in MB (0 = unlimited) |

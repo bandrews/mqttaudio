@@ -315,9 +315,100 @@ pub(crate) async fn get_with_timeout(url: &str) -> Result<reqwest::Response, Str
     }
 }
 
+/// Where a download should be written through to disk while it streams.
+/// The bytes land in temp_path and are renamed to final_path only when the
+/// download completes, so a partial download can never be mistaken for a
+/// cached file.
+#[derive(Clone)]
+pub struct PersistTarget {
+    pub temp_path: std::path::PathBuf,
+    pub final_path: std::path::PathBuf,
+}
+
+/// Cache-relevant response headers captured when a stream starts
+pub struct HttpResponseInfo {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_type: Option<String>,
+}
+
+fn header_string(response: &reqwest::Response, name: &str) -> Option<String> {
+    response.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
+/// Writes download chunks through to a temp file, finalizing on completion.
+/// A disk error disables persistence but never fails the download itself.
+struct PersistWriter {
+    target: PersistTarget,
+    file: Option<std::fs::File>,
+}
+
+impl PersistWriter {
+    fn new(target: PersistTarget) -> Self {
+        let file = match std::fs::File::create(&target.temp_path) {
+            Ok(f) => Some(f),
+            Err(e) => {
+                tracing::warn!(
+                    "Cannot write through to {}: {}; download continues uncached",
+                    target.temp_path.display(), e
+                );
+                None
+            }
+        };
+        Self { target, file }
+    }
+
+    fn write(&mut self, chunk: &[u8]) {
+        use std::io::Write;
+        if let Some(file) = self.file.as_mut() {
+            if let Err(e) = file.write_all(chunk) {
+                tracing::warn!(
+                    "Write-through to {} failed: {}; download continues uncached",
+                    self.target.temp_path.display(), e
+                );
+                self.abandon();
+            }
+        }
+    }
+
+    /// Rename the finished temp file into place
+    fn finalize(mut self) {
+        if let Some(file) = self.file.take() {
+            let flushed = file.sync_all();
+            drop(file);
+            if let Err(e) = flushed.and_then(|_| std::fs::rename(&self.target.temp_path, &self.target.final_path)) {
+                tracing::warn!(
+                    "Could not finalize cache file {}: {}",
+                    self.target.final_path.display(), e
+                );
+                let _ = std::fs::remove_file(&self.target.temp_path);
+            }
+        }
+    }
+
+    /// Stop persisting and remove the partial file
+    fn abandon(&mut self) {
+        if self.file.take().is_some() {
+            let _ = std::fs::remove_file(&self.target.temp_path);
+        }
+    }
+}
+
 /// Start an HTTP download in the background and return a reader.
 /// The reader implements MediaSource and can be used with StreamingDecoder.
 pub async fn start_http_stream(url: &str) -> Result<HttpStreamReader, HttpStreamError> {
+    start_http_stream_with_persist(url, None).await.map(|(reader, _)| reader)
+}
+
+/// Start an HTTP download, optionally writing the raw bytes through to disk
+/// for the cache. Returns the reader plus the response's cache headers.
+pub async fn start_http_stream_with_persist(
+    url: &str,
+    persist: Option<PersistTarget>,
+) -> Result<(HttpStreamReader, HttpResponseInfo), HttpStreamError> {
     use futures_util::StreamExt;
 
     let response = get_with_timeout(url)
@@ -332,6 +423,12 @@ pub async fn start_http_stream(url: &str) -> Result<HttpStreamReader, HttpStream
         )));
     }
 
+    let info = HttpResponseInfo {
+        etag: header_string(&response, "etag"),
+        last_modified: header_string(&response, "last-modified"),
+        content_type: header_string(&response, "content-type"),
+    };
+
     let content_length = response.content_length();
 
     let reader = HttpStreamReader::new(content_length);
@@ -342,6 +439,8 @@ pub async fn start_http_stream(url: &str) -> Result<HttpStreamReader, HttpStream
 
     // Spawn background download task
     tokio::spawn(async move {
+        let mut writer = persist.map(PersistWriter::new);
+
         loop {
             let chunk_result = match tokio::time::timeout(
                 std::time::Duration::from_secs(BODY_STALL_TIMEOUT_SECS),
@@ -350,6 +449,7 @@ pub async fn start_http_stream(url: &str) -> Result<HttpStreamReader, HttpStream
                 Ok(Some(r)) => r,
                 Ok(None) => break,
                 Err(_) => {
+                    if let Some(w) = writer.as_mut() { w.abandon(); }
                     handles.fail(format!(
                         "Download stalled: no data for {} seconds",
                         BODY_STALL_TIMEOUT_SECS
@@ -359,25 +459,33 @@ pub async fn start_http_stream(url: &str) -> Result<HttpStreamReader, HttpStream
             };
 
             if handles.is_cancelled() {
+                if let Some(w) = writer.as_mut() { w.abandon(); }
                 handles.fail("Download cancelled".to_string());
                 return;
             }
 
             match chunk_result {
                 Ok(chunk) => {
+                    if let Some(w) = writer.as_mut() { w.write(&chunk); }
                     handles.append(chunk);
                 }
                 Err(e) => {
+                    if let Some(w) = writer.as_mut() { w.abandon(); }
                     handles.fail(format!("Download error: {}", e));
                     return;
                 }
             }
         }
 
+        // Finalize the cache file before marking the stream complete, so a
+        // complete buffer always implies the cache file is in place
+        if let Some(w) = writer.take() {
+            w.finalize();
+        }
         handles.complete();
     });
 
-    Ok(reader)
+    Ok((reader, info))
 }
 
 #[cfg(test)]

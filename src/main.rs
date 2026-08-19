@@ -591,12 +591,16 @@ async fn main() {
 
     // Create cache manager using config
     let cache_dir = config.cache_directory();
-    let resampler_quality = config.advanced.resampler_quality;
-    let max_memory_mb = config.cache.max_memory_mb;
+    let cache_options = cache::CacheOptions {
+        resampler_quality: config.advanced.resampler_quality,
+        max_memory_mb: config.cache.max_memory_mb,
+        disk_enabled: config.cache.enabled,
+        revalidate_after_seconds: config.cache.revalidate_after_seconds,
+    };
     tracing::info!("Cache directory: {}", cache_dir.display());
-    tracing::info!("Resampler quality: {:?}", resampler_quality);
+    tracing::info!("Resampler quality: {:?}", cache_options.resampler_quality);
 
-    let cache_manager = match cache::CacheManager::with_options(cache_dir, resampler_quality, max_memory_mb) {
+    let cache_manager = match cache::CacheManager::with_options(cache_dir, cache_options) {
         Ok(cm) => Arc::new(Mutex::new(cm)),
         Err(e) => {
             tracing::error!("Failed to initialize cache: {}", e);

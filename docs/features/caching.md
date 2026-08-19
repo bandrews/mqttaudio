@@ -14,13 +14,14 @@ Decoded audio (PCM) is kept in RAM for instant playback:
 
 ### Disk Cache
 
-Downloaded files can be stored on disk:
-- HTTP files fetched by blocking startup precache are saved to the cache
-  directory and persist across restarts
-- Files played (or precached at runtime) through the streaming path are
-  held in memory only and are re-downloaded after a restart
-- Cached files are served as-is; they are not revalidated against the
-  server (see HTTP Validation below)
+Downloaded files are stored on disk:
+- Every HTTP download - streamed plays, runtime precache, and startup
+  precache alike - is written through to the cache directory and persists
+  across restarts
+- Set `cache.enabled: false` to disable the disk cache entirely: downloads
+  then play from memory only and are re-fetched after a restart
+- Cached files are periodically revalidated against the server (see HTTP
+  Validation below)
 
 ## Streaming Playback
 
@@ -104,7 +105,9 @@ Force re-download of a specific file:
 
 | Field | Default | Description |
 |-------|---------|-------------|
+| `enabled` | `true` | Disk-cache downloaded files (`false` = memory only) |
 | `directory` | `~/.mqttaudio/cache` | Disk cache location |
+| `revalidate_after_seconds` | `300` | Seconds before a cached URL is checked against the server (0 = every access) |
 | `precache` | `[]` | Files to cache on startup |
 | `max_memory_mb` | `512` | Memory cache limit in MB (0 = unlimited) |
 
@@ -138,10 +141,19 @@ Override in your config file:
 
 ## HTTP Validation
 
-Disk-cached files are served without contacting the server again. ETag and
-Last-Modified headers are stored with each entry, but conditional
-revalidation is not implemented: if you update a file on your server, send
-`cache_invalidate` for that URL (or `cache_clear`) to force a re-download.
+Cached URLs are checked for freshness on a schedule set by
+`cache.revalidate_after_seconds` (default 300; 0 = check on every access):
+
+1. On download, the ETag and Last-Modified headers are stored
+2. When a cached URL is played after the interval has elapsed, a
+   conditional request asks the server whether it changed
+3. Not modified (304) - the cached copy is served and the clock resets
+4. Changed (200) - the new content replaces the cache and plays instead
+
+If the server cannot be reached, the cached copy keeps playing and the
+check retries after the next interval - a dead server never blocks
+playback for more than a few seconds, once per interval. `cache_invalidate`
+still forces an immediate re-download when you don't want to wait.
 
 ## Local Files
 

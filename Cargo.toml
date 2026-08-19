@@ -65,6 +65,9 @@ rand = "0.8"
 # Date/time handling
 chrono = "0.4"
 
+# Stable cache filename hashing
+sha2 = "0.10"
+
 # Directory utilities
 dirs = "5.0"
 
