@@ -197,7 +197,9 @@ async fn main() {
         args.max_cache_mb,
     );
 
-    // Initialize logging based on config
+    // Initialize logging based on config.
+    // logging.verbose is documented as equivalent to level "debug", so it
+    // raises the level when the configured level is less detailed.
     let log_level = match config.logging.level.as_str() {
         "error" => tracing::Level::ERROR,
         "warn" => tracing::Level::WARN,
@@ -205,6 +207,11 @@ async fn main() {
         "debug" => tracing::Level::DEBUG,
         "trace" => tracing::Level::TRACE,
         _ => tracing::Level::INFO,
+    };
+    let log_level = if config.logging.verbose && log_level < tracing::Level::DEBUG {
+        tracing::Level::DEBUG
+    } else {
+        log_level
     };
 
     // Create log channel for MQTT publishing (if configured)
@@ -433,6 +440,7 @@ async fn main() {
         &device,
         config.audio.channels,
         Some(config.audio.sample_rate),
+        Some(config.audio.buffer_size),
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -632,12 +640,15 @@ async fn main() {
         }
     }
 
-    let mixer_state_clone = mixer_state.clone();
-    let active_voices_clone = active_voices.clone();
-
-    // Start audio stream
-    let stream = device.build_output_stream(
-        &stream_config,
+    // Start audio stream. The callback builder exists so the stream can be
+    // rebuilt with the device's default buffer size if the device rejects the
+    // configured fixed size.
+    let make_audio_callback = {
+        let mixer_state = mixer_state.clone();
+        let active_voices = active_voices.clone();
+        move || {
+            let mixer_state_clone = mixer_state.clone();
+            let active_voices_clone = active_voices.clone();
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 let mut state = mixer_state_clone.lock().unwrap();
                 audio::mixer::mix_audio(data, &mut state);
@@ -665,12 +676,36 @@ async fn main() {
                 // Update active voices tracker
                 let mut active = active_voices_clone.lock().unwrap();
                 *active = voices_after;
-            },
-            |err| {
-                tracing::error!("Audio stream error: {}", err);
-            },
-            None,
-        ).expect("Failed to build audio stream");
+            }
+        }
+    };
+    let audio_error_callback = |err| {
+        tracing::error!("Audio stream error: {}", err);
+    };
+
+    let stream = match device.build_output_stream(
+        &stream_config,
+        make_audio_callback(),
+        audio_error_callback,
+        None,
+    ) {
+        Ok(s) => s,
+        Err(e) if matches!(stream_config.buffer_size, cpal::BufferSize::Fixed(_)) => {
+            tracing::warn!(
+                "Device rejected the configured buffer size ({:?}): {}; retrying with the device default",
+                stream_config.buffer_size, e
+            );
+            let mut fallback_config = stream_config.clone();
+            fallback_config.buffer_size = cpal::BufferSize::Default;
+            device.build_output_stream(
+                &fallback_config,
+                make_audio_callback(),
+                audio_error_callback,
+                None,
+            ).expect("Failed to build audio stream")
+        }
+        Err(e) => panic!("Failed to build audio stream: {}", e),
+    };
 
         stream.play().expect("Failed to start audio stream");
         tracing::info!("Audio stream started");
@@ -736,6 +771,11 @@ async fn main() {
 
                     match cmd {
                         mqtt::commands::AudioCommand::Play { file, id, volume, voice, channel_map, fade_in, start_position_ms, loop_mode, crossfade_ms } => {
+                            if let Err(e) = config.is_local_path_allowed(&file) {
+                                tracing::error!("Play rejected: {}", e);
+                                continue;
+                            }
+
                             // Load file (with streaming support for faster startup)
                             let mut cache_mgr = cache_manager.lock().unwrap();
                             let buffer_result = cache_mgr.get_or_load_streaming(&file, output_sample_rate).await;
@@ -1015,6 +1055,11 @@ async fn main() {
                             }
                         }
                         mqtt::commands::AudioCommand::Precache { file } => {
+                            if let Err(e) = config.is_local_path_allowed(&file) {
+                                tracing::error!("Precache rejected: {}", e);
+                                continue;
+                            }
+
                             // Non-blocking precache - starts loading and returns immediately
                             let mut cache_mgr = cache_manager.lock().unwrap();
                             match cache_mgr.precache_streaming(&file, output_sample_rate).await {
@@ -1151,10 +1196,22 @@ async fn main() {
                                         &sample.file_path,
                                         &sample.voice_id,
                                     ) {
+                                        let sample_rate = sample.buffer.sample_rate();
+                                        if sample_rate == 0 {
+                                            tracing::warn!("Seek skipped for sample {}: sample rate not yet known", sample.id);
+                                            continue;
+                                        }
                                         // Convert milliseconds to frames
-                                        let target_frame = ((position_ms as u64 * sample.buffer.sample_rate() as u64) / 1000) as usize;
-                                        // Clamp to buffer bounds
-                                        sample.position = target_frame.min(sample.buffer.frames().saturating_sub(1));
+                                        let target_frame = ((position_ms as u64 * sample_rate as u64) / 1000) as usize;
+                                        // Clamp to the total length when known. A still-loading
+                                        // stream seeks to the requested position and plays
+                                        // silence until data arrives, matching how Play handles
+                                        // start_position_ms; clamping to frames() would snap the
+                                        // seek back to whatever has downloaded so far.
+                                        sample.position = match sample.buffer.total_frames_or_estimate() {
+                                            Some(total) if total > 0 => target_frame.min(total - 1),
+                                            _ => target_frame,
+                                        };
                                         updated_count += 1;
                                     }
                                 }

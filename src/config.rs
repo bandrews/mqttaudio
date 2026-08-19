@@ -545,6 +545,47 @@ impl Config {
             .collect()
     }
 
+    /// Check whether a file path may be played or precached.
+    ///
+    /// HTTP/HTTPS URLs are always allowed. When `security.allowed_directories`
+    /// is non-empty, a local path must resolve (symlinks followed) inside one
+    /// of the allowed directories, which also rejects `../` traversal. An
+    /// empty list leaves local playback unrestricted.
+    pub fn is_local_path_allowed(&self, path: &str) -> Result<(), String> {
+        if path.starts_with("http://") || path.starts_with("https://") {
+            return Ok(());
+        }
+        if self.security.allowed_directories.is_empty() {
+            return Ok(());
+        }
+
+        let expanded = Self::expand_tilde(path);
+        let canonical = fs::canonicalize(&expanded)
+            .map_err(|e| format!("Cannot resolve path '{}': {}", path, e))?;
+
+        for dir in &self.security.allowed_directories {
+            let dir_expanded = Self::expand_tilde(dir);
+            match fs::canonicalize(&dir_expanded) {
+                Ok(allowed) => {
+                    if canonical.starts_with(&allowed) {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "security.allowed_directories entry '{}' cannot be resolved: {}",
+                        dir, e
+                    );
+                }
+            }
+        }
+
+        Err(format!(
+            "'{}' is outside security.allowed_directories; add its directory there to permit it",
+            path
+        ))
+    }
+
     /// Merge CLI arguments into this config (CLI args override config file)
     #[allow(clippy::too_many_arguments)]
     pub fn merge_cli_args(
@@ -1670,6 +1711,79 @@ mod tests {
         assert_eq!(config.cache.precache.len(), 2);
         assert_eq!(config.cache.precache[0], "/sounds/startup.wav");
         assert_eq!(config.cache.precache[1], "https://example.com/welcome.mp3");
+    }
+
+    #[test]
+    fn test_local_path_allowed_when_no_directories_configured() {
+        let config = Config::default();
+        // An empty list leaves local playback unrestricted
+        assert!(config.is_local_path_allowed("/etc/hostname").is_ok());
+    }
+
+    #[test]
+    fn test_local_path_allowed_inside_configured_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sound.wav");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut config = Config::default();
+        config.security.allowed_directories = vec![dir.path().to_string_lossy().to_string()];
+
+        assert!(config.is_local_path_allowed(file.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn test_local_path_denied_outside_configured_directory() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("secret.wav");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut config = Config::default();
+        config.security.allowed_directories = vec![allowed.path().to_string_lossy().to_string()];
+
+        let err = config.is_local_path_allowed(file.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("allowed_directories"), "error should name the setting: {}", err);
+    }
+
+    #[test]
+    fn test_local_path_denied_via_traversal() {
+        let parent = tempfile::tempdir().unwrap();
+        let allowed = parent.path().join("sounds");
+        std::fs::create_dir(&allowed).unwrap();
+        let secret = parent.path().join("secret.wav");
+        std::fs::write(&secret, b"x").unwrap();
+
+        let mut config = Config::default();
+        config.security.allowed_directories = vec![allowed.to_string_lossy().to_string()];
+
+        let sneaky = format!("{}/../secret.wav", allowed.to_string_lossy());
+        assert!(config.is_local_path_allowed(&sneaky).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_path_denied_via_symlink() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.wav");
+        std::fs::write(&secret, b"x").unwrap();
+        let link = allowed.path().join("link.wav");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let mut config = Config::default();
+        config.security.allowed_directories = vec![allowed.path().to_string_lossy().to_string()];
+
+        assert!(config.is_local_path_allowed(link.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn test_local_path_check_ignores_urls() {
+        let mut config = Config::default();
+        config.security.allowed_directories = vec!["/opt/sounds".to_string()];
+
+        assert!(config.is_local_path_allowed("https://example.com/a.mp3").is_ok());
+        assert!(config.is_local_path_allowed("http://example.com/a.mp3").is_ok());
     }
 
     #[test]

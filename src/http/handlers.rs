@@ -566,7 +566,8 @@ pub async fn handle_input_volume(
 #[derive(Deserialize)]
 pub struct InputMuteParams {
     input: String,
-    #[serde(default)]
+    /// Required, matching the MQTT command: an omitted field must error
+    /// rather than silently unmute
     mute: bool,
 }
 
