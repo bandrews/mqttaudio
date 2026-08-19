@@ -248,8 +248,17 @@ impl StreamingDecoder {
                 continue;
             }
 
-            // Decode the packet
-            let decoded = self.decoder.decode(&packet)?;
+            // Decode the packet. Symphonia documents DecodeError as
+            // recoverable: skip the corrupt packet (a brief dropout) rather
+            // than failing the whole stream.
+            let decoded = match self.decoder.decode(&packet) {
+                Ok(decoded) => decoded,
+                Err(SymphoniaError::DecodeError(e)) => {
+                    tracing::warn!("Skipping corrupt packet in stream: {}", e);
+                    continue;
+                }
+                Err(e) => return Err(StreamingDecodeError::Decode(e)),
+            };
 
             // Convert to f32 interleaved samples
             let mut samples = Vec::new();

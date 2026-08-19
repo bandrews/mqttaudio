@@ -1091,6 +1091,32 @@ async fn test_multiple_local_files_concurrent() {
 }
 
 #[tokio::test]
+async fn test_corrupt_packets_do_not_abort_the_decode() {
+    // tests/audio/corrupt_440hz_2s.flac is a valid 2s FLAC with a 200-byte
+    // burst of flipped bits in the middle (FLAC frames are CRC-checked, so
+    // the corruption surfaces as a decode error). Corrupt frames are
+    // recoverable per Symphonia's contract, so the file must still play -
+    // minus a brief dropout - rather than failing outright.
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/audio/corrupt_440hz_2s.flac");
+    let buffer = cache_manager
+        .get_or_load_streaming(path, 44100)
+        .await
+        .expect("a corrupt packet must not make the whole file unplayable");
+
+    // The fixture corrupts 8 of ~27 frames; with resync losses roughly two
+    // thirds of the audio survives. The bar here is "plays with dropouts
+    // instead of failing": more than half the 2s file must decode.
+    assert!(
+        buffer.frames() > 44_100,
+        "expected most of the 2s file to decode, got {} frames",
+        buffer.frames()
+    );
+}
+
+#[tokio::test]
 async fn test_nonexistent_file_error() {
     // Test error handling for missing files
     let cache_dir = TempDir::new().unwrap();

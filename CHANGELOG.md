@@ -116,6 +116,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `plughw:` alias as the fix, and when routing references a channel the device
   cannot reach.
 
+### Removed
+
+- The `--lfe-channel` and `--crossover-frequency` CLI flags. They could
+  never activate bass management on their own (the feature also needs
+  `source_channels`, which has no flag) and only overrode an
+  already-configured setup. Bass management is configured entirely in the
+  `bass_management` config section.
+
 ### Changed
 
 - Unknown channel names in routing now explain the `audio.channel_names` /

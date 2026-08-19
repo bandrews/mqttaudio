@@ -26,6 +26,7 @@ pub mod cache;
 pub mod mqtt {
     pub mod commands;
     pub mod client;
+    pub mod logger;
 }
 
 pub mod http;

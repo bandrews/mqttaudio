@@ -56,7 +56,10 @@ pub async fn start_server(
 
     let app = create_router(state, config.cors_permissive, config.websocket_enabled);
 
-    let addr: SocketAddr = format!("{}:{}", config.bind_address, config.port).parse()?;
+    let ip: std::net::IpAddr = config.bind_address.parse().map_err(|e| {
+        format!("http.bind_address '{}' is not an IP address: {}", config.bind_address, e)
+    })?;
+    let addr = SocketAddr::new(ip, config.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
 

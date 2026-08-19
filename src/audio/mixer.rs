@@ -110,8 +110,11 @@ pub struct ActiveSample {
     /// Fractional part of playback position for sub-sample interpolation
     fractional_position: f64,
 
-    /// Per-sample volume (0.0 - 1.0)
+    /// Per-sample volume (0.0 - 1.0) - current smoothed value
     pub volume: f32,
+
+    /// Target per-sample volume for smooth ramping
+    pub target_volume: f32,
 
     /// Voice-level volume (0.0 - 1.0) - current smoothed value
     pub voice_volume: f32,
@@ -136,6 +139,14 @@ pub struct ActiveSample {
 
     /// Number of samples to crossfade at loop boundaries (0 = disabled)
     pub crossfade_samples: usize,
+
+    /// Scratch buffer for the pitch-corrected mix path, sized when pitch
+    /// correction is enabled so the audio callback does not allocate
+    pitch_scratch: Vec<f32>,
+
+    /// Scratch for the stretcher's input when looping (the input is built
+    /// with wrap-around and crossfade blending rather than sliced directly)
+    pitch_input_scratch: Vec<f32>,
 }
 
 impl ActiveSample {
@@ -166,6 +177,7 @@ impl ActiveSample {
             position: 0,
             fractional_position: 0.0,
             volume,
+            target_volume: volume,
             voice_volume,
             target_voice_volume: voice_volume,
             channel_map,
@@ -174,6 +186,8 @@ impl ActiveSample {
             pitch_corrector: None,
             loop_mode: false,
             crossfade_samples: 0,
+            pitch_scratch: Vec::new(),
+            pitch_input_scratch: Vec::new(),
         }
     }
 
@@ -207,6 +221,7 @@ impl ActiveSample {
             position: 0,
             fractional_position: 0.0,
             volume,
+            target_volume: volume,
             voice_volume,
             target_voice_volume: voice_volume,
             channel_map,
@@ -215,6 +230,8 @@ impl ActiveSample {
             pitch_corrector: None,
             loop_mode,
             crossfade_samples,
+            pitch_scratch: Vec::new(),
+            pitch_input_scratch: Vec::new(),
         }
     }
 
@@ -240,6 +257,7 @@ impl ActiveSample {
             position: 0,
             fractional_position: 0.0,
             volume,
+            target_volume: volume,
             voice_volume,
             target_voice_volume: voice_volume,
             channel_map,
@@ -248,6 +266,8 @@ impl ActiveSample {
             pitch_corrector: None,
             loop_mode,
             crossfade_samples,
+            pitch_scratch: Vec::new(),
+            pitch_input_scratch: Vec::new(),
         }
     }
 
@@ -293,12 +313,20 @@ impl ActiveSample {
     /// Creates a new PitchCorrector if one doesn't exist.
     pub fn enable_pitch_correction(&mut self) {
         if self.pitch_corrector.is_none() {
+            let channels = self.buffer.channels_blocking().max(1);
             let mut pc = PitchCorrector::new(
-                self.buffer.channels(),
+                channels,
                 self.buffer.sample_rate(),
             );
             pc.set_speed(self.speed);
             self.pitch_corrector = Some(pc);
+            // Size the mix scratches here, on the command thread, so the
+            // audio callback does not allocate; 8192 output frames covers any
+            // sane device buffer, and the input side is that times the
+            // fastest pitch-corrected speed (a larger need grows once, then
+            // stays)
+            self.pitch_scratch.resize(8192 * channels, 0.0);
+            self.pitch_input_scratch.resize(8192 * 8 * channels, 0.0);
         }
     }
 
@@ -385,22 +413,18 @@ impl ActiveSample {
         self.target_voice_volume = target.clamp(0.0, crate::config::MAX_GAIN);
     }
 
-    /// Advance voice volume toward target by one frame.
-    /// Uses linear ramping with a fixed rate that provides ~20ms transition at 44.1kHz.
-    /// Returns true if volume is still ramping, false if at target.
-    pub fn advance_voice_volume(&mut self) -> bool {
-        const RAMP_RATE: f32 = 0.001; // ~22ms for full 0-1 transition at 44.1kHz
+    /// Set target sample volume for smooth ramping
+    pub fn set_target_volume(&mut self, target: f32) {
+        self.target_volume = target.clamp(0.0, crate::config::MAX_GAIN);
+    }
 
-        if (self.voice_volume - self.target_voice_volume).abs() < RAMP_RATE {
-            self.voice_volume = self.target_voice_volume;
-            false
-        } else if self.voice_volume < self.target_voice_volume {
-            self.voice_volume += RAMP_RATE;
-            true
-        } else {
-            self.voice_volume -= RAMP_RATE;
-            true
-        }
+    /// Advance the sample and voice volumes toward their targets by one frame.
+    /// Uses linear ramping with a fixed rate that provides ~20ms transition at 44.1kHz.
+    /// Returns true if either volume is still ramping, false if both are at target.
+    pub fn advance_volumes(&mut self) -> bool {
+        let voice_ramping = ramp_toward(&mut self.voice_volume, self.target_voice_volume);
+        let sample_ramping = ramp_toward(&mut self.volume, self.target_volume);
+        voice_ramping || sample_ramping
     }
 
     /// Advance the playback position by the given number of output frames,
@@ -413,21 +437,9 @@ impl ActiveSample {
         let buffer_frames = self.buffer.frames();
 
         if self.loop_mode && buffer_frames > 0 {
-            // Handle looping
-            if new_pos < 0.0 {
-                // Reverse playback wrapped past start - loop to end
-                let wrapped = new_pos % buffer_frames as f64 + buffer_frames as f64;
-                self.position = wrapped as usize % buffer_frames;
-                self.fractional_position = wrapped.fract();
-            } else if new_pos >= buffer_frames as f64 {
-                // Forward playback wrapped past end - loop to start
-                let wrapped = new_pos % buffer_frames as f64;
-                self.position = wrapped as usize;
-                self.fractional_position = wrapped.fract();
-            } else {
-                self.position = new_pos as usize;
-                self.fractional_position = new_pos.fract();
-            }
+            let wrapped = wrap_loop_position(new_pos, buffer_frames, self.crossfade_samples);
+            self.position = wrapped as usize;
+            self.fractional_position = wrapped.fract();
         } else {
             // Non-looping behavior
             if new_pos < 0.0 {
@@ -450,6 +462,60 @@ impl ActiveSample {
     }
 }
 
+/// Map a playback position into a looping buffer's active region.
+///
+/// With a crossfade, the last crossfade_samples frames are blended with the
+/// head frames [0, cf), so the loop's period is buffer_frames - cf: a forward
+/// wrap lands at cf (the head was already heard inside the blend, landing at
+/// 0 would play it twice) and a reverse wrap lands just before the tail.
+/// Without a crossfade this is a plain modulo wrap.
+fn wrap_loop_position(pos: f64, buffer_frames: usize, crossfade_samples: usize) -> f64 {
+    if buffer_frames == 0 {
+        return 0.0;
+    }
+    let cf = if crossfade_samples > 0 && buffer_frames > crossfade_samples * 2 {
+        crossfade_samples
+    } else {
+        0
+    };
+    let n = buffer_frames as f64;
+    let period = (buffer_frames - cf) as f64;
+
+    let wrapped = if pos >= n {
+        cf as f64 + (pos - n) % period
+    } else if pos < 0.0 {
+        (n - cf as f64) + pos % period
+    } else {
+        return pos;
+    };
+
+    if wrapped < 0.0 {
+        wrapped + period
+    } else if wrapped >= n {
+        wrapped - period
+    } else {
+        wrapped
+    }
+}
+
+/// Step a smoothed volume one frame toward its target.
+/// Linear ramping at a fixed rate: ~22ms for a full 0-1 transition at 44.1kHz.
+/// Returns true while still ramping.
+fn ramp_toward(current: &mut f32, target: f32) -> bool {
+    const RAMP_RATE: f32 = 0.001;
+
+    if (*current - target).abs() < RAMP_RATE {
+        *current = target;
+        false
+    } else if *current < target {
+        *current += RAMP_RATE;
+        true
+    } else {
+        *current -= RAMP_RATE;
+        true
+    }
+}
+
 /// Active live input (microphone) being mixed
 pub struct LiveInput {
     /// Voice ID this input belongs to (for ducking)
@@ -461,8 +527,15 @@ pub struct LiveInput {
     /// Number of input channels
     pub input_channels: usize,
 
-    /// Per-input volume (0.0 - 1.0)
+    /// Per-input volume (0.0 - 1.0) - current smoothed value
     pub volume: f32,
+
+    /// Target input volume for smooth ramping
+    pub target_volume: f32,
+
+    /// The level to restore on unmute, so muting does not forget a
+    /// configured or boosted volume
+    pub unmuted_volume: f32,
 
     /// Voice-level volume (0.0 - 1.0) - current smoothed value
     pub voice_volume: f32,
@@ -511,6 +584,8 @@ impl LiveInput {
             consumer,
             input_channels,
             volume,
+            target_volume: volume,
+            unmuted_volume: volume,
             voice_volume: 1.0,
             target_voice_volume: 1.0,
             channel_map,
@@ -552,18 +627,37 @@ impl LiveInput {
         self.target_voice_volume = target.clamp(0.0, crate::config::MAX_GAIN);
     }
 
-    /// Advance voice volume toward target by one frame.
-    /// Uses linear ramping with a fixed rate that provides ~20ms transition at 44.1kHz.
-    pub fn advance_voice_volume(&mut self) {
-        const RAMP_RATE: f32 = 0.001; // ~22ms for full 0-1 transition at 44.1kHz
-
-        if (self.voice_volume - self.target_voice_volume).abs() < RAMP_RATE {
-            self.voice_volume = self.target_voice_volume;
-        } else if self.voice_volume < self.target_voice_volume {
-            self.voice_volume += RAMP_RATE;
-        } else {
-            self.voice_volume -= RAMP_RATE;
+    /// Set the input volume target for smooth ramping. A nonzero level is
+    /// remembered as the level unmute restores.
+    pub fn set_target_volume(&mut self, target: f32) {
+        self.target_volume = target.clamp(0.0, crate::config::MAX_GAIN);
+        if self.target_volume > 0.0 {
+            self.unmuted_volume = self.target_volume;
         }
+    }
+
+    /// Mute or unmute this input, ramping to avoid a pop. Unmute restores
+    /// the configured (or last set) volume rather than snapping to 1.0.
+    pub fn set_muted(&mut self, mute: bool) {
+        if mute {
+            if self.target_volume > 0.0 {
+                self.unmuted_volume = self.target_volume;
+            }
+            self.target_volume = 0.0;
+        } else {
+            self.target_volume = self.unmuted_volume;
+        }
+    }
+
+    /// Whether this input is muted (or on its way there)
+    pub fn is_muted(&self) -> bool {
+        self.target_volume == 0.0
+    }
+
+    /// Advance the input and voice volumes toward their targets by one frame.
+    pub fn advance_volumes(&mut self) {
+        ramp_toward(&mut self.voice_volume, self.target_voice_volume);
+        ramp_toward(&mut self.volume, self.target_volume);
     }
 }
 
@@ -697,23 +791,19 @@ fn mix_sample_into_output(
     let buffer_frames = sample.buffer.frames();
     let buffer_channels = sample.buffer.channels();
     let loop_mode = sample.loop_mode;
-    let sample_volume = sample.volume;
 
     // Calculate current precise position (integer + fractional parts)
     let mut src_pos = sample.precise_position();
 
     for frame_idx in 0..frames {
         // Advance voice volume toward target (smooth ramping to avoid pops)
-        sample.advance_voice_volume();
+        sample.advance_volumes();
 
-        // Handle looping wrap-around
+        // Handle looping wrap-around (crossfade shortens the loop period so
+        // the blended head is not played twice)
         if loop_mode && buffer_frames > 0 {
-            if src_pos < 0.0 {
-                // Wrap from start to end
-                src_pos = src_pos % buffer_frames as f64 + buffer_frames as f64;
-            } else if src_pos >= buffer_frames as f64 {
-                // Wrap from end to start
-                src_pos = src_pos % buffer_frames as f64;
+            if src_pos < 0.0 || src_pos >= buffer_frames as f64 {
+                src_pos = wrap_loop_position(src_pos, buffer_frames, sample.crossfade_samples);
             }
         } else {
             // Check bounds based on direction (non-looping)
@@ -743,7 +833,7 @@ fn mix_sample_into_output(
 
         // Calculate fade multiplier for this frame
         let fade_multiplier = sample.fade_state.multiplier();
-        let base_volume = sample_volume * sample.voice_volume;
+        let base_volume = sample.volume * sample.voice_volume;
         let final_volume = base_volume * fade_multiplier * ducking_multiplier;
 
         // Calculate fractional part for interpolation
@@ -846,43 +936,94 @@ fn mix_sample_with_pitch_correction(
         None => return, // Streaming buffer - skip pitch correction
     };
 
-    let sample_volume = sample.volume;
     let speed = sample.speed;
     let src_channels = decoded_buffer.channels;
 
     // Calculate how many input frames we need (scaled by speed)
     let input_frames_needed = ((frames as f32 * speed).ceil() as usize).max(1);
 
-    // Calculate how many input frames are available
-    let available_frames = decoded_buffer.frames.saturating_sub(sample.position);
-    let input_frames = input_frames_needed.min(available_frames);
+    let buffer_frames = decoded_buffer.frames;
+    let loop_mode = sample.loop_mode && buffer_frames > 0;
+
+    // For a looping sample, build the stretcher's input with wrap-around and
+    // the crossfade blend baked in, so the stretcher is never starved at the
+    // loop seam. A non-looping sample feeds the contiguous remainder directly.
+    let mut wrapped_input: Option<Vec<f32>> = None;
+    let input_frames = if loop_mode {
+        let needed_samples = input_frames_needed * src_channels;
+        if sample.pitch_input_scratch.len() < needed_samples {
+            sample.pitch_input_scratch.resize(needed_samples, 0.0);
+        }
+        let mut input = std::mem::take(&mut sample.pitch_input_scratch);
+
+        let cf = if sample.crossfade_samples > 0 && buffer_frames > sample.crossfade_samples * 2 {
+            sample.crossfade_samples
+        } else {
+            0
+        };
+        let period = buffer_frames - cf;
+        let crossfade_start = buffer_frames - cf;
+
+        for i in 0..input_frames_needed {
+            let mut frame = sample.position + i;
+            if frame >= buffer_frames {
+                frame = cf + (frame - buffer_frames) % period;
+            }
+            for ch in 0..src_channels {
+                let mut value = decoded_buffer.data[frame * src_channels + ch];
+                if cf > 0 && frame >= crossfade_start {
+                    let frames_into_crossfade = frame - crossfade_start;
+                    let progress = frames_into_crossfade as f32 / cf as f32;
+                    let blend = decoded_buffer.data[frames_into_crossfade * src_channels + ch];
+                    value = value * (1.0 - progress) + blend * progress;
+                }
+                input[i * src_channels + ch] = value;
+            }
+        }
+
+        wrapped_input = Some(input);
+        input_frames_needed
+    } else {
+        // Calculate how many input frames are available
+        let available_frames = buffer_frames.saturating_sub(sample.position);
+        input_frames_needed.min(available_frames)
+    };
 
     if input_frames == 0 {
         return;
     }
 
-    // Extract input samples from the buffer (interleaved)
-    let input_start = sample.position * src_channels;
-    let input_end = (sample.position + input_frames) * src_channels;
-    let input_slice = &decoded_buffer.data[input_start..input_end];
-
-    // Create output buffer for the stretcher (interleaved, same channel count as source)
+    // Reuse the preallocated stretcher scratch (interleaved, same channel
+    // count as the source); growing it here is a rare one-time event for
+    // devices with buffers past the preallocation
     let output_samples = frames * src_channels;
-    let mut stretched = vec![0.0f32; output_samples];
+    if sample.pitch_scratch.len() < output_samples {
+        sample.pitch_scratch.resize(output_samples, 0.0);
+    }
+    let mut stretched = std::mem::take(&mut sample.pitch_scratch);
+    stretched[..output_samples].fill(0.0);
 
     // Process through the pitch corrector
+    let input_slice: &[f32] = match &wrapped_input {
+        Some(input) => &input[..input_frames * src_channels],
+        None => {
+            let input_start = sample.position * src_channels;
+            let input_end = (sample.position + input_frames) * src_channels;
+            &decoded_buffer.data[input_start..input_end]
+        }
+    };
     if let Some(ref mut pc) = sample.pitch_corrector {
-        pc.process(input_slice, &mut stretched);
+        pc.process(input_slice, &mut stretched[..output_samples]);
     }
 
     // Apply volume, fade, ducking and channel mapping
     for frame_idx in 0..frames {
         // Advance voice volume toward target (smooth ramping to avoid pops)
-        sample.advance_voice_volume();
+        sample.advance_volumes();
 
         // Calculate fade multiplier for this frame
         let fade_multiplier = sample.fade_state.multiplier();
-        let base_volume = sample_volume * sample.voice_volume;
+        let base_volume = sample.volume * sample.voice_volume;
         let final_volume = base_volume * fade_multiplier * ducking_multiplier;
 
         // Apply channel mapping and mix into output
@@ -904,6 +1045,12 @@ fn mix_sample_with_pitch_correction(
         sample.fade_state.advance();
     }
 
+    // Return the scratches for the next callback
+    if let Some(input) = wrapped_input {
+        sample.pitch_input_scratch = input;
+    }
+    sample.pitch_scratch = stretched;
+
     // Note: position is advanced by advance_position() in mix_audio
 }
 
@@ -924,7 +1071,6 @@ fn mix_live_input_into_output(
     if input_channels == 0 {
         return;
     }
-    let base_volume = input.volume;
 
     // Bound capture latency: a capture clock faster than the output clock
     // builds a backlog that would otherwise grow until the ring buffer is full.
@@ -949,17 +1095,17 @@ fn mix_live_input_into_output(
     }
 
     for frame_idx in 0..frames {
-        // Advance voice volume toward target (smooth ramping to avoid pops).
-        // This runs for every output frame, including starved ones, so a fade
-        // still completes on schedule while the input is silent.
-        input.advance_voice_volume();
+        // Advance the volumes toward their targets (smooth ramping to avoid
+        // pops). This runs for every output frame, including starved ones, so
+        // a fade still completes on schedule while the input is silent.
+        input.advance_volumes();
 
         if frame_idx >= frames_to_read {
             // Underrun - leave the remaining output as silence (already zeroed)
             continue;
         }
 
-        let final_volume = base_volume * input.voice_volume * ducking_multiplier;
+        let final_volume = input.volume * input.voice_volume * ducking_multiplier;
         let frame_start = frame_idx * input_channels;
 
         for &(src_ch, dest_ch) in &input.channel_map {
@@ -985,6 +1131,50 @@ mod tests {
     }
 
     const TEST_FILE: &str = "test.wav";
+
+    #[test]
+    fn test_sample_volume_change_ramps_instead_of_jumping() {
+        // A volume command must not step the gain in one frame - that pops.
+        let buffer = create_test_buffer(48000, 2, 1.0);
+        let mut sample = ActiveSample::new(1, "t".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        sample.set_target_volume(0.0);
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 512 * 2];
+        mix_audio(&mut output, &mut state);
+
+        assert!(
+            output[0] > 0.9,
+            "the first frame should still be near the old level, got {}",
+            output[0]
+        );
+        let last = output[output.len() - 2];
+        assert!(
+            last < output[0],
+            "later frames should have ramped down: first {}, last {}",
+            output[0], last
+        );
+    }
+
+    #[test]
+    fn test_input_mute_restores_configured_volume() {
+        // Unmuting must restore the level the input was configured/boosted
+        // to, not snap to 1.0
+        let (_producer, consumer) = crate::audio::input::create_ring_buffer(1024);
+        let mut input = LiveInput::new("mic".to_string(), consumer, 2, 0.7, vec![(0, 0)]);
+
+        input.set_muted(true);
+        assert!(input.is_muted());
+        input.set_muted(false);
+        assert_eq!(input.target_volume, 0.7);
+
+        input.set_target_volume(2.0);
+        input.set_muted(true);
+        input.set_muted(false);
+        assert_eq!(input.target_volume, 2.0, "a boosted mic comes back boosted");
+    }
 
     #[test]
     fn test_single_sample_mixing() {
@@ -1218,6 +1408,96 @@ mod tests {
 
         // Sample should not be finished
         assert!(!state.active_samples[0].is_finished());
+    }
+
+    #[test]
+    fn test_wrap_loop_position_without_crossfade_wraps_to_start() {
+        assert_eq!(wrap_loop_position(1050.0, 1000, 0), 50.0);
+        assert_eq!(wrap_loop_position(-30.0, 1000, 0), 970.0);
+        assert_eq!(wrap_loop_position(500.0, 1000, 0), 500.0);
+    }
+
+    #[test]
+    fn test_wrap_loop_position_with_crossfade_skips_the_blended_head() {
+        // The last cf frames were blended with head frames [0, cf), so the
+        // loop resumes at cf - replaying [0, cf) would double the head
+        assert_eq!(wrap_loop_position(1050.0, 1000, 100), 150.0);
+        // Reverse: the head blend covered the tail, so wrap to just before it
+        assert_eq!(wrap_loop_position(-30.0, 1000, 100), 870.0);
+    }
+
+    #[test]
+    fn test_crossfade_loop_plays_head_only_once_per_loop() {
+        // Head frames [0, 3) are 0.9 markers, the rest 0.1. With a 3-frame
+        // crossfade, the head is heard only inside the blend at the tail -
+        // hearing 0.9 at full level right after the wrap is the double-play.
+        let mut data = Vec::new();
+        for frame in 0..10 {
+            let v = if frame < 3 { 0.9 } else { 0.1 };
+            data.extend([v, v]);
+        }
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        sample.loop_mode = true;
+        sample.crossfade_samples = 3;
+        sample.position = 5;
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Positions played: 5, 6 (plain 0.1), 7, 8, 9 (tail blended with
+        // head), then the wrap - which must land at frame 3 (0.1), not 0 (0.9)
+        let mut output = vec![0.0f32; 8 * 2];
+        mix_audio(&mut output, &mut state);
+
+        for frame in 5..8 {
+            let v = output[frame * 2];
+            assert!(
+                (v - 0.1).abs() < 0.05,
+                "frame {} after the wrap should be past the blended head (0.1), got {}",
+                frame, v
+            );
+        }
+    }
+
+    #[test]
+    fn test_looping_pitch_corrected_sample_has_no_gap_at_the_seam() {
+        // The stretcher's input must wrap across the loop boundary; an
+        // underfed stretcher renders the boundary callback (partly) silent.
+        // A sine keeps the phase-vocoder stretcher fed with real content.
+        let frames = 4800;
+        let mut data = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let v = (i as f32 / 48000.0 * 440.0 * std::f32::consts::TAU).sin() * 0.8;
+            data.extend([v, v]);
+        }
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+
+        let mut sample = ActiveSample::new(1, "test".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        sample.loop_mode = true;
+        sample.set_speed_with_mode(8.0, true);
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Warm the stretcher up past its own latency, then check every
+        // callback: at 8x the input wraps within every callback, so an
+        // input feed that fails to wrap starves the stretcher constantly
+        let mut quiet_callbacks = Vec::new();
+        for callback in 0..40 {
+            let mut output = vec![0.0f32; 512 * 2];
+            mix_audio(&mut output, &mut state);
+            let mean: f32 = output.iter().map(|s| s.abs()).sum::<f32>() / output.len() as f32;
+            if callback >= 10 && mean < 0.4 {
+                quiet_callbacks.push((callback, mean));
+            }
+        }
+        assert!(
+            quiet_callbacks.is_empty(),
+            "looping pitch-corrected playback dropped out at the seam: {:?}",
+            quiet_callbacks
+        );
     }
 
     #[test]
@@ -2885,7 +3165,7 @@ mod tests {
 
         // Ramp until we reach target
         while (sample.voice_volume - sample.target_voice_volume).abs() > 0.0001 {
-            sample.advance_voice_volume();
+            sample.advance_volumes();
             let current = sample.voice_volume;
 
             // Verify volume changed by at most RAMP_RATE (0.001)
@@ -2914,7 +3194,7 @@ mod tests {
         // Change target to 0.5 and start ramping
         sample.set_target_voice_volume(0.5);
         for _ in 0..100 {
-            sample.advance_voice_volume();
+            sample.advance_volumes();
         }
         // After 100 frames at 0.001/frame = 0.1 change
         // Volume should be 1.0 - 0.1 = 0.9 (still above 0.5)
@@ -2928,7 +3208,7 @@ mod tests {
 
         // Continue ramping toward 0.2
         for _ in 0..200 {
-            sample.advance_voice_volume();
+            sample.advance_volumes();
         }
         // After 200 more frames at 0.001/frame = 0.2 change
         // Volume should be ~0.9 - 0.2 = 0.7
@@ -2942,7 +3222,7 @@ mod tests {
         // Volume should start increasing
         let vol_before_third = sample.voice_volume;
         for _ in 0..100 {
-            sample.advance_voice_volume();
+            sample.advance_volumes();
         }
         assert!(sample.voice_volume > vol_before_third,
             "Volume should increase toward 0.9: {} -> {}", vol_before_third, sample.voice_volume);
@@ -2994,12 +3274,12 @@ mod tests {
 
         // Verify ramping works
         let initial = input.voice_volume;
-        input.advance_voice_volume();
+        input.advance_volumes();
         assert!(input.voice_volume < initial, "Voice volume should decrease toward target");
 
         // Continue ramping
         for _ in 0..1000 {
-            input.advance_voice_volume();
+            input.advance_volumes();
         }
         assert!((input.voice_volume - 0.3).abs() < 0.01, "Should reach target of 0.3");
     }
@@ -3015,7 +3295,7 @@ mod tests {
         assert_eq!(sample.target_voice_volume, 0.7);
 
         // Advancing should not change anything
-        let result = sample.advance_voice_volume();
+        let result = sample.advance_volumes();
         assert!(!result, "Should return false when at target");
         assert_eq!(sample.voice_volume, 0.7);
     }

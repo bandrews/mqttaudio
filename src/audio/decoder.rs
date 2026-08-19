@@ -119,6 +119,7 @@ pub fn decode_file(
 
     // Decode all packets
     let mut samples = Vec::new();
+    let mut skipped_packets: u64 = 0;
 
     loop {
         // Get the next packet
@@ -136,11 +137,28 @@ pub fn decode_file(
             continue;
         }
 
-        // Decode the packet
-        let decoded = decoder.decode(&packet)?;
+        // Decode the packet. Symphonia documents DecodeError as recoverable:
+        // the packet is corrupt but the stream is fine, so skip it (a brief
+        // dropout) rather than failing the whole file.
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(SymphoniaError::DecodeError(e)) => {
+                skipped_packets += 1;
+                tracing::debug!("Skipping corrupt packet in {}: {}", path, e);
+                continue;
+            }
+            Err(e) => return Err(DecodeError::SymphoniaError(e)),
+        };
 
         // Convert to f32 and append to samples vector
         convert_samples_to_f32(&decoded, &mut samples);
+    }
+
+    if skipped_packets > 0 {
+        tracing::warn!(
+            "Skipped {} corrupt packets while decoding {} - expect brief dropouts",
+            skipped_packets, path
+        );
     }
 
     tracing::info!(

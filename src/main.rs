@@ -1,12 +1,7 @@
 // ABOUTME: Entry point for mqttaudio MQTT-controlled audio daemon.
 // ABOUTME: Handles CLI parsing, initialization, and main event loop.
 
-mod audio;
-mod cache;
-mod config;
-mod http;
-mod mqtt;
-mod voice;
+use mqttaudio::{audio, cache, config, http, mqtt, voice};
 
 use clap::Parser;
 use cpal::traits::{DeviceTrait, StreamTrait};
@@ -69,14 +64,6 @@ struct Args {
     /// Test mixer with multiple simultaneous files (Phase 4)
     #[arg(long)]
     test_mixer: bool,
-
-    /// LFE (subwoofer) channel number for bass management
-    #[arg(long)]
-    lfe_channel: Option<usize>,
-
-    /// Crossover frequency (Hz) for bass management
-    #[arg(long)]
-    crossover_frequency: Option<f32>,
 
     /// MQTT topic to publish log messages to
     #[arg(long)]
@@ -190,8 +177,6 @@ async fn main() {
         args.sample_rate,
         args.channels,
         args.verbose,
-        args.lfe_channel,
-        args.crossover_frequency,
         args.log_topic.clone(),
         args.mqtt_username.clone(),
         args.mqtt_password.clone(),
@@ -512,6 +497,22 @@ async fn main() {
             bm_config.crossover_frequency_hz,
             bm_config.source_channels
         );
+        // Config validation cannot know the device width; say so now rather
+        // than processing silently with routes that can never sound
+        if bm_config.lfe_channel >= output_channels {
+            tracing::warn!(
+                "Bass management is inactive: lfe_channel {} but the device opened with {} channels",
+                bm_config.lfe_channel, output_channels
+            );
+        }
+        for src in &bm_config.source_channels {
+            if *src >= output_channels {
+                tracing::warn!(
+                    "Bass management source channel {} is beyond the device's {} channels and contributes nothing",
+                    src, output_channels
+                );
+            }
+        }
         Some(audio::bass_management::BassManagement::new(bm_config, output_sample_rate, output_channels))
     } else {
         None
@@ -733,35 +734,35 @@ async fn main() {
                 let mut state = mixer_state_clone.lock().unwrap();
                 audio::mixer::mix_audio(data, &mut state);
 
-                // Track which voices had samples before cleanup
-                let voices_before: HashSet<String> = state.active_samples.iter()
-                    .map(|s| s.voice_id.clone())
-                    .collect();
+                // The steady-state callback allocates nothing: bookkeeping
+                // below runs only in the callback where a sample actually
+                // finished (cue endings), the moment the work is unavoidable
+                if !state.active_samples.iter().any(|s| s.is_finished()) {
+                    return;
+                }
 
                 // Record finished samples for off-thread bookkeeping cleanup
-                // (voice manager, ducking maps), then remove them
+                // (voice manager), then remove them
                 let mut finished: Vec<(u64, String)> = state.active_samples.iter()
                     .filter(|s| s.is_finished())
                     .map(|s| (s.id, s.voice_id.clone()))
                     .collect();
-                state.finished_samples.append(&mut finished);
                 state.active_samples.retain(|s| !s.is_finished());
 
-                // Track which voices have samples after cleanup
-                let voices_after: HashSet<String> = state.active_samples.iter()
-                    .map(|s| s.voice_id.clone())
-                    .collect();
-
-                // Notify ducking engine of voices that became inactive
-                if let Some(ref mut engine) = state.ducking_engine {
-                    for voice in voices_before.difference(&voices_after) {
-                        engine.notify_voice_active(voice, false);
+                // A finished sample's voice goes inactive when it was the
+                // voice's last sample
+                for (_, voice_id) in &finished {
+                    let voice_still_playing = state.active_samples.iter()
+                        .any(|s| &s.voice_id == voice_id);
+                    if !voice_still_playing {
+                        if let Some(ref mut engine) = state.ducking_engine {
+                            engine.notify_voice_active(voice_id, false);
+                        }
+                        active_voices_clone.lock().unwrap().remove(voice_id);
                     }
                 }
 
-                // Update active voices tracker
-                let mut active = active_voices_clone.lock().unwrap();
-                *active = voices_after;
+                state.finished_samples.append(&mut finished);
             }
         }
     };
@@ -853,7 +854,13 @@ async fn main() {
                 }
                 Err(e) => {
                     tracing::error!("Failed to start HTTP server: {}", e);
-                    // Continue without HTTP server - not fatal
+                    if !mqtt_enabled {
+                        // HTTP was the only control surface; a daemon that can
+                        // receive no commands should fail loudly, not idle
+                        tracing::error!("HTTP was the only enabled interface - exiting");
+                        std::process::exit(1);
+                    }
+                    tracing::warn!("Continuing with MQTT only");
                 }
             }
         }
@@ -928,7 +935,22 @@ async fn main() {
                                         })
                                         .collect();
                                     match mapping {
-                                        Ok(m) => Some(m),
+                                        Ok(m) => {
+                                            // Routes past the device width mix to nothing; say so
+                                            // once at command time instead of playing silence
+                                            if m.is_empty() {
+                                                tracing::warn!("channel_map for '{}' is empty - it will play silently", file);
+                                            }
+                                            for (_, dest) in &m {
+                                                if *dest >= output_channels {
+                                                    tracing::warn!(
+                                                        "channel_map for '{}' routes to channel {} but the device opened with {} channels - that route will be silent",
+                                                        file, dest, output_channels
+                                                    );
+                                                }
+                                            }
+                                            Some(m)
+                                        }
                                         Err(e) => {
                                             deliver(reply.take(), Err(CommandError::new(CommandErrorKind::InvalidRequest, format!("Failed to resolve channel alias: {}", e))));
                                             continue;
@@ -1312,10 +1334,10 @@ async fn main() {
                             // Try to find by index first
                             if let Ok(idx) = input.parse::<usize>() {
                                 if idx < state.live_inputs.len() {
-                                    state.live_inputs[idx].volume = new_volume.clamp(0.0, config::MAX_GAIN);
+                                    state.live_inputs[idx].set_target_volume(new_volume);
                                     tracing::info!(
                                         "Set input {} volume to {:.2}",
-                                        idx, state.live_inputs[idx].volume
+                                        idx, state.live_inputs[idx].target_volume
                                     );
                                     found = true;
                                 }
@@ -1325,10 +1347,10 @@ async fn main() {
                             if !found {
                                 for live_input in state.live_inputs.iter_mut() {
                                     if live_input.voice_id == input {
-                                        live_input.volume = new_volume.clamp(0.0, config::MAX_GAIN);
+                                        live_input.set_target_volume(new_volume);
                                         tracing::info!(
                                             "Set input '{}' volume to {:.2}",
-                                            input, live_input.volume
+                                            input, live_input.target_volume
                                         );
                                         found = true;
                                         break;
@@ -1350,10 +1372,7 @@ async fn main() {
                             // Try to find by index first
                             if let Ok(idx) = input.parse::<usize>() {
                                 if idx < state.live_inputs.len() {
-                                    // Mute by setting volume to 0, unmute restores to 1.0
-                                    // Note: This is a simple mute - a more sophisticated version
-                                    // would store the previous volume
-                                    state.live_inputs[idx].volume = if mute { 0.0 } else { 1.0 };
+                                    state.live_inputs[idx].set_muted(mute);
                                     tracing::info!(
                                         "Input {} {}",
                                         idx, if mute { "muted" } else { "unmuted" }
@@ -1366,7 +1385,7 @@ async fn main() {
                             if !found {
                                 for live_input in state.live_inputs.iter_mut() {
                                     if live_input.voice_id == input {
-                                        live_input.volume = if mute { 0.0 } else { 1.0 };
+                                        live_input.set_muted(mute);
                                         tracing::info!(
                                             "Input '{}' {}",
                                             input, if mute { "muted" } else { "unmuted" }
@@ -1510,7 +1529,7 @@ async fn main() {
                                         &sample.file_path,
                                         &sample.voice_id,
                                     ) {
-                                        sample.volume = volume.clamp(0.0, config::MAX_GAIN);
+                                        sample.set_target_volume(volume);
                                         updated_count += 1;
                                     }
                                 }

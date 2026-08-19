@@ -508,6 +508,20 @@ pub fn expand_macros(
 /// Supports both flattened and nested (legacy) formats:
 /// - Flattened: {"command": "play", "file": "test.wav", "volume": 0.8}
 /// - Nested: {"command": "play", "message": {"file": "test.wav", "volume": 0.8}}
+/// Reject a non-numeric internal_id at parse time: the system-assigned ids
+/// are numeric, so a non-numeric value could only ever silently match nothing.
+fn validate_internal_id(internal_id: &Option<String>) -> Result<(), ParseError> {
+    if let Some(iid) = internal_id {
+        if iid.parse::<u64>().is_err() {
+            return Err(ParseError::InvalidParameter(format!(
+                "internal_id '{}' is not numeric - use the internal_id values shown by /status/samples",
+                iid
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
     let mqtt_cmd: MqttCommand = serde_json::from_str(json)?;
 
@@ -626,6 +640,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 return Err(ParseError::MissingMessage);
             }
             let seek_msg: SeekMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            validate_internal_id(&seek_msg.internal_id)?;
 
             Ok(AudioCommand::Seek {
                 selector: SampleSelector {
@@ -642,6 +657,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 return Err(ParseError::MissingMessage);
             }
             let speed_msg: SpeedMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            validate_internal_id(&speed_msg.internal_id)?;
 
             if speed_msg.speed == 0.0 {
                 return Err(ParseError::InvalidParameter(
@@ -665,6 +681,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 return Err(ParseError::MissingMessage);
             }
             let stop_msg: StopMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            validate_internal_id(&stop_msg.internal_id)?;
 
             Ok(AudioCommand::Stop {
                 selector: SampleSelector {
@@ -681,6 +698,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 return Err(ParseError::MissingMessage);
             }
             let vol_msg: VolumeMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            validate_internal_id(&vol_msg.internal_id)?;
 
             Ok(AudioCommand::Volume {
                 selector: SampleSelector {
@@ -923,6 +941,25 @@ mod tests {
         match cmd {
             AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, 2000),
             _ => panic!("Expected FadeAll command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_non_numeric_internal_id_is_rejected() {
+        // internal_id is the system-assigned numeric id from /status/samples;
+        // a non-numeric value can never match anything, so failing loudly
+        // beats the silent "matched no samples" it used to produce
+        for command in ["stop", "seek", "speed", "volume"] {
+            let json = format!(
+                r#"{{"command": "{}", "internal_id": "abc", "position_ms": 1, "speed": 1.0, "volume": 1.0}}"#,
+                command
+            );
+            let err = parse_command(&json).unwrap_err();
+            assert!(
+                err.to_string().contains("internal_id"),
+                "{} should reject a non-numeric internal_id, got: {}",
+                command, err
+            );
         }
     }
 

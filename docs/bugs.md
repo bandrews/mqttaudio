@@ -19,12 +19,6 @@ Supporting it means fanning one capture stream out to several `LiveInput`
 readers rather than the single-producer/single-consumer ring buffer used today.
 Documented as a limitation in `docs/features/microphone-input.md` instead.
 
-## `input_mute` discards the configured volume
-
-Unmuting sets the volume to 1.0 rather than restoring what was configured, so
-a microphone set to 0.7 comes back at full level, and one boosted to 2.0 comes
-back quieter. There is already a code comment noting this in `src/main.rs`.
-
 ## `fadeall` does not fade live inputs
 
 `fadeall` fades the playing samples, matching what `stopall` stops. A live

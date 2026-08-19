@@ -84,42 +84,24 @@ HTTP revalidation, stream write-through + memory budgeting, the command-loop
 restructure with real HTTP outcomes and load cancellation, mic-triggered
 ducking, WebSocket log streaming with auth, env vars, mic resampler quality,
 the voice/ducking leak cleanup, `speed: 0` rejection, and in-place CHANGELOG
-corrections. The remainder below stays deferred as originally written.
+corrections.
 
-## Deferred — needs a decision (30 items, see triage.md for detail)
+## Still deferred (see triage.md for detail)
 
-The ones most worth a decision soon:
+The engineering backlog was completed in a follow-up pass (triage.md,
+"Completed in the backlog pass"): loop-crossfade timing, resampler
+alignment, RT-callback allocations, corrupt-packet resilience, volume-change
+ramps, bass warnings, IPv6/auth hardening, streamed disk writes with
+download cancellation, honest progress estimates, channel_map over HTTP,
+the lib/bin module unification, dev-tool paths, and route warnings.
 
-1. **Empty `allowed_directories` semantics (D1).** Docs used to promise
-   "empty = HTTP-only", but the README quick start and every default-config
-   setup relies on local playback. Enforcement now applies only to non-empty
-   lists; docs say so. Decide whether empty should eventually mean deny-local.
-2. **`cache.enabled` and `revalidate_after_seconds` (D2, D3)** are still
-   accepted-but-inert (docs now say "reserved"). Implement or remove.
-3. **Streamed HTTP audio is never written to disk cache and never enters the
-   memory-cache budget (D4, D5).** Every URL play re-downloads after restart,
-   `max_memory_mb` doesn't bound streamed loads, and completed loads live in
-   `active_loads` forever — the real memory-growth story on long-running
-   installs, together with the VoiceManager/DuckingEngine per-playback leaks
-   (D10).
-4. **Command-loop serialization (D6).** A slow load delays `stopall`; the
-   cache mutex is held across awaits (a `/status` poll during a stall can
-   even block the audio callback). Timeouts now bound the damage; the
-   architecture fix (async mutex / per-load tasks) is real work.
-5. **WebSocket log streaming (D8)** was advertised but never wired into
-   tracing — no client ever received a log line. Docs now say so. Wire it up
-   (and add auth to `/ws`) or drop the endpoint.
-6. **Mic-triggered ducking (D7)** needs signal-level detection to exist; docs
-   no longer claim it.
-7. **HTTP responses are fire-and-forget (D9)** — clients can't learn a
-   command failed. Needs an API design pass.
-
-The rest (D11–D30) are audio-quality subtleties (loop-crossfade double-play,
-resampler tail loss, RT-safety violations in the callback, decode aborts on
-one corrupt packet, volume-change pops), cache-layer hardening (unstable
-filename hashing, non-atomic writes, progress estimates), and smaller polish
-(IPv6 bind, constant-time token compare, `speed: 0` semantics, dev-tool
-paths, lib.rs duplication).
+D20 closed the list: the `--lfe-channel`/`--crossover-frequency` CLI flags
+were removed (they could never activate bass management alone, and a
+self-activation default would wrongly feed every zone into the sub); bass
+management is configured entirely in the `bass_management` config section.
+Nothing from the review remains open beyond the known limitations recorded
+in `docs/bugs.md`. D1's empty-list semantics stay as decided (empty =
+unrestricted, documented).
 
 ## Verification
 

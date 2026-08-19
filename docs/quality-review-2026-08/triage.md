@@ -64,7 +64,50 @@ implemented in the four sprints of `sprint-plan.md`:
   downloads, reader drop not cancelling its download.
 - D30: CHANGELOG corrected in place.
 
+## Completed in the backlog pass (2026-08-19, after the sprint program)
+
+- D11: the steady-state audio callback is allocation-free (bookkeeping runs
+  only in callbacks where a sample finished; the pitch path reuses
+  preallocated scratch buffers). Allocation at cue endings (ducking notify)
+  remains, as before.
+- D12: crossfade loops no longer double-play the head (the loop period is
+  buffer length minus the crossfade), and looping pitch-corrected samples
+  feed the stretcher across the seam with the crossfade baked in - A/B
+  verified.
+- D13: both resamplers drain the sinc filter and trim its delay; resampled
+  audio is time-aligned and covers the input duration exactly.
+- D15: corrupt packets are skipped (Symphonia's recoverable-error contract)
+  instead of aborting the file; regression fixture committed.
+- D17: input_volume, input_mute, and per-sample volume ramp instead of
+  stepping; unmute restores the configured level (closes the bugs.md entry).
+- D21: duplicate bass sources rejected at validation; out-of-range
+  lfe/source channels warn at startup.
+- D22: IPv6 bind_address, constant-time token compare, percent-decoded query
+  tokens, and an HTTP-only daemon exits when its server fails to start.
+- D23: fully resolved - atomic writes, SHA-256 filenames, query-string
+  handling, downloads stream to disk instead of buffering whole files in
+  RAM, and dropping a stream reader cancels its download.
+- D24: length estimates only for WAV; no more nonsense progress numbers for
+  compressed streams.
+- D25: channel_map accepted on POST /play; non-numeric internal_id rejected
+  at parse time.
+- D26: the binary consumes the library crate; the duplicated module tree is
+  gone.
+- D27: --test-mixer uses repo-relative paths.
+- D28: unreachable channel_map routes warn at command time.
+
 ## Deferred — needs a decision or a design
+
+Everything below is retained as the original triage record. All items are
+now resolved: D20 was decided on 2026-08-19 — the
+`--lfe-channel`/`--crossover-frequency` flags were **removed**, since they
+could never activate bass management alone, the natural self-activation
+default (all channels feed the sub) is wrong for multi-zone installs, and
+overriding an existing config from the CLI is not a real workflow. Bass
+management lives entirely in the `bass_management` config section. What
+remains known-but-accepted is listed in `docs/bugs.md` (one capture device
+per input entry, `fadeall` not affecting live inputs, the audio callback's
+mixer mutex).
 
 | # | Issue | Why deferred |
 |---|---|---|

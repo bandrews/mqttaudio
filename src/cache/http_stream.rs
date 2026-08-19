@@ -100,6 +100,12 @@ impl HttpStreamReader {
         self.cancelled.store(true, Ordering::Release);
     }
 
+    /// Whether the download finished or failed (nothing left to cancel)
+    fn download_settled(&self) -> bool {
+        let guard = self.buffer.lock().unwrap();
+        guard.complete || guard.error.is_some()
+    }
+
     /// Check if the download is complete
     pub fn is_complete(&self) -> bool {
         let guard = self.buffer.lock().unwrap();
@@ -393,6 +399,16 @@ impl PersistWriter {
     fn abandon(&mut self) {
         if self.file.take().is_some() {
             let _ = std::fs::remove_file(&self.target.temp_path);
+        }
+    }
+}
+
+impl Drop for HttpStreamReader {
+    fn drop(&mut self) {
+        // An abandoned reader must not keep its download running; a download
+        // that already finished (the normal case) has nothing to cancel
+        if !self.download_settled() {
+            self.cancel();
         }
     }
 }

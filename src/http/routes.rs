@@ -15,6 +15,54 @@ use axum::{
 };
 use tower_http::cors::{Any, CorsLayer};
 
+/// Compare a presented token against the expected one in constant time,
+/// so response timing cannot leak how much of a guess matched.
+fn token_matches(candidate: &str, expected: &str) -> bool {
+    let c = candidate.as_bytes();
+    let e = expected.as_bytes();
+    let mut diff = c.len() ^ e.len();
+    for (i, &eb) in e.iter().enumerate() {
+        let cb = c.get(i).copied().unwrap_or(0);
+        diff |= (cb ^ eb) as usize;
+    }
+    diff == 0
+}
+
+/// Percent-decode a query parameter value ('+' as space), so tokens with
+/// URL-encoded characters authenticate through the query form.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()
+                    .and_then(|h| u8::from_str_radix(h, 16).ok());
+                match hex {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Authentication middleware that checks for Bearer token if configured.
 async fn auth_middleware(
     State(state): State<AppState>,
@@ -35,19 +83,20 @@ async fn auth_middleware(
     match auth_header {
         Some(header) if header.starts_with("Bearer ") => {
             let token = &header[7..];
-            if token == expected_token {
+            if token_matches(token, expected_token) {
                 Ok(next.run(request).await)
             } else {
                 Err(StatusCode::UNAUTHORIZED)
             }
         }
         _ => {
-            // Also check query parameter for simpler clients
+            // Also check query parameter for simpler clients (WebSockets and
+            // browsers cannot always set headers)
             let uri = request.uri();
             if let Some(query) = uri.query() {
                 for param in query.split('&') {
                     if let Some(token) = param.strip_prefix("token=") {
-                        if token == expected_token {
+                        if token_matches(&percent_decode(token), expected_token) {
                             return Ok(next.run(request).await);
                         }
                     }

@@ -349,6 +349,10 @@ Mute or unmute an input.
 | `input` | string | *required* | Input name or index |
 | `mute` | boolean | *required* | true = mute, false = unmute |
 
+Muting ramps the level down over ~20ms (no pop), and unmuting restores the
+input's configured or last-set volume - a mic set to 0.7 comes back at 0.7,
+a boosted one comes back boosted.
+
 ---
 
 ## Examples
