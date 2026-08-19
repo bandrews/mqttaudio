@@ -139,6 +139,10 @@ pub struct ActiveSample {
 
     /// Number of samples to crossfade at loop boundaries (0 = disabled)
     pub crossfade_samples: usize,
+
+    /// Scratch buffer for the pitch-corrected mix path, sized when pitch
+    /// correction is enabled so the audio callback does not allocate
+    pitch_scratch: Vec<f32>,
 }
 
 impl ActiveSample {
@@ -178,6 +182,7 @@ impl ActiveSample {
             pitch_corrector: None,
             loop_mode: false,
             crossfade_samples: 0,
+            pitch_scratch: Vec::new(),
         }
     }
 
@@ -220,6 +225,7 @@ impl ActiveSample {
             pitch_corrector: None,
             loop_mode,
             crossfade_samples,
+            pitch_scratch: Vec::new(),
         }
     }
 
@@ -254,6 +260,7 @@ impl ActiveSample {
             pitch_corrector: None,
             loop_mode,
             crossfade_samples,
+            pitch_scratch: Vec::new(),
         }
     }
 
@@ -299,12 +306,17 @@ impl ActiveSample {
     /// Creates a new PitchCorrector if one doesn't exist.
     pub fn enable_pitch_correction(&mut self) {
         if self.pitch_corrector.is_none() {
+            let channels = self.buffer.channels_blocking().max(1);
             let mut pc = PitchCorrector::new(
-                self.buffer.channels(),
+                channels,
                 self.buffer.sample_rate(),
             );
             pc.set_speed(self.speed);
             self.pitch_corrector = Some(pc);
+            // Size the mix scratch here, on the command thread, so the audio
+            // callback does not allocate; 8192 frames covers any sane device
+            // buffer (a larger one grows it once, then stays)
+            self.pitch_scratch.resize(8192 * channels, 0.0);
         }
     }
 
@@ -912,13 +924,19 @@ fn mix_sample_with_pitch_correction(
     let input_end = (sample.position + input_frames) * src_channels;
     let input_slice = &decoded_buffer.data[input_start..input_end];
 
-    // Create output buffer for the stretcher (interleaved, same channel count as source)
+    // Reuse the preallocated stretcher scratch (interleaved, same channel
+    // count as the source); growing it here is a rare one-time event for
+    // devices with buffers past the preallocation
     let output_samples = frames * src_channels;
-    let mut stretched = vec![0.0f32; output_samples];
+    if sample.pitch_scratch.len() < output_samples {
+        sample.pitch_scratch.resize(output_samples, 0.0);
+    }
+    let mut stretched = std::mem::take(&mut sample.pitch_scratch);
+    stretched[..output_samples].fill(0.0);
 
     // Process through the pitch corrector
     if let Some(ref mut pc) = sample.pitch_corrector {
-        pc.process(input_slice, &mut stretched);
+        pc.process(input_slice, &mut stretched[..output_samples]);
     }
 
     // Apply volume, fade, ducking and channel mapping
@@ -949,6 +967,9 @@ fn mix_sample_with_pitch_correction(
         // Advance fade state
         sample.fade_state.advance();
     }
+
+    // Return the scratch for the next callback
+    sample.pitch_scratch = stretched;
 
     // Note: position is advanced by advance_position() in mix_audio
 }

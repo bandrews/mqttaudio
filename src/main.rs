@@ -749,35 +749,35 @@ async fn main() {
                 let mut state = mixer_state_clone.lock().unwrap();
                 audio::mixer::mix_audio(data, &mut state);
 
-                // Track which voices had samples before cleanup
-                let voices_before: HashSet<String> = state.active_samples.iter()
-                    .map(|s| s.voice_id.clone())
-                    .collect();
+                // The steady-state callback allocates nothing: bookkeeping
+                // below runs only in the callback where a sample actually
+                // finished (cue endings), the moment the work is unavoidable
+                if !state.active_samples.iter().any(|s| s.is_finished()) {
+                    return;
+                }
 
                 // Record finished samples for off-thread bookkeeping cleanup
-                // (voice manager, ducking maps), then remove them
+                // (voice manager), then remove them
                 let mut finished: Vec<(u64, String)> = state.active_samples.iter()
                     .filter(|s| s.is_finished())
                     .map(|s| (s.id, s.voice_id.clone()))
                     .collect();
-                state.finished_samples.append(&mut finished);
                 state.active_samples.retain(|s| !s.is_finished());
 
-                // Track which voices have samples after cleanup
-                let voices_after: HashSet<String> = state.active_samples.iter()
-                    .map(|s| s.voice_id.clone())
-                    .collect();
-
-                // Notify ducking engine of voices that became inactive
-                if let Some(ref mut engine) = state.ducking_engine {
-                    for voice in voices_before.difference(&voices_after) {
-                        engine.notify_voice_active(voice, false);
+                // A finished sample's voice goes inactive when it was the
+                // voice's last sample
+                for (_, voice_id) in &finished {
+                    let voice_still_playing = state.active_samples.iter()
+                        .any(|s| &s.voice_id == voice_id);
+                    if !voice_still_playing {
+                        if let Some(ref mut engine) = state.ducking_engine {
+                            engine.notify_voice_active(voice_id, false);
+                        }
+                        active_voices_clone.lock().unwrap().remove(voice_id);
                     }
                 }
 
-                // Update active voices tracker
-                let mut active = active_voices_clone.lock().unwrap();
-                *active = voices_after;
+                state.finished_samples.append(&mut finished);
             }
         }
     };
