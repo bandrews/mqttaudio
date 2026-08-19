@@ -88,19 +88,18 @@ corrections.
 
 ## Still deferred (see triage.md for detail)
 
-What remains open after the sprint program is engineering backlog, not
-product decisions: audio-quality subtleties (loop-crossfade double-play
-D12, resampler tail loss D13, remaining RT allocations in the callback D11,
-decode aborts on one corrupt packet D15, volume-change pops D17), the
-`--lfe-channel` CLI activation story (D20), bass-management runtime
-warnings (D21), IPv6 bind + constant-time token compare (D22), the
-remaining cache hardening from D23 (whole-file downloads buffer in RAM,
-dropping a reader does not cancel its download), encoded-bytes progress
-estimates (D24), `channel_map` over `POST /play` (D25), lib.rs's duplicated
-module tree (D26), dev-tool paths (D27), and command-time channel-width
-warnings (D28). D1's empty-list semantics stay as decided (empty =
-unrestricted, documented), with deny-local available as a future opt-in if
-ever wanted.
+The engineering backlog was completed in a follow-up pass (triage.md,
+"Completed in the backlog pass"): loop-crossfade timing, resampler
+alignment, RT-callback allocations, corrupt-packet resilience, volume-change
+ramps, bass warnings, IPv6/auth hardening, streamed disk writes with
+download cancellation, honest progress estimates, channel_map over HTTP,
+the lib/bin module unification, dev-tool paths, and route warnings.
+
+Still open: **D20** - whether the `--lfe-channel`/`--crossover-frequency`
+CLI flags should be able to activate bass management on their own (today
+they are overrides on top of a configured setup, as documented) - and the
+known limitations in `docs/bugs.md`. D1's empty-list semantics stay as
+decided (empty = unrestricted, documented).
 
 ## Verification
 

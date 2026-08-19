@@ -4,7 +4,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-#[cfg(test)]
 use std::path::Path;
 use std::fs;
 use std::io;
@@ -283,21 +282,13 @@ impl DiskCache {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string());
 
-        // Download body
-        let bytes = response.bytes().await
-            .map_err(|e| CacheError::HttpError(format!("Failed to read response: {}", e)))?;
-
-        let file_size = bytes.len() as u64;
-
         // Generate cache filename
         let cache_filename = Self::cache_filename_for_url(url);
         let cache_path = self.cache_dir.join("files").join(&cache_filename);
 
-        // Write to a temp file and rename into place, so a crash or full disk
-        // mid-write can never leave a truncated file at the final path
+        // Stream the body to disk (temp file + rename)
         let temp_path = cache_path.with_extension("part");
-        fs::write(&temp_path, &bytes)?;
-        fs::rename(&temp_path, &cache_path)?;
+        let file_size = stream_body_to_file(response, &temp_path, &cache_path).await?;
 
         tracing::info!("Downloaded {} bytes to {}", file_size, cache_filename);
 
@@ -393,32 +384,23 @@ impl DiskCache {
         let content_type = response.headers().get("content-type")
             .and_then(|v| v.to_str().ok()).map(|s| s.to_string());
 
-        let bytes = match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            response.bytes(),
-        ).await {
-            Ok(Ok(b)) => b,
-            _ => {
-                tracing::warn!("Failed to download changed copy of {}; serving the cached copy", url);
-                return Freshness::Unknown;
-            }
-        };
-
         let cache_filename = Self::cache_filename_for_url(url);
         let cache_path = self.files_dir().join(&cache_filename);
         let temp_path = cache_path.with_extension("part");
-        if let Err(e) = fs::write(&temp_path, &bytes).and_then(|_| fs::rename(&temp_path, &cache_path)) {
-            tracing::warn!("Failed to store changed copy of {}: {}; serving the cached copy", url, e);
-            let _ = fs::remove_file(&temp_path);
-            return Freshness::Unknown;
-        }
+        let file_size = match stream_body_to_file(response, &temp_path, &cache_path).await {
+            Ok(size) => size,
+            Err(e) => {
+                tracing::warn!("Failed to store changed copy of {}: {}; serving the cached copy", url, e);
+                return Freshness::Unknown;
+            }
+        };
 
         self.put_entry(url.to_string(), CacheEntry {
             local_file: cache_filename,
             etag,
             last_modified,
             last_validated: chrono::Utc::now().to_rfc3339(),
-            file_size: bytes.len() as u64,
+            file_size,
             content_type,
         });
         if let Err(e) = self.save_metadata() {
@@ -427,6 +409,51 @@ impl DiskCache {
 
         Freshness::Replaced
     }
+}
+
+/// Stream a response body straight to a temp file and rename it into place,
+/// so downloads never hold whole files in memory and a crash or stall can
+/// never leave a partial file at the final path. Returns the byte count.
+async fn stream_body_to_file(
+    response: reqwest::Response,
+    temp_path: &Path,
+    final_path: &Path,
+) -> Result<u64, CacheError> {
+    use futures_util::StreamExt;
+    use std::io::Write;
+
+    let mut file = fs::File::create(temp_path)?;
+    let mut stream = response.bytes_stream();
+    let mut size: u64 = 0;
+
+    loop {
+        let chunk = match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            stream.next(),
+        ).await {
+            Ok(Some(Ok(chunk))) => chunk,
+            Ok(Some(Err(e))) => {
+                let _ = fs::remove_file(temp_path);
+                return Err(CacheError::HttpError(format!("Failed to read response: {}", e)));
+            }
+            Ok(None) => break,
+            Err(_) => {
+                let _ = fs::remove_file(temp_path);
+                return Err(CacheError::HttpError("Download stalled: no data for 60 seconds".to_string()));
+            }
+        };
+
+        if let Err(e) = file.write_all(&chunk) {
+            let _ = fs::remove_file(temp_path);
+            return Err(e.into());
+        }
+        size += chunk.len() as u64;
+    }
+
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temp_path, final_path)?;
+    Ok(size)
 }
 
 /// Result of checking a cached URL against its server
