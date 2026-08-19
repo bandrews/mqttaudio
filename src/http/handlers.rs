@@ -656,7 +656,7 @@ pub async fn handle_inputs(State(state): State<AppState>) -> impl IntoResponse {
                 "voice_id": input.voice_id,
                 "volume": input.volume,
                 "channels": input.input_channels,
-                "muted": input.volume == 0.0,
+                "muted": input.is_muted(),
                 "backlog_frames": input.backlog_frames(),
                 "max_backlog_frames": input.max_backlog_frames,
                 "dropped_frames": input.dropped_frames(),

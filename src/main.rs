@@ -1349,10 +1349,10 @@ async fn main() {
                             // Try to find by index first
                             if let Ok(idx) = input.parse::<usize>() {
                                 if idx < state.live_inputs.len() {
-                                    state.live_inputs[idx].volume = new_volume.clamp(0.0, config::MAX_GAIN);
+                                    state.live_inputs[idx].set_target_volume(new_volume);
                                     tracing::info!(
                                         "Set input {} volume to {:.2}",
-                                        idx, state.live_inputs[idx].volume
+                                        idx, state.live_inputs[idx].target_volume
                                     );
                                     found = true;
                                 }
@@ -1362,10 +1362,10 @@ async fn main() {
                             if !found {
                                 for live_input in state.live_inputs.iter_mut() {
                                     if live_input.voice_id == input {
-                                        live_input.volume = new_volume.clamp(0.0, config::MAX_GAIN);
+                                        live_input.set_target_volume(new_volume);
                                         tracing::info!(
                                             "Set input '{}' volume to {:.2}",
-                                            input, live_input.volume
+                                            input, live_input.target_volume
                                         );
                                         found = true;
                                         break;
@@ -1387,10 +1387,7 @@ async fn main() {
                             // Try to find by index first
                             if let Ok(idx) = input.parse::<usize>() {
                                 if idx < state.live_inputs.len() {
-                                    // Mute by setting volume to 0, unmute restores to 1.0
-                                    // Note: This is a simple mute - a more sophisticated version
-                                    // would store the previous volume
-                                    state.live_inputs[idx].volume = if mute { 0.0 } else { 1.0 };
+                                    state.live_inputs[idx].set_muted(mute);
                                     tracing::info!(
                                         "Input {} {}",
                                         idx, if mute { "muted" } else { "unmuted" }
@@ -1403,7 +1400,7 @@ async fn main() {
                             if !found {
                                 for live_input in state.live_inputs.iter_mut() {
                                     if live_input.voice_id == input {
-                                        live_input.volume = if mute { 0.0 } else { 1.0 };
+                                        live_input.set_muted(mute);
                                         tracing::info!(
                                             "Input '{}' {}",
                                             input, if mute { "muted" } else { "unmuted" }
@@ -1547,7 +1544,7 @@ async fn main() {
                                         &sample.file_path,
                                         &sample.voice_id,
                                     ) {
-                                        sample.volume = volume.clamp(0.0, config::MAX_GAIN);
+                                        sample.set_target_volume(volume);
                                         updated_count += 1;
                                     }
                                 }
