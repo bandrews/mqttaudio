@@ -228,6 +228,29 @@ Device names must match exactly (case-sensitive):
 }
 ```
 
+The index number printed by `--list-inputs` also works: `"device": "0"`.
+
+### Device Listed But "Input device not found"
+
+Input enumeration only shows devices that can be opened for capture at that
+moment, so a device visible in an interactive `--list-inputs` can still be
+missing when the daemon starts (typically under systemd). The error message
+lists the devices that were available and, on Linux, why a direct ALSA capture
+open of the requested name fails:
+
+- **Device or resource busy** - another process holds the capture side: a
+  sound server (PipeWire, PulseAudio), another capture application, or a
+  second copy of the daemon. `fuser -v /dev/snd/*` shows the holder
+- **Permission denied** - the daemon's user cannot open the device. For a
+  systemd service, add the service user to the `audio` group:
+  `sudo usermod -aG audio USER`, then restart the service
+- **No such device** - the name does not exist; compare against `arecord -L`
+
+To see exactly what the daemon sees, run the listing as the service user:
+```bash
+sudo -u SERVICE_USER ./mqttaudio --list-inputs
+```
+
 ### Check Routing
 
 Verify routes point to valid output channels:

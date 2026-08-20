@@ -74,6 +74,7 @@ dirs = "5.0"
 # Linux-specific: ALSA bindings for device probing
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.9"
+libc = "0.2"
 
 [dev-dependencies]
 criterion = "0.5"
