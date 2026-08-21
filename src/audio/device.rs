@@ -3,6 +3,18 @@
 
 use std::fmt;
 
+/// The identifier a config names a device by: the backend's driver id (the
+/// ALSA pcm id such as "plughw:CARD=UMC1820,DEV=0") where one exists,
+/// otherwise the device's display name.
+pub fn device_identifier(device: &cpal::Device) -> String {
+    use cpal::traits::DeviceTrait;
+    device
+        .description()
+        .ok()
+        .and_then(|d| d.driver().map(str::to_string))
+        .unwrap_or_else(|| device.to_string())
+}
+
 /// Category of audio device, used for filtering and display
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeviceCategory {

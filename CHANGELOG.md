@@ -68,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capture application. Device handles are now released before inputs open,
   and again as soon as the output stream is built. Full-duplex on a single
   interface (play out of and capture into the same card) works now.
+- **Audio streams died permanently on the first unrecovered xrun**: the
+  audio backend's ALSA loop only recovered underruns detected at one call
+  site; an xrun or error state surfacing anywhere else (observed in the
+  field as endless `snd_pcm_poll_descriptors ... (-32)` and `POLLERR`
+  spam with no audio) spun forever without recovery. The backend is
+  upgraded (cpal 0.15 to 0.18) to one that recovers xruns and suspend
+  events at every call site and exits the stream worker cleanly when a
+  device disconnects. The ALSA `null` device, which the upgraded backend
+  enumerates, stays excluded from device listing and selection.
 - **Capture ignored the preferred sample rate on `plughw:` devices**: ALSA
   plug devices report one continuous rate range with an implausible maximum,
   and the capability sanity filter discarded the whole configuration for it,

@@ -2,7 +2,7 @@
 // ABOUTME: Manages input streams and routes audio to mixer via ring buffers.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, SampleRate, Stream, SupportedStreamConfig};
+use cpal::{Device, SampleFormat, Stream, SupportedStreamConfig};
 use ringbuf::{HeapRb, HeapConsumer, HeapProducer};
 use crate::config::ResamplerQuality;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -23,9 +23,14 @@ pub fn list_input_devices() {
     match host.input_devices() {
         Ok(devices) => {
             let mut count = 0usize;
+            // The ALSA null device discards audio; capturing from it yields
+            // silence, so it is never listed or selectable
+            let devices = devices
+                .filter(|d| crate::audio::device::device_identifier(d) != "null");
             for (i, device) in devices.enumerate() {
                 count += 1;
-                if let Ok(name) = device.name() {
+                {
+                    let name = crate::audio::device::device_identifier(&device);
                     println!("  {}. {}", i, name);
 
                     // Query all supported configs to find max channels
@@ -34,14 +39,14 @@ pub fn list_input_devices() {
                         let mut sample_rates: Vec<(u32, u32)> = Vec::new();
 
                         for config in configs {
-                            let max_rate = config.max_sample_rate().0;
+                            let max_rate = config.max_sample_rate();
                             // Skip configs from ALSA plugins that claim unrealistic capabilities
                             if max_rate > MAX_REASONABLE_SAMPLE_RATE {
                                 continue;
                             }
 
                             max_channels = max_channels.max(config.channels());
-                            let min_rate = config.min_sample_rate().0;
+                            let min_rate = config.min_sample_rate();
                             // Collect unique sample rate ranges
                             if !sample_rates.iter().any(|(min, max)| *min == min_rate && *max == max_rate) {
                                 sample_rates.push((min_rate, max_rate));
@@ -65,12 +70,12 @@ pub fn list_input_devices() {
                         } else if let Ok(config) = device.default_input_config() {
                             // All configs were filtered out - fall back to default
                             // This happens with ALSA plugin devices
-                            println!("     Sample rate: {} Hz (plugin)", config.sample_rate().0);
+                            println!("     Sample rate: {} Hz (plugin)", config.sample_rate());
                             println!("     Channels: {} (plugin)", config.channels());
                         }
                     } else if let Ok(config) = device.default_input_config() {
                         // Fallback to default config if supported_input_configs fails
-                        println!("     Sample rate: {} Hz", config.sample_rate().0);
+                        println!("     Sample rate: {} Hz", config.sample_rate());
                         println!("     Channels: {}", config.channels());
                     }
                 }
@@ -199,7 +204,8 @@ pub fn get_input_device(name: Option<&str>) -> Result<Device, InputError> {
             // --list-inputs.
             let names: Vec<String> = host.input_devices()
                 .map_err(|e| InputError::DeviceEnumeration(e.to_string()))?
-                .map(|d| d.name().unwrap_or_else(|_| "<unknown>".to_string()))
+                .map(|d| crate::audio::device::device_identifier(&d))
+                .filter(|n| n != "null")
                 .collect();
 
             if let Some(pos) = resolve_requested_device(device_name, &names) {
@@ -212,7 +218,7 @@ pub fn get_input_device(name: Option<&str>) -> Result<Device, InputError> {
                 // falls through to the not-found report.
                 let found = host.input_devices()
                     .map_err(|e| InputError::DeviceEnumeration(e.to_string()))?
-                    .find(|d| d.name().map(|n| n == target).unwrap_or(false));
+                    .find(|d| crate::audio::device::device_identifier(d) == target);
                 if let Some(device) = found {
                     return Ok(device);
                 }
@@ -286,7 +292,7 @@ pub fn find_input_config(
     let supported: Vec<_> = device
         .supported_input_configs()
         .map_err(|e| InputError::ConfigError(e.to_string()))?
-        .filter(|c| c.min_sample_rate().0 <= MAX_REASONABLE_SAMPLE_RATE)
+        .filter(|c| c.min_sample_rate() <= MAX_REASONABLE_SAMPLE_RATE)
         .filter(|c| c.channels() <= MAX_REASONABLE_CHANNELS)
         .collect();
 
@@ -339,20 +345,20 @@ pub fn find_input_config(
 
     // Matching the output rate keeps the resampler out of the signal path
     let exact_rate = matching.iter().find(|c| {
-        choose_capture_rate(c.min_sample_rate().0, c.max_sample_rate().0, preferred_sample_rate)
+        choose_capture_rate(c.min_sample_rate(), c.max_sample_rate(), preferred_sample_rate)
             == preferred_sample_rate
     });
 
     match exact_rate {
-        Some(c) => Ok(c.with_sample_rate(SampleRate(preferred_sample_rate))),
+        Some(c) => Ok(c.with_sample_rate(preferred_sample_rate)),
         None => {
             let closest = matching[0];
             let rate = choose_capture_rate(
-                closest.min_sample_rate().0,
-                closest.max_sample_rate().0,
+                closest.min_sample_rate(),
+                closest.max_sample_rate(),
                 preferred_sample_rate,
             );
-            Ok(closest.with_sample_rate(SampleRate(rate)))
+            Ok(closest.with_sample_rate(rate))
         }
     }
 }
@@ -484,7 +490,7 @@ pub fn create_input_stream(
     target_sample_rate: u32,
 ) -> Result<ActiveInput, InputError> {
     let device = get_input_device(config.device_name.as_deref())?;
-    let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+    let device_name = crate::audio::device::device_identifier(&device);
 
     let preferred_rate = config.sample_rate.unwrap_or(target_sample_rate);
     let supported_config = find_input_config(
@@ -494,7 +500,7 @@ pub fn create_input_stream(
         preferred_rate,
     )?;
 
-    let input_sample_rate = supported_config.sample_rate().0;
+    let input_sample_rate = supported_config.sample_rate();
     let channels = supported_config.channels() as usize;
 
     if channels == 0 {
@@ -611,7 +617,7 @@ fn create_passthrough_input_stream(
     peak_level: Arc<AtomicU32>,
 ) -> Result<Stream, InputError> {
     let stream = device.build_input_stream(
-        config,
+        config.clone(),
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
             update_peak_level(&peak_level, data);
             push_frames(&mut producer, data, channels, &dropped_frames);
@@ -679,7 +685,7 @@ fn create_resampling_input_stream(
     let mut interleaved = vec![0.0f32; max_output_frames * channels];
 
     let stream = device.build_input_stream(
-        config,
+        config.clone(),
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
             update_peak_level(&peak_level, data);
             for (i, sample) in data.iter().enumerate() {

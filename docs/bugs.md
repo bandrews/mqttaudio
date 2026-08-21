@@ -33,17 +33,17 @@ holding that lock while the audio thread waits on it is a priority inversion
 that shows up as an output glitch. It has not caused a reported problem, but it
 is the reason to keep every other lock holder short.
 
-## Dead audio streams leave the daemon running but silent
+## A disconnected audio device leaves the daemon running but silent
 
-When a stream dies out from under the daemon - observed in the field as
-`alsa::poll() returned POLLERR` on input and output simultaneously when a USB
-interface dropped off the bus - the error callbacks only log. The process
-stays up with MQTT connected and every stream dead, so an unattended install
-plays nothing until someone restarts it. Stream death should be treated as
-fatal (letting systemd `Restart=` recover with fresh device opens) or the
-streams rebuilt in place. Left alone until the field failure's dmesg
-distinguishes a USB-layer reset from something the daemon did; the fix shape
-depends on which it is.
+Xruns and suspend events recover automatically inside the stream workers,
+and their error callbacks report each recovery. What does not recover is a
+device disappearing outright (a USB interface dropping off the bus): the
+worker thread exits cleanly, the error callback logs `DeviceNotAvailable`
+once, and the process stays up with MQTT connected and a dead stream, so an
+unattended install plays nothing until someone restarts it. Device loss
+should be treated as fatal (letting systemd `Restart=` recover with fresh
+device opens) or the streams rebuilt by name. Pair with `Restart=always` in
+the deployed unit file.
 
 ## `mqtt::client::tests::test_mqtt_event_processing` needs a live broker
 

@@ -77,8 +77,8 @@ fn list_devices_cpal_only() {
                     if info.cpal_channels.is_none() {
                         if let Ok(config) = device.default_output_config() {
                             info.cpal_channels = Some(config.channels());
-                            info.cpal_sample_rate_min = Some(config.sample_rate().0);
-                            info.cpal_sample_rate_max = Some(config.sample_rate().0);
+                            info.cpal_sample_rate_min = Some(config.sample_rate());
+                            info.cpal_sample_rate_max = Some(config.sample_rate());
                         }
                     }
 
@@ -103,7 +103,7 @@ pub fn get_default_device_config() -> Result<DeviceConfig, Box<dyn std::error::E
     let config = device.default_output_config()?;
 
     Ok(DeviceConfig {
-        sample_rate: config.sample_rate().0,
+        sample_rate: config.sample_rate(),
         channels: config.channels() as usize,
         buffer_size: 512, // Default buffer size
     })
@@ -117,13 +117,13 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
 
     match name {
         Some(device_name) => {
-            // First try to find in enumerated devices
+            // First try to find in enumerated devices. The ALSA null device
+            // discards audio and is never matched.
             if let Ok(devices) = host.output_devices() {
                 for device in devices {
-                    if let Ok(n) = device.name() {
-                        if n == device_name {
-                            return Ok(device);
-                        }
+                    let n = super::device::device_identifier(&device);
+                    if n != "null" && n == device_name {
+                        return Ok(device);
                     }
                 }
             }
@@ -135,14 +135,13 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
             {
                 if let Ok(devices) = host.output_devices() {
                     for device in devices {
-                        if let Ok(n) = device.name() {
-                            // Try matching ALSA device names by card number
-                            // Supports hw:, plughw:, sysdefault:
-                            if let Some(matched) = super::device::try_match_alsa_device(device_name, &n) {
-                                if matched {
-                                    tracing::info!("Matched ALSA device '{}' to '{}'", device_name, n);
-                                    return Ok(device);
-                                }
+                        let n = super::device::device_identifier(&device);
+                        // Try matching ALSA device names by card number
+                        // Supports hw:, plughw:, sysdefault:
+                        if let Some(matched) = super::device::try_match_alsa_device(device_name, &n) {
+                            if matched {
+                                tracing::info!("Matched ALSA device '{}' to '{}'", device_name, n);
+                                return Ok(device);
                             }
                         }
                     }
@@ -168,7 +167,6 @@ pub fn find_output_config(
     requested_sample_rate: Option<u32>,
     requested_buffer_size: Option<u32>,
 ) -> Result<cpal::StreamConfig, Box<dyn std::error::Error>> {
-    use cpal::SampleRate;
 
     // Get all supported configs
     let supported_configs: Vec<_> = device.supported_output_configs()?.collect();
@@ -214,7 +212,7 @@ pub fn find_output_config(
     let target_sample_rate = requested_sample_rate.unwrap_or_else(|| {
         // Use the default config's sample rate if possible, otherwise pick a common rate
         device.default_output_config()
-            .map(|c| c.sample_rate().0)
+            .map(|c| c.sample_rate())
             .unwrap_or(48000)
     });
 
@@ -222,8 +220,8 @@ pub fn find_output_config(
     // Prefer configs with reasonable sample rate ranges, but accept any if needed
     let best_config = matching_configs.iter()
         .filter(|c| {
-            let min = c.min_sample_rate().0;
-            let max = c.max_sample_rate().0;
+            let min = c.min_sample_rate();
+            let max = c.max_sample_rate();
             target_sample_rate >= min && target_sample_rate <= max
         })
         .next();
@@ -231,7 +229,7 @@ pub fn find_output_config(
     match best_config {
         Some(config_range) => {
             let buffer_size = resolve_buffer_size(requested_buffer_size, config_range.buffer_size());
-            let config = config_range.with_sample_rate(SampleRate(target_sample_rate));
+            let config = config_range.with_sample_rate(target_sample_rate);
             Ok(cpal::StreamConfig {
                 channels: config.channels(),
                 sample_rate: config.sample_rate(),
@@ -241,13 +239,13 @@ pub fn find_output_config(
         None => {
             // Sample rate not directly supported - clamp to valid range
             let config_range = matching_configs[0];
-            let min_rate = config_range.min_sample_rate().0;
-            let max_rate = config_range.max_sample_rate().0;
+            let min_rate = config_range.min_sample_rate();
+            let max_rate = config_range.max_sample_rate();
             let buffer_size = resolve_buffer_size(requested_buffer_size, config_range.buffer_size());
             // Clamp target to valid range, but also cap max at 384kHz for sanity
             let capped_max = max_rate.min(384000);
             let sample_rate = target_sample_rate.max(min_rate).min(capped_max);
-            let config = config_range.with_sample_rate(SampleRate(sample_rate));
+            let config = config_range.with_sample_rate(sample_rate);
             Ok(cpal::StreamConfig {
                 channels: config.channels(),
                 sample_rate: config.sample_rate(),
@@ -289,11 +287,11 @@ pub fn init_test_sine_wave() -> Result<Stream, Box<dyn std::error::Error>> {
         .ok_or("No default output device available")?;
 
     let config = device.default_output_config()?;
-    let sample_rate = config.sample_rate().0;
+    let sample_rate = config.sample_rate();
     let channels = config.channels() as usize;
 
     tracing::info!("Initializing audio stream:");
-    tracing::info!("  Device: {}", device.name()?);
+    tracing::info!("  Device: {}", super::device::device_identifier(&device));
     tracing::info!("  Sample rate: {} Hz", sample_rate);
     tracing::info!("  Channels: {}", channels);
     tracing::info!("  Format: {:?}", config.sample_format());
@@ -304,7 +302,7 @@ pub fn init_test_sine_wave() -> Result<Stream, Box<dyn std::error::Error>> {
     let phase_increment = (440.0 * 2.0 * std::f32::consts::PI / sample_rate as f32) * 1000.0;
 
     let stream = device.build_output_stream(
-        &config.into(),
+        config.into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             // Audio callback - generates 440Hz sine wave
             for frame in data.chunks_mut(channels) {
@@ -346,7 +344,7 @@ pub fn play_file(path: &str) -> Result<Stream, Box<dyn std::error::Error>> {
         .ok_or("No default output device available")?;
 
     let config = device.default_output_config()?;
-    let output_sample_rate = config.sample_rate().0;
+    let output_sample_rate = config.sample_rate();
 
     // Decode the audio file with automatic resampling to device sample rate
     tracing::info!("Loading audio file: {}", path);
@@ -363,7 +361,7 @@ pub fn play_file(path: &str) -> Result<Stream, Box<dyn std::error::Error>> {
     let output_channels = config.channels() as usize;
 
     tracing::info!("Initializing audio stream:");
-    tracing::info!("  Device: {}", device.name()?);
+    tracing::info!("  Device: {}", super::device::device_identifier(&device));
     tracing::info!("  Sample rate: {} Hz", output_sample_rate);
     tracing::info!("  Channels: {}", output_channels);
 
@@ -376,7 +374,7 @@ pub fn play_file(path: &str) -> Result<Stream, Box<dyn std::error::Error>> {
     let position_clone = position.clone();
 
     let stream = device.build_output_stream(
-        &config.into(),
+        config.into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             // Audio callback - play from buffer
             let frames_needed = data.len() / output_channels;
@@ -436,11 +434,11 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
         .ok_or("No default output device available")?;
 
     let config = device.default_output_config()?;
-    let output_sample_rate = config.sample_rate().0;
+    let output_sample_rate = config.sample_rate();
     let output_channels = config.channels() as usize;
 
     tracing::info!("Initializing mixer test:");
-    tracing::info!("  Device: {}", device.name()?);
+    tracing::info!("  Device: {}", super::device::device_identifier(&device));
     tracing::info!("  Sample rate: {} Hz", output_sample_rate);
     tracing::info!("  Channels: {}", output_channels);
 
@@ -505,7 +503,7 @@ pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
 
     // Build audio stream with mixer
     let stream = device.build_output_stream(
-        &config.into(),
+        config.into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
             // Audio callback - mix all active samples
             let mut state = mixer_state_clone.lock().unwrap();

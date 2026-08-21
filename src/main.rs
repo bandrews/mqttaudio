@@ -437,7 +437,7 @@ async fn main() {
         }
     };
 
-    let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+    let device_name = audio::device::device_identifier(&device);
     let stream_config = match audio::engine::find_output_config(
         &device,
         config.audio.channels,
@@ -459,7 +459,7 @@ async fn main() {
         }
     };
 
-    let output_sample_rate = stream_config.sample_rate.0;
+    let output_sample_rate = stream_config.sample_rate;
     let output_channels = stream_config.channels as usize;
     // Capture streams run with the same buffer size so shared-clock USB
     // interfaces accept both directions at once
@@ -801,7 +801,7 @@ async fn main() {
         tracing::error!("Failed to open the output stream on '{}': {}", device_name, error);
         tracing::error!(
             "  Requested: {} channels, {} Hz, buffer {:?}",
-            stream_config.channels, stream_config.sample_rate.0, stream_config.buffer_size
+            stream_config.channels, stream_config.sample_rate, stream_config.buffer_size
         );
         for input in &_active_inputs {
             tracing::error!(
@@ -818,7 +818,7 @@ async fn main() {
         std::process::exit(1);
     };
     let stream = match device.build_output_stream(
-        &stream_config,
+        stream_config.clone(),
         make_audio_callback(),
         audio_error_callback,
         None,
@@ -832,7 +832,7 @@ async fn main() {
             let mut fallback_config = stream_config.clone();
             fallback_config.buffer_size = cpal::BufferSize::Default;
             match device.build_output_stream(
-                &fallback_config,
+                fallback_config,
                 make_audio_callback(),
                 audio_error_callback,
                 None,

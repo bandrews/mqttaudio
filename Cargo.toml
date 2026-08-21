@@ -8,7 +8,7 @@ license = "MIT"
 
 [dependencies]
 # Audio I/O
-cpal = "0.15"
+cpal = "0.18"
 
 # Audio decoding
 symphonia = { version = "0.5", features = ["all"] }
@@ -73,7 +73,7 @@ dirs = "5.0"
 
 # Linux-specific: ALSA bindings for device probing
 [target.'cfg(target_os = "linux")'.dependencies]
-alsa = "0.9"
+alsa = "0.11"
 libc = "0.2"
 
 [dev-dependencies]
