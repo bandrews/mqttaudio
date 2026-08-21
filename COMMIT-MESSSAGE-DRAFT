@@ -1,2 +1,39 @@
-(no work in progress - committed through "Stop the daemon's output device
-from blocking its own capture side")
+Enumerate input devices one at a time so card aliases stay visible
+
+Follow-up to the capture self-block fix, found by walking the UMC1820
+field configuration through the fixed code: get_input_device collected
+every enumerated device into a Vec before matching. cpal opens each
+device for capture during enumeration and keeps the handle for the
+device's lifetime, so on a card with a single capture substream the first
+alias enumerated (hw:CARD=X) held the substream while the rest of the
+collection ran - every other alias of the same card (plughw:, dsnoop:,
+sysdefault:) failed its capture open and silently dropped out of the
+device list. The recommended plughw: name for such a card could never
+resolve, and the collected list could also disagree with --list-inputs
+numbering (which iterates lazily), breaking selection by index.
+
+get_input_device now makes two lazy passes: the first collects names
+only, dropping each device before the next opens, so every alias
+enumerates and the numbering matches --list-inputs exactly; the choice of
+device (exact name, then index, then ALSA card match) is a pure function
+over those names; the second pass fetches only the chosen device by name.
+A device that vanishes between passes falls through to the existing
+not-found report with the enumerated names and ALSA probe.
+
+Verification: the resolver decision order is unit-tested (exact name
+beats index, index bounds, ALSA card fallback, unmatched); tests were
+written first and failed before the implementation. Clean release build
+with zero warnings; full suite green (507 lib + 28 http-api + 1
+broker-restart + 26 streaming). The alias-blocking behavior itself needs
+a real single-substream capture card, so field confirmation comes from
+the UMC1820 install.
+
+Prompts that led to this work:
+
+- "Here's what my friend sent back from the initial checks." (journalctl
+  showing the new EBUSY diagnosis on a build without the self-block fix,
+  and the question "does mqttaudio support full-duplex operation on a
+  single ALSA card, and if so what's the correct config to open both
+  streams simultaneously?")
+
+This commit was authored by Claude (AI assistant) working with Ben Andrews.

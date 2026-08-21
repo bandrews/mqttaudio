@@ -68,6 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capture application. Device handles are now released before inputs open,
   and again as soon as the output stream is built. Full-duplex on a single
   interface (play out of and capture into the same card) works now.
+- **Input device resolution hid sibling aliases of a card**: resolving an
+  input collected every enumerated device at once, and since enumeration
+  opens each device for capture, the first alias of a card (`hw:`) claimed
+  its only capture substream and made every other alias of the same card
+  (`plughw:`, `dsnoop:`) unenumerable - so the recommended `plughw:` name
+  could never resolve. Devices are now enumerated one at a time, which also
+  keeps device numbering identical to `--list-inputs` for selection by
+  index.
 - **"Input device not found" is now diagnosable**: the error lists which
   devices could be opened for capture at that moment, and on Linux probes the
   requested name directly through ALSA to say *why* it is unavailable - held
