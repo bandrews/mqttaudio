@@ -159,6 +159,27 @@ fn probe_capture_open(name: &str) -> Option<String> {
     }
 }
 
+/// Decide which enumerated input device a configured name selects: the exact
+/// name first, then the --list-inputs index, then an ALSA card match.
+/// Returns the position in the enumerated name list.
+fn resolve_requested_device(requested: &str, names: &[String]) -> Option<usize> {
+    if let Some(pos) = names.iter().position(|n| n == requested) {
+        return Some(pos);
+    }
+    if let Some(index) = parse_device_index(requested, names.len()) {
+        return Some(index);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(pos) = names.iter().position(|n| {
+            crate::audio::device::try_match_alsa_device(requested, n) == Some(true)
+        }) {
+            return Some(pos);
+        }
+    }
+    None
+}
+
 /// Get an input device by name, by --list-inputs index, or the default if
 /// name is None
 ///
@@ -170,34 +191,30 @@ pub fn get_input_device(name: Option<&str>) -> Result<Device, InputError> {
 
     match name {
         Some(device_name) => {
-            let devices: Vec<Device> = host.input_devices()
+            // Enumeration opens every device for capture, so each one must be
+            // dropped before the next opens: holding them all at once lets
+            // the first alias of a card claim its only capture substream and
+            // hide every other alias (plughw:, dsnoop:) of the same card.
+            // Collecting names only also keeps the numbering identical to
+            // --list-inputs.
+            let names: Vec<String> = host.input_devices()
                 .map_err(|e| InputError::DeviceEnumeration(e.to_string()))?
-                .collect();
-            let names: Vec<String> = devices
-                .iter()
                 .map(|d| d.name().unwrap_or_else(|_| "<unknown>".to_string()))
                 .collect();
 
-            for (device, n) in devices.iter().zip(&names) {
-                if n == device_name {
-                    return Ok(device.clone());
+            if let Some(pos) = resolve_requested_device(device_name, &names) {
+                let target = names[pos].clone();
+                if target != device_name {
+                    tracing::info!("Matched input device '{}' to '{}'", device_name, target);
                 }
-            }
-
-            if let Some(index) = parse_device_index(device_name, devices.len()) {
-                tracing::info!("Using input device {} ('{}')", index, names[index]);
-                return Ok(devices[index].clone());
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                for (device, n) in devices.iter().zip(&names) {
-                    if crate::audio::device::try_match_alsa_device(device_name, n)
-                        == Some(true)
-                    {
-                        tracing::info!("Matched ALSA input device '{}' to '{}'", device_name, n);
-                        return Ok(device.clone());
-                    }
+                // The chosen device is fetched by name in a second pass; the
+                // device set can shift between passes, so a vanished device
+                // falls through to the not-found report.
+                let found = host.input_devices()
+                    .map_err(|e| InputError::DeviceEnumeration(e.to_string()))?
+                    .find(|d| d.name().map(|n| n == target).unwrap_or(false));
+                if let Some(device) = found {
+                    return Ok(device);
                 }
             }
 
@@ -783,6 +800,43 @@ mod tests {
         assert_eq!(parse_device_index("-1", 3), None);
         assert_eq!(parse_device_index("hw:CARD=UMC1820,DEV=0", 3), None);
         assert_eq!(parse_device_index("", 3), None);
+    }
+
+    #[test]
+    fn test_resolve_requested_device_prefers_exact_name() {
+        let names = vec![
+            "hw:CARD=UMC1820,DEV=0".to_string(),
+            "plughw:CARD=UMC1820,DEV=0".to_string(),
+        ];
+        assert_eq!(resolve_requested_device("plughw:CARD=UMC1820,DEV=0", &names), Some(1));
+        assert_eq!(resolve_requested_device("hw:CARD=UMC1820,DEV=0", &names), Some(0));
+    }
+
+    #[test]
+    fn test_resolve_requested_device_by_index() {
+        let names = vec![
+            "hw:CARD=UMC1820,DEV=0".to_string(),
+            "plughw:CARD=UMC1820,DEV=0".to_string(),
+        ];
+        assert_eq!(resolve_requested_device("1", &names), Some(1));
+        assert_eq!(resolve_requested_device("2", &names), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_resolve_requested_device_by_alsa_card() {
+        let names = vec![
+            "hw:CARD=Headset,DEV=0".to_string(),
+            "hw:CARD=UMC1820,DEV=0".to_string(),
+        ];
+        assert_eq!(resolve_requested_device("hw:CARD=UMC1820, DEV=0", &names), Some(1));
+    }
+
+    #[test]
+    fn test_resolve_requested_device_unmatched() {
+        let names = vec!["hw:CARD=UMC1820,DEV=0".to_string()];
+        assert_eq!(resolve_requested_device("hw:CARD=Missing,DEV=0", &names), None);
+        assert_eq!(resolve_requested_device("anything", &[]), None);
     }
 
     #[test]

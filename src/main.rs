@@ -466,6 +466,13 @@ async fn main() {
     tracing::info!("  Sample rate: {} Hz", output_sample_rate);
     tracing::info!("  Channels: {}", output_channels);
 
+    // Resolving a device opens handles for both directions and keeps them.
+    // Release them before the inputs open: a retained idle capture handle
+    // holds the card's capture side, which makes the card invisible to input
+    // enumeration and blocks every other capture application. The device is
+    // re-resolved when the output stream is built.
+    drop(device);
+
     // Create mixer state and voice manager
     use audio::mixer::{ActiveSample, MixerState};
     use audio::ducking::DuckingEngine;
@@ -770,6 +777,16 @@ async fn main() {
         tracing::error!("Audio stream error: {}", err);
     };
 
+    // The stream takes ownership of the playback handle only, so the device
+    // is dropped as soon as the stream exists; keeping it would hold the
+    // card's capture side open for the life of the process.
+    let device = match audio::engine::find_output_device(config.audio.device.as_deref()) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::error!("Output device disappeared before stream start: {}", e);
+            std::process::exit(1);
+        }
+    };
     let stream = match device.build_output_stream(
         &stream_config,
         make_audio_callback(),
@@ -793,6 +810,7 @@ async fn main() {
         }
         Err(e) => panic!("Failed to build audio stream: {}", e),
     };
+    drop(device);
 
         stream.play().expect("Failed to start audio stream");
         tracing::info!("Audio stream started");

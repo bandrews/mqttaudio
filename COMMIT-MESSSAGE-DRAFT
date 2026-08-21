@@ -1,2 +1,2 @@
-(no work in progress - committed through "Diagnose 'Input device not found'
-and accept --list-inputs indices")
+(no work in progress - committed through "Enumerate input devices one at a
+time so card aliases stay visible")
