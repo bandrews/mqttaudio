@@ -1,2 +1,41 @@
-(no work in progress - committed through "Diagnose 'Input device not found'
-and accept --list-inputs indices")
+Stop the daemon's output device from blocking its own capture side
+
+Field evidence (fuser -v /dev/snd/*) from the UMC1820 install showed the
+daemon itself holding the card's capture node (pcmC2D0c) open alongside its
+active playback stream - while reporting "Input device not found" for that
+same card's input. PipeWire was only attached to a different card.
+
+Root cause: cpal's ALSA backend opens a device for BOTH directions when it
+is resolved and keeps whichever handles succeeded inside the Device struct;
+building a stream takes only the playback handle out. main() resolved the
+output device into a binding that lived for the life of the process, so the
+leftover idle capture handle held the card's single hw capture substream
+forever. Input enumeration (which only lists devices it can open for
+capture at that moment) then couldn't see the card at all - the daemon was
+EBUSY-blocking itself, and also blocking every other capture application
+(arecord, dsnoop, a second listing run) for as long as it ran.
+
+Fix in main(): drop the resolved output device before inputs are opened,
+and re-resolve it only at the moment the output stream is built, dropping
+it again immediately after. cpal's StreamInner keeps only the playback PCM
+it takes, so nothing retains the capture side. The input path was checked
+for the mirror problem: its device is a function local that drops on
+return, and no struct in the codebase retains a cpal Device.
+
+Verification: clean release build with zero warnings and the full test
+suite green (503 lib + 28 http-api + 1 broker-restart + 26 streaming).
+The failure itself needs real audio hardware with a single-substream
+capture device, which this development environment does not have, so the
+end-to-end confirmation is the field install restarting on this build.
+
+Prompts that led to this work:
+
+- "Are we sure this isn't an issue caused by the app opening the card for
+  output and then ALSA considering that the handle and not letting us open
+  it for input too?"
+- "Here's what my friend sent back from the initial checks." (fuser showed
+  mqttaudio holding pcmC2D0c and pcmC2D0p on card 2, crux in the audio
+  group, and an interactive --list-inputs run - with the daemon up -
+  enumerating no devices at all)
+
+This commit was authored by Claude (AI assistant) working with Ben Andrews.

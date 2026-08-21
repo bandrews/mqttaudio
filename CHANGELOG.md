@@ -61,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way output devices are, so `"hw:CARD=UMC1820, DEV=0"` matches the enumerated
   device. An input `device` may also be the index number printed by
   `--list-inputs`.
+- **The daemon blocked its own microphone input**: resolving the output
+  device opens handles for both directions, and the daemon kept them for the
+  life of the process - so its own idle capture handle made the output card's
+  input side busy, invisible to input enumeration, and unusable by any other
+  capture application. Device handles are now released before inputs open,
+  and again as soon as the output stream is built. Full-duplex on a single
+  interface (play out of and capture into the same card) works now.
 - **"Input device not found" is now diagnosable**: the error lists which
   devices could be opened for capture at that moment, and on Linux probes the
   requested name directly through ALSA to say *why* it is unavailable - held
