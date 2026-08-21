@@ -269,6 +269,15 @@ WARN Input device sample rate differs from output - resampling will add latency
 
 This works but adds latency. For best results, use matching sample rates.
 
+On a shared-clock interface (one USB card doing both directions), capture
+cannot be forced to a rate the card is not running at. If capture keeps
+opening at the wrong rate despite `sample_rate`, something else is holding
+the card at that rate - a `dmix`/`dsnoop` device from asound.conf, a sound
+server, or another application. Free the card and capture will follow the
+output rate. Choppiness with both overruns *and* starvation in the input
+health log, alongside ALSA `underrun occurred` messages, points at the
+output side stalling (typically a dmix chain) rather than at the mic.
+
 ---
 
 ## Ducking Not Working
