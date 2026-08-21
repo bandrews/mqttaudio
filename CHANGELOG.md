@@ -68,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capture application. Device handles are now released before inputs open,
   and again as soon as the output stream is built. Full-duplex on a single
   interface (play out of and capture into the same card) works now.
+- **Capture ignored the preferred sample rate on `plughw:` devices**: ALSA
+  plug devices report one continuous rate range with an implausible maximum,
+  and the capability sanity filter discarded the whole configuration for it,
+  falling back to the device default (often 44100 Hz stereo) regardless of
+  the output rate or an explicit `sample_rate`. That forced the capture
+  resampler into the path and, on shared-clock interfaces, made the output
+  stream impossible to open at its own configured rate. The implausible
+  ceiling is now clamped instead of disqualifying the configuration, so
+  capture follows the output rate whenever the hardware allows it.
 - **Full-duplex on shared-clock USB interfaces**: with capture already
   running, opening the output stream on the same card could fail with
   `Invalid argument` and crash the daemon, because the two directions ran

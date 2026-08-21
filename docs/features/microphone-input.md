@@ -413,6 +413,17 @@ A handful of `underrun_frames` at startup is normal while the buffer primes.
   routes. Check the channel count from `--list-inputs`, and remember source
   channels are 0-indexed: input 1 on the front panel is `source_channel: 0`
 
+**Choppy mic audio, health log shows both overruns and starvation:**
+- Check the startup log for "sample rate differs from output - resampling
+  will add latency": on a shared-clock interface, capture cannot be forced
+  to a rate the card is not running at. When capture opens at the wrong
+  rate despite `sample_rate`, something else holds the card at that rate -
+  a `dmix`/`dsnoop` definition from asound.conf, a sound server, or another
+  application. Free the card and capture follows the output rate
+- ALSA underrun messages (`snd_pcm_recover underrun occurred`) mean the
+  *output* is stalling; that stalls mixing, which then backs up capture.
+  Fix the output side (direct `plughw:`, not a dmix chain) first
+
 **Overruns (`dropped_frames` climbing):**
 - The capture thread is producing faster than the mixer consumes. Raise
   `latency_ms` to give the buffer more headroom
