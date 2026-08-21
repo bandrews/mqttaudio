@@ -408,6 +408,10 @@ pub struct InputStreamConfig {
     pub sample_rate: Option<u32>,
     /// Quality preset for capture-rate conversion, from advanced.resampler_quality
     pub resampler_quality: ResamplerQuality,
+    /// Stream buffer size in frames, matched to the output stream so both
+    /// directions of a shared-clock USB interface run compatible parameters
+    /// (None = device default)
+    pub buffer_size: Option<u32>,
 }
 
 impl Default for InputStreamConfig {
@@ -419,6 +423,7 @@ impl Default for InputStreamConfig {
             min_channels: 1,
             sample_rate: None,
             resampler_quality: ResamplerQuality::default(),
+            buffer_size: None,
         }
     }
 }
@@ -496,8 +501,7 @@ pub fn create_input_stream(
     }
 
     // Calculate ring buffer size based on OUTPUT sample rate (after potential resampling)
-    let buffer_size = calculate_ring_buffer_size(target_sample_rate, channels, config.latency_ms);
-    let (producer, consumer) = create_ring_buffer(buffer_size);
+    let ring_buffer_size = calculate_ring_buffer_size(target_sample_rate, channels, config.latency_ms);
     let dropped_frames = Arc::new(AtomicU64::new(0));
     let peak_level = Arc::new(AtomicU32::new(0));
 
@@ -520,30 +524,54 @@ pub fn create_input_stream(
         config.latency_ms
     );
 
-    // Build the input stream
-    let stream = if needs_resampling {
-        // Create resampler for converting input to output sample rate
-        create_resampling_input_stream(
-            &device,
-            supported_config,
-            producer,
-            input_sample_rate,
-            target_sample_rate,
-            channels,
-            config.resampler_quality,
-            dropped_frames.clone(),
-            peak_level.clone(),
-        )?
-    } else {
-        // Direct passthrough - no resampling needed
-        create_passthrough_input_stream(
-            &device,
-            supported_config,
-            producer,
-            channels,
-            dropped_frames.clone(),
-            peak_level.clone(),
-        )?
+    let mut stream_config: cpal::StreamConfig = supported_config.into();
+
+    let build = |stream_config: &cpal::StreamConfig| -> Result<(Stream, HeapConsumer<f32>), InputError> {
+        let (producer, consumer) = create_ring_buffer(ring_buffer_size);
+        let stream = if needs_resampling {
+            create_resampling_input_stream(
+                &device,
+                stream_config,
+                producer,
+                input_sample_rate,
+                target_sample_rate,
+                channels,
+                config.resampler_quality,
+                dropped_frames.clone(),
+                peak_level.clone(),
+            )?
+        } else {
+            create_passthrough_input_stream(
+                &device,
+                stream_config,
+                producer,
+                channels,
+                dropped_frames.clone(),
+                peak_level.clone(),
+            )?
+        };
+        Ok((stream, consumer))
+    };
+
+    // Capture runs with the same buffer size as the output stream when one is
+    // configured: USB interfaces that share a clock between directions accept
+    // playback alongside capture only when both run compatible parameters.
+    let (stream, consumer) = match config.buffer_size {
+        Some(frames) => {
+            stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
+            match build(&stream_config) {
+                Ok(built) => built,
+                Err(e) => {
+                    tracing::warn!(
+                        "Input device rejected buffer size {}: {}; retrying with the device default",
+                        frames, e
+                    );
+                    stream_config.buffer_size = cpal::BufferSize::Default;
+                    build(&stream_config)?
+                }
+            }
+        }
+        None => build(&stream_config)?,
     };
 
     stream.play().map_err(|e| InputError::StreamError(e.to_string()))?;
@@ -565,14 +593,14 @@ pub fn create_input_stream(
 /// would be reporting. Dropped frames are counted for the caller to report.
 fn create_passthrough_input_stream(
     device: &Device,
-    config: SupportedStreamConfig,
+    config: &cpal::StreamConfig,
     mut producer: HeapProducer<f32>,
     channels: usize,
     dropped_frames: Arc<AtomicU64>,
     peak_level: Arc<AtomicU32>,
 ) -> Result<Stream, InputError> {
     let stream = device.build_input_stream(
-        &config.into(),
+        config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
             update_peak_level(&peak_level, data);
             push_frames(&mut producer, data, channels, &dropped_frames);
@@ -594,7 +622,7 @@ fn create_passthrough_input_stream(
 #[allow(clippy::too_many_arguments)]
 fn create_resampling_input_stream(
     device: &Device,
-    config: SupportedStreamConfig,
+    config: &cpal::StreamConfig,
     mut producer: HeapProducer<f32>,
     input_rate: u32,
     output_rate: u32,
@@ -640,7 +668,7 @@ fn create_resampling_input_stream(
     let mut interleaved = vec![0.0f32; max_output_frames * channels];
 
     let stream = device.build_input_stream(
-        &config.into(),
+        config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
             update_peak_level(&peak_level, data);
             for (i, sample) in data.iter().enumerate() {

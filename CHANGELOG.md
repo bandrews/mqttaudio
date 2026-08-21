@@ -68,6 +68,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   capture application. Device handles are now released before inputs open,
   and again as soon as the output stream is built. Full-duplex on a single
   interface (play out of and capture into the same card) works now.
+- **Full-duplex on shared-clock USB interfaces**: with capture already
+  running, opening the output stream on the same card could fail with
+  `Invalid argument` and crash the daemon, because the two directions ran
+  with different buffer parameters. Capture streams now open with the same
+  `audio.buffer_size` as the output (falling back to the device default if
+  rejected), and an output stream that still cannot open reports the
+  requested parameters and the running capture configuration instead of
+  panicking.
 - **Input device resolution hid sibling aliases of a card**: resolving an
   input collected every enumerated device at once, and since enumeration
   opens each device for capture, the first alias of a card (`hw:`) claimed

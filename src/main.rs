@@ -461,6 +461,12 @@ async fn main() {
 
     let output_sample_rate = stream_config.sample_rate.0;
     let output_channels = stream_config.channels as usize;
+    // Capture streams run with the same buffer size so shared-clock USB
+    // interfaces accept both directions at once
+    let output_buffer_frames = match stream_config.buffer_size {
+        cpal::BufferSize::Fixed(frames) => Some(frames),
+        _ => None,
+    };
 
     tracing::info!("Audio device: {}", device_name);
     tracing::info!("  Sample rate: {} Hz", output_sample_rate);
@@ -561,6 +567,7 @@ async fn main() {
             min_channels: audio::input::required_channels(&channel_map),
             sample_rate: input_config.sample_rate,
             resampler_quality: config.advanced.resampler_quality,
+            buffer_size: output_buffer_frames,
         };
 
         match audio::input::create_input_stream(stream_config, output_sample_rate) {
@@ -787,6 +794,29 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    // A build failure with capture streams open usually means the two
+    // directions' parameters conflict on a shared-clock interface, so the
+    // report includes what capture is running
+    let report_stream_failure = |error: &dyn std::fmt::Display| -> ! {
+        tracing::error!("Failed to open the output stream on '{}': {}", device_name, error);
+        tracing::error!(
+            "  Requested: {} channels, {} Hz, buffer {:?}",
+            stream_config.channels, stream_config.sample_rate.0, stream_config.buffer_size
+        );
+        for input in &_active_inputs {
+            tracing::error!(
+                "  Capture is open at {} Hz with {} channels on this system",
+                input.sample_rate, input.channels
+            );
+        }
+        if !_active_inputs.is_empty() {
+            tracing::error!(
+                "  USB interfaces that share a clock between directions need playback \
+                 and capture at the same sample rate and compatible buffer sizes"
+            );
+        }
+        std::process::exit(1);
+    };
     let stream = match device.build_output_stream(
         &stream_config,
         make_audio_callback(),
@@ -801,14 +831,17 @@ async fn main() {
             );
             let mut fallback_config = stream_config.clone();
             fallback_config.buffer_size = cpal::BufferSize::Default;
-            device.build_output_stream(
+            match device.build_output_stream(
                 &fallback_config,
                 make_audio_callback(),
                 audio_error_callback,
                 None,
-            ).expect("Failed to build audio stream")
+            ) {
+                Ok(s) => s,
+                Err(e) => report_stream_failure(&e),
+            }
         }
-        Err(e) => panic!("Failed to build audio stream: {}", e),
+        Err(e) => report_stream_failure(&e),
     };
     drop(device);
 

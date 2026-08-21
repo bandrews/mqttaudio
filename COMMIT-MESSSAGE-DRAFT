@@ -1,2 +1,2 @@
-(no work in progress - committed through "Enumerate input devices one at a
-time so card aliases stay visible")
+(no work in progress - committed through "Open capture with the output's
+buffer size so shared-clock cards run duplex")

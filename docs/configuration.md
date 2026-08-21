@@ -171,7 +171,7 @@ Audio output settings.
 |-------|------|---------|-------------|
 | `device` | string | system default | Audio device name (use `--list-devices` to see options) |
 | `sample_rate` | integer | `48000` | Output sample rate in Hz |
-| `buffer_size` | integer | `512` | Buffer size in frames (lower = less latency, more CPU) |
+| `buffer_size` | integer | `512` | Buffer size in frames for output and capture streams (lower = less latency, more CPU) |
 | `channels` | integer | auto-detect | Number of output channels |
 | `channel_aliases` | object | `{}` | Named aliases for channel numbers |
 | `channel_names` | object | `{}` | Display labels for channel numbers |
