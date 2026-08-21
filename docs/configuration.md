@@ -360,7 +360,7 @@ Microphone/input device configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `device` | string | *required* | Input device name (use `--list-inputs`) |
+| `device` | string | *required* | Input device name or `--list-inputs` index (e.g. `"0"`) |
 | `volume` | float | `1.0` | Input volume (0.0 to 4.0, unity is 1.0) |
 | `voice_id` | string | — | Voice name for ducking integration |
 | `routes` | array | *required* | Channel routing (source → dest, can use aliases) |

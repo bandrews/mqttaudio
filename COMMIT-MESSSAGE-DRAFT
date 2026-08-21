@@ -1,3 +1,2 @@
-(no work in progress - the quality-review fix series and the four-sprint
-decision program are committed through "Sprint 4: WebSocket log streaming
-with auth, env vars, mic resampler quality, CHANGELOG accuracy")
+(no work in progress - committed through "Diagnose 'Input device not found'
+and accept --list-inputs indices")

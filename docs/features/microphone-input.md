@@ -95,8 +95,9 @@ format; a bare `hw:` device that only offers integer formats is rejected at
 startup with the format it does offer. `hw:` works where the card exposes a
 float format natively.
 
-Names are matched exactly first, then by ALSA card, so `"hw:CARD=UMC1820, DEV=0"`
-and `"hw:1,0"` both resolve to the same enumerated device.
+Names are matched exactly first, then as a `--list-inputs` index, then by ALSA
+card, so `"hw:CARD=UMC1820, DEV=0"`, `"hw:1,0"`, and `"0"` (the index from the
+listing) can all resolve to the same enumerated device.
 
 ## Routing
 
@@ -378,10 +379,26 @@ A handful of `underrun_frames` at startup is normal while the buffer primes.
 ## Troubleshooting
 
 **No audio from microphone:**
-- Verify device name matches exactly (`--list-inputs`)
+- Verify device name matches exactly (`--list-inputs`), or use the listing's
+  index number as the device name
 - Check routes are configured correctly
 - Check volume is not 0
 - Check the device isn't muted via `input_mute`
+
+**"Input device not found" for a device `--list-inputs` shows:**
+- Only devices that can be opened for capture *at that moment* are enumerable,
+  so a device can appear in an interactive listing yet be missing when the
+  daemon starts. The error lists what was available and, on Linux, reports why
+  a direct ALSA capture open of the requested name fails:
+  - *busy*: another process holds the capture side - a sound server (PipeWire,
+    PulseAudio) or another capture application, including a second copy of the
+    daemon. `fuser -v /dev/snd/*` shows the holder
+  - *permission denied*: when running as a systemd service, the service user
+    must be in the `audio` group (`sudo usermod -aG audio USER`, then restart)
+  - *no such device*: the name does not exist; compare against `arecord -L`
+- Run the listing in the same context the daemon runs in
+  (`sudo -u SERVICE_USER ./mqttaudio --list-inputs`) to see what the daemon
+  sees
 
 **Microphone is too quiet:**
 - Raise `volume` above 1.0, or send `input_volume` with a value above 1.0

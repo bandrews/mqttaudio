@@ -59,7 +59,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stalled the capture thread and caused the overruns they reported.
 - **Input device naming**: input devices are now resolved by ALSA card the same
   way output devices are, so `"hw:CARD=UMC1820, DEV=0"` matches the enumerated
-  device.
+  device. An input `device` may also be the index number printed by
+  `--list-inputs`.
+- **"Input device not found" is now diagnosable**: the error lists which
+  devices could be opened for capture at that moment, and on Linux probes the
+  requested name directly through ALSA to say *why* it is unavailable - held
+  by another process (a sound server such as PipeWire, or a second daemon),
+  permission denied (service user not in the `audio` group), or nonexistent.
+  Capture devices are only enumerable while they can actually be opened, so a
+  device shown by an interactive `--list-inputs` could previously vanish into
+  an unexplained "not found" when the daemon ran as a service.
 - **Voice volume ramping on live inputs**: a fade no longer stalls while the
   input is starved.
 - **`audio.channel_volumes` had no effect**: the per-channel calibration was

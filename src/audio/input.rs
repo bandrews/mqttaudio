@@ -22,7 +22,9 @@ pub fn list_input_devices() {
     println!("Available audio input devices:");
     match host.input_devices() {
         Ok(devices) => {
+            let mut count = 0usize;
             for (i, device) in devices.enumerate() {
+                count += 1;
                 if let Ok(name) = device.name() {
                     println!("  {}. {}", i, name);
 
@@ -73,12 +75,92 @@ pub fn list_input_devices() {
                     }
                 }
             }
+            if count == 0 {
+                println!("  (none — devices that cannot be opened for capture right now,");
+                println!("   because they are busy or inaccessible to this user, are not listed)");
+            }
         }
         Err(e) => eprintln!("Error listing input devices: {}", e),
     }
 }
 
-/// Get an input device by name, or the default if name is None
+/// Interpret a configured device name as an index into the enumerated input
+/// device list, matching the numbering printed by --list-inputs. Only whole
+/// numbers within range qualify.
+fn parse_device_index(requested: &str, device_count: usize) -> Option<usize> {
+    let index: usize = requested.trim().parse().ok()?;
+    if index < device_count {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+/// Build the device-not-found message: what was requested, which devices could
+/// be opened for capture at that moment, and any direct-ALSA probe diagnosis.
+/// Enumeration only yields devices that open for capture, so a device that is
+/// busy or inaccessible is invisible here even though --list-inputs may have
+/// shown it earlier.
+fn device_not_found_message(requested: &str, available: &[String], probe: Option<&str>) -> String {
+    let mut msg = format!("Input device not found: {}", requested);
+    if available.is_empty() {
+        msg.push_str(
+            "\n  No devices could be opened for capture at this moment; \
+             busy or inaccessible devices are not enumerable.",
+        );
+    } else {
+        msg.push_str(&format!(
+            "\n  Devices currently available for capture: {}",
+            available.join(", ")
+        ));
+    }
+    if let Some(probe) = probe {
+        msg.push_str(&format!("\n  {}", probe));
+    }
+    msg
+}
+
+/// Ask ALSA directly why a capture open of this name fails, to explain why a
+/// device is missing from enumeration (which silently skips any device that
+/// cannot be opened for capture at that moment).
+#[cfg(target_os = "linux")]
+fn probe_capture_open(name: &str) -> Option<String> {
+    use alsa::pcm::PCM;
+    use alsa::Direction;
+
+    match PCM::new(name, Direction::Capture, true) {
+        Ok(_) => Some(format!(
+            "ALSA opens '{}' for capture directly, but its configurations were \
+             rejected during enumeration; its native sample format may be \
+             unsupported. Try the plughw: form of the name.",
+            name
+        )),
+        Err(e) => {
+            let advice = match e.errno() {
+                libc::EBUSY => {
+                    "another process holds this device for capture (a sound \
+                     server such as PipeWire or PulseAudio, or another capture \
+                     application)"
+                }
+                libc::EACCES | libc::EPERM => {
+                    "permission denied; when running as a service, check that \
+                     the service user is in the 'audio' group"
+                }
+                libc::ENOENT | libc::ENODEV | libc::ENXIO => {
+                    "no ALSA device has this name; compare against 'arecord -L'"
+                }
+                _ => "see the ALSA error for details",
+            };
+            Some(format!(
+                "Direct ALSA capture open of '{}' failed: {} — {}",
+                name, e, advice
+            ))
+        }
+    }
+}
+
+/// Get an input device by name, by --list-inputs index, or the default if
+/// name is None
 ///
 /// Falls back to ALSA card matching so that names written by hand
 /// ("hw:CARD=UMC1820, DEV=0") still resolve to the enumerated device, the same
@@ -91,30 +173,44 @@ pub fn get_input_device(name: Option<&str>) -> Result<Device, InputError> {
             let devices: Vec<Device> = host.input_devices()
                 .map_err(|e| InputError::DeviceEnumeration(e.to_string()))?
                 .collect();
+            let names: Vec<String> = devices
+                .iter()
+                .map(|d| d.name().unwrap_or_else(|_| "<unknown>".to_string()))
+                .collect();
 
-            for device in &devices {
-                if let Ok(n) = device.name() {
-                    if n == device_name {
+            for (device, n) in devices.iter().zip(&names) {
+                if n == device_name {
+                    return Ok(device.clone());
+                }
+            }
+
+            if let Some(index) = parse_device_index(device_name, devices.len()) {
+                tracing::info!("Using input device {} ('{}')", index, names[index]);
+                return Ok(devices[index].clone());
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                for (device, n) in devices.iter().zip(&names) {
+                    if crate::audio::device::try_match_alsa_device(device_name, n)
+                        == Some(true)
+                    {
+                        tracing::info!("Matched ALSA input device '{}' to '{}'", device_name, n);
                         return Ok(device.clone());
                     }
                 }
             }
 
             #[cfg(target_os = "linux")]
-            {
-                for device in &devices {
-                    if let Ok(n) = device.name() {
-                        if crate::audio::device::try_match_alsa_device(device_name, &n)
-                            == Some(true)
-                        {
-                            tracing::info!("Matched ALSA input device '{}' to '{}'", device_name, n);
-                            return Ok(device.clone());
-                        }
-                    }
-                }
-            }
+            let probe = probe_capture_open(device_name);
+            #[cfg(not(target_os = "linux"))]
+            let probe = None;
 
-            Err(InputError::DeviceNotFound(device_name.to_string()))
+            Err(InputError::DeviceNotFound {
+                requested: device_name.to_string(),
+                available: names,
+                probe,
+            })
         }
         None => {
             host.default_input_device()
@@ -579,7 +675,11 @@ fn create_resampling_input_stream(
 #[derive(Debug)]
 pub enum InputError {
     DeviceEnumeration(String),
-    DeviceNotFound(String),
+    DeviceNotFound {
+        requested: String,
+        available: Vec<String>,
+        probe: Option<String>,
+    },
     NoDefaultDevice,
     ConfigError(String),
     StreamError(String),
@@ -590,7 +690,9 @@ impl std::fmt::Display for InputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InputError::DeviceEnumeration(e) => write!(f, "Failed to enumerate devices: {}", e),
-            InputError::DeviceNotFound(name) => write!(f, "Input device not found: {}", name),
+            InputError::DeviceNotFound { requested, available, probe } => {
+                write!(f, "{}", device_not_found_message(requested, available, probe.as_deref()))
+            }
             InputError::NoDefaultDevice => write!(f, "No default input device available"),
             InputError::ConfigError(e) => write!(f, "Configuration error: {}", e),
             InputError::StreamError(e) => write!(f, "Stream error: {}", e),
@@ -669,6 +771,79 @@ mod tests {
 
         assert!(config.device_name.is_none());
         assert_eq!(config.latency_ms, 20);
+    }
+
+    #[test]
+    fn test_parse_device_index() {
+        assert_eq!(parse_device_index("0", 3), Some(0));
+        assert_eq!(parse_device_index("2", 3), Some(2));
+        assert_eq!(parse_device_index(" 1 ", 3), Some(1));
+        assert_eq!(parse_device_index("3", 3), None, "out of range");
+        assert_eq!(parse_device_index("0", 0), None, "no devices");
+        assert_eq!(parse_device_index("-1", 3), None);
+        assert_eq!(parse_device_index("hw:CARD=UMC1820,DEV=0", 3), None);
+        assert_eq!(parse_device_index("", 3), None);
+    }
+
+    #[test]
+    fn test_device_not_found_message_lists_available_devices() {
+        let available = vec![
+            "hw:CARD=UMC1820,DEV=0".to_string(),
+            "default".to_string(),
+        ];
+        let msg = device_not_found_message("plughw:CARD=UMC1820,DEV=0", &available, None);
+        assert!(msg.contains("plughw:CARD=UMC1820,DEV=0"));
+        assert!(msg.contains("hw:CARD=UMC1820,DEV=0"));
+        assert!(msg.contains("default"));
+    }
+
+    #[test]
+    fn test_device_not_found_message_explains_empty_enumeration() {
+        let msg = device_not_found_message("hw:CARD=X,DEV=0", &[], None);
+        assert!(msg.contains("hw:CARD=X,DEV=0"));
+        assert!(msg.to_lowercase().contains("no devices"));
+    }
+
+    #[test]
+    fn test_device_not_found_message_includes_probe_result() {
+        let msg = device_not_found_message(
+            "hw:CARD=X,DEV=0",
+            &[],
+            Some("Direct ALSA capture open failed: EBUSY"),
+        );
+        assert!(msg.contains("Direct ALSA capture open failed: EBUSY"));
+    }
+
+    #[test]
+    fn test_device_not_found_error_display_carries_details() {
+        let err = InputError::DeviceNotFound {
+            requested: "plughw:CARD=UMC1820,DEV=0".to_string(),
+            available: vec!["hw:CARD=UMC1820,DEV=0".to_string()],
+            probe: Some("probe detail".to_string()),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Input device not found"));
+        assert!(msg.contains("plughw:CARD=UMC1820,DEV=0"));
+        assert!(msg.contains("hw:CARD=UMC1820,DEV=0"));
+        assert!(msg.contains("probe detail"));
+    }
+
+    #[test]
+    fn test_get_input_device_error_reports_requested_name_and_probe() {
+        // A card name no system has, so this fails everywhere. The error must
+        // carry the requested name and, on Linux, a direct-ALSA diagnosis of
+        // why the capture open fails.
+        match get_input_device(Some("hw:CARD=NoSuchCardExists,DEV=0")) {
+            Err(InputError::DeviceNotFound { requested, probe, .. }) => {
+                assert_eq!(requested, "hw:CARD=NoSuchCardExists,DEV=0");
+                #[cfg(target_os = "linux")]
+                assert!(probe.is_some(), "Linux probe should always produce a diagnosis");
+                #[cfg(not(target_os = "linux"))]
+                assert!(probe.is_none());
+            }
+            Err(other) => panic!("expected DeviceNotFound, got: {}", other),
+            Ok(_) => panic!("nonexistent device resolved"),
+        }
     }
 
     #[test]
