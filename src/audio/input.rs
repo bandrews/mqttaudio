@@ -268,6 +268,15 @@ pub fn select_channel_count(available: &[u16], exact: Option<usize>, minimum: us
 /// Only f32 configurations are considered: the capture callback reads f32
 /// samples, and ALSA `hw:` devices that expose integer formats only must be
 /// opened through their `plughw:` alias instead.
+/// Choose the capture rate from a reported range. ALSA plug devices report a
+/// continuous range with an implausible maximum; that is capability-report
+/// noise, not a reason to disqualify the configuration, so the ceiling is
+/// clamped and the preferred rate wins whenever the range covers it.
+fn choose_capture_rate(min_rate: u32, max_rate: u32, preferred: u32) -> u32 {
+    let max_rate = max_rate.min(MAX_REASONABLE_SAMPLE_RATE);
+    preferred.max(min_rate).min(max_rate)
+}
+
 pub fn find_input_config(
     device: &Device,
     requested_channels: Option<usize>,
@@ -277,7 +286,7 @@ pub fn find_input_config(
     let supported: Vec<_> = device
         .supported_input_configs()
         .map_err(|e| InputError::ConfigError(e.to_string()))?
-        .filter(|c| c.max_sample_rate().0 <= MAX_REASONABLE_SAMPLE_RATE)
+        .filter(|c| c.min_sample_rate().0 <= MAX_REASONABLE_SAMPLE_RATE)
         .filter(|c| c.channels() <= MAX_REASONABLE_CHANNELS)
         .collect();
 
@@ -330,17 +339,19 @@ pub fn find_input_config(
 
     // Matching the output rate keeps the resampler out of the signal path
     let exact_rate = matching.iter().find(|c| {
-        c.min_sample_rate().0 <= preferred_sample_rate
-            && preferred_sample_rate <= c.max_sample_rate().0
+        choose_capture_rate(c.min_sample_rate().0, c.max_sample_rate().0, preferred_sample_rate)
+            == preferred_sample_rate
     });
 
     match exact_rate {
         Some(c) => Ok(c.with_sample_rate(SampleRate(preferred_sample_rate))),
         None => {
             let closest = matching[0];
-            let rate = preferred_sample_rate
-                .max(closest.min_sample_rate().0)
-                .min(closest.max_sample_rate().0);
+            let rate = choose_capture_rate(
+                closest.min_sample_rate().0,
+                closest.max_sample_rate().0,
+                preferred_sample_rate,
+            );
             Ok(closest.with_sample_rate(SampleRate(rate)))
         }
     }
@@ -865,6 +876,21 @@ mod tests {
         let names = vec!["hw:CARD=UMC1820,DEV=0".to_string()];
         assert_eq!(resolve_requested_device("hw:CARD=Missing,DEV=0", &names), None);
         assert_eq!(resolve_requested_device("anything", &[]), None);
+    }
+
+    #[test]
+    fn test_choose_capture_rate_honors_preferred_within_plugin_range() {
+        // ALSA plug devices report a continuous range with an absurd maximum;
+        // the preferred rate inside the plausible part of the range wins.
+        assert_eq!(choose_capture_rate(4000, 4294967295, 48000), 48000);
+        assert_eq!(choose_capture_rate(4000, 4294967295, 44100), 44100);
+    }
+
+    #[test]
+    fn test_choose_capture_rate_clamps_to_range() {
+        assert_eq!(choose_capture_rate(44100, 44100, 48000), 44100);
+        assert_eq!(choose_capture_rate(48000, 192000, 44100), 48000);
+        assert_eq!(choose_capture_rate(8000, 4294967295, 500000), 384000);
     }
 
     #[test]
