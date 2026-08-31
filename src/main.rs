@@ -504,23 +504,54 @@ async fn main() {
     let mut input_telemetry: Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)> =
         Vec::new();
     let mut cmd_tx = cmd_tx;
+    struct SharedCapture {
+        active: audio::input::ActiveInput,
+        consumers: Vec<ringbuf::HeapConsumer<f32>>,
+    }
+    let mut captures: std::collections::HashMap<
+        (Option<String>, u32),
+        Result<SharedCapture, String>,
+    > = std::collections::HashMap::new();
+    for input_config in &config.inputs {
+        let key = (input_config.device.clone(), input_config.latency_ms);
+        captures.entry(key.clone()).or_insert_with(|| {
+            let stream_config = audio::input::InputStreamConfig {
+                device_name: input_config.device.clone(),
+                latency_ms: input_config.latency_ms,
+            };
+            audio::input::create_input_stream_with_fanout(
+                stream_config,
+                output_sample_rate,
+                config
+                    .inputs
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.device == input_config.device
+                            && candidate.latency_ms == input_config.latency_ms
+                    })
+                    .count(),
+            )
+            .map(|mut active| {
+                let mut consumers = active.take_consumers();
+                consumers.reverse();
+                SharedCapture { active, consumers }
+            })
+            .map_err(|error| error.to_string())
+        });
+    }
+
     for (idx, input_config) in config.inputs.iter().enumerate() {
-        let stream_config = audio::input::InputStreamConfig {
-            device_name: input_config.device.clone(),
-            latency_ms: input_config.latency_ms,
-        };
-
-        match audio::input::create_input_stream(stream_config, output_sample_rate) {
-            Ok(mut active_input) => {
-                tracing::info!(
-                    "Opened input device: {} ({} channels, voice '{}')",
-                    input_config.device.as_deref().unwrap_or("default"),
-                    active_input.channels,
-                    input_config.voice_id
-                );
-
-                // Take ownership of the consumer for the mixer
-                if let Some(consumer) = active_input.take_consumer() {
+        let key = (input_config.device.clone(), input_config.latency_ms);
+        match captures.get_mut(&key) {
+            Some(Ok(capture)) => {
+                let channels = capture.active.channels;
+                if let Some(consumer) = capture.consumers.pop() {
+                    tracing::info!(
+                        "Opened input device: {} ({} channels, voice '{}')",
+                        input_config.device.as_deref().unwrap_or("default"),
+                        channels,
+                        input_config.voice_id
+                    );
                     // Build channel map from routes config (resolve aliases)
                     let channel_map: Vec<(usize, usize)> =
                         match config.resolve_input_routes(&input_config.routes) {
@@ -543,9 +574,7 @@ async fn main() {
                     // Now that the device's channel count is known, warn about any
                     // route reading a source channel the device does not have; the
                     // mixer would otherwise drop it silently (F5).
-                    if let Some(warning) =
-                        out_of_range_input_routes(idx, &channel_map, active_input.channels)
-                    {
+                    if let Some(warning) = out_of_range_input_routes(idx, &channel_map, channels) {
                         tracing::warn!("{}", warning);
                     }
 
@@ -563,7 +592,7 @@ async fn main() {
                     let mut live_input = audio::mixer::LiveInput::new(
                         input_config.voice_id.clone(),
                         consumer,
-                        active_input.channels,
+                        channels,
                         input_config.volume,
                         channel_map,
                     );
@@ -589,7 +618,7 @@ async fn main() {
                         index: idx,
                         voice_id: input_config.voice_id.clone(),
                         volume: input_config.volume,
-                        channels: active_input.channels,
+                        channels,
                         muted: false,
                         unmuted_volume: input_config.volume,
                         applied_volume: Some(applied_volume),
@@ -600,7 +629,7 @@ async fn main() {
                     });
                     input_telemetry.push((
                         input_config.voice_id.clone(),
-                        std::sync::Arc::clone(&active_input.telemetry),
+                        std::sync::Arc::clone(&capture.active.telemetry),
                     ));
 
                     // Add to the mix via the command ring (drained once the
@@ -623,16 +652,15 @@ async fn main() {
                         &mut cmd_tx,
                         &ducking_snapshot,
                     );
+                } else {
+                    tracing::error!("No logical capture ring available for input {}", idx);
                 }
-
-                // Keep the stream alive by storing it
-                _active_inputs.push(active_input);
             }
-            Err(e) => {
+            Some(Err(error)) => {
                 tracing::error!(
                     "Failed to open input device '{}': {}",
                     input_config.device.as_deref().unwrap_or("default"),
-                    e
+                    error
                 );
                 input_statuses.push(http::InputStatus {
                     index: idx,
@@ -645,9 +673,16 @@ async fn main() {
                     applied_muted: None,
                     applied_unmuted_volume: None,
                     ready: false,
-                    last_error: Some(e.to_string()),
+                    last_error: Some(error.clone()),
                 });
             }
+            None => unreachable!("capture key was populated in the first pass"),
+        }
+    }
+
+    for result in captures.into_values() {
+        if let Ok(capture) = result {
+            _active_inputs.push(capture.active);
         }
     }
 

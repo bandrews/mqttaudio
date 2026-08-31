@@ -226,7 +226,7 @@ impl Default for InputStreamConfig {
 pub struct ActiveInput {
     #[allow(dead_code)] // Stream must be kept alive for audio to flow
     stream: Stream,
-    consumer: Option<HeapConsumer<f32>>,
+    consumers: Vec<HeapConsumer<f32>>,
     pub channels: usize,
     /// Capture-path counters (D57), drained/logged off-RT and surfaced on /metrics.
     pub telemetry: Arc<InputTelemetry>,
@@ -236,7 +236,12 @@ impl ActiveInput {
     /// Take ownership of the ring buffer consumer
     /// Returns None if already taken
     pub fn take_consumer(&mut self) -> Option<HeapConsumer<f32>> {
-        self.consumer.take()
+        self.consumers.pop()
+    }
+
+    /// Take every logical-strip consumer fed by this one physical capture.
+    pub fn take_consumers(&mut self) -> Vec<HeapConsumer<f32>> {
+        std::mem::take(&mut self.consumers)
     }
 }
 
@@ -246,6 +251,23 @@ pub fn create_input_stream(
     config: InputStreamConfig,
     target_sample_rate: u32,
 ) -> Result<ActiveInput, InputError> {
+    create_input_stream_with_fanout(config, target_sample_rate, 1)
+}
+
+/// Create one physical capture stream and fan its resampled frames into a
+/// bounded ring for each logical input strip. This avoids opening a single-open
+/// ALSA device once per team microphone while keeping existing one-consumer
+/// callers source-compatible.
+pub fn create_input_stream_with_fanout(
+    config: InputStreamConfig,
+    target_sample_rate: u32,
+    consumer_count: usize,
+) -> Result<ActiveInput, InputError> {
+    if consumer_count == 0 {
+        return Err(InputError::ConfigError(
+            "consumer_count must be positive".to_string(),
+        ));
+    }
     let device = get_input_device(config.device_name.as_deref())?;
     let device_name = device
         .description()
@@ -258,7 +280,10 @@ pub fn create_input_stream(
 
     // Calculate ring buffer size based on OUTPUT sample rate (after potential resampling)
     let buffer_size = calculate_ring_buffer_size(target_sample_rate, channels, config.latency_ms);
-    let (producer, consumer) = create_ring_buffer(buffer_size);
+    let rings: Vec<(HeapProducer<f32>, HeapConsumer<f32>)> = (0..consumer_count)
+        .map(|_| create_ring_buffer(buffer_size))
+        .collect();
+    let (producers, consumers): (Vec<_>, Vec<_>) = rings.into_iter().unzip();
 
     if input_sample_rate != target_sample_rate {
         tracing::warn!(
@@ -287,7 +312,7 @@ pub fn create_input_stream(
         &device,
         supported_config,
         sample_format,
-        producer,
+        producers,
         input_sample_rate,
         target_sample_rate,
         channels,
@@ -299,7 +324,7 @@ pub fn create_input_stream(
 
     Ok(ActiveInput {
         stream,
-        consumer: Some(consumer),
+        consumers,
         channels,
         telemetry,
     })
@@ -493,8 +518,24 @@ impl ResampleState {
 /// allocation), and the ratio is steered toward a half-full ring via
 /// `set_resample_ratio` (which only updates two floats). Nothing here allocates,
 /// frees, or locks.
+#[allow(dead_code)]
 pub fn resample_block(state: &mut ResampleState, data: &[f32], producer: &mut HeapProducer<f32>) {
+    resample_block_fanout(state, data, std::slice::from_mut(producer));
+}
+
+/// Resample one block and publish the interleaved result to every logical-strip
+/// ring backed by one physical capture. All producers are preallocated during
+/// setup; this function only performs bounded pushes and relaxed counters.
+pub fn resample_block_fanout(
+    state: &mut ResampleState,
+    data: &[f32],
+    producers: &mut [HeapProducer<f32>],
+) {
     use rubato::Resampler;
+
+    if producers.is_empty() {
+        return;
+    }
 
     let channels = state.channels;
     // cpal delivers whole frames; a non-frame-aligned block would desync the
@@ -527,7 +568,7 @@ pub fn resample_block(state: &mut ResampleState, data: &[f32], producer: &mut He
         }
 
         // Steer the ratio toward a half-full ring before processing this chunk.
-        steer_ratio(state, producer);
+        steer_ratio(state, &producers[0]);
 
         // Resample one full chunk into the reusable output buffer.
         let (_in_frames, out_frames) =
@@ -551,10 +592,12 @@ pub fn resample_block(state: &mut ResampleState, data: &[f32], producer: &mut He
 
         // Interleave the produced frames into the ring buffer.
         let mut dropped = 0usize;
-        for frame_idx in 0..out_frames {
-            for ch in 0..channels {
-                if producer.push(state.output[ch][frame_idx]).is_err() {
-                    dropped += 1;
+        for producer in producers.iter_mut() {
+            for frame_idx in 0..out_frames {
+                for ch in 0..channels {
+                    if producer.push(state.output[ch][frame_idx]).is_err() {
+                        dropped += 1;
+                    }
                 }
             }
         }
@@ -617,7 +660,7 @@ fn build_resampling_input_stream(
     device: &Device,
     config: SupportedStreamConfig,
     sample_format: cpal::SampleFormat,
-    producer: HeapProducer<f32>,
+    producers: Vec<HeapProducer<f32>>,
     input_rate: u32,
     output_rate: u32,
     channels: usize,
@@ -626,7 +669,7 @@ fn build_resampling_input_stream(
         Some(InputSampleHandling::F32) => build_typed_resampling_input_stream::<f32>(
             device,
             config,
-            producer,
+            producers,
             input_rate,
             output_rate,
             channels,
@@ -634,7 +677,7 @@ fn build_resampling_input_stream(
         Some(InputSampleHandling::I16) => build_typed_resampling_input_stream::<i16>(
             device,
             config,
-            producer,
+            producers,
             input_rate,
             output_rate,
             channels,
@@ -642,7 +685,7 @@ fn build_resampling_input_stream(
         Some(InputSampleHandling::U16) => build_typed_resampling_input_stream::<u16>(
             device,
             config,
-            producer,
+            producers,
             input_rate,
             output_rate,
             channels,
@@ -650,7 +693,7 @@ fn build_resampling_input_stream(
         Some(InputSampleHandling::I32) => build_typed_resampling_input_stream::<i32>(
             device,
             config,
-            producer,
+            producers,
             input_rate,
             output_rate,
             channels,
@@ -669,7 +712,7 @@ fn build_resampling_input_stream(
 fn build_typed_resampling_input_stream<T>(
     device: &Device,
     config: SupportedStreamConfig,
-    mut producer: HeapProducer<f32>,
+    mut producers: Vec<HeapProducer<f32>>,
     input_rate: u32,
     output_rate: u32,
     channels: usize,
@@ -678,7 +721,10 @@ where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
 {
-    let ring_capacity = producer.capacity();
+    let ring_capacity = producers
+        .first()
+        .map(|producer| producer.capacity())
+        .unwrap_or(0);
     let mut state = ResampleState::new(input_rate, output_rate, channels, ring_capacity)?;
     let telemetry = state.telemetry();
     let callback_telemetry = Arc::clone(&telemetry);
@@ -706,7 +752,7 @@ where
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 convert_input_block::<T>(data, &mut scratch, |f32s| {
-                    resample_block(&mut state, f32s, &mut producer);
+                    resample_block_fanout(&mut state, f32s, &mut producers);
                 });
             },
             move |err| {
@@ -817,6 +863,23 @@ mod tests {
 
         assert!(config.device_name.is_none());
         assert_eq!(config.latency_ms, 20);
+    }
+
+    #[test]
+    fn test_resample_fanout_feeds_each_logical_strip_ring() {
+        let channels = 2;
+        let mut state = ResampleState::new(48000, 48000, channels, 8192).unwrap();
+        let (first, mut first_consumer) = create_ring_buffer(8192);
+        let (second, mut second_consumer) = create_ring_buffer(8192);
+        let data = vec![0.25_f32; 1024 * channels];
+        resample_block_fanout(&mut state, &data, &mut [first, second]);
+        let mut first_out = vec![0.0; 2048];
+        let mut second_out = vec![0.0; 2048];
+        let first_count = first_consumer.pop_slice(&mut first_out);
+        let second_count = second_consumer.pop_slice(&mut second_out);
+        assert!(first_count > 0);
+        assert_eq!(first_count, second_count);
+        assert_eq!(&first_out[..first_count], &second_out[..second_count]);
     }
 
     // Note: Device enumeration tests require actual hardware and are skipped in CI
