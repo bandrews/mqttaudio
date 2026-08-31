@@ -8,6 +8,7 @@ mod config_editor;
 mod http;
 mod mqtt;
 mod rt_engine;
+mod talkback;
 mod voice;
 
 use clap::Parser;
@@ -504,6 +505,8 @@ async fn main() {
     let mut input_telemetry: Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)> =
         Vec::new();
     let mut cmd_tx = cmd_tx;
+    let mut talkback_lease = talkback::TalkbackLease::default();
+    let talkback_status = std::sync::Arc::new(std::sync::RwLock::new(talkback_lease.status(0)));
     struct SharedCapture {
         active: audio::input::ActiveInput,
         consumers: Vec<ringbuf::HeapConsumer<f32>>,
@@ -861,6 +864,7 @@ async fn main() {
             config_json.clone(),
             latency_stats.clone(),
             input_telemetry.clone(),
+            talkback_status.clone(),
             log_broadcaster.clone(),
         )
         .await
@@ -937,6 +941,9 @@ async fn main() {
                             snapshot: &status_snapshot,
                             ducking_snapshot: &ducking_snapshot,
                             inputs: &mut input_statuses,
+                            talkback: &mut talkback_lease,
+                            talkback_status: &talkback_status,
+                            now_ms: start_time.elapsed().as_millis() as u64,
                             output_channels,
                             output_sample_rate,
                             config: &config,
@@ -945,6 +952,7 @@ async fn main() {
                             max_block_frames,
                         };
                         handle_command(cmd, &mut ctx).await;
+                        ctx.refresh_talkback(start_time.elapsed().as_millis() as u64);
                     }
                     Err(e) => {
                         tracing::error!("Failed to parse command: {}", e);
@@ -952,6 +960,20 @@ async fn main() {
                 }
             }
             _ = reaper_tick.tick() => {
+                let now_ms = start_time.elapsed().as_millis() as u64;
+                if let Some(source_id) = talkback_lease.active_source().map(str::to_string) {
+                    if let Some((_transition, status)) = talkback_lease.expire(now_ms) {
+                        if let Some(input) = resolve_talkback_input(&input_statuses, &source_id) {
+                            if cmd_tx
+                                .push(rt_engine::AudioCommand::SetInputMute { input, mute: true })
+                                .is_err()
+                            {
+                                tracing::error!("Audio command ring full while expiring talkback lease");
+                            }
+                        }
+                        *talkback_status.write().unwrap() = status;
+                    }
+                }
                 reap_finished_samples(
                     &mut grave_rx,
                     &mut streamed_grave_rx,
@@ -1038,6 +1060,25 @@ fn find_input_status_mut<'a>(
         return inputs.get_mut(index);
     }
     inputs.iter_mut().find(|input| input.voice_id == selector)
+}
+
+fn resolve_talkback_input(inputs: &[http::InputStatus], source_id: &str) -> Option<String> {
+    if inputs
+        .iter()
+        .any(|input| input.ready && input.voice_id == source_id)
+    {
+        return Some(source_id.to_string());
+    }
+    // The venue profile uses the semantic GM_MIC name while the checked-in
+    // daemon config historically calls the same first strip `mic`.
+    if source_id == "GM_MIC"
+        && inputs
+            .iter()
+            .any(|input| input.ready && input.voice_id == "mic")
+    {
+        return Some("mic".to_string());
+    }
+    None
 }
 
 /// Build the warning for an input whose resolved routes read source channels the
@@ -1435,6 +1476,9 @@ struct CommandCtx<'a> {
     snapshot: &'a std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
     ducking_snapshot: &'a std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
     inputs: &'a mut [http::InputStatus],
+    talkback: &'a mut talkback::TalkbackLease,
+    talkback_status: &'a std::sync::Arc<std::sync::RwLock<talkback::TalkbackStatus>>,
+    now_ms: u64,
     output_channels: usize,
     output_sample_rate: u32,
     config: &'a config::Config,
@@ -1468,6 +1512,11 @@ impl CommandCtx<'_> {
             self.inputs,
             self.output_channels,
         );
+    }
+
+    fn refresh_talkback(&self, now_ms: u64) {
+        let status = self.talkback.status(now_ms);
+        *self.talkback_status.write().unwrap() = status;
     }
 }
 
@@ -2601,6 +2650,16 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 );
                 return;
             }
+            if !mute
+                && (ctx.talkback.active_for(&input)
+                    || (input == "mic" && ctx.talkback.active_for("GM_MIC")))
+            {
+                tracing::warn!(
+                    "Input '{}' is owned by an active talkback lease; ordinary unmute was rejected",
+                    input
+                );
+                return;
+            }
             let queued = ctx.send(rt_engine::AudioCommand::SetInputMute {
                 input: input.clone(),
                 mute,
@@ -2620,6 +2679,69 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 }
                 ctx.refresh();
             }
+        }
+        mqtt::commands::AudioCommand::TalkbackAcquire(request) => {
+            let Some(input) = resolve_talkback_input(ctx.inputs, &request.source_id) else {
+                tracing::warn!(
+                    "Talkback source '{}' is unavailable; lease was not acquired",
+                    request.source_id
+                );
+                ctx.refresh_talkback(ctx.now_ms);
+                return;
+            };
+            match ctx.talkback.acquire(
+                &request.client_id,
+                &request.source_id,
+                &request.destination,
+                request.gain,
+                request.lease_ms,
+                ctx.now_ms,
+            ) {
+                Ok((_transition, _status)) => {
+                    if !ctx.send(rt_engine::AudioCommand::SetInputMute {
+                        input: input.clone(),
+                        mute: false,
+                    }) {
+                        ctx.talkback.hard_mute(ctx.now_ms);
+                    }
+                    ctx.refresh_talkback(ctx.now_ms);
+                }
+                Err(error) => {
+                    tracing::warn!("Talkback acquire rejected: {}", error);
+                    ctx.refresh_talkback(ctx.now_ms);
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::TalkbackRelease(request) => {
+            let source = ctx.talkback.active_source().map(str::to_string);
+            match ctx
+                .talkback
+                .release(&request.client_id, &request.lease_id, ctx.now_ms)
+            {
+                Ok((_transition, _status)) => {
+                    if let Some(source_id) = source {
+                        if let Some(input) = resolve_talkback_input(ctx.inputs, &source_id) {
+                            let _ = ctx
+                                .send(rt_engine::AudioCommand::SetInputMute { input, mute: true });
+                        }
+                    }
+                    ctx.refresh_talkback(ctx.now_ms);
+                }
+                Err(error) => {
+                    tracing::warn!("Talkback release rejected: {}", error);
+                    ctx.refresh_talkback(ctx.now_ms);
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::TalkbackHardMute => {
+            let source = ctx.talkback.active_source().map(str::to_string);
+            let _ = ctx.talkback.hard_mute(ctx.now_ms);
+            if let Some(source_id) = source {
+                if let Some(input) = resolve_talkback_input(ctx.inputs, &source_id) {
+                    let _ = ctx.send(rt_engine::AudioCommand::SetInputMute { input, mute: true });
+                }
+            }
+            ctx.refresh_talkback(ctx.now_ms);
         }
         mqtt::commands::AudioCommand::Seek {
             selector,
@@ -2865,6 +2987,8 @@ mod tests {
         snapshot: Arc<RwLock<http::StatusSnapshot>>,
         ducking_snapshot: Arc<RwLock<HashMap<String, f32>>>,
         inputs: Vec<http::InputStatus>,
+        talkback: talkback::TalkbackLease,
+        talkback_status: Arc<RwLock<talkback::TalkbackStatus>>,
         config: config::Config,
         latency_stats: Arc<http::PlayLatencyStats>,
         latency: http::LatencyTracker,
@@ -2922,6 +3046,10 @@ mod tests {
                 })),
                 ducking_snapshot: Arc::new(RwLock::new(HashMap::new())),
                 inputs: Vec::new(),
+                talkback: talkback::TalkbackLease::default(),
+                talkback_status: Arc::new(RwLock::new(
+                    talkback::TalkbackLease::default().status(0),
+                )),
                 config: config::Config::default(),
                 latency_stats: latency_stats.clone(),
                 latency: http::LatencyTracker::new(latency_stats),
@@ -2955,6 +3083,9 @@ mod tests {
                 snapshot: &self.snapshot,
                 ducking_snapshot: &self.ducking_snapshot,
                 inputs: &mut self.inputs,
+                talkback: &mut self.talkback,
+                talkback_status: &self.talkback_status,
+                now_ms: 0,
                 output_channels: 2,
                 output_sample_rate: SR,
                 config: &self.config,
@@ -4004,6 +4135,53 @@ mod tests {
         );
         assert_eq!(fixture.inputs[0].volume, 0.7);
         assert!(!fixture.inputs[0].muted);
+    }
+
+    #[tokio::test]
+    async fn talkback_lease_acquire_release_and_expiry_mute_the_input() {
+        let mut fixture = Fixture::new(vec![]);
+        push_live_input(&mut fixture, "mic", 0.7);
+        fixture
+            .run(AudioCommand::TalkbackAcquire(
+                mqtt::commands::TalkbackAcquireMessage {
+                    client_id: "gm-1".to_string(),
+                    source_id: "GM_MIC".to_string(),
+                    destination: "GUEST_ALL".to_string(),
+                    gain: 0.0,
+                    lease_ms: 500,
+                },
+            ))
+            .await;
+        fixture.drain();
+        assert!(fixture.talkback.status(0).applied_live);
+        assert_eq!(fixture.mixer.live_inputs[0].volume, 0.7);
+
+        fixture
+            .run(AudioCommand::TalkbackRelease(
+                mqtt::commands::TalkbackReleaseMessage {
+                    client_id: "gm-1".to_string(),
+                    lease_id: "lease-0001".to_string(),
+                },
+            ))
+            .await;
+        fixture.drain();
+        assert!(!fixture.talkback.status(0).applied_live);
+        assert_eq!(fixture.mixer.live_inputs[0].volume, 0.0);
+
+        fixture
+            .run(AudioCommand::TalkbackAcquire(
+                mqtt::commands::TalkbackAcquireMessage {
+                    client_id: "gm-1".to_string(),
+                    source_id: "GM_MIC".to_string(),
+                    destination: "GUEST_ALL".to_string(),
+                    gain: 0.0,
+                    lease_ms: 500,
+                },
+            ))
+            .await;
+        fixture.drain();
+        let _ = fixture.talkback.expire(500);
+        assert!(!fixture.talkback.status(500).applied_live);
     }
 
     #[tokio::test]

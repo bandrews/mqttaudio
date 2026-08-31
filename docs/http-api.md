@@ -57,6 +57,7 @@ Config file example:
 | `/status/samples` | GET | List of active samples |
 | `/status/voices` | GET | List of active voices (with per-voice ducking multiplier) |
 | `/status/inputs` | GET | List of configured live inputs |
+| `/status/talkback` | GET | Applied fail-closed talkback lease state |
 | `/status/cache` | GET | Cache statistics |
 
 ### Command Endpoints (Authentication Required if configured)
@@ -75,6 +76,9 @@ Config file example:
 | `/voice/stop` | POST | Stop a voice |
 | `/input/volume` | POST | Set live-input volume |
 | `/input/mute` | POST | Mute/unmute a live input |
+| `/talkback/acquire` | POST | Acquire or renew a bounded talkback lease |
+| `/talkback/release` | POST | Release the caller's talkback lease |
+| `/talkback/hard-mute` | POST | Priority-mute every active talkback lease |
 | `/cache/clear` | POST | Clear all caches |
 | `/cache/invalidate` | POST | Invalidate specific cache entry |
 | `/cache/reload` | POST | Invalidate then re-precache an entry (fresh + instant) |
@@ -281,6 +285,29 @@ Returns the configured live inputs and their current volume/mute state:
 | `unmuted_volume` | float | Calibrated level restored when an applied mute is released |
 | `ready` | boolean | Whether the capture stream opened and can accept commands |
 | `last_error` | string / null | Capture/open error when `ready` is false |
+
+### `/status/talkback` Response
+
+The daemon reports the applied lease, not a browser's requested state. A
+lease automatically returns to `muted` when its monotonic expiry is reached or
+the process restarts:
+
+```json
+{
+  "talkback": {
+    "state": "muted",
+    "applied_live": false,
+    "lease_id": null,
+    "owner_client_id": null,
+    "source_id": null,
+    "destination": null,
+    "gain": 0.0,
+    "lease_expires_at_ms": null,
+    "last_transition": "expired",
+    "last_error": null
+  }
+}
+```
 
 ### `/status/cache` Response
 

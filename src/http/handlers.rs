@@ -700,6 +700,74 @@ pub async fn handle_input_mute(
     }
 }
 
+#[derive(Deserialize)]
+pub struct TalkbackAcquireParams {
+    pub client_id: String,
+    #[serde(default = "default_talkback_source")]
+    pub source_id: String,
+    pub destination: String,
+    pub gain: f32,
+    pub lease_ms: u64,
+}
+
+fn default_talkback_source() -> String {
+    "GM_MIC".to_string()
+}
+
+pub async fn handle_talkback_acquire(
+    State(state): State<AppState>,
+    Json(params): Json<TalkbackAcquireParams>,
+) -> impl IntoResponse {
+    let command = json!({ "command": "talkback_acquire", "message": {
+        "client_id": params.client_id,
+        "source_id": params.source_id,
+        "destination": params.destination,
+        "gain": params.gain,
+        "lease_ms": params.lease_ms
+    }});
+    match send_command(&state, &command.to_string()).await {
+        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CommandResponse::error(&error)),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TalkbackReleaseParams {
+    pub client_id: String,
+    pub lease_id: String,
+}
+
+pub async fn handle_talkback_release(
+    State(state): State<AppState>,
+    Json(params): Json<TalkbackReleaseParams>,
+) -> impl IntoResponse {
+    let command = json!({ "command": "talkback_release", "message": {
+        "client_id": params.client_id,
+        "lease_id": params.lease_id
+    }});
+    match send_command(&state, &command.to_string()).await {
+        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CommandResponse::error(&error)),
+        ),
+    }
+}
+
+pub async fn handle_talkback_hard_mute(State(state): State<AppState>) -> impl IntoResponse {
+    let command = json!({ "command": "talkback_hard_mute", "message": {} });
+    match send_command(&state, &command.to_string()).await {
+        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CommandResponse::error(&error)),
+        ),
+    }
+}
+
 // =============================================================================
 // Status Endpoints
 // =============================================================================
@@ -873,6 +941,11 @@ pub async fn handle_inputs(State(state): State<AppState>) -> impl IntoResponse {
         .collect();
 
     Json(json!({ "inputs": inputs }))
+}
+
+pub async fn handle_talkback_status(State(state): State<AppState>) -> impl IntoResponse {
+    let status = state.talkback.read().unwrap().clone();
+    Json(json!({ "talkback": status }))
 }
 
 // =============================================================================

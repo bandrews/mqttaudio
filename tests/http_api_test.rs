@@ -7,6 +7,7 @@ use mqttaudio::cache::CacheManager;
 use mqttaudio::http::{
     create_router, AppState, InputStatus, LogBroadcaster, SampleStatus, StatusSnapshot,
 };
+use mqttaudio::talkback::TalkbackLease;
 use mqttaudio::voice::VoiceManager;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -67,6 +68,7 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         config_json: Arc::new(serde_json::json!({})),
         latency: Arc::new(mqttaudio::http::PlayLatencyStats::default()),
         input_telemetry: Arc::new(Vec::new()),
+        talkback: Arc::new(RwLock::new(TalkbackLease::default().status(0))),
     };
 
     (state, cmd_rx)
@@ -1215,6 +1217,51 @@ async fn test_inputs_endpoint_reports_muted_toggle_and_channels() {
     assert_eq!(muted["muted"], true, "volume == 0.0 reports muted = true");
     assert_eq!(muted["ready"], false);
     assert_eq!(muted["last_error"], "device missing");
+}
+
+#[tokio::test]
+async fn test_talkback_status_and_command_endpoints() {
+    let (state, mut rx) = create_test_state();
+    {
+        let mut status = state.talkback.write().unwrap();
+        let mut lease = TalkbackLease::default();
+        let _ = lease
+            .acquire("gm", "GM_MIC", "GUEST_ALL", 0.0, 500, 0)
+            .unwrap();
+        *status = lease.status(0);
+    }
+    let app = create_router(state, false, false);
+    let status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/status/talkback")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(status.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["talkback"]["applied_live"], true);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/talkback/hard-mute")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let command: serde_json::Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+    assert_eq!(command["command"], "talkback_hard_mute");
 }
 
 #[tokio::test]

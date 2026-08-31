@@ -196,6 +196,9 @@ pub struct AppState {
     /// Per-input capture-path counters (Sprint 13, D57), for `/metrics`:
     /// (voice id, counters) per configured live input.
     pub input_telemetry: Arc<Vec<(String, Arc<crate::audio::input::InputTelemetry>)>>,
+    /// Applied daemon-enforced talkback lease state. The control loop owns
+    /// transitions; HTTP exposes a read-only snapshot for the gateway/UI.
+    pub talkback: Arc<RwLock<crate::talkback::TalkbackStatus>>,
 }
 
 /// Redact secrets from a serialized config for `GET /config` (DW11):
@@ -251,6 +254,7 @@ pub async fn start_server(
     config_json: Arc<serde_json::Value>,
     latency: Arc<PlayLatencyStats>,
     input_telemetry: Arc<Vec<(String, Arc<crate::audio::input::InputTelemetry>)>>,
+    talkback: Arc<RwLock<crate::talkback::TalkbackStatus>>,
     log_broadcaster: Arc<LogBroadcaster>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let state_broadcaster = Arc::new(LogBroadcaster::new());
@@ -280,6 +284,7 @@ pub async fn start_server(
         config_json,
         latency,
         input_telemetry,
+        talkback,
     };
 
     // State-event tick timer (~15 Hz, DW12): only does work when telemetry is on AND

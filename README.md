@@ -287,6 +287,9 @@ When `config.inputs` is configured to mix a microphone or line input (see
   from a zero gain alone.
 - **Configured inputs remain visible when capture cannot open.** Such records report `ready: false` and the
   concrete `last_error`; input mutations are rejected instead of silently targeting an absent stream.
+- **Talkback uses a daemon-owned expiring lease.** `talkback_acquire` renewals are exclusive to one client and
+  `talkback_release`/`talkback_hard_mute` return the input to silence; a stopped renewer expires to muted without
+  relying on browser cleanup. See the `/status/talkback` HTTP endpoint for applied state.
 - **Inputs can trigger ducking.** A mic whose `voice_id` is a ducking rule's `primary_voice` ducks that
   rule's background voices while its stream is open.
 - **Out-of-range routes warn.** A route reading a source channel the device does not have is logged once at
