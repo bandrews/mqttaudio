@@ -285,6 +285,8 @@ When `config.inputs` is configured to mix a microphone or line input (see
 - **`/status/inputs` reports applied mute state.** The endpoint exposes explicit `muted` and
   `unmuted_volume` fields that are reconciled when an input command is queued, so consumers do not infer mute
   from a zero gain alone.
+- **Configured inputs remain visible when capture cannot open.** Such records report `ready: false` and the
+  concrete `last_error`; input mutations are rejected instead of silently targeting an absent stream.
 - **Inputs can trigger ducking.** A mic whose `voice_id` is a ducking rule's `primary_voice` ducks that
   rule's background voices while its stream is open.
 - **Out-of-range routes warn.** A route reading a source channel the device does not have is logged once at

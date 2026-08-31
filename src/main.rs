@@ -586,7 +586,7 @@ async fn main() {
                     );
 
                     input_statuses.push(http::InputStatus {
-                        index: input_statuses.len(),
+                        index: idx,
                         voice_id: input_config.voice_id.clone(),
                         volume: input_config.volume,
                         channels: active_input.channels,
@@ -595,6 +595,8 @@ async fn main() {
                         applied_volume: Some(applied_volume),
                         applied_muted: Some(applied_muted),
                         applied_unmuted_volume: Some(applied_unmuted_volume),
+                        ready: true,
+                        last_error: None,
                     });
                     input_telemetry.push((
                         input_config.voice_id.clone(),
@@ -632,6 +634,19 @@ async fn main() {
                     input_config.device.as_deref().unwrap_or("default"),
                     e
                 );
+                input_statuses.push(http::InputStatus {
+                    index: idx,
+                    voice_id: input_config.voice_id.clone(),
+                    volume: input_config.volume,
+                    channels: 0,
+                    muted: true,
+                    unmuted_volume: input_config.volume,
+                    applied_volume: None,
+                    applied_muted: None,
+                    applied_unmuted_volume: None,
+                    ready: false,
+                    last_error: Some(e.to_string()),
+                });
             }
         }
     }
@@ -2396,7 +2411,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             // A live input shares this voice id even when no sample-backed voice
             // exists. The control plane cannot read the audio thread's live_inputs
             // (D22a), so it checks the configured input voice ids it does own (D35).
-            let input_match = ctx.inputs.iter().any(|i| i.voice_id == voice);
+            let input_match = ctx.inputs.iter().any(|i| i.voice_id == voice && i.ready);
 
             if success || input_match {
                 // For a sample-backed voice send the VoiceManager's clamped stored
@@ -2421,7 +2436,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 for input_status in ctx
                     .inputs
                     .iter_mut()
-                    .filter(|input| input.voice_id == voice)
+                    .filter(|input| input.voice_id == voice && input.ready)
                 {
                     input_status.volume = target;
                     input_status.unmuted_volume = target;
@@ -2508,6 +2523,16 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         } => {
             // The audio thread resolves the input by index or voice id and clamps.
             tracing::info!("Set input '{}' volume to {:.2}", input, new_volume);
+            let input_ready = find_input_status_mut(ctx.inputs, &input)
+                .map(|status| status.ready)
+                .unwrap_or(false);
+            if !input_ready {
+                tracing::warn!(
+                    "Input '{}' is unavailable; volume command was not queued",
+                    input
+                );
+                return;
+            }
             let volume = new_volume.clamp(0.0, 1.0);
             let queued = ctx.send(rt_engine::AudioCommand::SetInputVolume {
                 input: input.clone(),
@@ -2531,6 +2556,16 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 input,
                 if mute { "muted" } else { "unmuted" }
             );
+            let input_ready = find_input_status_mut(ctx.inputs, &input)
+                .map(|status| status.ready)
+                .unwrap_or(false);
+            if !input_ready {
+                tracing::warn!(
+                    "Input '{}' is unavailable; mute command was not queued",
+                    input
+                );
+                return;
+            }
             let queued = ctx.send(rt_engine::AudioCommand::SetInputMute {
                 input: input.clone(),
                 mute,
@@ -3829,6 +3864,8 @@ mod tests {
             applied_volume: None,
             applied_muted: None,
             applied_unmuted_volume: None,
+            ready: true,
+            last_error: None,
         });
     }
 

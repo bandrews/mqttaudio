@@ -65,6 +65,9 @@ pub struct InputStatus {
     pub applied_volume: Option<Arc<AtomicU32>>,
     pub applied_muted: Option<Arc<AtomicBool>>,
     pub applied_unmuted_volume: Option<Arc<AtomicU32>>,
+    /// Whether the capture stream opened successfully.
+    pub ready: bool,
+    pub last_error: Option<String>,
 }
 
 /// Control-side view of what is playing, exposed to the HTTP status handlers.

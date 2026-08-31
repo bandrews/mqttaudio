@@ -865,7 +865,9 @@ pub async fn handle_inputs(State(state): State<AppState>) -> impl IntoResponse {
                     .unwrap_or(input.muted),
                 "unmuted_volume": input.applied_unmuted_volume.as_ref()
                     .map(|value| f32::from_bits(value.load(Ordering::Relaxed)))
-                    .unwrap_or(input.unmuted_volume)
+                    .unwrap_or(input.unmuted_volume),
+                "ready": input.ready,
+                "last_error": input.last_error
             })
         })
         .collect();

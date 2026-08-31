@@ -1159,6 +1159,8 @@ async fn test_inputs_endpoint_reports_muted_toggle_and_channels() {
             applied_volume: None,
             applied_muted: None,
             applied_unmuted_volume: None,
+            ready: true,
+            last_error: None,
         });
         snapshot.inputs.push(InputStatus {
             index: 1,
@@ -1170,6 +1172,8 @@ async fn test_inputs_endpoint_reports_muted_toggle_and_channels() {
             applied_volume: None,
             applied_muted: None,
             applied_unmuted_volume: None,
+            ready: false,
+            last_error: Some("device missing".to_string()),
         });
     }
 
@@ -1202,12 +1206,15 @@ async fn test_inputs_endpoint_reports_muted_toggle_and_channels() {
         "volume reported, got {live_vol}"
     );
     assert_eq!(live["muted"], false, "non-zero volume is not muted");
+    assert_eq!(live["ready"], true);
 
     let muted = &inputs[1];
     assert_eq!(muted["index"], 1);
     assert_eq!(muted["voice_id"], "mic_muted");
     assert_eq!(muted["channels"], 6, "six-channel input reported as 6");
     assert_eq!(muted["muted"], true, "volume == 0.0 reports muted = true");
+    assert_eq!(muted["ready"], false);
+    assert_eq!(muted["last_error"], "device missing");
 }
 
 #[tokio::test]
@@ -1463,6 +1470,8 @@ async fn test_metrics_reports_active_voice_and_sample_counts() {
             applied_volume: None,
             applied_muted: None,
             applied_unmuted_volume: None,
+            ready: true,
+            last_error: None,
         });
     }
 
