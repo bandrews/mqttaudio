@@ -333,6 +333,8 @@ curl -X POST http://localhost:8080/play \
 The server also exposes observability endpoints (no auth in open mode):
 
 - `GET /version` — build identity (`name`, `version`, and `git_sha` when the build injected `MQTTAUDIO_GIT_SHA`).
+- `GET /ready` — readiness (HTTP 200 only when output and every configured input are ready; `/health` remains
+  the process-liveness probe).
 - `GET /metrics` — operational telemetry: `uptime_seconds`, `clips` (limiter holds), `xruns` (audio
   stream-error/dropout count), active voice/sample/input counts, and a per-voice `ducking` map of resolved
   multipliers. Every value is real, suitable for scraping into a monitor.

@@ -124,7 +124,9 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         );
 
     // Health check (no auth)
-    let health_route = Router::new().route("/health", get(handlers::handle_health));
+    let health_route = Router::new()
+        .route("/health", get(handlers::handle_health))
+        .route("/ready", get(handlers::handle_ready));
 
     // Command routes always carry the auth middleware (enforced when a token is
     // set, or always when require_auth locks the whole API).

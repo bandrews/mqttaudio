@@ -58,6 +58,7 @@ Config file example:
 | `/status/voices` | GET | List of active voices (with per-voice ducking multiplier) |
 | `/status/inputs` | GET | List of configured live inputs |
 | `/status/talkback` | GET | Applied fail-closed talkback lease state |
+| `/ready` | GET | Readiness of output and configured capture inputs |
 | `/status/cache` | GET | Cache statistics |
 
 ### Command Endpoints (Authentication Required if configured)

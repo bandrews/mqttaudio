@@ -114,6 +114,60 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
+async fn test_ready_endpoint_distinguishes_liveness_from_input_readiness() {
+    let (state, _rx) = create_test_state();
+    let app = create_router(state.clone(), false, false);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ready"], true);
+
+    state.status.write().unwrap().inputs.push(InputStatus {
+        index: 0,
+        voice_id: "GM_MIC".to_string(),
+        volume: 0.0,
+        channels: 0,
+        muted: true,
+        unmuted_volume: 0.0,
+        applied_volume: None,
+        applied_muted: None,
+        applied_unmuted_volume: None,
+        ready: false,
+        last_error: Some("device missing".to_string()),
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["ready"], false);
+    assert_eq!(json["failed_inputs"][0]["voice_id"], "GM_MIC");
+}
+
+#[tokio::test]
 async fn test_status_endpoint() {
     let (state, _rx) = create_test_state();
     let app = create_router(state, false, false);

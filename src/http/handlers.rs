@@ -55,6 +55,33 @@ pub async fn handle_health() -> impl IntoResponse {
     }))
 }
 
+/// Readiness is distinct from process liveness: an output stream or a
+/// configured capture input can be unavailable while the HTTP server still
+/// answers `/health`. This endpoint is intentionally small and contains no
+/// secrets or raw audio telemetry.
+pub async fn handle_ready(State(state): State<AppState>) -> impl IntoResponse {
+    let snapshot = state.status.read().unwrap();
+    let output_ready = snapshot.output_channels > 0;
+    let inputs_ready = snapshot.inputs.iter().all(|input| input.ready);
+    let ready = output_ready && inputs_ready;
+    let body = json!({
+        "status": if ready { "ready" } else { "not_ready" },
+        "ready": ready,
+        "checks": { "output": output_ready, "inputs": inputs_ready },
+        "failed_inputs": snapshot.inputs.iter().filter(|input| !input.ready).map(|input| {
+            json!({ "voice_id": input.voice_id, "error": input.last_error })
+        }).collect::<Vec<_>>(),
+    });
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(body),
+    )
+}
+
 // =============================================================================
 // Version & Metrics
 // =============================================================================

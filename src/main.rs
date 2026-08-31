@@ -3621,7 +3621,17 @@ mod tests {
             *start_position_ms = Some(1500);
         }
         fixture.run(cmd).await;
-        fixture.drain();
+        let mut attempts = 0;
+        while attempts < 500 {
+            fixture.drain();
+            if let Some(sample) = fixture.mixer.active_samples.first() {
+                if sample.buffer.is_frame_loaded(sample.position) {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            attempts += 1;
+        }
         let sample = &fixture.mixer.active_samples[0];
         assert_eq!(sample.position, 1500 * 48, "1500ms at 48k");
         assert!(
