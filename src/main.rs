@@ -573,6 +573,8 @@ async fn main() {
                         voice_id: input_config.voice_id.clone(),
                         volume: input_config.volume,
                         channels: active_input.channels,
+                        muted: false,
+                        unmuted_volume: input_config.volume,
                     });
                     input_telemetry.push((
                         input_config.voice_id.clone(),
@@ -864,7 +866,7 @@ async fn main() {
                             playing: &mut playing,
                             snapshot: &status_snapshot,
                             ducking_snapshot: &ducking_snapshot,
-                            inputs: &input_statuses,
+                            inputs: &mut input_statuses,
                             output_channels,
                             output_sample_rate,
                             config: &config,
@@ -951,6 +953,21 @@ fn refresh_snapshot(
     guard.output_channels = output_channels;
     guard.samples = samples;
     guard.inputs = inputs.to_vec();
+}
+
+/// Resolve the same input selector semantics used by the real-time mixer on
+/// the control side so `/status/inputs` reflects the command that was actually
+/// queued. Numeric selectors address the stable configured index; any other
+/// selector addresses the declared voice id. Returning the control-side record
+/// lets callers update the authoritative status without touching the RT state.
+fn find_input_status_mut<'a>(
+    inputs: &'a mut [http::InputStatus],
+    selector: &str,
+) -> Option<&'a mut http::InputStatus> {
+    if let Ok(index) = selector.parse::<usize>() {
+        return inputs.get_mut(index);
+    }
+    inputs.iter_mut().find(|input| input.voice_id == selector)
 }
 
 /// Build the warning for an input whose resolved routes read source channels the
@@ -1347,7 +1364,7 @@ struct CommandCtx<'a> {
     playing: &'a mut std::collections::HashMap<u64, http::SampleStatus>,
     snapshot: &'a std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
     ducking_snapshot: &'a std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
-    inputs: &'a [http::InputStatus],
+    inputs: &'a mut [http::InputStatus],
     output_channels: usize,
     output_sample_rate: u32,
     config: &'a config::Config,
@@ -1364,9 +1381,12 @@ struct CommandCtx<'a> {
 
 impl CommandCtx<'_> {
     /// Push a resolved command to the audio thread, logging if the ring is full.
-    fn send(&mut self, command: rt_engine::AudioCommand) {
+    fn send(&mut self, command: rt_engine::AudioCommand) -> bool {
         if self.cmd_tx.push(command).is_err() {
             tracing::error!("Audio command ring full; command dropped");
+            false
+        } else {
+            true
         }
     }
 
@@ -2459,10 +2479,19 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         } => {
             // The audio thread resolves the input by index or voice id and clamps.
             tracing::info!("Set input '{}' volume to {:.2}", input, new_volume);
-            ctx.send(rt_engine::AudioCommand::SetInputVolume {
-                input,
-                volume: new_volume,
+            let volume = new_volume.clamp(0.0, 1.0);
+            let queued = ctx.send(rt_engine::AudioCommand::SetInputVolume {
+                input: input.clone(),
+                volume,
             });
+            if queued {
+                if let Some(status) = find_input_status_mut(ctx.inputs, &input) {
+                    status.volume = volume;
+                    status.unmuted_volume = volume;
+                    status.muted = false;
+                }
+                ctx.refresh();
+            }
         }
         mqtt::commands::AudioCommand::InputMute { input, mute } => {
             // Mute stores the input's current volume and zeroes it; unmute restores
@@ -2473,7 +2502,25 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 input,
                 if mute { "muted" } else { "unmuted" }
             );
-            ctx.send(rt_engine::AudioCommand::SetInputMute { input, mute });
+            let queued = ctx.send(rt_engine::AudioCommand::SetInputMute {
+                input: input.clone(),
+                mute,
+            });
+            if queued {
+                if let Some(status) = find_input_status_mut(ctx.inputs, &input) {
+                    if mute {
+                        if !status.muted {
+                            status.unmuted_volume = status.volume;
+                        }
+                        status.volume = 0.0;
+                        status.muted = true;
+                    } else {
+                        status.volume = status.unmuted_volume;
+                        status.muted = false;
+                    }
+                }
+                ctx.refresh();
+            }
         }
         mqtt::commands::AudioCommand::Seek {
             selector,
@@ -2808,7 +2855,7 @@ mod tests {
                 playing: &mut self.playing,
                 snapshot: &self.snapshot,
                 ducking_snapshot: &self.ducking_snapshot,
-                inputs: &self.inputs,
+                inputs: &mut self.inputs,
                 output_channels: 2,
                 output_sample_rate: SR,
                 config: &self.config,
@@ -3746,6 +3793,8 @@ mod tests {
             voice_id: voice.to_string(),
             volume,
             channels: 1,
+            muted: false,
+            unmuted_volume: volume,
         });
     }
 
@@ -3817,6 +3866,9 @@ mod tests {
             .await;
         fixture.drain();
         assert!((fixture.mixer.live_inputs[0].volume - 0.7).abs() < 1e-6);
+        assert_eq!(fixture.inputs[0].volume, 0.7);
+        assert_eq!(fixture.inputs[0].unmuted_volume, 0.7);
+        assert!(!fixture.inputs[0].muted);
 
         // Mute: the input drops to silence.
         fixture
@@ -3827,6 +3879,9 @@ mod tests {
             .await;
         fixture.drain();
         assert_eq!(fixture.mixer.live_inputs[0].volume, 0.0);
+        assert_eq!(fixture.inputs[0].volume, 0.0);
+        assert_eq!(fixture.inputs[0].unmuted_volume, 0.7);
+        assert!(fixture.inputs[0].muted);
 
         // Unmute: the calibrated 0.7 is restored, NOT 1.0.
         fixture
@@ -3841,6 +3896,8 @@ mod tests {
             "unmute must restore the calibrated 0.7, got {}",
             fixture.mixer.live_inputs[0].volume
         );
+        assert_eq!(fixture.inputs[0].volume, 0.7);
+        assert!(!fixture.inputs[0].muted);
     }
 
     #[tokio::test]

@@ -282,6 +282,9 @@ When `config.inputs` is configured to mix a microphone or line input (see
   input's level even when no sample is playing on the voice (previously a no-op).
 - **`input_mute` restores the prior level.** Unmuting returns the input to the volume it had when muted (e.g.
   a calibrated `0.7`), not a hardcoded `1.0`. Setting an explicit `input_volume` clears the muted state.
+- **`/status/inputs` reports applied mute state.** The endpoint exposes explicit `muted` and
+  `unmuted_volume` fields that are reconciled when an input command is queued, so consumers do not infer mute
+  from a zero gain alone.
 - **Inputs can trigger ducking.** A mic whose `voice_id` is a ducking rule's `primary_voice` ducks that
   rule's background voices while its stream is open.
 - **Out-of-range routes warn.** A route reading a source channel the device does not have is logged once at

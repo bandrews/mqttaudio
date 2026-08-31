@@ -1154,12 +1154,16 @@ async fn test_inputs_endpoint_reports_muted_toggle_and_channels() {
             voice_id: "mic_live".to_string(),
             volume: 0.8,
             channels: 2,
+            muted: false,
+            unmuted_volume: 0.8,
         });
         snapshot.inputs.push(InputStatus {
             index: 1,
             voice_id: "mic_muted".to_string(),
             volume: 0.0,
             channels: 6,
+            muted: true,
+            unmuted_volume: 0.8,
         });
     }
 
@@ -1448,6 +1452,8 @@ async fn test_metrics_reports_active_voice_and_sample_counts() {
             voice_id: "mic".to_string(),
             volume: 1.0,
             channels: 1,
+            muted: false,
+            unmuted_volume: 1.0,
         });
     }
 

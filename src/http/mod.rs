@@ -54,6 +54,12 @@ pub struct InputStatus {
     pub voice_id: String,
     pub volume: f32,
     pub channels: usize,
+    /// Applied mute state, kept separately from volume so a muted input can
+    /// retain and report its calibrated level for a safe unmute.
+    pub muted: bool,
+    /// The level that will be restored when `muted` is cleared. This is an
+    /// operational value, not a physical calibration claim.
+    pub unmuted_volume: f32,
 }
 
 /// Control-side view of what is playing, exposed to the HTTP status handlers.

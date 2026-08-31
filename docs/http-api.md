@@ -266,7 +266,7 @@ Returns the configured live inputs and their current volume/mute state:
 ```json
 {
   "inputs": [
-    { "index": 0, "voice_id": "gamemaster_mic", "volume": 0.8, "channels": 1, "muted": false }
+    { "index": 0, "voice_id": "gamemaster_mic", "volume": 0.8, "channels": 1, "muted": false, "unmuted_volume": 0.8 }
   ]
 }
 ```
@@ -277,7 +277,8 @@ Returns the configured live inputs and their current volume/mute state:
 | `voice_id` | string | Voice group the input feeds |
 | `volume` | float | Current input volume (0.0-1.0) |
 | `channels` | integer | Input channel count |
-| `muted` | boolean | Derived as `volume == 0.0` |
+| `muted` | boolean | Applied mute state; this is explicit rather than inferred from the current volume |
+| `unmuted_volume` | float | Calibrated level restored when an applied mute is released |
 
 ### `/status/cache` Response
 
