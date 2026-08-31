@@ -1248,6 +1248,10 @@ async fn test_talkback_status_and_command_endpoints() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["talkback"]["applied_live"], true);
+    assert!(
+        json["now_ms"].is_u64(),
+        "talkback status must include its monotonic clock origin"
+    );
 
     let response = app
         .oneshot(

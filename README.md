@@ -308,6 +308,10 @@ mqttaudio runs open by default so it stays easy to use on a trusted LAN. Each of
 - **Encrypt the MQTT connection** — add an `[mqtt.tls]` block (`ca_path` for a private CA, or omit it for public CAs). Plain TCP stays the default on every port, including 8883.
 - **Require an HTTP token** — set `http.require_auth` to require the bearer token on the status/command/WebSocket endpoints (the health endpoint stays open). A warning is logged if the server binds a non-loopback address without auth.
 
+For container deployments, `MQTTAUDIO_HTTP_BIND_ADDRESS`, `MQTTAUDIO_HTTP_AUTH_TOKEN`, and
+`MQTTAUDIO_HTTP_REQUIRE_AUTH=true` provide the equivalent overrides without putting a secret in the checked-in
+audio config. Requiring auth without a token fails startup closed.
+
 See [Configuration](docs/configuration.md) and [HTTP API](docs/http-api.md) for details.
 
 ## HTTP REST API (Optional)
@@ -334,6 +338,8 @@ The server also exposes observability endpoints (no auth in open mode):
   multipliers. Every value is real, suitable for scraping into a monitor.
 - `GET /status` and `/status/voices` also carry the limiter `clip_count`, the `xruns` counter, and (on
   `/status/voices`) each voice's current `ducking_multiplier`.
+- `GET /status/talkback` includes `now_ms` alongside `lease_expires_at_ms`; both values use the daemon's
+  monotonic clock so a gateway can display a remaining-time hint without using wall time for safety.
 
 ## Production Deployment
 

@@ -164,6 +164,28 @@ async fn main() {
         args.max_cache_mb,
     );
 
+    // Container/deployment environments must be able to enable the internal
+    // HTTP gateway without baking a bearer token into the checked-in venue
+    // config. A requested non-loopback bind always requires auth; an absent
+    // token leaves startup validation failed closed rather than exposing an
+    // unauthenticated daemon on the Compose network.
+    if let Ok(bind_address) = std::env::var("MQTTAUDIO_HTTP_BIND_ADDRESS") {
+        if !bind_address.trim().is_empty() {
+            config.http.bind_address = bind_address;
+        }
+    }
+    if let Ok(auth_token) = std::env::var("MQTTAUDIO_HTTP_AUTH_TOKEN") {
+        if !auth_token.is_empty() {
+            config.http.auth_token = Some(auth_token);
+        }
+    }
+    if std::env::var("MQTTAUDIO_HTTP_REQUIRE_AUTH")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        config.http.require_auth = true;
+        config.http.enabled = true;
+    }
+
     // Initialize logging based on config
     let log_level = match config.logging.level.as_str() {
         "error" => tracing::Level::ERROR,

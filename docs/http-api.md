@@ -294,6 +294,7 @@ the process restarts:
 
 ```json
 {
+  "now_ms": 1234,
   "talkback": {
     "state": "muted",
     "applied_live": false,
@@ -308,6 +309,10 @@ the process restarts:
   }
 }
 ```
+
+`lease_expires_at_ms` and `now_ms` are monotonic daemon-clock values. A
+gateway may derive a display-only remaining duration from their difference;
+expiry enforcement never uses wall-clock conversion.
 
 ### `/status/cache` Response
 

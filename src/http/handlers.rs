@@ -945,7 +945,11 @@ pub async fn handle_inputs(State(state): State<AppState>) -> impl IntoResponse {
 
 pub async fn handle_talkback_status(State(state): State<AppState>) -> impl IntoResponse {
     let status = state.talkback.read().unwrap().clone();
-    Json(json!({ "talkback": status }))
+    // The lease deadline is on the daemon's monotonic clock. Include the
+    // matching current value so a server-side gateway can derive a short-lived
+    // wall-clock hint without ever using wall time for expiry/safety decisions.
+    let now_ms = state.start_time.elapsed().as_millis() as u64;
+    Json(json!({ "talkback": status, "now_ms": now_ms }))
 }
 
 // =============================================================================
