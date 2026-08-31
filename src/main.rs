@@ -560,12 +560,29 @@ async fn main() {
                     }
 
                     // Create LiveInput for the mixer
-                    let live_input = audio::mixer::LiveInput::new(
+                    let mut live_input = audio::mixer::LiveInput::new(
                         input_config.voice_id.clone(),
                         consumer,
                         active_input.channels,
                         input_config.volume,
                         channel_map,
+                    );
+
+                    // The audio callback publishes applied input state through
+                    // preallocated atomics. HTTP status reads these values without
+                    // locking or mirroring a requested command as applied.
+                    let applied_volume = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                        input_config.volume.to_bits(),
+                    ));
+                    let applied_muted =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let applied_unmuted_volume = std::sync::Arc::new(
+                        std::sync::atomic::AtomicU32::new(input_config.volume.to_bits()),
+                    );
+                    live_input.set_status_observers(
+                        applied_volume.clone(),
+                        applied_muted.clone(),
+                        applied_unmuted_volume.clone(),
                     );
 
                     input_statuses.push(http::InputStatus {
@@ -575,6 +592,9 @@ async fn main() {
                         channels: active_input.channels,
                         muted: false,
                         unmuted_volume: input_config.volume,
+                        applied_volume: Some(applied_volume),
+                        applied_muted: Some(applied_muted),
+                        applied_unmuted_volume: Some(applied_unmuted_volume),
                     });
                     input_telemetry.push((
                         input_config.voice_id.clone(),
@@ -2398,6 +2418,15 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                         status.voice_volume = target;
                     }
                 }
+                for input_status in ctx
+                    .inputs
+                    .iter_mut()
+                    .filter(|input| input.voice_id == voice)
+                {
+                    input_status.volume = target;
+                    input_status.unmuted_volume = target;
+                    input_status.muted = false;
+                }
                 ctx.refresh();
                 tracing::info!("Set voice '{}' volume to {:.2}", voice, target);
             } else {
@@ -3751,6 +3780,8 @@ mod tests {
         );
         // The ramp is gradual, so the current value has not jumped to the target.
         assert!((input.voice_volume - 1.0).abs() < 1e-6);
+        assert_eq!(fixture.inputs[0].volume, 0.4);
+        assert!(!fixture.inputs[0].muted);
     }
 
     #[tokio::test]
@@ -3795,6 +3826,9 @@ mod tests {
             channels: 1,
             muted: false,
             unmuted_volume: volume,
+            applied_volume: None,
+            applied_muted: None,
+            applied_unmuted_volume: None,
         });
     }
 

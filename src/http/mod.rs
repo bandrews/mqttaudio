@@ -60,6 +60,11 @@ pub struct InputStatus {
     /// The level that will be restored when `muted` is cleared. This is an
     /// operational value, not a physical calibration claim.
     pub unmuted_volume: f32,
+    /// Audio-thread applied values. Optional for test fixtures and inputs that
+    /// failed before a stream could be opened.
+    pub applied_volume: Option<Arc<AtomicU32>>,
+    pub applied_muted: Option<Arc<AtomicBool>>,
+    pub applied_unmuted_volume: Option<Arc<AtomicU32>>,
 }
 
 /// Control-side view of what is playing, exposed to the HTTP status handlers.

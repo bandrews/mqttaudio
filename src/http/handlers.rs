@@ -846,6 +846,7 @@ pub async fn handle_cache_status(State(state): State<AppState>) -> impl IntoResp
 }
 
 pub async fn handle_inputs(State(state): State<AppState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
     let snapshot = state.status.read().unwrap();
 
     let inputs: Vec<Value> = snapshot
@@ -855,10 +856,16 @@ pub async fn handle_inputs(State(state): State<AppState>) -> impl IntoResponse {
             json!({
                 "index": input.index,
                 "voice_id": input.voice_id,
-                "volume": input.volume,
+                "volume": input.applied_volume.as_ref()
+                    .map(|value| f32::from_bits(value.load(Ordering::Relaxed)))
+                    .unwrap_or(input.volume),
                 "channels": input.channels,
-                "muted": input.muted,
-                "unmuted_volume": input.unmuted_volume
+                "muted": input.applied_muted.as_ref()
+                    .map(|value| value.load(Ordering::Relaxed))
+                    .unwrap_or(input.muted),
+                "unmuted_volume": input.applied_unmuted_volume.as_ref()
+                    .map(|value| f32::from_bits(value.load(Ordering::Relaxed)))
+                    .unwrap_or(input.unmuted_volume)
             })
         })
         .collect();

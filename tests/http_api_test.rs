@@ -1156,6 +1156,9 @@ async fn test_inputs_endpoint_reports_muted_toggle_and_channels() {
             channels: 2,
             muted: false,
             unmuted_volume: 0.8,
+            applied_volume: None,
+            applied_muted: None,
+            applied_unmuted_volume: None,
         });
         snapshot.inputs.push(InputStatus {
             index: 1,
@@ -1164,6 +1167,9 @@ async fn test_inputs_endpoint_reports_muted_toggle_and_channels() {
             channels: 6,
             muted: true,
             unmuted_volume: 0.8,
+            applied_volume: None,
+            applied_muted: None,
+            applied_unmuted_volume: None,
         });
     }
 
@@ -1454,6 +1460,9 @@ async fn test_metrics_reports_active_voice_and_sample_counts() {
             channels: 1,
             muted: false,
             unmuted_volume: 1.0,
+            applied_volume: None,
+            applied_muted: None,
+            applied_unmuted_volume: None,
         });
     }
 
