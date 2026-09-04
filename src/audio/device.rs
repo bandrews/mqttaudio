@@ -229,10 +229,45 @@ impl Default for DeviceList {
     }
 }
 
+/// Select the config identifier from CPAL metadata for the active backend.
+pub fn output_device_identifier(description: &cpal::DeviceDescription, alsa: bool) -> &str {
+    if alsa {
+        // CPAL stores the ALSA PCM ID in driver; name is the card's description.
+        description.driver().unwrap_or_else(|| description.name())
+    } else {
+        description.name()
+    }
+}
+
 /// Display formatted device list
 pub fn format_device_list(list: &DeviceList) -> String {
     let mut output = String::new();
     output.push_str("Available audio output devices:\n");
+
+    output.push_str(
+        "Copy the Device ID exactly into --device or audio.device in your JSON config.\n",
+    );
+    output.push_str("Description is for identification only; it is not the device value.\n");
+    output.push_str("CLI lines are options to add to your usual mqttaudio command.\n");
+    output.push_str("Config lines belong inside the existing \"audio\" object.\n");
+    if list
+        .devices
+        .iter()
+        .any(|d| d.name.starts_with("plughw:") || d.name.starts_with("hw:"))
+    {
+        output.push_str(
+            "\nLinux/ALSA: start with the plughw: entry for your sound card under Suggested Devices.\n",
+        );
+        output.push_str(
+            "plughw: converts formats when needed; hw: requires a supported hardware format.\n",
+        );
+        output.push_str(
+            "If hw: fails with an unsupported format or Invalid argument, try the matching plughw: entry.\n",
+        );
+        output.push_str(
+            "Several entries can refer to the same card. Native capabilities are informational, not config values.\n",
+        );
+    }
 
     // Display order for categories
     let display_order = [
@@ -256,10 +291,25 @@ pub fn format_device_list(list: &DeviceList) -> String {
         output.push_str(&format!("\n=== {} ===\n", category));
 
         for device in devices {
-            output.push_str(&format!("  {}\n", device.name));
+            output.push_str(&format!("  Device ID: {}\n", device.name));
 
             if let Some(ref desc) = device.description {
-                output.push_str(&format!("    {}\n", desc));
+                output.push_str(&format!("    Description: {}\n", desc));
+            }
+
+            if device.category != DeviceCategory::Unavailable {
+                let json_name =
+                    serde_json::to_string(&device.name).expect("device name is a string");
+                // Quote shell metacharacters without changing the device identifier.
+                #[cfg(not(target_os = "windows"))]
+                let cli_name = format!("'{}'", device.name.replace('\'', "'\"'\"'"));
+                #[cfg(target_os = "windows")]
+                let cli_name = json_name.clone();
+                output.push_str(&format!("    CLI: --device {}\n", cli_name));
+                output.push_str(&format!(
+                    "    Config (audio.device): \"device\": {}\n",
+                    json_name
+                ));
             }
 
             if let Some(ref reason) = device.suggestion_reason {
@@ -307,6 +357,76 @@ pub fn format_device_list(list: &DeviceList) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alsa_selection_uses_pcm_id_instead_of_friendly_description() {
+        let description = cpal::DeviceDescriptionBuilder::new("GIGAPort HD+, USB Audio")
+            .driver("plughw:CARD=HD,DEV=0")
+            .build();
+        assert_eq!(
+            output_device_identifier(&description, true),
+            "plughw:CARD=HD,DEV=0"
+        );
+        assert_eq!(
+            output_device_identifier(&description, false),
+            "GIGAPort HD+, USB Audio"
+        );
+        let default = cpal::DeviceDescriptionBuilder::new("default").build();
+        assert_eq!(output_device_identifier(&default, true), "default");
+    }
+
+    #[test]
+    fn device_listing_identifies_alsa_selection_values() {
+        let mut list = DeviceList::new();
+        list.devices.push(
+            DeviceInfo::new("plughw:CARD=HD,DEV=0".into(), DeviceCategory::Suggested)
+                .with_description("GIGAPort HD+, USB Audio"),
+        );
+        list.devices.push(
+            DeviceInfo::new("jack".into(), DeviceCategory::System)
+                .with_unavailable_reason("JACK server not running"),
+        );
+        let output = format_device_list(&list);
+        assert!(output.contains("Device ID: plughw:CARD=HD,DEV=0"));
+        assert!(output.contains("Description: GIGAPort HD+, USB Audio"));
+        assert!(output.contains("start with the plughw:"));
+        assert!(output.contains("Config (audio.device): \"device\": \"plughw:CARD=HD,DEV=0\""));
+        let unavailable = output.split("=== Unavailable ===").nth(1).unwrap();
+        assert!(unavailable.contains("JACK server not running"));
+        assert!(!unavailable.contains("CLI:"));
+        assert!(!unavailable.contains("Config (audio.device):"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn device_listing_examples_preserve_device_names() {
+        for name in [
+            "plughw:CARD=HD,DEV=0",
+            "Bob's \"USB\" $Audio; `false` \\ device",
+        ] {
+            let mut list = DeviceList::new();
+            list.devices
+                .push(DeviceInfo::new(name.into(), DeviceCategory::Hardware));
+            let output = format_device_list(&list);
+            let cli = output
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("CLI: "))
+                .unwrap();
+            let result = std::process::Command::new("sh")
+                .args(["-c", &format!("set -- {}; printf '%s' \"$2\"", cli)])
+                .output()
+                .unwrap();
+            assert!(result.status.success());
+            assert_eq!(String::from_utf8(result.stdout).unwrap(), name);
+            let config = output
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("Config (audio.device): "))
+                .unwrap();
+            let value: serde_json::Value =
+                serde_json::from_str(&format!("{{{}}}", config)).unwrap();
+            assert_eq!(value["device"], name);
+        }
+    }
 
     #[test]
     fn test_device_info_creation() {

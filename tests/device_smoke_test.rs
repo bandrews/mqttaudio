@@ -124,7 +124,10 @@ fn output_device_detection_round_trips_by_name() {
         .expect("a default output device");
     let name = default
         .description()
-        .map(|d| d.name().to_string())
+        .map(|d| {
+            mqttaudio::audio::device::output_device_identifier(&d, cfg!(target_os = "linux"))
+                .to_string()
+        })
         .expect("the default output device reports a name");
     assert!(
         !name.is_empty(),
@@ -135,7 +138,10 @@ fn output_device_detection_round_trips_by_name() {
         find_output_device(Some(&name)).expect("the enumerated name must round-trip to a device");
     let reselected_name = reselected
         .description()
-        .map(|d| d.name().to_string())
+        .map(|d| {
+            mqttaudio::audio::device::output_device_identifier(&d, cfg!(target_os = "linux"))
+                .to_string()
+        })
         .expect("the re-selected output device reports a name");
     assert_eq!(
         reselected_name, name,

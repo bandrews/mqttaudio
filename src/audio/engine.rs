@@ -1,6 +1,7 @@
 // ABOUTME: Audio engine coordinator managing playback, caching, and state.
 // ABOUTME: Handles sample loading, voice management, and mixer state updates.
 
+use crate::audio::device::output_device_identifier;
 use crate::audio::types::DeviceConfig;
 use crate::rt_engine::AudioCallbackState;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -34,7 +35,10 @@ pub fn output_device_list() -> super::device::DeviceList {
     match host.output_devices() {
         Ok(devices) => {
             for device in devices {
-                if let Ok(name) = device.description().map(|d| d.name().to_string()) {
+                if let Ok(name) = device
+                    .description()
+                    .map(|d| output_device_identifier(&d, cfg!(target_os = "linux")).to_string())
+                {
                     let mut info = DeviceInfo::new(name.clone(), DeviceCategory::Hardware);
 
                     // Query supported configs
@@ -102,8 +106,7 @@ pub fn get_default_device_config() -> Result<DeviceConfig, Box<dyn std::error::E
 }
 
 /// Find an output device by name (returns default if name is None)
-/// On ALSA, devices may be openable even if not enumerated, so we try
-/// both enumeration and direct construction.
+/// Linux matches ALSA PCM IDs; other platforms match human-readable names.
 pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
 
@@ -112,7 +115,9 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
             // First try to find in enumerated devices
             if let Ok(devices) = host.output_devices() {
                 for device in devices {
-                    if let Ok(n) = device.description().map(|d| d.name().to_string()) {
+                    if let Ok(n) = device.description().map(|d| {
+                        output_device_identifier(&d, cfg!(target_os = "linux")).to_string()
+                    }) {
                         if n == device_name {
                             return Ok(device);
                         }
@@ -127,7 +132,9 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
             {
                 if let Ok(devices) = host.output_devices() {
                     for device in devices {
-                        if let Ok(n) = device.description().map(|d| d.name().to_string()) {
+                        if let Ok(n) = device.description().map(|d| {
+                            output_device_identifier(&d, cfg!(target_os = "linux")).to_string()
+                        }) {
                             // Try matching ALSA device names by card number
                             // Supports hw:, plughw:, sysdefault:
                             if let Some(matched) = try_match_alsa_device(device_name, &n) {
@@ -145,7 +152,16 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
                 }
             }
 
-            Err(format!("Output device not found: {}", device_name).into())
+            let mut message = format!(
+                "Output device not found: {}. Run mqttaudio --list-devices and copy a Device ID exactly into --device or audio.device.",
+                device_name
+            );
+            if cfg!(target_os = "linux") {
+                message.push_str(
+                    " On Linux, use the ALSA ID (for example plughw:CARD=HD,DEV=0), not the human-readable description.",
+                );
+            }
+            Err(message.into())
         }
         None => host
             .default_output_device()
@@ -339,7 +355,7 @@ pub fn find_output_config(
     let discrete = crate::audio::alsa_probe::discrete_rates_for(
         &device
             .description()
-            .map(|d| d.name().to_string())
+            .map(|d| output_device_identifier(&d, true).to_string())
             .unwrap_or_default(),
     );
     #[cfg(not(target_os = "linux"))]

@@ -40,7 +40,7 @@
     },
 
     "_notes": [
-      "device: Audio output device name. null = system default. Use --list-devices to see options",
+      "device: Exact Device ID from --list-devices. null = system default. On Linux copy the ALSA ID (e.g. plughw:CARD=HD,DEV=0), not the Description",
       "sample_rate: Output sample rate in Hz. Common values: 44100, 48000, 96000",
       "buffer_size: Audio buffer size in frames. Smaller = lower latency but higher CPU",
       "  Common values: 256 (low latency), 512 (balanced), 1024 (high compatibility)",
@@ -112,7 +112,7 @@
         "topic": "exhibits/gallery/audio"
       },
       "audio": {
-        "device": "USB Audio Interface",
+        "device": null,
         "sample_rate": 48000,
         "buffer_size": 512,
         "channel_aliases": {

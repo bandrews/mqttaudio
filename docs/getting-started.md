@@ -223,7 +223,7 @@ and can play test tones through each speaker. Alternatively, write the file by h
     "topic": "audio/commands"
   },
   "audio": {
-    "device": "USB Audio Interface",
+    "device": null,
     "sample_rate": 48000
   },
   "security": {
@@ -246,21 +246,84 @@ List available devices:
 ./mqttaudio --list-devices
 ```
 
-Example output:
-```
-Available audio output devices:
-  0. Built-in Output
-     Sample rate: 48000 Hz
-     Channels: 2
-  1. USB Audio Interface
-     Sample rate: 48000 Hz
-     Channels: 8
+Copy the **Device ID** exactly. Each usable entry includes a `CLI` option and a
+`Config (audio.device)` line. Add the CLI option to your usual command, or copy the
+config line into the existing `"audio"` object. `--device` overrides `audio.device`
+in the config file. To use the system default, omit `--device` and set
+`audio.device` to `null` (or omit it).
+
+### Linux (ALSA)
+
+Find your sound card by its **Description**, then start with its `plughw:` entry
+under **Suggested Devices**. An excerpt for a GIGAPort HD+ looks like this:
+
+```text
+=== Suggested Devices ===
+  Device ID: plughw:CARD=HD,DEV=0
+    Description: GIGAPort HD+, USB Audio
+    CLI: --device 'plughw:CARD=HD,DEV=0'
+    Config (audio.device): "device": "plughw:CARD=HD,DEV=0"
+    Why: Hardware device with automatic format conversion
+    Native: 8 ch, 44100 Hz, S16LE
 ```
 
-Use the device name in your config or command line:
+Here, the device value is `plughw:CARD=HD,DEV=0`. The description
+`GIGAPort HD+, USB Audio` helps you identify the card, but cannot be used as its
+device value. `CARD=HD` identifies the ALSA card and `DEV=0` selects a PCM device on
+that card. Copy the whole ID, including the prefix, colon, equals signs, and comma.
+
+For this example card, start mqttaudio with:
+
+```bash
+./mqttaudio --server localhost --topic audio/commands --device 'plughw:CARD=HD,DEV=0' --channels 8 --sample-rate 44100
+```
+
+Or merge these settings into your config:
+
+```json
+{
+  "audio": {
+    "device": "plughw:CARD=HD,DEV=0",
+    "channels": 8,
+    "sample_rate": 44100
+  }
+}
+```
+
+Use the ID and capabilities reported for **your** hardware; `HD`, eight channels,
+and 44100 Hz are specific to this example. `Native` describes probed capabilities;
+it is not text to paste into the config, and it does not guarantee every combination
+of channels, rate, and format will open. Missing capabilities do not necessarily mean
+the device is absent or unusable.
+
+ALSA can list several ways to access the same physical card:
+
+| Prefix | What it means | When to use it |
+|--------|---------------|----------------|
+| `plughw:` | Hardware access with automatic sample format, rate, and channel conversion as needed | Start here for a specific card |
+| `hw:` | Direct hardware access, without automatic conversion | Use when the selected stream format is supported by the hardware |
+| `default:` / `sysdefault:` | A configured default for a sound card | An alternative whose behavior depends on the ALSA configuration |
+| `dmix:` | Software mixing for sharing a device | When the configured mixer suits your output needs |
+
+If `hw:CARD=HD,DEV=0` fails with a format error such as
+`snd_pcm_hw_params_set_format` / `Invalid argument`, try
+`plughw:CARD=HD,DEV=0`. A format error means the stream could not be configured;
+it is different from **Output device not found**. `plughw:` does not imply a fixed
+latency penalty; conversion work depends on the requested and supported formats.
+See the [ALSA PCM plugin reference](https://www.alsa-project.org/alsa-doc/alsa-lib/pcm_plugins.html)
+for details.
+
+### macOS and Windows
+
+Device IDs are generally human-readable names. Copy the exact **Device ID** shown
+on your machine, for example:
+
 ```bash
 ./mqttaudio --device "USB Audio Interface" --topic audio/commands
 ```
+
+The equivalent setting inside your config's `"audio"` object is
+`"device": "USB Audio Interface"`.
 
 ## Next Steps
 

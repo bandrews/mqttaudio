@@ -14,7 +14,7 @@ OPTIONS:
   -t, --topic <TOPIC>          MQTT topic to subscribe to
   --mqtt-username <USER>       MQTT broker username for authentication
   --mqtt-password <PASS>       MQTT broker password for authentication
-  -d, --device <NAME>          Audio output device name
+  -d, --device <DEVICE>        Device ID from --list-devices (ALSA ID on Linux)
   -r, --sample-rate <RATE>     Output sample rate (config default: 48000)
   -n, --channels <COUNT>       Number of output channels (config default: auto-detect)
   --lfe-channel <INDEX>        LFE (subwoofer) channel index for bass management
@@ -24,7 +24,7 @@ OPTIONS:
   --max-cache-mb <MB>          Override the memory cache cap in MiB (0 = auto-detect a bounded cap)
   -v, --verbose                Enable verbose logging (debug level)
   --configure                  Launch the interactive configuration editor and exit
-  --list-devices               List available audio output devices and exit
+  --list-devices               List output Device IDs with CLI and JSON examples
   --list-inputs                List available audio input devices and exit
   --help                       Print help information
   --version                    Print version information
@@ -84,7 +84,7 @@ Specify with `--config`, or mqttaudio searches these locations:
     "topic": "audio/commands"
   },
   "audio": {
-    "device": "USB Audio Interface",
+    "device": null,
     "sample_rate": 48000,
     "buffer_size": 512,
     "channels": 8,
@@ -213,11 +213,17 @@ If you send a `username`/`password` to a non-loopback broker **without** TLS, mq
 
 ### audio
 
-Audio output settings.
+Audio output settings. `device: null` uses the system default. For a specific
+output, run `./mqttaudio --list-devices` and copy its **Device ID** into
+`audio.device`, or use the printed `--device` option (which overrides the config).
+On Linux, this is an ALSA ID such as `"plughw:CARD=HD,DEV=0"`, **not** the
+description `"GIGAPort HD+, USB Audio"`. macOS and Windows generally use
+human-readable device names. See [Finding Your Audio Device](getting-started.md#finding-your-audio-device)
+for platform examples and ALSA prefix guidance.
 
 ```json
 "audio": {
-  "device": "USB Audio Interface",
+  "device": null,
   "sample_rate": 48000,
   "buffer_size": 512,
   "channels": 8,
@@ -232,7 +238,7 @@ Audio output settings.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `device` | string | system default | Audio device name (use `--list-devices` to see options) |
+| `device` | string or null | system default | Exact Device ID from `--list-devices`; Linux uses an ALSA ID. `null` selects the system default. |
 | `sample_rate` | integer | `48000` | Output sample rate in Hz |
 | `buffer_size` | integer | `512` | Buffer size in frames (lower = less latency, more CPU) |
 | `channels` | integer | auto-detect | Number of output channels |
@@ -651,7 +657,7 @@ When audio files have a different sample rate than the output device (e.g., a 44
     "topic": "escaperoom/audio"
   },
   "audio": {
-    "device": "USB Audio Interface"
+    "device": null
   },
   "inputs": [
     {
