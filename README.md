@@ -76,9 +76,17 @@ device testing — you can play a test tone through each speaker before committi
 # List available audio devices
 ./mqttaudio --list-devices
 
-# Use a specific device
-./mqttaudio --server localhost --topic audio/commands --device "USB Audio"
+# Linux: copy the ALSA Device ID shown by --list-devices for your card
+./mqttaudio --server localhost --topic audio/commands --device 'plughw:CARD=HD,DEV=0'
+
+# macOS/Windows: copy the Device ID shown by --list-devices
+./mqttaudio --server localhost --topic audio/commands --device "USB Audio Interface"
 ```
+
+On Linux, `GIGAPort HD+, USB Audio` is a description; the value for `--device` or
+`audio.device` is an ALSA ID such as `plughw:CARD=HD,DEV=0`. Copy the ID for **your**
+card from the listing. See [Finding Your Audio Device](docs/getting-started.md#finding-your-audio-device)
+for CLI/config examples and help choosing between `plughw:` and `hw:`.
 
 ### 4. Play Your First Sound
 
@@ -186,7 +194,7 @@ Alternatively, create a config file by hand:
     "topic": "audio/commands"
   },
   "audio": {
-    "device": "USB Audio Interface",
+    "device": null,
     "sample_rate": 48000
   },
   "security": {

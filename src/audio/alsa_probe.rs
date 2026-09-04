@@ -26,6 +26,7 @@ fn classify_device_name(name: &str) -> DeviceCategory {
         DeviceCategory::ChannelLayout
     } else if name.starts_with("sysdefault:")
         || name == "default"
+        || name.starts_with("default:")
         || name == "pulse"
         || name == "jack"
         || name == "oss"
@@ -65,8 +66,12 @@ fn should_suggest_device(name: &str, category: &DeviceCategory) -> bool {
             // But filter out common plugin names
             !is_plugin_device(name)
         }
-        // sysdefault for specific cards is often good
-        DeviceCategory::System if name.starts_with("sysdefault:CARD=") => true,
+        // Defaults for specific cards are often good
+        DeviceCategory::System
+            if name.starts_with("sysdefault:CARD=") || name.starts_with("default:CARD=") =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -360,7 +365,7 @@ pub fn probe_alsa_devices() -> DeviceList {
                 if name.starts_with("plughw:") {
                     suggested.suggestion_reason =
                         Some("Hardware device with automatic format conversion".to_string());
-                } else if name.starts_with("sysdefault:") {
+                } else if name.starts_with("sysdefault:") || name.starts_with("default:") {
                     suggested.suggestion_reason =
                         Some("System default for this sound card".to_string());
                 } else {
@@ -397,6 +402,10 @@ mod tests {
             DeviceCategory::SoftwareMixer
         );
         assert_eq!(classify_device_name("default"), DeviceCategory::System);
+        assert_eq!(
+            classify_device_name("default:CARD=HD"),
+            DeviceCategory::System
+        );
         assert_eq!(classify_device_name("pulse"), DeviceCategory::System);
         assert_eq!(
             classify_device_name("surround71:CARD=PCH,DEV=0"),
@@ -421,6 +430,10 @@ mod tests {
         assert!(should_suggest_device("room", &DeviceCategory::Virtual));
         assert!(!should_suggest_device("lavrate", &DeviceCategory::Virtual));
         assert!(!should_suggest_device("default", &DeviceCategory::System));
+        assert!(should_suggest_device(
+            "default:CARD=HD",
+            &DeviceCategory::System
+        ));
         assert!(should_suggest_device(
             "sysdefault:CARD=UMC1820",
             &DeviceCategory::System

@@ -35,7 +35,7 @@ struct Args {
     #[arg(short, long)]
     topic: Option<String>,
 
-    /// Audio output device name
+    /// Output Device ID from --list-devices (ALSA ID on Linux, not the description)
     #[arg(short, long)]
     device: Option<String>,
 
@@ -55,7 +55,7 @@ struct Args {
     #[arg(long)]
     configure: bool,
 
-    /// List available audio output devices and exit
+    /// List audio output Device IDs with CLI and JSON config examples, then exit
     #[arg(long)]
     list_devices: bool,
 

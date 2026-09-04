@@ -11,10 +11,29 @@ List available devices:
 ./mqttaudio --list-devices
 ```
 
-Specify the correct device:
+Copy the exact **Device ID** from the listing into `--device` or `audio.device`.
+The output includes both CLI options and JSON config lines.
+
+On Linux, locate your card by its **Description**, then use its `plughw:` ID.
+For example, a card described as `GIGAPort HD+, USB Audio` may need:
 ```bash
-./mqttaudio --device "Your Device Name" --topic audio/commands
+./mqttaudio --device 'plughw:CARD=HD,DEV=0' --topic audio/commands
 ```
+
+The corresponding JSON setting inside `"audio"` is
+`"device": "plughw:CARD=HD,DEV=0"`. Replace the ID with the one from your listing.
+On macOS/Windows, copy the displayed Device ID, which is usually a friendly name.
+
+- **Output device not found:** check that you copied the Device ID, including its
+  prefix, rather than the description. Check for a `--device` flag overriding your config.
+- **Format error / Invalid argument when opening `hw:`:** try the matching `plughw:`
+  entry, and choose a channel count and sample rate supported by the hardware.
+  This is a stream configuration failure, not a missing device.
+- **Permission denied / device busy:** check access to the audio device for the
+  account running mqttaudio and whether another process is using the device.
+
+See [Finding Your Audio Device](getting-started.md#finding-your-audio-device)
+for a complete example and an explanation of the ALSA prefixes.
 
 ### Check Volume
 
