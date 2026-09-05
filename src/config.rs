@@ -7,6 +7,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Highest gain any volume control accepts.
+///
+/// Unity is 1.0; 4.0 is +12 dB, enough to lift a quiet microphone or an
+/// underpowered subwoofer without letting a mistyped value destroy a speaker.
+/// The mixer saturates its output regardless, so boosted material clips rather
+/// than wrapping.
+pub const MAX_GAIN: f32 = 4.0;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MqttConfig {
@@ -85,6 +93,8 @@ pub struct AudioConfig {
     /// Maps alias names to channel numbers (e.g., "front_left" -> 0)
     #[serde(default)]
     pub channel_aliases: HashMap<String, usize>,
+    /// Optional display labels, also accepted in channel volume settings.
+    pub channel_names: HashMap<String, String>,
     /// Limiter ceiling in dBFS. The summed output bus is soft-limited so its peak
     /// stays at or below this level (default -1.0 dBFS). Must be <= 0 dBFS.
     #[serde(default = "default_output_ceiling_db")]
@@ -117,10 +127,14 @@ impl ChannelRef {
     pub fn resolve(&self, aliases: &HashMap<String, usize>) -> Result<usize, String> {
         match self {
             ChannelRef::Index(idx) => Ok(*idx),
-            ChannelRef::Alias(name) => aliases
-                .get(name)
-                .copied()
-                .ok_or_else(|| format!("Unknown channel alias: '{}'", name)),
+            ChannelRef::Alias(name) => {
+                aliases.get(name)
+                    .copied()
+                    .ok_or_else(|| format!(
+                        "Unknown channel '{}': define it in audio.channel_aliases as \"{}\": <channel number>",
+                        name, name
+                    ))
+            }
         }
     }
 }
@@ -197,6 +211,7 @@ impl Default for AudioConfig {
             buffer_size: 512,
             channel_volumes: HashMap::new(),
             channel_aliases: HashMap::new(),
+            channel_names: HashMap::new(),
             output_ceiling_db: DEFAULT_OUTPUT_CEILING_DB,
             master_gain: DEFAULT_MASTER_GAIN,
         }
@@ -383,6 +398,17 @@ pub struct InputConfig {
     pub routes: Vec<InputRouteConfig>,
     /// Buffer latency in milliseconds
     pub latency_ms: u32,
+    /// Capture channel count to open (None = smallest count the routes need)
+    pub channels: Option<usize>,
+    /// Capture sample rate to request (None = match the output sample rate)
+    pub sample_rate: Option<u32>,
+    /// Peak capture level (0.0-1.0) above which this input counts as
+    /// actively speaking for ducking rules with its voice_id as
+    /// primary_voice. None disables activity detection.
+    pub activity_threshold: Option<f32>,
+    /// How long activity persists after the level drops below the threshold,
+    /// so ducking does not flutter between words
+    pub activity_hold_ms: u32,
 }
 
 impl Default for InputConfig {
@@ -393,6 +419,10 @@ impl Default for InputConfig {
             voice_id: "mic".to_string(),
             routes: Vec::new(),
             latency_ms: 20,
+            channels: None,
+            sample_rate: None,
+            activity_threshold: None,
+            activity_hold_ms: 750,
         }
     }
 }
@@ -768,6 +798,48 @@ impl Config {
         })
     }
 
+    /// Check whether a file path may be played or precached.
+    ///
+    /// HTTP/HTTPS URLs are always allowed. When `security.allowed_directories`
+    /// is non-empty, a local path must resolve (symlinks followed) inside one
+    /// of the allowed directories, which also rejects `../` traversal. An
+    /// empty list leaves local playback unrestricted.
+    pub fn is_local_path_allowed(&self, path: &str) -> Result<(), String> {
+        if path.starts_with("http://") || path.starts_with("https://") {
+            return Ok(());
+        }
+        if self.security.allowed_directories.is_empty() {
+            return Ok(());
+        }
+
+        let expanded = Self::expand_tilde(path);
+        let canonical = fs::canonicalize(&expanded)
+            .map_err(|e| format!("Cannot resolve path '{}': {}", path, e))?;
+
+        for dir in &self.security.allowed_directories {
+            let dir_expanded = Self::expand_tilde(dir);
+            match fs::canonicalize(&dir_expanded) {
+                Ok(allowed) => {
+                    if canonical.starts_with(&allowed) {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "security.allowed_directories entry '{}' cannot be resolved: {}",
+                        dir,
+                        e
+                    );
+                }
+            }
+        }
+
+        Err(format!(
+            "'{}' is outside security.allowed_directories; add its directory there to permit it",
+            path
+        ))
+    }
+
     /// Merge CLI arguments into this config (CLI args override config file)
     #[allow(clippy::too_many_arguments)]
     pub fn merge_cli_args(
@@ -779,8 +851,6 @@ impl Config {
         sample_rate: Option<u32>,
         channels: Option<usize>,
         verbose: bool,
-        lfe_channel: Option<usize>,
-        crossover_frequency: Option<f32>,
         log_topic: Option<String>,
         mqtt_username: Option<String>,
         mqtt_password: Option<String>,
@@ -824,14 +894,6 @@ impl Config {
             self.logging.mqtt_topic = Some(lt);
         }
 
-        // Override bass management settings
-        if let Some(ch) = lfe_channel {
-            self.bass_management.lfe_channel = ChannelRef::Index(ch);
-        }
-        if let Some(freq) = crossover_frequency {
-            self.bass_management.crossover_frequency_hz = freq;
-        }
-
         // Override HTTP settings
         if let Some(hp) = http_port {
             self.http.enabled = true;
@@ -845,8 +907,31 @@ impl Config {
     }
 
     /// Resolve a channel reference to a numeric index using this config's aliases
+    ///
+    /// `audio.channel_names` labels channels for display and `audio.channel_aliases`
+    /// is what routing resolves against. Naming a channel in the first and using it
+    /// in a route is the easiest mistake to make with this config, so a name found
+    /// only in `channel_names` is reported with the entry needed to fix it.
     pub fn resolve_channel(&self, channel: &ChannelRef) -> Result<usize, String> {
-        channel.resolve(&self.audio.channel_aliases)
+        channel.resolve(&self.audio.channel_aliases).map_err(|e| {
+            let ChannelRef::Alias(name) = channel else {
+                return e;
+            };
+
+            match self
+                .audio
+                .channel_names
+                .iter()
+                .find(|(_, label)| *label == name)
+            {
+                Some((index, _)) => format!(
+                    "Unknown channel '{}': audio.channel_names labels channel {} as '{}', \
+                     but routing resolves against audio.channel_aliases - add \"{}\": {} there",
+                    name, index, name, name, index
+                ),
+                None => e,
+            }
+        })
     }
 
     /// Resolve `audio.channel_volumes` into a per-output-channel gain vector of
@@ -854,22 +939,6 @@ impl Config {
     /// indices or aliases; entries that resolve outside the channel range (or to an
     /// unknown alias) are skipped with a warning so a misconfiguration never aborts
     /// startup or panics the audio thread.
-    pub fn resolve_channel_gains(&self, output_channels: usize) -> Vec<f32> {
-        let mut gains = vec![1.0; output_channels];
-        for (key, &volume) in &self.audio.channel_volumes {
-            let channel = ChannelRef::from_key(key);
-            match self.resolve_channel(&channel) {
-                Ok(index) if index < output_channels => gains[index] = volume,
-                Ok(index) => tracing::warn!(
-                    "audio.channel_volumes: channel {} is beyond the {} output channels; ignoring",
-                    index,
-                    output_channels
-                ),
-                Err(e) => tracing::warn!("audio.channel_volumes: {}; ignoring '{}'", e, key),
-            }
-        }
-        gains
-    }
 
     /// Resolve bass management channel references to numeric indices
     pub fn resolve_bass_management(&self) -> Result<ResolvedBassManagement, String> {
@@ -888,6 +957,51 @@ impl Config {
             remove_bass_from_sources: self.bass_management.remove_bass_from_sources,
             lfe_gain: self.bass_management.lfe_gain,
         })
+    }
+
+    /// Resolve a channel_volumes key to a channel index.
+    ///
+    /// Keys may be a channel number, an alias from `audio.channel_aliases`, or
+    /// a name from `audio.channel_names`, so levelling works whichever way the
+    /// channels were labelled.
+    fn resolve_channel_volume_key(&self, key: &str) -> Result<usize, String> {
+        if let Ok(index) = key.parse::<usize>() {
+            return Ok(index);
+        }
+
+        if let Some(index) = self.audio.channel_aliases.get(key) {
+            return Ok(*index);
+        }
+
+        for (index, name) in &self.audio.channel_names {
+            if name == key {
+                return index
+                    .parse::<usize>()
+                    .map_err(|_| format!("channel_names key '{}' is not a channel number", index));
+            }
+        }
+
+        Err(format!(
+            "'{}' is not a channel number, an audio.channel_aliases entry, or an audio.channel_names value",
+            key
+        ))
+    }
+
+    /// Per-channel output gains, indexed by channel number.
+    ///
+    /// Channels with no entry in `audio.channel_volumes` are left at unity.
+    /// Entries beyond the output channel count are ignored, so a config shared
+    /// between a wide and a narrow device still loads.
+    pub fn resolve_channel_gains(&self, output_channels: usize) -> Vec<f32> {
+        let mut gains = vec![1.0; output_channels];
+        for (key, gain) in &self.audio.channel_volumes {
+            if let Ok(index) = self.resolve_channel_volume_key(key) {
+                if index < output_channels {
+                    gains[index] = *gain;
+                }
+            }
+        }
+        gains
     }
 
     /// Resolve input route channel references to numeric indices
@@ -1000,11 +1114,17 @@ impl Config {
 
         // Channel volumes must be 0.0 to 1.0
         for (ch, vol) in &self.audio.channel_volumes {
-            if *vol < 0.0 || *vol > 1.0 {
+            if !vol.is_finite() || *vol < 0.0 || *vol > MAX_GAIN {
                 errors.push(format!(
-                    "audio.channel_volumes.{} must be between 0.0 and 1.0",
+                    "audio.channel_volumes.{} must be between 0.0 and MAX_GAIN",
                     ch
                 ));
+            }
+        }
+
+        for key in self.audio.channel_volumes.keys() {
+            if let Err(e) = self.resolve_channel_volume_key(key) {
+                errors.push(e);
             }
         }
 
@@ -1106,8 +1226,11 @@ impl Config {
 
         // Input validation
         for (i, input) in self.inputs.iter().enumerate() {
-            if input.volume < 0.0 || input.volume > 1.0 {
-                errors.push(format!("inputs[{}].volume must be between 0.0 and 1.0", i));
+            if input.volume < 0.0 || input.volume > MAX_GAIN {
+                errors.push(format!(
+                    "inputs[{}].volume must be between 0.0 and {}",
+                    i, MAX_GAIN
+                ));
             }
             if input.routes.is_empty() {
                 errors.push(format!("inputs[{}].routes must not be empty", i));
@@ -1115,6 +1238,33 @@ impl Config {
             if input.latency_ms < 5 || input.latency_ms > 500 {
                 errors.push(format!(
                     "inputs[{}].latency_ms must be between 5 and 500",
+                    i
+                ));
+            }
+            if let Some(channels) = input.channels {
+                if channels == 0 || channels > 64 {
+                    errors.push(format!("inputs[{}].channels must be between 1 and 64", i));
+                }
+            }
+            if let Some(rate) = input.sample_rate {
+                if !(8000..=192000).contains(&rate) {
+                    errors.push(format!(
+                        "inputs[{}].sample_rate must be between 8000 and 192000",
+                        i
+                    ));
+                }
+            }
+            if let Some(threshold) = input.activity_threshold {
+                if threshold <= 0.0 || threshold > 1.0 {
+                    errors.push(format!(
+                        "inputs[{}].activity_threshold must be above 0.0 and at most 1.0",
+                        i
+                    ));
+                }
+            }
+            if input.activity_hold_ms > 10000 {
+                errors.push(format!(
+                    "inputs[{}].activity_hold_ms must be at most 10000",
                     i
                 ));
             }
@@ -1126,6 +1276,28 @@ impl Config {
                 if let Err(e) = self.resolve_channel(&route.dest_channel) {
                     errors.push(format!("inputs[{}].routes[{}].dest_channel: {}", i, j, e));
                 }
+            }
+        }
+
+        // Ducking rule validation
+        for (i, rule) in self.ducking_rules.iter().enumerate() {
+            if rule.target_volume < 0.0 || rule.target_volume > 1.0 {
+                errors.push(format!(
+                    "ducking_rules[{}].target_volume must be between 0.0 and 1.0",
+                    i
+                ));
+            }
+            if rule.fade_duration_ms > 60000 {
+                errors.push(format!(
+                    "ducking_rules[{}].fade_duration_ms must be at most 60000",
+                    i
+                ));
+            }
+            if rule.ducked_voices.is_empty() {
+                errors.push(format!(
+                    "ducking_rules[{}].ducked_voices must not be empty",
+                    i
+                ));
             }
         }
 
@@ -1239,8 +1411,6 @@ mod tests {
             None,
             false,
             None,
-            None,
-            None,
             Some("cli_user".to_string()),
             Some("cli_pass".to_string()),
             None,
@@ -1271,8 +1441,6 @@ mod tests {
             None,
             None,
             false,
-            None,
-            None,
             None,
             Some("cli_user".to_string()),
             Some("cli_pass".to_string()),
@@ -1560,7 +1728,7 @@ mod tests {
     fn test_validate_invalid_channel_volume() {
         let mut config = Config::default();
         config.mqtt.topic = Some("test".to_string());
-        config.audio.channel_volumes.insert("0".to_string(), 1.5);
+        config.audio.channel_volumes.insert("0".to_string(), -0.5);
 
         let result = config.validate();
         assert!(result.is_err());
@@ -1729,8 +1897,6 @@ mod tests {
             None,
             None, // channels
             false,
-            None,
-            None,
             None, // log_topic
             None, // mqtt_username
             None, // mqtt_password
@@ -1753,8 +1919,6 @@ mod tests {
             Some(96000),
             Some(8), // channels
             true,
-            Some(5),
-            Some(120.0),
             Some("audio/logs".to_string()), // log_topic
             Some("testuser".to_string()),   // mqtt_username
             Some("testpass".to_string()),   // mqtt_password
@@ -1773,8 +1937,6 @@ mod tests {
         assert!(config.logging.verbose);
         assert_eq!(config.logging.level, "debug");
         assert_eq!(config.logging.mqtt_topic, Some("audio/logs".to_string()));
-        assert_eq!(config.bass_management.lfe_channel, ChannelRef::Index(5));
-        assert_eq!(config.bass_management.crossover_frequency_hz, 120.0);
     }
 
     #[test]
@@ -1792,8 +1954,6 @@ mod tests {
             None,
             None, // channels
             false,
-            None,
-            None,
             None, // log_topic
             None, // mqtt_username
             None, // mqtt_password
@@ -1813,7 +1973,7 @@ mod tests {
         assert!(!config.logging.verbose);
 
         config.merge_cli_args(
-            None, None, None, None, None, None, true, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, true, None, None, None, None, None,
         );
 
         assert!(config.logging.verbose);
@@ -2026,11 +2186,194 @@ mod tests {
     }
 
     #[test]
+    fn test_unknown_alias_error_names_the_alias_map() {
+        let config = Config::default();
+        let err = config
+            .resolve_channel(&ChannelRef::Alias("booth".to_string()))
+            .unwrap_err();
+
+        assert!(err.contains("booth"));
+        assert!(
+            err.contains("channel_aliases"),
+            "the error should say which map to add the name to, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_unknown_alias_error_points_at_channel_names() {
+        // channel_names is index -> name for display; routing resolves against
+        // channel_aliases. Naming a channel in the wrong map is the easiest
+        // mistake to make, so the error has to say so.
+        let mut config = Config::default();
+        config
+            .audio
+            .channel_names
+            .insert("6".to_string(), "booth".to_string());
+
+        let err = config
+            .resolve_channel(&ChannelRef::Alias("booth".to_string()))
+            .unwrap_err();
+
+        assert!(err.contains("channel_names"), "got: {}", err);
+        assert!(err.contains("channel_aliases"), "got: {}", err);
+        assert!(
+            err.contains("6"),
+            "the error should name the channel it found: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_input_route_error_points_at_channel_names() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config
+            .audio
+            .channel_names
+            .insert("4".to_string(), "house".to_string());
+        config.inputs.push(InputConfig {
+            routes: vec![InputRouteConfig {
+                source_channel: ChannelRef::Index(0),
+                dest_channel: ChannelRef::Alias("house".to_string()),
+            }],
+            ..Default::default()
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("channel_names") && e.contains("channel_aliases")),
+            "validation should explain the two maps, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_channel_volumes_allow_boost() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.audio.channel_volumes.insert("3".to_string(), 1.5);
+
+        assert!(
+            config.validate().is_ok(),
+            "boosting a channel above unity is allowed"
+        );
+    }
+
+    #[test]
+    fn test_channel_volumes_reject_excessive_gain() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config
+            .audio
+            .channel_volumes
+            .insert("3".to_string(), MAX_GAIN + 1.0);
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("channel_volumes")));
+    }
+
+    #[test]
+    fn test_input_volume_allows_boost() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.inputs.push(InputConfig {
+            volume: 2.0,
+            routes: vec![InputRouteConfig {
+                source_channel: ChannelRef::Index(0),
+                dest_channel: ChannelRef::Index(0),
+            }],
+            ..Default::default()
+        });
+
+        assert!(
+            config.validate().is_ok(),
+            "a quiet microphone can be boosted"
+        );
+    }
+
+    #[test]
+    fn test_input_volume_rejects_excessive_gain() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.inputs.push(InputConfig {
+            volume: MAX_GAIN + 1.0,
+            routes: vec![InputRouteConfig {
+                source_channel: ChannelRef::Index(0),
+                dest_channel: ChannelRef::Index(0),
+            }],
+            ..Default::default()
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("volume")));
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_by_index() {
+        let mut config = Config::default();
+        config.audio.channel_volumes.insert("0".to_string(), 0.5);
+        config.audio.channel_volumes.insert("3".to_string(), 1.5);
+
+        let gains = config.resolve_channel_gains(4);
+        assert_eq!(gains, vec![0.5, 1.0, 1.0, 1.5]);
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_by_alias_strict() {
+        let mut config = Config::default();
+        config.audio.channel_aliases.insert("sub".to_string(), 3);
+        config.audio.channel_volumes.insert("sub".to_string(), 1.8);
+
+        let gains = config.resolve_channel_gains(4);
+        assert_eq!(gains[3], 1.8);
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_by_channel_name() {
+        // channel_names is index -> name, and the example config levels
+        // channels using those names
+        let mut config = Config::default();
+        config
+            .audio
+            .channel_names
+            .insert("3".to_string(), "lfe".to_string());
+        config.audio.channel_volumes.insert("lfe".to_string(), 1.2);
+
+        let gains = config.resolve_channel_gains(4);
+        assert_eq!(gains[3], 1.2);
+    }
+
+    #[test]
+    fn test_resolve_channel_gains_ignores_channels_beyond_output() {
+        let mut config = Config::default();
+        config.audio.channel_volumes.insert("9".to_string(), 0.5);
+
+        let gains = config.resolve_channel_gains(2);
+        assert_eq!(gains, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_channel_volumes_unknown_name_is_an_error() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config
+            .audio
+            .channel_volumes
+            .insert("nowhere".to_string(), 0.5);
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("nowhere")));
+    }
+
+    #[test]
     fn test_input_validation_invalid_volume() {
         let mut config = Config::default();
         config.mqtt.topic = Some("test".to_string());
         config.inputs.push(InputConfig {
-            volume: 1.5, // Invalid
+            volume: -0.5, // Invalid
             routes: vec![InputRouteConfig {
                 source_channel: ChannelRef::Index(0),
                 dest_channel: ChannelRef::Index(0),
@@ -2097,10 +2440,82 @@ mod tests {
                 },
             ],
             latency_ms: 25,
+            channels: None,
+            sample_rate: None,
+            activity_threshold: None,
+            activity_hold_ms: 750,
         });
 
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_input_activity_threshold_validation() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.inputs.push(InputConfig {
+            activity_threshold: Some(1.5), // Invalid - above 1.0
+            routes: vec![InputRouteConfig {
+                source_channel: ChannelRef::Index(0),
+                dest_channel: ChannelRef::Index(0),
+            }],
+            ..Default::default()
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("activity_threshold")));
+
+        config.inputs[0].activity_threshold = Some(0.05);
+        assert!(config.validate().is_ok(), "a sensible threshold validates");
+    }
+
+    #[test]
+    fn test_bass_management_rejects_duplicate_sources() {
+        // The same source channel listed twice runs its crossover filter
+        // twice per frame, corrupting the filter state
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.bass_management.enabled = true;
+        config.bass_management.source_channels = vec![
+            ChannelRef::Index(0),
+            ChannelRef::Index(1),
+            ChannelRef::Index(0),
+        ];
+
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("source_channels") && e.contains("duplicate")),
+            "got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_ducking_rule_validation() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.ducking_rules.push(DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec![],
+            target_volume: 1.5,
+            fade_duration_ms: 120000,
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("target_volume")));
+        assert!(errors.iter().any(|e| e.contains("fade_duration_ms")));
+        assert!(errors.iter().any(|e| e.contains("ducked_voices")));
+
+        config.ducking_rules[0] = DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.2,
+            fade_duration_ms: 1000,
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -2126,6 +2541,91 @@ mod tests {
         assert_eq!(config.cache.precache.len(), 2);
         assert_eq!(config.cache.precache[0], "/sounds/startup.wav");
         assert_eq!(config.cache.precache[1], "https://example.com/welcome.mp3");
+    }
+
+    #[test]
+    fn test_local_path_allowed_when_no_directories_configured() {
+        let config = Config::default();
+        // An empty list leaves local playback unrestricted
+        assert!(config.is_local_path_allowed("/etc/hostname").is_ok());
+    }
+
+    #[test]
+    fn test_local_path_allowed_inside_configured_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("sound.wav");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut config = Config::default();
+        config.security.allowed_directories = vec![dir.path().to_string_lossy().to_string()];
+
+        assert!(config.is_local_path_allowed(file.to_str().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn test_local_path_denied_outside_configured_directory() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let file = outside.path().join("secret.wav");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut config = Config::default();
+        config.security.allowed_directories = vec![allowed.path().to_string_lossy().to_string()];
+
+        let err = config
+            .is_local_path_allowed(file.to_str().unwrap())
+            .unwrap_err();
+        assert!(
+            err.contains("allowed_directories"),
+            "error should name the setting: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_local_path_denied_via_traversal() {
+        let parent = tempfile::tempdir().unwrap();
+        let allowed = parent.path().join("sounds");
+        std::fs::create_dir(&allowed).unwrap();
+        let secret = parent.path().join("secret.wav");
+        std::fs::write(&secret, b"x").unwrap();
+
+        let mut config = Config::default();
+        config.security.allowed_directories = vec![allowed.to_string_lossy().to_string()];
+
+        let sneaky = format!("{}/../secret.wav", allowed.to_string_lossy());
+        assert!(config.is_local_path_allowed(&sneaky).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_local_path_denied_via_symlink() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.wav");
+        std::fs::write(&secret, b"x").unwrap();
+        let link = allowed.path().join("link.wav");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let mut config = Config::default();
+        config.security.allowed_directories = vec![allowed.path().to_string_lossy().to_string()];
+
+        assert!(config
+            .is_local_path_allowed(link.to_str().unwrap())
+            .is_err());
+    }
+
+    #[test]
+    fn test_local_path_check_ignores_urls() {
+        let mut config = Config::default();
+        config.security.allowed_directories = vec!["/opt/sounds".to_string()];
+
+        assert!(config
+            .is_local_path_allowed("https://example.com/a.mp3")
+            .is_ok());
+        assert!(config
+            .is_local_path_allowed("http://example.com/a.mp3")
+            .is_ok());
     }
 
     #[test]
@@ -2403,8 +2903,6 @@ mod tests {
             None,
             None,
             false,
-            None,
-            None,
             Some("audio/logs".to_string()),
             None,
             None,
@@ -2855,8 +3353,6 @@ mod tests {
             None,
             None,
             None,
-            None,
-            None,
             Some(9000),
             None,
         );
@@ -2879,8 +3375,6 @@ mod tests {
             None,
             None,
             false,
-            None,
-            None,
             None,
             None,
             None,

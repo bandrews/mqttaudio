@@ -1,15 +1,7 @@
 // ABOUTME: Entry point for mqttaudio MQTT-controlled audio daemon.
 // ABOUTME: Handles CLI parsing, initialization, and main event loop.
 
-mod audio;
-mod cache;
-mod config;
-mod config_editor;
-mod http;
-mod mqtt;
-mod rt_engine;
-mod talkback;
-mod voice;
+use mqttaudio::{audio, cache, config, config_editor, http, mqtt, rt_engine, talkback, voice};
 
 use clap::Parser;
 use cpal::traits::DeviceTrait;
@@ -155,8 +147,6 @@ async fn main() {
         args.sample_rate,
         args.channels,
         args.verbose,
-        args.lfe_channel,
-        args.crossover_frequency,
         args.log_topic.clone(),
         args.mqtt_username.clone(),
         args.mqtt_password.clone(),
@@ -195,6 +185,14 @@ async fn main() {
         "trace" => tracing::Level::TRACE,
         _ => tracing::Level::INFO,
     };
+    let log_level = if config.logging.verbose && log_level < tracing::Level::DEBUG {
+        tracing::Level::DEBUG
+    } else {
+        log_level
+    };
+
+    // The WebSocket log broadcaster is created before logging is initialized
+    // so its tracing layer can stream every log line to /ws clients
 
     // Initialize logging: a console fmt layer (text or JSON per logging.format),
     // the WebSocket log layer (D62 — created BEFORE logging init and shared with
@@ -207,7 +205,7 @@ async fn main() {
         use tracing_subscriber::util::SubscriberInitExt;
 
         let fmt_layer = build_fmt_layer(&config.logging.format, log_level, std::io::stdout);
-        let ws_layer = http::WebSocketLogLayer::new(log_broadcaster.clone());
+        let ws_layer = http::WebSocketLogLayer::new(log_broadcaster.clone(), log_level);
 
         if config.logging.mqtt_topic.is_some() {
             let (sender, receiver) = mqtt::logger::create_log_channel(100);
@@ -390,6 +388,13 @@ async fn main() {
     tracing::info!("  Channels: {}", output_channels);
     tracing::info!("  Sample format: {:?}", sample_format);
 
+    // Resolving a device opens handles for both directions and keeps them.
+    // Release them before the inputs open: a retained idle capture handle
+    // holds the card's capture side, which makes the card invisible to input
+    // enumeration and blocks every other capture application. The device is
+    // re-resolved when the output stream is built.
+    drop(device);
+
     // Create mixer state and voice manager
     use audio::ducking::{DuckingApplier, DuckingEngine};
     use audio::mixer::MixerState;
@@ -543,6 +548,24 @@ async fn main() {
             let stream_config = audio::input::InputStreamConfig {
                 device_name: input_config.device.clone(),
                 latency_ms: input_config.latency_ms,
+                min_channels: config
+                    .inputs
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.device == input_config.device
+                            && candidate.latency_ms == input_config.latency_ms
+                    })
+                    .flat_map(|candidate| candidate.routes.iter())
+                    .filter_map(|route| config.resolve_channel(&route.source_channel).ok())
+                    .max()
+                    .map_or(1, |ch| ch + 1),
+                sample_rate: Some(output_sample_rate),
+                buffer_size: match stream_config.buffer_size {
+                    cpal::BufferSize::Fixed(frames) => Some(frames),
+                    _ => None,
+                },
+                resampler_quality: config.advanced.resampler_quality,
+                ..Default::default()
             };
             audio::input::create_input_stream_with_fanout(
                 stream_config,
@@ -649,6 +672,7 @@ async fn main() {
                         applied_volume: Some(applied_volume),
                         applied_muted: Some(applied_muted),
                         applied_unmuted_volume: Some(applied_unmuted_volume),
+                        health: Some(live_input.health.clone()),
                         ready: true,
                         last_error: None,
                     });
@@ -697,6 +721,7 @@ async fn main() {
                     applied_volume: None,
                     applied_muted: None,
                     applied_unmuted_volume: None,
+                    health: None,
                     ready: false,
                     last_error: Some(error.clone()),
                 });
@@ -779,12 +804,13 @@ async fn main() {
         );
     }
 
-    let cache_manager = match cache::CacheManager::with_resolved_cap(
+    let cache_manager = match cache::CacheManager::with_disk_cache(
         cache_dir,
         resampler_quality,
         memory_cap,
         config.security.allowed_directories.clone(),
         config.cache.revalidate_after_seconds,
+        config.cache.enabled,
     ) {
         Ok(cm) => Arc::new(tokio::sync::Mutex::new(cm)),
         Err(e) => {
@@ -866,7 +892,7 @@ async fn main() {
     let mut streaming_upgrades: Vec<StreamingUpgrade> = Vec::new();
 
     // Create the text-command channel (HTTP/MQTT payloads -> control loop).
-    let (text_tx, mut text_rx) = mpsc::channel::<String>(100);
+    let (text_tx, mut text_rx) = mpsc::channel::<mqtt::commands::CommandRequest>(100);
 
     // Start HTTP server if enabled
     if config.http.enabled {
@@ -941,11 +967,13 @@ async fn main() {
                     None => break, // command channel closed
                 };
 
+                let mqtt::commands::CommandRequest { payload, reply } = payload;
                 // Expand macros before parsing
                 let expanded = match mqtt::commands::expand_macros(&payload, &config.macros) {
                     Ok(e) => e,
                     Err(e) => {
                         tracing::error!("Macro expansion error: {}", e);
+                        if let Some(reply) = reply { let _ = reply.send(Err(mqtt::commands::CommandError::new(mqtt::commands::CommandErrorKind::InvalidRequest, e.to_string()))); }
                         continue;
                     }
                 };
@@ -972,12 +1000,18 @@ async fn main() {
                             latency: &latency_tracker,
                             streaming_upgrades: &mut streaming_upgrades,
                             max_block_frames,
+                            error: None,
                         };
                         handle_command(cmd, &mut ctx).await;
+                        if let Some(reply) = reply {
+                            let outcome = ctx.error.take().map_or_else(|| Ok("Command completed".to_string()), Err);
+                            let _ = reply.send(outcome);
+                        }
                         ctx.refresh_talkback(start_time.elapsed().as_millis() as u64);
                     }
                     Err(e) => {
                         tracing::error!("Failed to parse command: {}", e);
+                        if let Some(reply) = reply { let _ = reply.send(Err(mqtt::commands::CommandError::new(mqtt::commands::CommandErrorKind::InvalidRequest, e.to_string()))); }
                     }
                 }
             }
@@ -1513,13 +1547,22 @@ struct CommandCtx<'a> {
     /// documented cap when the device default is unknown) — sizes the shipped
     /// pitch scratch (D56/D58).
     max_block_frames: usize,
+    error: Option<mqtt::commands::CommandError>,
 }
 
 impl CommandCtx<'_> {
+    fn fail(&mut self, kind: mqtt::commands::CommandErrorKind, message: impl Into<String>) {
+        self.error = Some(mqtt::commands::CommandError::new(kind, message.into()));
+    }
+
     /// Push a resolved command to the audio thread, logging if the ring is full.
     fn send(&mut self, command: rt_engine::AudioCommand) -> bool {
         if self.cmd_tx.push(command).is_err() {
             tracing::error!("Audio command ring full; command dropped");
+            self.fail(
+                mqtt::commands::CommandErrorKind::Internal,
+                "Audio command queue is full",
+            );
             false
         } else {
             true
@@ -1870,7 +1913,11 @@ async fn make_persist_target(
     let etag = open.etag().map(|s| s.to_string());
     let last_modified = open.last_modified().map(|s| s.to_string());
     let content_type = open.content_type().map(|s| s.to_string());
-    let (temp_path, final_path) = ctx.cache_manager.lock().await.windowed_persist_paths(file);
+    let (temp_path, final_path) = ctx
+        .cache_manager
+        .lock()
+        .await
+        .windowed_persist_paths(file)?;
     let (done_tx, done_rx) = tokio::sync::oneshot::channel::<u64>();
     let cache_manager = std::sync::Arc::clone(ctx.cache_manager);
     let url = file.to_string();
@@ -2259,6 +2306,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             Ok(m) => m,
                             Err(e) => {
                                 tracing::error!("Failed to resolve channel alias: {}", e);
+                                ctx.fail(
+                                    mqtt::commands::CommandErrorKind::InvalidRequest,
+                                    e.to_string(),
+                                );
                                 return;
                             }
                         };
@@ -2445,6 +2496,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 }
                 Err(e) => {
                     tracing::error!("Failed to load {}: {}", file, e);
+                    ctx.fail(
+                        mqtt::commands::CommandErrorKind::NotFound,
+                        format!("Failed to load {}: {}", file, e),
+                    );
                 }
             }
         }
@@ -2458,6 +2513,9 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 fade_ms: STOP_FADE_MS,
             });
             tracing::info!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS);
+        }
+        mqtt::commands::AudioCommand::FadeAll { time_ms } => {
+            ctx.send(rt_engine::AudioCommand::FadeOutAll { fade_ms: time_ms });
         }
         mqtt::commands::AudioCommand::VoiceStop { voice } => {
             // Apply quick 10ms fade-out to prevent clicks/pops
@@ -3114,6 +3172,7 @@ mod tests {
                 latency: &self.latency,
                 streaming_upgrades: &mut self.streaming_upgrades,
                 max_block_frames: 512,
+                error: None,
             };
             handle_command(cmd, &mut ctx).await;
         }
@@ -4062,6 +4121,7 @@ mod tests {
             applied_volume: None,
             applied_muted: None,
             applied_unmuted_volume: None,
+            health: None,
             ready: true,
             last_error: None,
         });

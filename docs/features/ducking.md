@@ -145,7 +145,13 @@ When the primary voice stops, ducked voices fade back to full volume over the sa
 
 ## Microphone Input Ducking
 
-Ducking works with microphone inputs too. Configure the microphone with a `voice_id`:
+A microphone input's `voice_id` can appear in `ducked_voices`: playing a
+sample on the rule's `primary_voice` lowers the microphone along with any
+other ducked voices.
+
+A microphone can also trigger ducking. Give the input an
+`activity_threshold` - the peak capture level (0.0-1.0) above which the
+input counts as speaking - and its `voice_id` works as a `primary_voice`:
 
 ```json
 {
@@ -153,6 +159,8 @@ Ducking works with microphone inputs too. Configure the microphone with a `voice
     {
       "device": "USB Microphone",
       "voice_id": "presenter_mic",
+      "activity_threshold": 0.05,
+      "activity_hold_ms": 750,
       "routes": [{"source_channel": 0, "dest_channel": 0}]
     }
   ],

@@ -57,6 +57,12 @@ pub struct ChunkedResampler {
     ratio: f64,
     /// Whether flush() has been called
     flushed: bool,
+    /// Filter startup delay still to be trimmed from the stream's head
+    leading_delay_to_skip: usize,
+    /// Frames pushed in, for sizing the flush drain
+    input_frames_received: u64,
+    /// Frames handed out so far
+    output_frames_emitted: u64,
 }
 
 impl ChunkedResampler {
@@ -127,6 +133,7 @@ impl ChunkedResampler {
         )?;
 
         let input_buffer = vec![Vec::new(); channels];
+        let leading_delay_to_skip = resampler.output_delay();
 
         Ok(Self {
             resampler,
@@ -135,6 +142,9 @@ impl ChunkedResampler {
             chunk_size,
             ratio,
             flushed: false,
+            leading_delay_to_skip,
+            input_frames_received: 0,
+            output_frames_emitted: 0,
         })
     }
 
@@ -152,6 +162,8 @@ impl ChunkedResampler {
         if samples.is_empty() {
             return Ok(None);
         }
+
+        self.input_frames_received += (samples.len() / self.channels) as u64;
 
         // De-interleave input into per-channel buffers
         for frame in samples.chunks(self.channels) {
@@ -193,8 +205,17 @@ impl ChunkedResampler {
         // Process through Rubato
         let output_channels = self.resampler.process(&chunk_input, None)?;
 
-        // Re-interleave output
-        self.interleave_output(&output_channels)
+        // Re-interleave, trimming the filter's startup delay from the head of
+        // the stream so output is time-aligned with the input
+        let mut interleaved = self.interleave_output(&output_channels)?;
+        if self.leading_delay_to_skip > 0 {
+            let frames = interleaved.len() / self.channels;
+            let skip = self.leading_delay_to_skip.min(frames);
+            interleaved.drain(..skip * self.channels);
+            self.leading_delay_to_skip -= skip;
+        }
+        self.output_frames_emitted += (interleaved.len() / self.channels) as u64;
+        Ok(interleaved)
     }
 
     /// Flush remaining samples at end of stream.
@@ -213,24 +234,32 @@ impl ChunkedResampler {
             output.extend(chunk_output);
         }
 
-        // Handle remaining partial chunk with padding
-        let remaining = self.input_buffer[0].len();
-        if remaining > 0 {
-            // Pad each channel to chunk_size
+        // Feed zero-padded chunks until the filter has surrendered every
+        // frame the input covered - the delay trim at the head means the last
+        // frames only come out with extra zeroes pushed behind them
+        let expected_total = (self.input_frames_received as f64 * self.ratio).round() as u64;
+        let mut drain_guard = 0;
+        while self.output_frames_emitted < expected_total {
             for ch_buffer in &mut self.input_buffer {
                 ch_buffer.resize(self.chunk_size, 0.0);
             }
+            output.extend(self.process_chunk()?);
 
-            // Process the padded chunk
-            let chunk_output = self.process_chunk()?;
+            drain_guard += 1;
+            if drain_guard > 64 {
+                // The delay is at most a fraction of one chunk; this cannot
+                // legitimately take dozens of zero chunks
+                tracing::warn!("Resampler flush did not converge; emitting what it produced");
+                break;
+            }
+        }
 
-            // Calculate how many output frames correspond to the actual input
-            let expected_output_frames = (remaining as f64 * self.ratio).ceil() as usize;
-            let actual_output_frames = chunk_output.len() / self.channels;
-
-            // Take only the frames we need (may be fewer due to padding)
-            let frames_to_take = expected_output_frames.min(actual_output_frames);
-            output.extend_from_slice(&chunk_output[..frames_to_take * self.channels]);
+        // Drop any frames past the input's duration
+        if self.output_frames_emitted > expected_total {
+            let excess = (self.output_frames_emitted - expected_total) as usize;
+            let keep = output.len().saturating_sub(excess * self.channels);
+            output.truncate(keep);
+            self.output_frames_emitted = expected_total;
         }
 
         Ok(output)
@@ -280,6 +309,41 @@ impl ChunkedResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_chunked_output_is_time_aligned_and_full_length() {
+        // Same contract as the one-shot resampler: the sinc filter's delay
+        // must not shift the stream, and its tail must be drained on flush
+        let mut resampler = ChunkedResampler::new(44100, 48000, 1, ResamplerQuality::Fast).unwrap();
+
+        let input = vec![1.0f32; 4410];
+        let mut out = Vec::new();
+        for chunk in input.chunks(512) {
+            if let Some(processed) = resampler.push(chunk).unwrap() {
+                out.extend(processed);
+            }
+        }
+        out.extend(resampler.flush().unwrap());
+
+        let expected = (4410.0f64 * 48000.0 / 44100.0).round() as usize;
+        assert!(
+            (out.len() as i32 - expected as i32).abs() <= 2,
+            "expected ~{} frames, got {}",
+            expected,
+            out.len()
+        );
+        assert!(
+            out[0] > 0.3,
+            "stream must start at the signal, got {}",
+            out[0]
+        );
+        assert!(out[64] > 0.99, "got {}", out[64]);
+        assert!(
+            out[out.len() - 64] > 0.99,
+            "the tail must not be dropped, got {}",
+            out[out.len() - 64]
+        );
+    }
 
     #[test]
     fn test_construction_basic() {
@@ -332,15 +396,17 @@ mod tests {
         let result = resampler.push(&samples).unwrap();
 
         assert!(result.is_some());
-        let output = result.unwrap();
+        let mut output = result.unwrap();
 
-        // Output should have approximately chunk_size * ratio frames
-        let expected_frames = (1024.0 * 48000.0 / 44100.0) as usize;
+        // The first chunk emits less than chunk_size * ratio (the filter's
+        // startup delay is trimmed from the stream head); flush drains the
+        // remainder so push + flush covers the input exactly
+        output.extend(resampler.flush().unwrap());
+        let expected_frames = (1024.0f64 * 48000.0 / 44100.0).round() as usize;
         let actual_frames = output.len() / 2;
 
-        // Allow some tolerance for resampler latency
         assert!(
-            (actual_frames as i32 - expected_frames as i32).abs() < 50,
+            (actual_frames as i32 - expected_frames as i32).abs() <= 2,
             "Expected ~{} frames, got {}",
             expected_frames,
             actual_frames
@@ -441,14 +507,15 @@ mod tests {
         let result = resampler.push(&samples).unwrap();
 
         assert!(result.is_some());
-        let output = result.unwrap();
+        let mut output = result.unwrap();
+        output.extend(resampler.flush().unwrap());
 
-        // Mono output
-        let expected_frames = (1024.0 * 48000.0 / 44100.0) as usize;
+        // Mono output covers the input duration exactly after the flush drain
+        let expected_frames = (1024.0f64 * 48000.0 / 44100.0).round() as usize;
         let actual_frames = output.len(); // mono, so len == frames
 
         assert!(
-            (actual_frames as i32 - expected_frames as i32).abs() < 50,
+            (actual_frames as i32 - expected_frames as i32).abs() <= 2,
             "Expected ~{} frames, got {}",
             expected_frames,
             actual_frames
@@ -577,14 +644,15 @@ mod tests {
         let result = resampler.push(&samples).unwrap();
 
         assert!(result.is_some());
-        let output = result.unwrap();
+        let mut output = result.unwrap();
+        output.extend(resampler.flush().unwrap());
 
-        // With ratio=1.0, output should be approximately same length as input
+        // With ratio=1.0, push + flush yields exactly the input length
         let input_frames = 512;
         let output_frames = output.len() / 2;
 
         assert!(
-            (output_frames as i32 - input_frames).abs() < 50,
+            (output_frames as i32 - input_frames as i32).abs() <= 2,
             "Expected ~{} frames, got {}",
             input_frames,
             output_frames

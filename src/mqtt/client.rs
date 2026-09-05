@@ -83,10 +83,15 @@ pub async fn connect_mqtt(
 ) -> Result<(AsyncClient, EventLoop), MqttError> {
     tracing::info!("Connecting to MQTT broker: {}:{}", cfg.server, cfg.port);
 
-    // Use unique client ID with random suffix to avoid conflicts
-    use rand::Rng;
-    let random_suffix: u32 = rand::thread_rng().gen();
-    let client_id = format!("mqttaudio_{:08x}", random_suffix);
+    // Use the configured client ID, or a unique random one to avoid conflicts
+    let client_id = match cfg.client_id.as_deref() {
+        Some(id) => id.to_string(),
+        None => {
+            use rand::Rng;
+            let random_suffix: u32 = rand::thread_rng().gen();
+            format!("mqttaudio_{:08x}", random_suffix)
+        }
+    };
 
     let mut mqttoptions = MqttOptions::new(client_id, &cfg.server, cfg.port);
     mqttoptions.set_keep_alive(Duration::from_secs(60));
@@ -136,7 +141,7 @@ pub async fn process_mqtt_events(
     client: AsyncClient,
     topic: String,
     mut eventloop: EventLoop,
-    command_tx: mpsc::Sender<String>,
+    command_tx: mpsc::Sender<super::commands::CommandRequest>,
 ) {
     tracing::info!("Starting MQTT event loop");
 
@@ -150,7 +155,8 @@ pub async fn process_mqtt_events(
                 // Never block the MQTT event loop on a slow consumer: drop (with a
                 // warning + running count) rather than back-pressuring poll(), which
                 // would stall keepalive and get the broker to drop the session.
-                match command_tx.try_send(payload) {
+                match command_tx.try_send(super::commands::CommandRequest::fire_and_forget(payload))
+                {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         dropped_commands += 1;

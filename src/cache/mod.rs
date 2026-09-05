@@ -54,8 +54,17 @@ impl LoadGeneration {
     }
 }
 
+/// Disk-cache metadata captured when a streaming download starts, applied to
+/// the disk cache once the download completes and its file is finalized
+pub struct PendingDiskWrite {
+    pub cache_filename: String,
+    pub final_path: PathBuf,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_type: Option<String>,
+}
+
 /// Tracks an active streaming load operation
-#[derive(Clone)]
 pub struct ActiveLoad {
     /// The streaming buffer being filled
     pub buffer: Arc<RwLock<StreamingBuffer>>,
@@ -65,13 +74,18 @@ pub struct ActiveLoad {
     /// Source-file identity at load start, re-checked at promotion (D51). `None`
     /// for sources with no stable on-disk identity (a live network download).
     pub generation: Option<LoadGeneration>,
+    pub pending_disk_write: Option<PendingDiskWrite>,
 }
 
 /// Unified cache manager coordinating memory and disk caches
 pub struct CacheManager {
     memory_cache: MemoryCache,
-    disk_cache: DiskCache,
+    /// None when the disk cache is disabled in config
+    disk_cache: Option<DiskCache>,
     resampler_quality: ResamplerQuality,
+    /// When each URL was last checked against its server (in-memory, so a
+    /// dead server is asked at most once per interval rather than per play)
+    last_revalidation_attempt: HashMap<String, std::time::Instant>,
     /// Currently active streaming loads (path -> ActiveLoad)
     active_loads: HashMap<String, ActiveLoad>,
     /// Local-path allowlist; empty = allow-all (open by default).
@@ -138,7 +152,29 @@ impl CacheManager {
         allowed_directories: Vec<String>,
         revalidate_after_seconds: u64,
     ) -> Result<Self, CacheError> {
-        let disk_cache = DiskCache::new(cache_dir)?;
+        Self::with_disk_cache(
+            cache_dir,
+            resampler_quality,
+            memory_cap,
+            allowed_directories,
+            revalidate_after_seconds,
+            true,
+        )
+    }
+
+    pub fn with_disk_cache(
+        cache_dir: PathBuf,
+        resampler_quality: ResamplerQuality,
+        memory_cap: MemoryCap,
+        allowed_directories: Vec<String>,
+        revalidate_after_seconds: u64,
+        disk_enabled: bool,
+    ) -> Result<Self, CacheError> {
+        let disk_cache = if disk_enabled {
+            Some(DiskCache::new(cache_dir)?)
+        } else {
+            None
+        };
         let memory_cache = MemoryCache::with_cap(memory_cap);
 
         tracing::info!(
@@ -153,6 +189,7 @@ impl CacheManager {
             memory_cache,
             disk_cache,
             resampler_quality,
+            last_revalidation_attempt: HashMap::new(),
             active_loads: HashMap::new(),
             allowed_directories,
             revalidate_after_seconds,
@@ -212,13 +249,19 @@ impl CacheManager {
     /// Whether `file_path` is cached in memory or on disk. A cached URL is served
     /// full-featured from the cache rather than windowed.
     pub fn is_cached(&self, file_path: &str) -> bool {
-        self.memory_cache.contains(file_path) || self.disk_cache.is_cached(file_path)
+        self.memory_cache.contains(file_path)
+            || self
+                .disk_cache
+                .as_ref()
+                .is_some_and(|disk| disk.is_cached(file_path))
     }
 
     /// Temp + final disk paths for teeing a cacheable windowed download (see
     /// [`DiskCache::windowed_persist_paths`]).
-    pub fn windowed_persist_paths(&self, url: &str) -> (PathBuf, PathBuf) {
-        self.disk_cache.windowed_persist_paths(url)
+    pub fn windowed_persist_paths(&self, url: &str) -> Option<(PathBuf, PathBuf)> {
+        self.disk_cache
+            .as_ref()
+            .map(|disk| disk.windowed_persist_paths(url))
     }
 
     /// Register a windowed download that was teed to disk as a cache entry, so a later
@@ -231,8 +274,11 @@ impl CacheManager {
         last_modified: Option<String>,
         content_type: Option<String>,
     ) -> Result<(), CacheError> {
-        self.disk_cache
-            .record_streamed_download(url, file_size, etag, last_modified, content_type)
+        if let Some(disk) = self.disk_cache.as_mut() {
+            disk.record_streamed_download(url, file_size, etag, last_modified, content_type)
+        } else {
+            Ok(())
+        }
     }
 
     /// Create a new cache manager with specified resampler quality and no memory limit.
@@ -300,10 +346,18 @@ impl CacheManager {
             }
         }
 
-        // Check if already loading - return existing streaming buffer
+        // Check if already loading - return existing streaming buffer.
+        // A load that already failed is evicted instead of joined, so one
+        // transient network or decode error does not poison the URL until restart.
         if let Some(active) = self.active_loads.get(file_path) {
-            tracing::debug!("Joining existing streaming load for: {}", file_path);
-            return Ok(SampleBuffer::Streaming(Arc::clone(&active.buffer)));
+            let failed = active.buffer.read().map(|b| b.has_error()).unwrap_or(false);
+            if failed {
+                tracing::warn!("Previous streaming load of {} failed; retrying", file_path);
+                self.active_loads.remove(file_path);
+            } else {
+                tracing::debug!("Joining existing streaming load for: {}", file_path);
+                return Ok(SampleBuffer::Streaming(Arc::clone(&active.buffer)));
+            }
         }
 
         // For HTTP URLs, use streaming approach
@@ -311,17 +365,32 @@ impl CacheManager {
             // Check disk cache first - if cached, decode the cached file
             // progressively (D51): playback starts at once, the decode fills the
             // buffer in the background, and promotion publishes it when done.
-            if self.disk_cache.is_cached(file_path) {
+            if self
+                .disk_cache
+                .as_ref()
+                .is_some_and(|disk| disk.is_cached(file_path))
+            {
                 tracing::debug!("Disk cache hit for: {}", file_path);
                 let _ = self
                     .disk_cache
+                    .as_mut()
+                    .unwrap()
                     .revalidate_if_due(
                         file_path,
                         std::time::Duration::from_secs(self.revalidate_after_seconds),
                     )
                     .await;
-                let entry = self.disk_cache.get_entry(file_path).unwrap();
-                let local_path = self.disk_cache.get_cached_file_path(entry);
+                let entry = self
+                    .disk_cache
+                    .as_ref()
+                    .unwrap()
+                    .get_entry(file_path)
+                    .unwrap();
+                let local_path = self
+                    .disk_cache
+                    .as_ref()
+                    .unwrap()
+                    .get_cached_file_path(entry);
                 return self
                     .start_file_streaming_decode(file_path, local_path, target_sample_rate)
                     .await;
@@ -396,6 +465,7 @@ impl CacheManager {
                 buffer: Arc::clone(&streaming_buffer),
                 path: key.to_string(),
                 generation: LoadGeneration::capture(&source_path),
+                pending_disk_write: None,
             },
         );
 
@@ -409,24 +479,107 @@ impl CacheManager {
         Ok(SampleBuffer::Streaming(streaming_buffer))
     }
 
+    /// Whether it is time to ask the server if a cached copy of this URL is
+    /// still current. Gated by an in-memory attempt timestamp so a dead
+    /// server is retried at most once per interval, not once per play.
+    fn revalidation_due(&self, url: &str) -> bool {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return false;
+        }
+        let Some(disk) = self.disk_cache.as_ref() else {
+            return false;
+        };
+        let Some(entry) = disk.get_entry(url) else {
+            return false;
+        };
+        if !disk.is_cached(url) {
+            return false;
+        }
+
+        let interval = std::time::Duration::from_secs(self.revalidate_after_seconds);
+        if let Some(attempted) = self.last_revalidation_attempt.get(url) {
+            if attempted.elapsed() < interval {
+                return false;
+            }
+        } else {
+            // No attempt this run - go by the persisted validation time
+            if let Ok(validated) = chrono::DateTime::parse_from_rfc3339(&entry.last_validated) {
+                let age = chrono::Utc::now().signed_duration_since(validated);
+                if age.to_std().map(|a| a < interval).unwrap_or(false) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Revalidate a cached URL against its server if due. A changed file
+    /// replaces the disk copy and drops the stale memory entry; an
+    /// unreachable server leaves the cached copy in service.
+    async fn maybe_revalidate(&mut self, url: &str) {
+        if !self.revalidation_due(url) {
+            return;
+        }
+        self.last_revalidation_attempt
+            .insert(url.to_string(), std::time::Instant::now());
+
+        let disk = self
+            .disk_cache
+            .as_mut()
+            .expect("revalidation_due checked the disk cache");
+        match disk.revalidate(url).await {
+            disk::Freshness::Fresh => {
+                tracing::debug!("Cached copy of {} is still current", url);
+            }
+            disk::Freshness::Replaced => {
+                tracing::info!("Server copy of {} changed; cache refreshed", url);
+                self.memory_cache.remove(url);
+            }
+            disk::Freshness::Unknown => {
+                tracing::warn!("Could not revalidate {}; serving the cached copy", url);
+            }
+        }
+    }
+
     /// Start a streaming load for an HTTP URL
     async fn start_streaming_load(
         &mut self,
         url: &str,
         target_sample_rate: u32,
     ) -> Result<SampleBuffer, Box<dyn std::error::Error + Send + Sync>> {
-        // Start HTTP stream
-        let reader = http_stream::start_http_stream(url)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
-
-        // Get estimated frames from content length (rough estimate)
-        let (_bytes_so_far, content_length) = reader.progress();
-        let estimated_frames = content_length.map(|len| {
-            // Rough estimate: assume 16-bit stereo @ target rate
-            // This will be refined once the decoder starts
-            len / 4
+        // When the disk cache is on, tee the download into it so the file
+        // survives a restart
+        let persist = self.disk_cache.as_ref().map(|disk| {
+            let cache_filename = DiskCache::cache_filename_for_url(url);
+            let final_path = disk.files_dir().join(&cache_filename);
+            let temp_path = final_path.with_extension("part");
+            (
+                cache_filename,
+                http_stream::BufferedPersistTarget {
+                    temp_path,
+                    final_path,
+                },
+            )
         });
+
+        // Start HTTP stream
+        let (reader, response_info) = http_stream::start_http_stream_with_persist(
+            url,
+            persist.as_ref().map(|(_, target)| target.clone()),
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        // Get estimated frames from content length. Encoded bytes only map
+        // to frames for uncompressed WAV (~4 bytes per 16-bit stereo frame);
+        // for compressed formats no estimate is better than a wildly wrong one.
+        let (_bytes_so_far, content_length) = reader.progress();
+        let url_path = url.split(['?', '#']).next().unwrap_or(url);
+        let estimated_frames = if url_path.to_lowercase().ends_with(".wav") {
+            content_length.map(|len| len / 4)
+        } else {
+            None
+        };
 
         // Create streaming buffer (channels will be updated by decoder)
         let streaming_buffer = Arc::new(RwLock::new(StreamingBuffer::new(
@@ -435,18 +588,35 @@ impl CacheManager {
             estimated_frames,
         )));
 
-        // Track the active load
+        // Track the active load, remembering the disk registration to make
+        // once the download lands
+        let pending_disk_write = persist.map(|(cache_filename, target)| PendingDiskWrite {
+            cache_filename,
+            final_path: target.final_path,
+            etag: response_info.etag,
+            last_modified: response_info.last_modified,
+            content_type: response_info.content_type,
+        });
         let active_load = ActiveLoad {
             buffer: Arc::clone(&streaming_buffer),
             path: url.to_string(),
             generation: None,
+            pending_disk_write,
         };
         self.active_loads.insert(url.to_string(), active_load);
 
-        // Create hint for format detection
+        // Create hint for format detection from the URL path (query strings
+        // and non-audio suffixes would mislead the probe)
         let mut hint = Hint::new();
-        if let Some(ext) = url.rsplit('.').next() {
-            hint.with_extension(ext);
+        if let Some(ext) = url_path
+            .rsplit('/')
+            .next()
+            .and_then(|f| f.rsplit('.').next())
+        {
+            let ext = ext.to_lowercase();
+            if matches!(ext.as_str(), "wav" | "mp3" | "ogg" | "flac") {
+                hint.with_extension(&ext);
+            }
         }
 
         // Spawn decode task
@@ -495,6 +665,7 @@ impl CacheManager {
                 buffer: Arc::clone(&streaming_buffer),
                 path: url.to_string(),
                 generation: None,
+                pending_disk_write: None,
             },
         );
 
@@ -688,6 +859,26 @@ impl CacheManager {
                         );
                         self.memory_cache.put(path.clone(), Arc::new(decoded));
                         tracing::debug!("Promoted streaming buffer to cache: {}", path);
+                        if let (Some(pending), Some(disk)) =
+                            (&active.pending_disk_write, self.disk_cache.as_mut())
+                        {
+                            if let Ok(meta) = std::fs::metadata(&pending.final_path) {
+                                disk.put_entry(
+                                    path.clone(),
+                                    disk::CacheEntry {
+                                        local_file: pending.cache_filename.clone(),
+                                        etag: pending.etag.clone(),
+                                        last_modified: pending.last_modified.clone(),
+                                        last_validated: chrono::Utc::now().to_rfc3339(),
+                                        file_size: meta.len(),
+                                        content_type: pending.content_type.clone(),
+                                    },
+                                );
+                                if let Err(e) = disk.save_metadata() {
+                                    tracing::warn!("Failed to save cache metadata: {}", e);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -701,6 +892,10 @@ impl CacheManager {
         file_path: &str,
         target_sample_rate: u32,
     ) -> Result<Arc<DecodedBuffer>, Box<dyn std::error::Error>> {
+        // Fold finished loads into the caches and revalidate if due
+        self.cleanup_completed_loads();
+        self.maybe_revalidate(file_path).await;
+
         // Check memory cache first
         if let Some(buffer) = self.memory_cache.get(file_path) {
             tracing::debug!("Memory cache hit for: {}", file_path);
@@ -708,23 +903,48 @@ impl CacheManager {
         }
 
         // Determine if this is an HTTP URL or local file
-        let local_path = if file_path.starts_with("http://") || file_path.starts_with("https://") {
-            // HTTP URL - check disk cache
-            if self.disk_cache.is_cached(file_path) {
+        let is_url = file_path.starts_with("http://") || file_path.starts_with("https://");
+        let local_path = if is_url {
+            if self.disk_cache.is_none() {
+                // Disk cache disabled: stream into memory and wait for it
+                let buffer = self
+                    .get_or_load_streaming(file_path, target_sample_rate)
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                if let Some(decoded) = buffer.as_complete() {
+                    return Ok(decoded);
+                }
+                return self.wait_for_streaming(file_path, buffer).await;
+            } else if self.disk_cache.as_ref().unwrap().is_cached(file_path) {
                 tracing::debug!("Disk cache hit for: {}", file_path);
                 let _ = self
                     .disk_cache
+                    .as_mut()
+                    .unwrap()
                     .revalidate_if_due(
                         file_path,
                         std::time::Duration::from_secs(self.revalidate_after_seconds),
                     )
                     .await;
-                let entry = self.disk_cache.get_entry(file_path).unwrap();
-                self.disk_cache.get_cached_file_path(entry)
+                let entry = self
+                    .disk_cache
+                    .as_ref()
+                    .unwrap()
+                    .get_entry(file_path)
+                    .unwrap();
+                self.disk_cache
+                    .as_ref()
+                    .unwrap()
+                    .get_cached_file_path(entry)
             } else {
                 // Download and cache
                 tracing::info!("Cache miss, downloading: {}", file_path);
-                let path = self.disk_cache.download_and_cache(file_path).await?;
+                let path = self
+                    .disk_cache
+                    .as_mut()
+                    .unwrap()
+                    .download_and_cache(file_path)
+                    .await?;
                 // Log stats after download
                 self.log_stats();
                 path
@@ -795,10 +1015,41 @@ impl CacheManager {
         Ok(())
     }
 
+    /// Wait for a streaming load to finish, then hand out its decoded buffer.
+    /// Used for blocking loads when the disk cache is disabled.
+    async fn wait_for_streaming(
+        &mut self,
+        url: &str,
+        buffer: SampleBuffer,
+    ) -> Result<Arc<DecodedBuffer>, Box<dyn std::error::Error>> {
+        // The download's own stall timeouts bound this loop in practice; the
+        // deadline is a backstop
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        loop {
+            if buffer.has_failed() {
+                return Err(format!("Streaming load of {} failed", url).into());
+            }
+            if buffer.is_complete() {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(format!("Timed out loading {}", url).into());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        self.cleanup_completed_loads();
+        self.memory_cache
+            .get(url)
+            .ok_or_else(|| format!("Load of {} completed but was not cached", url).into())
+    }
+
     /// Clear all caches (memory and disk)
     pub fn clear_all(&mut self) -> Result<(), CacheError> {
         self.memory_cache.clear();
-        self.disk_cache.clear_all()?;
+        if let Some(disk) = self.disk_cache.as_mut() {
+            disk.clear_all()?;
+        }
         tracing::info!("Cleared all caches");
         Ok(())
     }
@@ -814,7 +1065,10 @@ impl CacheManager {
         if self.active_loads.remove(file_path).is_some() {
             tracing::info!("Abandoned in-flight streaming load for: {}", file_path);
         }
-        self.disk_cache.remove_entry(file_path)?;
+        if let Some(disk) = self.disk_cache.as_mut() {
+            disk.remove_entry(file_path)?;
+        }
+        self.last_revalidation_attempt.remove(file_path);
         tracing::info!("Invalidated cache for: {}", file_path);
         Ok(())
     }
@@ -826,15 +1080,17 @@ impl CacheManager {
     /// stale-while-revalidate fix for the warm-memory-hit short-circuit. Returns how
     /// many entries were refreshed.
     pub async fn revalidate_stale_http(&mut self, window: std::time::Duration) -> usize {
-        let urls: Vec<String> = self
-            .disk_cache
+        let Some(disk) = self.disk_cache.as_mut() else {
+            return 0;
+        };
+        let urls: Vec<String> = disk
             .cached_urls()
             .into_iter()
             .filter(|u| self.memory_cache.contains(u))
             .collect();
         let mut refreshed = 0;
         for url in urls {
-            match self.disk_cache.revalidate_if_due(&url, window).await {
+            match disk.revalidate_if_due(&url, window).await {
                 Ok(true) => {
                     // Content changed: drop the stale decoded buffer (the playing
                     // sample keeps its own Arc; the next play re-decodes fresh).
@@ -851,7 +1107,11 @@ impl CacheManager {
 
     /// Flush the disk-cache metadata to disk (called on graceful shutdown).
     pub fn flush_metadata(&self) -> Result<(), CacheError> {
-        self.disk_cache.save_metadata()
+        if let Some(disk) = self.disk_cache.as_ref() {
+            disk.save_metadata()
+        } else {
+            Ok(())
+        }
     }
 
     /// Whether `key` is resident in the memory cache (status/test introspection).
@@ -917,8 +1177,8 @@ impl CacheManager {
     /// Get disk cache statistics
     pub fn disk_stats(&self) -> CacheStats {
         CacheStats {
-            entry_count: self.disk_cache.entry_count(),
-            size_bytes: self.disk_cache.total_size_bytes(),
+            entry_count: self.disk_cache.as_ref().map_or(0, |d| d.entry_count()),
+            size_bytes: self.disk_cache.as_ref().map_or(0, |d| d.total_size_bytes()),
         }
     }
 
@@ -1062,6 +1322,7 @@ mod tests {
                 buffer: Arc::new(RwLock::new(sb)),
                 path: url.to_string(),
                 generation: None,
+                pending_disk_write: None,
             },
         );
 
@@ -1104,6 +1365,7 @@ mod tests {
                 buffer: Arc::new(RwLock::new(sb)),
                 path: url.to_string(),
                 generation: None,
+                pending_disk_write: None,
             },
         );
 

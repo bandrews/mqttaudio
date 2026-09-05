@@ -15,14 +15,16 @@ This guide walks you through installing mqttaudio, running your first commands, 
 sudo apt-get install libasound2-dev libssl-dev pkg-config build-essential clang libclang-dev
 ```
 
-**macOS and Windows:** No additional dependencies.
+**macOS:** No additional dependencies.
+
+**Windows:** Requires the C++ build tools that ship with the Visual Studio Build Tools (the standard Rust-on-Windows toolchain).
 
 ## Installation
 
 ### From Source
 
 ```bash
-git clone https://github.com/yourusername/mqttaudio.git
+git clone https://github.com/bandrews/mqttaudio.git
 cd mqttaudio
 cargo build --release
 ```

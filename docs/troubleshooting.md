@@ -109,7 +109,9 @@ Try connecting to localhost first to rule out network problems:
 
 ### Local Files: Check Permissions
 
-Verify the file path is in `allowed_directories`:
+If `security.allowed_directories` is configured, the file must live inside
+one of the listed directories - a rejected play logs "Play rejected" with
+the offending path:
 
 ```json
 {
@@ -119,7 +121,8 @@ Verify the file path is in `allowed_directories`:
 }
 ```
 
-Or if using command line only, all local files must be accessible.
+With no `security` section (or an empty list), any file the daemon can read
+is playable.
 
 ### HTTP Files: Check Network
 
@@ -162,11 +165,6 @@ Larger buffers reduce glitches at the cost of latency:
     "buffer_size": 1024
   }
 }
-```
-
-Or:
-```bash
-./mqttaudio --buffer-size 1024 --topic audio/commands
 ```
 
 Common values: 256 (low latency), 512 (default), 1024 (stable), 2048 (very stable)
@@ -249,6 +247,29 @@ Device names must match exactly (case-sensitive):
 }
 ```
 
+The index number printed by `--list-inputs` also works: `"device": "0"`.
+
+### Device Listed But "Input device not found"
+
+Input enumeration only shows devices that can be opened for capture at that
+moment, so a device visible in an interactive `--list-inputs` can still be
+missing when the daemon starts (typically under systemd). The error message
+lists the devices that were available and, on Linux, why a direct ALSA capture
+open of the requested name fails:
+
+- **Device or resource busy** - another process holds the capture side: a
+  sound server (PipeWire, PulseAudio), another capture application, or a
+  second copy of the daemon. `fuser -v /dev/snd/*` shows the holder
+- **Permission denied** - the daemon's user cannot open the device. For a
+  systemd service, add the service user to the `audio` group:
+  `sudo usermod -aG audio USER`, then restart the service
+- **No such device** - the name does not exist; compare against `arecord -L`
+
+To see exactly what the daemon sees, run the listing as the service user:
+```bash
+sudo -u SERVICE_USER ./mqttaudio --list-inputs
+```
+
 ### Check Routing
 
 Verify routes point to valid output channels:
@@ -266,6 +287,15 @@ WARN Input device sample rate differs from output - resampling will add latency
 ```
 
 This works but adds latency. For best results, use matching sample rates.
+
+On a shared-clock interface (one USB card doing both directions), capture
+cannot be forced to a rate the card is not running at. If capture keeps
+opening at the wrong rate despite `sample_rate`, something else is holding
+the card at that rate - a `dmix`/`dsnoop` device from asound.conf, a sound
+server, or another application. Free the card and capture will follow the
+output rate. Choppiness with both overruns *and* starvation in the input
+health log, alongside ALSA `underrun occurred` messages, points at the
+output side stalling (typically a dmix chain) rather than at the mic.
 
 ---
 
@@ -385,6 +415,6 @@ mqttaudio logs to stderr by default. Capture logs:
 
 ### Report Issues
 
-File issues at: https://github.com/anthropics/claude-code/issues
+File issues at: https://github.com/bandrews/mqttaudio/issues
 
 Include the information above for faster resolution.

@@ -2,6 +2,13 @@
 
 mqttaudio can be configured via a JSON file, command-line arguments, or both. Command-line arguments override config file settings.
 
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `MQTTAUDIO_CONFIG` | Path to the config file, used when `--config` is not given |
+| `RUST_LOG` | Per-module log filtering (e.g. `mqttaudio=debug,mqttaudio::cache=trace`); overrides `logging.level` for console output |
+
 ## Command-Line Options
 
 ```
@@ -240,7 +247,7 @@ for platform examples and ALSA prefix guidance.
 |-------|------|---------|-------------|
 | `device` | string or null | system default | Exact Device ID from `--list-devices`; Linux uses an ALSA ID. `null` selects the system default. |
 | `sample_rate` | integer | `48000` | Output sample rate in Hz |
-| `buffer_size` | integer | `512` | Buffer size in frames (lower = less latency, more CPU) |
+| `buffer_size` | integer | `512` | Buffer size in frames for output and capture streams (lower = less latency, more CPU) |
 | `channels` | integer | auto-detect | Number of output channels |
 | `channel_aliases` | object | `{}` | Named aliases for channel numbers |
 | `channel_volumes` | object | `{}` | Per-output-channel calibration gain, `0.0`–`1.0`, keyed by channel number or alias |
@@ -297,6 +304,56 @@ The `channel_aliases` field lets you define meaningful names for channel numbers
 
 This makes configurations more readable and less error-prone. Channel aliases can also be used in MQTT play commands (see [Commands](commands.md)).
 
+#### Channel Names vs Channel Aliases
+
+Two fields name channels and they are not interchangeable:
+
+| Field | Direction | Used for |
+|-------|-----------|----------|
+| `channel_aliases` | name → number | Resolving channels in routes, bass management and play commands |
+| `channel_names` | number → name | Labelling channels for display |
+
+```json
+"audio": {
+  "channel_aliases": { "booth": 6 },
+  "channel_names": { "6": "booth" }
+}
+```
+
+Routing resolves against `channel_aliases` only. A name defined in
+`channel_names` and then used as a `dest_channel` fails validation with the
+entry you need to add:
+
+```
+inputs[0].routes[0].dest_channel: Unknown channel 'booth': audio.channel_names
+labels channel 6 as 'booth', but routing resolves against audio.channel_aliases
+- add "booth": 6 there
+```
+
+#### Channel Volumes
+
+`channel_volumes` sets a per-channel output gain, applied to the finished mix.
+Use it to level speakers against each other, or to lift an underpowered
+subwoofer:
+
+```json
+"audio": {
+  "channel_aliases": { "lfe": 3, "surround_left": 4 },
+  "channel_volumes": {
+    "lfe": 1.6,
+    "surround_left": 0.85,
+    "7": 0.9
+  }
+}
+```
+
+Keys may be a channel number, a `channel_aliases` name, or a `channel_names`
+label. Unity is 1.0, the maximum is 4.0 (+12 dB), and entries beyond the
+device's channel count are ignored. Gain is applied after bass management, so
+boosting the LFE channel raises the crossed-over bass along with anything
+routed there directly. The mixer saturates its output, so an over-enthusiastic
+boost clips rather than wrapping.
+
 ### cache
 
 File caching settings.
@@ -315,6 +372,8 @@ File caching settings.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `directory` | string | `~/.mqttaudio/cache` | Disk cache directory |
+| `enabled` | boolean | `true` | Disk-cache downloaded files. `false` = play from memory only, re-download after restart |
+| `revalidate_after_seconds` | integer | `300` | Seconds a cached URL is served before checking the server for changes (0 = every access) |
 | `precache` | array | `[]` | Files or directories to cache on startup |
 | `precache_blocking` | boolean | `true` | Block startup until precache completes |
 | `max_memory_mb` | integer | `0` | Simple memory-cache cap in MB. `0` (default) = auto-detect a bounded cap; a positive value is an explicit hard cap. Overridden by `memory_budget`. **(Changed: `0` no longer means unlimited.)** |
@@ -442,11 +501,15 @@ Microphone/input device configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `device` | string | *required* | Input device name (use `--list-inputs`) |
-| `volume` | float | `1.0` | Input volume (0.0 to 1.0) |
+| `device` | string | *required* | Input device name or `--list-inputs` index (e.g. `"0"`) |
+| `volume` | float | `1.0` | Input volume (0.0 to 4.0, unity is 1.0) |
 | `voice_id` | string | — | Voice name for ducking integration |
 | `routes` | array | *required* | Channel routing (source → dest, can use aliases) |
-| `latency_ms` | integer | `25` | Buffer latency (5-500ms) |
+| `latency_ms` | integer | `20` | Buffer latency (5-500ms) |
+| `activity_threshold` | float | `null` | Peak level (0.0-1.0) above which this input counts as speaking for ducking rules; `null` disables activity detection |
+| `activity_hold_ms` | integer | `750` | How long activity persists after the level drops (0-10000ms) |
+| `channels` | integer | *auto* | Capture channels to open (1-64). Defaults to the smallest count that covers every `source_channel` |
+| `sample_rate` | integer | *auto* | Capture rate to request (8000-192000). Defaults to the output rate, which avoids resampling |
 
 The `dest_channel` in routes can use channel aliases defined in `audio.channel_aliases`.
 
@@ -469,10 +532,10 @@ Automatic volume ducking configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `primary_voice` | string | *required* | Voice that triggers ducking |
-| `ducked_voices` | array | *required* | Voices to reduce in volume |
+| `primary_voice` | string | *required* | Voice that triggers ducking. A live input's `voice_id` works here when the input has an `activity_threshold` configured |
+| `ducked_voices` | array | *required* | Voices to reduce in volume. May include live input `voice_id`s |
 | `target_volume` | float | *required* | Volume to duck to (0.0 to 1.0) |
-| `fade_duration_ms` | integer | *required* | Fade duration in milliseconds |
+| `fade_duration_ms` | integer | *required* | Fade duration in milliseconds; restore uses the same duration |
 
 See [Audio Ducking](features/ducking.md) for details.
 
@@ -494,9 +557,10 @@ File access restrictions.
 | `allowed_directories` | array | `[]` | Directories allowed for local file access |
 
 **Notes:**
-- If empty, only HTTP/HTTPS URLs can be played
+- When non-empty, `play`/`precache` paths must resolve inside one of the
+  listed directories (symlinks are followed; `../` traversal is blocked)
+- If empty, local file access is unrestricted
 - `~` expands to the user's home directory
-- Path traversal (`../`) is blocked
 
 ### logging
 
@@ -566,7 +630,7 @@ Performance tuning and advanced settings. Most users won't need to change these.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `resampler_quality` | string | `"fast"` | Sample rate conversion quality preset |
+| `resampler_quality` | string | `"fast"` | Sample rate conversion quality preset, used for file decoding and live-input capture alike |
 
 #### Resampler Quality
 
@@ -664,6 +728,7 @@ When audio files have a different sample rate than the output device (e.g., a 44
       "device": "Gamemaster Headset",
       "volume": 0.9,
       "voice_id": "gm_mic",
+      "activity_threshold": 0.05,
       "routes": [
         {"source_channel": 0, "dest_channel": 4},
         {"source_channel": 0, "dest_channel": 5},
@@ -687,6 +752,10 @@ When audio files have a different sample rate than the output device (e.g., a 44
 }
 ```
 
+When the gamemaster speaks (capture level above `activity_threshold`), the
+room ambience and effects duck to 10% and recover 750 ms after the mic goes
+quiet.
+
 ### 5.1 Surround with Bass Management
 
 ```json
@@ -708,12 +777,3 @@ When audio files have a different sample rate than the output device (e.g., a 44
 }
 ```
 
----
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `MQTTAUDIO_CONFIG` | Path to config file |
-| `MQTTAUDIO_CACHE_DIR` | Override cache directory |
-| `RUST_LOG` | Rust logging configuration (e.g., `mqttaudio=debug`) |

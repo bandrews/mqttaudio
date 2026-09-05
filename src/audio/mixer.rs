@@ -117,8 +117,11 @@ pub struct ActiveSample {
     /// Fractional part of playback position for sub-sample interpolation
     fractional_position: f64,
 
-    /// Per-sample volume (0.0 - 1.0)
+    /// Per-sample volume (0.0 - 1.0) - current smoothed value
     pub volume: f32,
+
+    /// Target per-sample volume for smooth ramping
+    pub target_volume: f32,
 
     /// Voice-level volume (0.0 - 1.0) - current smoothed value
     pub voice_volume: f32,
@@ -155,6 +158,7 @@ pub struct ActiveSample {
     /// callback does not heap-allocate a stretcher output buffer every block.
     /// Grows to the largest block seen, then is reused.
     pitch_scratch: Vec<f32>,
+    pitch_input_scratch: Vec<f32>,
 
     /// Fractional carry for the pitch-correction input advance. Each pitch block
     /// consumes `output_frames * speed` input frames; only the integer part can be
@@ -241,7 +245,8 @@ impl ActiveSample {
             buffer,
             position: 0,
             fractional_position: 0.0,
-            volume: volume.clamp(0.0, 1.0),
+            volume: volume.clamp(0.0, crate::config::MAX_GAIN),
+            target_volume: volume.clamp(0.0, crate::config::MAX_GAIN),
             voice_volume,
             target_voice_volume: voice_volume,
             channel_map,
@@ -252,6 +257,7 @@ impl ActiveSample {
             loop_mode: false,
             crossfade_samples: 0,
             pitch_scratch: Vec::new(),
+            pitch_input_scratch: Vec::new(),
             pitch_input_accumulator: 0.0,
             pitch_tail_remaining: None,
             pitch_tail_buffer: Vec::new(),
@@ -291,7 +297,8 @@ impl ActiveSample {
             buffer,
             position: 0,
             fractional_position: 0.0,
-            volume: volume.clamp(0.0, 1.0),
+            volume: volume.clamp(0.0, crate::config::MAX_GAIN),
+            target_volume: volume.clamp(0.0, crate::config::MAX_GAIN),
             voice_volume,
             target_voice_volume: voice_volume,
             channel_map,
@@ -302,6 +309,7 @@ impl ActiveSample {
             loop_mode,
             crossfade_samples,
             pitch_scratch: Vec::new(),
+            pitch_input_scratch: Vec::new(),
             pitch_input_accumulator: 0.0,
             pitch_tail_remaining: None,
             pitch_tail_buffer: Vec::new(),
@@ -338,7 +346,8 @@ impl ActiveSample {
             buffer: buffer.into(),
             position: 0,
             fractional_position: 0.0,
-            volume: volume.clamp(0.0, 1.0),
+            volume: volume.clamp(0.0, crate::config::MAX_GAIN),
+            target_volume: volume.clamp(0.0, crate::config::MAX_GAIN),
             voice_volume,
             target_voice_volume: voice_volume,
             channel_map,
@@ -349,6 +358,7 @@ impl ActiveSample {
             loop_mode,
             crossfade_samples,
             pitch_scratch: Vec::new(),
+            pitch_input_scratch: Vec::new(),
             pitch_input_accumulator: 0.0,
             pitch_tail_remaining: None,
             pitch_tail_buffer: Vec::new(),
@@ -488,6 +498,8 @@ impl ActiveSample {
             self.pitch_crossfade_remaining = 0;
             self.pitch_crossfade_total = 0;
         }
+        self.pitch_input_scratch
+            .resize(8192 * 8 * self.buffer.channels().max(1), 0.0);
         self.pitch_corrector = Some(pc);
     }
 
@@ -565,6 +577,7 @@ impl ActiveSample {
                 // Adopt the pre-sized buffers; the old vecs ride back in the box.
                 std::mem::swap(&mut self.pitch_tail_buffer, &mut b.tail_buffer);
                 std::mem::swap(&mut self.pitch_scratch, &mut b.scratch);
+                std::mem::swap(&mut self.pitch_input_scratch, &mut b.input_scratch);
 
                 // Mirror enable_pitch_correction: prime at the CURRENT speed,
                 // reset the carry state, arm the direct->stretched crossfade.
@@ -626,6 +639,11 @@ impl ActiveSample {
             }
         }
 
+        // A streaming load that failed can never deliver more data
+        if self.buffer.has_failed() {
+            return true;
+        }
+
         // Looping samples never finish from buffer position
         if self.loop_mode {
             return false;
@@ -643,7 +661,7 @@ impl ActiveSample {
         // For forward playback, finished when position >= frames
         // For reverse playback, finished when position is 0 (or we've gone negative)
         if self.speed >= 0.0 {
-            if self.position >= self.buffer.frames() {
+            if self.buffer.is_complete() && self.position >= self.buffer.frames() {
                 return true;
             }
         } else {
@@ -665,25 +683,21 @@ impl ActiveSample {
 
     /// Set target voice volume for smooth ramping
     pub fn set_target_voice_volume(&mut self, target: f32) {
-        self.target_voice_volume = target.clamp(0.0, 1.0);
+        self.target_voice_volume = target.clamp(0.0, crate::config::MAX_GAIN);
     }
 
-    /// Advance voice volume toward target by one frame.
-    /// Uses linear ramping with a fixed rate that provides ~20ms transition at 44.1kHz.
-    /// Returns true if volume is still ramping, false if at target.
-    pub fn advance_voice_volume(&mut self) -> bool {
-        const RAMP_RATE: f32 = 0.001; // ~22ms for full 0-1 transition at 44.1kHz
+    /// Set target sample volume for smooth ramping
+    pub fn set_target_volume(&mut self, target: f32) {
+        self.target_volume = target.clamp(0.0, crate::config::MAX_GAIN);
+    }
 
-        if (self.voice_volume - self.target_voice_volume).abs() < RAMP_RATE {
-            self.voice_volume = self.target_voice_volume;
-            false
-        } else if self.voice_volume < self.target_voice_volume {
-            self.voice_volume += RAMP_RATE;
-            true
-        } else {
-            self.voice_volume -= RAMP_RATE;
-            true
-        }
+    /// Advance the sample and voice volumes toward their targets by one frame.
+    /// Uses linear ramping with a fixed rate that provides ~20ms transition at 44.1kHz.
+    /// Returns true if either volume is still ramping, false if both are at target.
+    pub fn advance_volumes(&mut self) -> bool {
+        let voice_ramping = ramp_toward(&mut self.voice_volume, self.target_voice_volume);
+        let sample_ramping = ramp_toward(&mut self.volume, self.target_volume);
+        voice_ramping || sample_ramping
     }
 
     /// The frame count to wrap against when looping, or `None` if looping must
@@ -779,6 +793,70 @@ impl ActiveSample {
     }
 }
 
+/// Map a playback position into a looping buffer's active region.
+///
+/// With a crossfade, the last crossfade_samples frames are blended with the
+/// head frames [0, cf), so the loop's period is buffer_frames - cf: a forward
+/// wrap lands at cf (the head was already heard inside the blend, landing at
+/// 0 would play it twice) and a reverse wrap lands just before the tail.
+/// Without a crossfade this is a plain modulo wrap.
+fn wrap_loop_position(pos: f64, buffer_frames: usize, crossfade_samples: usize) -> f64 {
+    if buffer_frames == 0 {
+        return 0.0;
+    }
+    let cf = if crossfade_samples > 0 && buffer_frames > crossfade_samples * 2 {
+        crossfade_samples
+    } else {
+        0
+    };
+    let n = buffer_frames as f64;
+    let period = (buffer_frames - cf) as f64;
+
+    let wrapped = if pos >= n {
+        cf as f64 + (pos - n) % period
+    } else if pos < 0.0 {
+        (n - cf as f64) + pos % period
+    } else {
+        return pos;
+    };
+
+    if wrapped < 0.0 {
+        wrapped + period
+    } else if wrapped >= n {
+        wrapped - period
+    } else {
+        wrapped
+    }
+}
+
+/// Step a smoothed volume one frame toward its target.
+/// Linear ramping at a fixed rate: ~22ms for a full 0-1 transition at 44.1kHz.
+/// Returns true while still ramping.
+fn ramp_toward(current: &mut f32, target: f32) -> bool {
+    const RAMP_RATE: f32 = 0.001;
+
+    if (*current - target).abs() < RAMP_RATE {
+        *current = target;
+        false
+    } else if *current < target {
+        *current += RAMP_RATE;
+        true
+    } else {
+        *current -= RAMP_RATE;
+        true
+    }
+}
+
+/// Capture/mixer health published without locking the audio thread.
+#[derive(Default)]
+pub struct InputHealth {
+    pub backlog_frames: AtomicU64,
+    pub max_backlog_frames: AtomicU64,
+    pub trimmed_frames: AtomicU64,
+    pub underrun_frames: AtomicU64,
+    pub dropped_frames: AtomicU64,
+}
+
 /// Active live input (microphone) being mixed
 pub struct LiveInput {
     /// Voice ID this input belongs to (for ducking)
@@ -790,8 +868,14 @@ pub struct LiveInput {
     /// Number of input channels
     pub input_channels: usize,
 
-    /// Per-input volume (0.0 - 1.0)
+    /// Per-input volume (0.0 - 1.0) - current smoothed value
     pub volume: f32,
+    pub target_volume: f32,
+    pub max_backlog_frames: usize,
+    pub trimmed_frames: u64,
+    pub underrun_frames: u64,
+    pub dropped_frames: Arc<AtomicU64>,
+    pub health: Arc<InputHealth>,
 
     /// Whether this input is currently muted. When muted, `volume` is held at 0.0
     /// and the operator's pre-mute level is kept in `pre_mute_volume` (D34).
@@ -827,11 +911,20 @@ impl LiveInput {
         volume: f32,
         channel_map: Vec<(usize, usize)>,
     ) -> Self {
+        let channels = input_channels.max(1);
+        let capacity_frames = consumer.capacity() / channels;
+
         Self {
             voice_id,
             consumer,
             input_channels,
             volume,
+            target_volume: volume,
+            max_backlog_frames: capacity_frames / 2,
+            trimmed_frames: 0,
+            underrun_frames: 0,
+            dropped_frames: Arc::new(AtomicU64::new(0)),
+            health: Arc::new(InputHealth::default()),
             muted: false,
             pre_mute_volume: volume,
             voice_volume: 1.0,
@@ -855,6 +948,24 @@ impl LiveInput {
         self.publish_status();
     }
 
+    pub fn publish_health(&self) {
+        self.health
+            .backlog_frames
+            .store(self.backlog_frames() as u64, Ordering::Relaxed);
+        self.health
+            .max_backlog_frames
+            .store(self.max_backlog_frames as u64, Ordering::Relaxed);
+        self.health
+            .trimmed_frames
+            .store(self.trimmed_frames, Ordering::Relaxed);
+        self.health
+            .underrun_frames
+            .store(self.underrun_frames, Ordering::Relaxed);
+        self.health
+            .dropped_frames
+            .store(self.dropped_frames(), Ordering::Relaxed);
+    }
+
     fn publish_status(&self) {
         if let Some(volume) = &self.applied_volume {
             volume.store(self.volume.to_bits(), Ordering::Relaxed);
@@ -867,6 +978,24 @@ impl LiveInput {
         }
     }
 
+    /// Share the capture thread's dropped-frame counter so input health can be
+    /// reported from the mixer state
+    pub fn with_dropped_frames(mut self, dropped_frames: Arc<AtomicU64>) -> Self {
+        self.dropped_frames = dropped_frames;
+        self
+    }
+
+    /// Number of whole frames currently waiting in the ring buffer
+    pub fn backlog_frames(&self) -> usize {
+        self.consumer.len() / self.input_channels.max(1)
+    }
+
+    /// Frames the capture callback could not hand over because the ring buffer
+    /// was full
+    pub fn dropped_frames(&self) -> u64 {
+        self.dropped_frames.load(Ordering::Relaxed)
+    }
+
     /// Get the combined volume (input volume * voice volume)
     #[allow(dead_code)]
     pub fn combined_volume(&self) -> f32 {
@@ -877,7 +1006,8 @@ impl LiveInput {
     /// so the value takes effect immediately and a later unmute does not revert it
     /// (D34). The value is clamped to a valid gain.
     pub fn set_volume(&mut self, volume: f32) {
-        self.volume = volume.clamp(0.0, 1.0);
+        self.volume = volume.clamp(0.0, crate::config::MAX_GAIN);
+        self.target_volume = self.volume;
         self.muted = false;
         self.pre_mute_volume = self.volume;
         self.publish_status();
@@ -890,13 +1020,16 @@ impl LiveInput {
     pub fn set_muted(&mut self, mute: bool) {
         if mute {
             if !self.muted {
-                self.pre_mute_volume = self.volume;
+                self.pre_mute_volume = self.target_volume;
                 self.volume = 0.0;
+                self.target_volume = 0.0;
                 self.muted = true;
                 self.publish_status();
             }
         } else if self.muted {
             self.volume = self.pre_mute_volume;
+            self.target_volume = self.volume;
+            self.target_volume = self.volume;
             self.muted = false;
             self.publish_status();
         }
@@ -905,21 +1038,35 @@ impl LiveInput {
     /// Set target voice volume for smooth ramping
     #[allow(dead_code)]
     pub fn set_target_voice_volume(&mut self, target: f32) {
-        self.target_voice_volume = target.clamp(0.0, 1.0);
+        self.target_voice_volume = target.clamp(0.0, crate::config::MAX_GAIN);
     }
 
-    /// Advance voice volume toward target by one frame.
-    /// Uses linear ramping with a fixed rate that provides ~20ms transition at 44.1kHz.
-    pub fn advance_voice_volume(&mut self) {
-        const RAMP_RATE: f32 = 0.001; // ~22ms for full 0-1 transition at 44.1kHz
-
-        if (self.voice_volume - self.target_voice_volume).abs() < RAMP_RATE {
-            self.voice_volume = self.target_voice_volume;
-        } else if self.voice_volume < self.target_voice_volume {
-            self.voice_volume += RAMP_RATE;
-        } else {
-            self.voice_volume -= RAMP_RATE;
+    /// Set the input volume target for smooth ramping. A nonzero level is
+    /// remembered as the level unmute restores.
+    pub fn set_target_volume(&mut self, target: f32) {
+        self.target_volume = target.clamp(0.0, crate::config::MAX_GAIN);
+        if self.target_volume > 0.0 {
+            self.pre_mute_volume = self.target_volume;
         }
+    }
+
+    /// Mute or unmute this input, ramping to avoid a pop. Unmute restores
+    /// the configured (or last set) volume rather than snapping to 1.0.
+
+    /// Whether this input is muted (or on its way there)
+    pub fn is_muted(&self) -> bool {
+        self.muted
+    }
+
+    /// Advance the input and voice volumes toward their targets by one frame.
+    pub fn advance_voice_volume(&mut self) {
+        ramp_toward(&mut self.voice_volume, self.target_voice_volume);
+    }
+
+    pub fn advance_volumes(&mut self) {
+        ramp_toward(&mut self.voice_volume, self.target_voice_volume);
+        ramp_toward(&mut self.volume, self.target_volume);
+        self.publish_status();
     }
 }
 
@@ -1128,6 +1275,7 @@ pub struct PitchBundle {
     pub tail_buffer: Vec<f32>,
     /// Pitch mix scratch sized to the largest output block (D58).
     pub scratch: Vec<f32>,
+    pub input_scratch: Vec<f32>,
 }
 
 impl PitchBundle {
@@ -1149,6 +1297,7 @@ impl PitchBundle {
             corrector: Some(corrector),
             tail_buffer,
             scratch,
+            input_scratch: vec![0.0; max_block_frames.max(1) * 8 * channels],
         }
     }
 }
@@ -1402,6 +1551,7 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
         let duck = ducking.map_or((1.0, 1.0), |a| a.buffer_endpoints(&input.voice_id));
 
         mix_live_input_into_output(input, output, frames, output_channels, duck);
+        input.publish_health();
     }
 
     // Mix each windowed streamed source into the output
@@ -1498,7 +1648,6 @@ fn mix_sample_into_output(
     // still-streaming buffer plays forward and emits silence past the loaded edge
     // rather than wrapping against its growing prefix.
     let loop_mode = sample.loop_boundary().is_some();
-    let sample_volume = sample.volume;
     // Frame the forward loop restarts from (past the overlapped head when a
     // crossfade is active); 0 for a plain loop. Constant for the whole block.
     let loop_restart = sample.loop_restart_frame() as f64;
@@ -1508,9 +1657,10 @@ fn mix_sample_into_output(
 
     for frame_idx in 0..frames {
         // Advance voice volume toward target (smooth ramping to avoid pops)
-        sample.advance_voice_volume();
+        sample.advance_volumes();
 
-        // Handle looping wrap-around
+        // Handle looping wrap-around (crossfade shortens the loop period so
+        // the blended head is not played twice)
         if loop_mode && buffer_frames > 0 {
             if src_pos < 0.0 {
                 // Wrap from start to end
@@ -1550,7 +1700,7 @@ fn mix_sample_into_output(
         // Calculate fade multiplier for this frame
         let fade_multiplier = sample.fade_state.multiplier();
         let ducking_multiplier = duck_frame_gain(duck, frame_idx, frames);
-        let base_volume = sample_volume * sample.voice_volume;
+        let base_volume = sample.volume * sample.voice_volume;
         let final_volume = base_volume * fade_multiplier * ducking_multiplier;
 
         // Fractional position between src_frame and src_frame+1. The interpolation
@@ -1687,7 +1837,45 @@ fn mix_sample_with_pitch_correction(
     // Produce this block's stretched output, either by feeding source input or, once
     // the source is exhausted, by emitting the drained tail. `produced` is false only
     // when there is genuinely nothing left to emit.
-    let produced = if let Some(remaining) = sample.pitch_tail_remaining {
+    let produced = if sample.loop_mode && decoded_buffer.frames > 0 {
+        sample.pitch_input_accumulator += frames as f64 * speed as f64;
+        let want = sample.pitch_input_accumulator.floor() as usize;
+        sample.pitch_input_accumulator -= want as f64;
+        let required = want * src_channels;
+        if sample.pitch_input_scratch.len() < required {
+            PITCH_SCRATCH_REGROWS.fetch_add(1, Ordering::Relaxed);
+            sample.pitch_input_scratch.resize(required, 0.0);
+        }
+        let cf = if sample.crossfade_active() {
+            sample.crossfade_samples
+        } else {
+            0
+        };
+        let mut pos = sample.position;
+        for frame in 0..want {
+            pos = wrap_loop_position(pos as f64, decoded_buffer.frames, cf) as usize;
+            for ch in 0..src_channels {
+                let tail = decoded_buffer.data[pos * src_channels + ch];
+                let value = if cf > 0 && pos >= decoded_buffer.frames - cf {
+                    let head_pos = pos - (decoded_buffer.frames - cf);
+                    let head = decoded_buffer.data[head_pos * src_channels + ch];
+                    equal_power_blend(tail, head, head_pos as f32 / cf as f32)
+                } else {
+                    tail
+                };
+                sample.pitch_input_scratch[frame * src_channels + ch] = value;
+            }
+            pos += 1;
+        }
+        sample.position = wrap_loop_position(pos as f64, decoded_buffer.frames, cf) as usize;
+        if let Some(pc) = sample.pitch_corrector.as_mut() {
+            pc.process(
+                &sample.pitch_input_scratch[..required],
+                &mut stretched[..output_samples],
+            );
+        }
+        true
+    } else if let Some(remaining) = sample.pitch_tail_remaining {
         // EOF reached on an earlier block: emit the next slice of the already-drained
         // tail (the stretcher's `flush` must be taken in one call, so it was captured
         // whole into `pitch_tail_buffer` at EOF and is now played out block by block).
@@ -1808,15 +1996,14 @@ fn apply_pitch_block(
     decoded: &DecodedBuffer,
     speed: f32,
 ) {
-    let sample_volume = sample.volume;
     for frame_idx in 0..frames {
         // Advance voice volume toward target (smooth ramping to avoid pops)
-        sample.advance_voice_volume();
+        sample.advance_volumes();
 
         // Calculate fade multiplier for this frame
         let fade_multiplier = sample.fade_state.multiplier();
         let ducking_multiplier = duck_frame_gain(duck, frame_idx, frames);
-        let base_volume = sample_volume * sample.voice_volume;
+        let base_volume = sample.volume * sample.voice_volume;
         let final_volume = base_volume * fade_multiplier * ducking_multiplier;
 
         // Equal-power crossfade gains for this frame. Outside the crossfade window
@@ -1882,7 +2069,7 @@ fn mix_ring_voice_frame(
     frame_idx: usize,
     output_channels: usize,
     gain: f32,
-    last_frame: &mut [f32; 16],
+    last_frame: &mut [f32; 64],
     underrun_frames: &mut usize,
 ) {
     // Read one frame worth of samples, or — on underrun — hold the last frame and
@@ -1898,7 +2085,7 @@ fn mix_ring_voice_frame(
     } else {
         // Read the entire frame from the ring buffer and remember it as the frame to
         // hold should the next frame underrun.
-        for slot in last_frame.iter_mut().take(input_channels.min(16)) {
+        for slot in last_frame.iter_mut().take(input_channels.min(64)) {
             if let Some(sample) = consumer.pop() {
                 *slot = sample;
             }
@@ -1908,7 +2095,7 @@ fn mix_ring_voice_frame(
 
     let final_gain = gain * fade_gain;
     for &(src_ch, dest_ch) in channel_map {
-        if src_ch >= input_channels || dest_ch >= output_channels || src_ch >= 16 {
+        if src_ch >= input_channels || dest_ch >= output_channels || src_ch >= 64 {
             continue;
         }
         let dest_idx = frame_idx * output_channels + dest_ch;
@@ -1929,13 +2116,22 @@ fn mix_live_input_into_output(
     output_channels: usize,
     duck: (f32, f32),
 ) {
-    let mut last_frame = [0.0f32; 16];
+    let mut last_frame = [0.0f32; 64];
     let mut underrun_frames = 0usize;
+    let available_frames = input.backlog_frames();
+    if available_frames > input.max_backlog_frames + frames {
+        let excess = available_frames - input.max_backlog_frames;
+        let skipped = input.consumer.skip(excess * input.input_channels);
+        input.trimmed_frames += (skipped / input.input_channels.max(1)) as u64;
+    }
 
     for frame_idx in 0..frames {
         // Advance voice volume toward target (smooth ramping to avoid pops). Done
         // every frame — including underrun frames — so the ramp stays time-accurate.
-        input.advance_voice_volume();
+        input.advance_volumes();
+        if input.consumer.len() < input.input_channels {
+            input.underrun_frames += 1;
+        }
 
         // input volume * voice volume * per-frame duck gain (D2); the underrun fade
         // gain is applied inside mix_ring_voice_frame.
@@ -1969,7 +2165,7 @@ fn mix_streamed_source_into_output(
     output_channels: usize,
     duck: (f32, f32),
 ) {
-    let mut last_frame = [0.0f32; 16];
+    let mut last_frame = [0.0f32; 64];
     let mut underrun_frames = 0usize;
 
     for frame_idx in 0..frames {
@@ -2019,6 +2215,52 @@ mod tests {
     }
 
     const TEST_FILE: &str = "test.wav";
+
+    #[test]
+    fn test_sample_volume_change_ramps_instead_of_jumping() {
+        // A volume command must not step the gain in one frame - that pops.
+        let buffer = create_test_buffer(48000, 2, 1.0);
+        let mut sample =
+            ActiveSample::new(1, "t".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        sample.set_target_volume(0.0);
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 512 * 2];
+        mix_audio(&mut output, &mut state);
+
+        assert!(
+            output[0] > state.output_ceiling * 0.99,
+            "the first frame should still be near the old level, got {}",
+            output[0]
+        );
+        let last = output[output.len() - 2];
+        assert!(
+            last < output[0],
+            "later frames should have ramped down: first {}, last {}",
+            output[0],
+            last
+        );
+    }
+
+    #[test]
+    fn test_input_mute_restores_configured_volume() {
+        // Unmuting must restore the level the input was configured/boosted
+        // to, not snap to 1.0
+        let (_producer, consumer) = crate::audio::input::create_ring_buffer(1024);
+        let mut input = LiveInput::new("mic".to_string(), consumer, 2, 0.7, vec![(0, 0)]);
+
+        input.set_muted(true);
+        assert!(input.is_muted());
+        input.set_muted(false);
+        assert_eq!(input.target_volume, 0.7);
+
+        input.set_target_volume(2.0);
+        input.set_muted(true);
+        input.set_muted(false);
+        assert_eq!(input.target_volume, 2.0, "a boosted mic comes back boosted");
+    }
 
     #[test]
     fn test_single_sample_mixing() {
@@ -2155,7 +2397,7 @@ mod tests {
     fn test_play_volume_clamped_at_construction() {
         let buffer = create_test_buffer(10, 2, 1.0);
 
-        // A Play with volume > 1.0 must be clamped to 1.0 at construction, matching
+        // A Play with volume above MAX_GAIN must be clamped to MAX_GAIN at construction, matching
         // the runtime Volume command (D23/F4). All three constructors clamp.
         let s1 = ActiveSample::new(
             1,
@@ -2165,7 +2407,11 @@ mod tests {
             1.0,
             "f".to_string(),
         );
-        assert_eq!(s1.volume, 1.0, "new() must clamp volume to 1.0");
+        assert_eq!(
+            s1.volume,
+            crate::config::MAX_GAIN,
+            "new() must clamp volume to MAX_GAIN"
+        );
 
         let s2 = ActiveSample::new_with_id(
             2,
@@ -2178,7 +2424,11 @@ mod tests {
             false,
             0,
         );
-        assert_eq!(s2.volume, 1.0, "new_with_id() must clamp volume to 1.0");
+        assert_eq!(
+            s2.volume,
+            crate::config::MAX_GAIN,
+            "new_with_id() must clamp volume to MAX_GAIN"
+        );
 
         let s3 = ActiveSample::new_with_mapping(
             3,
@@ -2193,8 +2443,9 @@ mod tests {
             0,
         );
         assert_eq!(
-            s3.volume, 1.0,
-            "new_with_mapping() must clamp volume to 1.0"
+            s3.volume,
+            crate::config::MAX_GAIN,
+            "new_with_mapping() must clamp volume to MAX_GAIN"
         );
     }
 
@@ -2460,6 +2711,111 @@ mod tests {
 
         // Sample should not be finished
         assert!(!state.active_samples[0].is_finished());
+    }
+
+    #[test]
+    fn test_wrap_loop_position_without_crossfade_wraps_to_start() {
+        assert_eq!(wrap_loop_position(1050.0, 1000, 0), 50.0);
+        assert_eq!(wrap_loop_position(-30.0, 1000, 0), 970.0);
+        assert_eq!(wrap_loop_position(500.0, 1000, 0), 500.0);
+    }
+
+    #[test]
+    fn test_wrap_loop_position_with_crossfade_skips_the_blended_head() {
+        // The last cf frames were blended with head frames [0, cf), so the
+        // loop resumes at cf - replaying [0, cf) would double the head
+        assert_eq!(wrap_loop_position(1050.0, 1000, 100), 150.0);
+        // Reverse: the head blend covered the tail, so wrap to just before it
+        assert_eq!(wrap_loop_position(-30.0, 1000, 100), 870.0);
+    }
+
+    #[test]
+    fn test_crossfade_loop_plays_head_only_once_per_loop() {
+        // Head frames [0, 3) are 0.9 markers, the rest 0.1. With a 3-frame
+        // crossfade, the head is heard only inside the blend at the tail -
+        // hearing 0.9 at full level right after the wrap is the double-play.
+        let mut data = Vec::new();
+        for frame in 0..10 {
+            let v = if frame < 3 { 0.9 } else { 0.1 };
+            data.extend([v, v]);
+        }
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
+        sample.loop_mode = true;
+        sample.crossfade_samples = 3;
+        sample.position = 5;
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Positions played: 5, 6 (plain 0.1), 7, 8, 9 (tail blended with
+        // head), then the wrap - which must land at frame 3 (0.1), not 0 (0.9)
+        let mut output = vec![0.0f32; 8 * 2];
+        mix_audio(&mut output, &mut state);
+
+        for frame in 5..8 {
+            let v = output[frame * 2];
+            assert!(
+                (v - 0.1).abs() < 0.05,
+                "frame {} after the wrap should be past the blended head (0.1), got {}",
+                frame,
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_looping_pitch_corrected_sample_has_no_gap_at_the_seam() {
+        // The stretcher's input must wrap across the loop boundary; an
+        // underfed stretcher renders the boundary callback (partly) silent.
+        // A sine keeps the phase-vocoder stretcher fed with real content.
+        let frames = 4800;
+        let mut data = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let v = (i as f32 / 48000.0 * 440.0 * std::f32::consts::TAU).sin() * 0.8;
+            data.extend([v, v]);
+        }
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
+        sample.loop_mode = true;
+        sample.set_speed_with_mode(8.0, true);
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Warm the stretcher up past its own latency, then check every
+        // callback: at 8x the input wraps within every callback, so an
+        // input feed that fails to wrap starves the stretcher constantly
+        let mut quiet_callbacks = Vec::new();
+        for callback in 0..40 {
+            let mut output = vec![0.0f32; 512 * 2];
+            mix_audio(&mut output, &mut state);
+            let mean: f32 = output.iter().map(|s| s.abs()).sum::<f32>() / output.len() as f32;
+            if callback >= 10 && mean < 0.4 {
+                quiet_callbacks.push((callback, mean));
+            }
+        }
+        assert!(
+            quiet_callbacks.is_empty(),
+            "looping pitch-corrected playback dropped out at the seam: {:?}",
+            quiet_callbacks
+        );
     }
 
     #[test]
@@ -3065,6 +3421,21 @@ mod tests {
         consumer
     }
 
+    fn create_test_ring_buffer_with_capacity(data: &[f32], capacity: usize) -> HeapConsumer<f32> {
+        use ringbuf::HeapRb;
+        let rb = HeapRb::<f32>::new(capacity);
+        let (mut producer, consumer) = rb.split();
+        producer.push_slice(data);
+        consumer
+    }
+
+    /// Interleaved test data where each sample's value identifies its channel
+    fn channel_marked_frames(frames: usize, channels: usize) -> Vec<f32> {
+        (0..frames * channels)
+            .map(|i| (i % channels) as f32 / 100.0)
+            .collect()
+    }
+
     #[test]
     fn test_live_input_basic_mixing() {
         // Create ring buffer with stereo data (10 frames)
@@ -3353,6 +3724,434 @@ mod tests {
         // Both inputs mix additively: 0.2 + 0.3 = 0.5
         for &s in &output {
             assert!((s - 0.5).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn test_live_input_high_channel_count() {
+        // Multichannel interfaces expose far more than 16 capture channels.
+        // Every channel must be routable and every sample must be consumed.
+        let channels = 20;
+        let frames = 4;
+        let data = channel_marked_frames(frames, channels);
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            channels,
+            1.0,
+            vec![(17, 0), (19, 1)],
+        );
+
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; frames * 2];
+        mix_audio(&mut output, &mut state);
+
+        for f in 0..frames {
+            assert!(
+                (output[f * 2] - 0.17).abs() < 1e-6,
+                "input channel 17 routes to output 0"
+            );
+            assert!(
+                (output[f * 2 + 1] - 0.19).abs() < 1e-6,
+                "input channel 19 routes to output 1"
+            );
+        }
+
+        assert_eq!(
+            state.live_inputs[0].consumer.len(),
+            0,
+            "every consumed frame must be fully drained"
+        );
+    }
+
+    #[test]
+    fn test_live_input_stays_frame_aligned_across_callbacks() {
+        // Leftover samples from a partially consumed frame would rotate the
+        // channel mapping on every subsequent callback.
+        let channels = 20;
+        let data = channel_marked_frames(6, channels);
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let live_input = LiveInput::new("mic".to_string(), consumer, channels, 1.0, vec![(3, 0)]);
+
+        let mut state = MixerState::new(1);
+        state.live_inputs.push(live_input);
+
+        for callback in 0..3 {
+            let mut output = vec![0.0f32; 2];
+            mix_audio(&mut output, &mut state);
+            for (i, &s) in output.iter().enumerate() {
+                assert!(
+                    (s - 0.03).abs() < 1e-6,
+                    "callback {} frame {} should still read channel 3, got {}",
+                    callback,
+                    i,
+                    s
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_live_input_trims_excess_backlog() {
+        // A capture clock running faster than the output clock builds a backlog.
+        // The mixer discards whole frames to bound latency instead of letting
+        // the ring buffer saturate and drop samples at the producer.
+        let channels = 2;
+        let capacity = 400; // 200 frames
+        let data = vec![0.5f32; 380]; // 190 frames queued
+        let consumer = create_test_ring_buffer_with_capacity(&data, capacity);
+
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            channels,
+            1.0,
+            vec![(0, 0), (1, 1)],
+        );
+        let max_backlog = live_input.max_backlog_frames;
+        assert!(max_backlog < 190, "test needs a backlog above the ceiling");
+
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 4]; // 2 frames
+        mix_audio(&mut output, &mut state);
+
+        let input = &state.live_inputs[0];
+        assert!(input.trimmed_frames > 0, "excess backlog should be trimmed");
+        assert!(
+            input.consumer.len() / channels <= max_backlog,
+            "backlog must be brought down to the ceiling"
+        );
+        assert_eq!(
+            input.consumer.len() % channels,
+            0,
+            "trimming must remove whole frames only"
+        );
+    }
+
+    #[test]
+    fn test_live_input_backlog_within_ceiling_is_kept() {
+        let channels = 2;
+        let data = vec![0.5f32; 20]; // 10 frames
+        let consumer = create_test_ring_buffer_with_capacity(&data, 400);
+
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            channels,
+            1.0,
+            vec![(0, 0), (1, 1)],
+        );
+
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 4];
+        mix_audio(&mut output, &mut state);
+
+        assert_eq!(state.live_inputs[0].trimmed_frames, 0);
+        assert_eq!(state.live_inputs[0].consumer.len(), 16, "8 frames left");
+    }
+
+    #[test]
+    fn test_live_input_counts_underrun_frames() {
+        let data = vec![0.8f32; 10]; // 5 stereo frames
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let live_input = LiveInput::new("mic".to_string(), consumer, 2, 1.0, vec![(0, 0), (1, 1)]);
+
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 20]; // 10 frames requested
+        mix_audio(&mut output, &mut state);
+
+        assert_eq!(state.live_inputs[0].underrun_frames, 5);
+    }
+
+    #[test]
+    fn test_live_input_volume_ramp_advances_through_underrun() {
+        // The ramp is wall-clock based: it must keep moving while the input is
+        // starved, otherwise a mute applied during a dropout never completes.
+        let consumer = create_test_ring_buffer_with_data(&[]);
+
+        let mut live_input = LiveInput::new("mic".to_string(), consumer, 1, 1.0, vec![(0, 0)]);
+        live_input.set_target_voice_volume(0.0);
+        let before = live_input.voice_volume;
+
+        let mut state = MixerState::new(1);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 100];
+        mix_audio(&mut output, &mut state);
+
+        assert!(
+            state.live_inputs[0].voice_volume < before,
+            "voice volume ramp should advance even with no input samples"
+        );
+    }
+
+    #[test]
+    fn test_live_input_ignores_out_of_range_routes() {
+        let data = vec![0.5f32; 8]; // 4 stereo frames
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        // Source channel 7 does not exist on a stereo input; destination 9
+        // does not exist on a stereo output. Both routes must be skipped
+        // without disturbing the valid one.
+        let live_input = LiveInput::new(
+            "mic".to_string(),
+            consumer,
+            2,
+            1.0,
+            vec![(7, 0), (0, 9), (1, 1)],
+        );
+
+        let mut state = MixerState::new(2);
+        state.live_inputs.push(live_input);
+
+        let mut output = vec![0.0f32; 8];
+        mix_audio(&mut output, &mut state);
+
+        for f in 0..4 {
+            assert_eq!(output[f * 2], 0.0);
+            assert_eq!(output[f * 2 + 1], 0.5);
+        }
+    }
+
+    #[test]
+    fn test_multiple_mics_on_one_interface() {
+        // Four microphones on an 18-channel interface: two summed onto a shared
+        // house speaker, two sent to their own endpoints, each at its own level.
+        let channels = 18;
+        let frames = 8;
+        let data = channel_marked_frames(frames, channels);
+        let consumer = create_test_ring_buffer_with_data(&data);
+
+        let mut mics = LiveInput::new(
+            "gamemaster".to_string(),
+            consumer,
+            channels,
+            0.5,
+            vec![
+                (0, 4),  // mic 1 -> house speaker
+                (1, 4),  // mic 2 -> house speaker (summed with mic 1)
+                (8, 5),  // mic 3 -> its own endpoint
+                (17, 6), // mic 4 -> its own endpoint
+            ],
+        );
+        mics.voice_volume = 1.0;
+        mics.target_voice_volume = 1.0;
+
+        let mut state = MixerState::new(8);
+        state.live_inputs.push(mics);
+
+        let mut output = vec![0.0f32; frames * 8];
+        mix_audio(&mut output, &mut state);
+
+        for f in 0..frames {
+            let base = f * 8;
+            // 0.00 + 0.01 summed, then halved by the input volume
+            assert!(
+                (output[base + 4] - 0.005).abs() < 1e-6,
+                "mics 1 and 2 sum on channel 4"
+            );
+            assert!((output[base + 5] - 0.04).abs() < 1e-6, "mic 3 on channel 5");
+            assert!(
+                (output[base + 6] - 0.085).abs() < 1e-6,
+                "mic 4 on channel 6"
+            );
+            assert_eq!(output[base], 0.0, "unrouted channels stay silent");
+            assert_eq!(output[base + 7], 0.0, "unrouted channels stay silent");
+        }
+
+        assert_eq!(state.live_inputs[0].underrun_frames, 0);
+        assert_eq!(state.live_inputs[0].trimmed_frames, 0);
+    }
+
+    #[test]
+    fn test_separate_mic_devices_mix_and_duck_independently() {
+        // Two microphones on separate capture devices, each its own voice, so
+        // they can be levelled and ducked independently while summing to the
+        // same speaker.
+        let consumer1 = create_test_ring_buffer_with_data(&vec![0.4f32; 8]);
+        let consumer2 = create_test_ring_buffer_with_data(&vec![0.6f32; 8]);
+
+        let mut mic1 = LiveInput::new("mic_north".to_string(), consumer1, 1, 0.5, vec![(0, 2)]);
+        mic1.voice_volume = 1.0;
+        mic1.target_voice_volume = 1.0;
+
+        let mut mic2 = LiveInput::new("mic_south".to_string(), consumer2, 1, 1.0, vec![(0, 2)]);
+        mic2.voice_volume = 0.5;
+        mic2.target_voice_volume = 0.5;
+
+        let mut state = MixerState::new(4);
+        state.live_inputs.push(mic1);
+        state.live_inputs.push(mic2);
+
+        let mut output = vec![0.0f32; 8 * 4];
+        mix_audio(&mut output, &mut state);
+
+        // 0.4 * 0.5 + 0.6 * 0.5 = 0.5 on the shared destination
+        for f in 0..8 {
+            assert!((output[f * 4 + 2] - 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_channel_gains_applied() {
+        let buffer = create_test_buffer(4, 2, 0.4);
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
+
+        let mut state = MixerState::new(2);
+        state.channel_gains = vec![0.5, 1.0];
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 8];
+        mix_audio(&mut output, &mut state);
+
+        for f in 0..4 {
+            assert!((output[f * 2] - 0.2).abs() < 1e-6, "channel 0 attenuated");
+            assert!(
+                (output[f * 2 + 1] - 0.4).abs() < 1e-6,
+                "channel 1 left alone"
+            );
+        }
+    }
+
+    #[test]
+    fn test_channel_gains_can_boost() {
+        // Lifting an underpowered subwoofer channel above unity
+        let buffer = create_test_buffer(4, 2, 0.3);
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
+
+        let mut state = MixerState::new(2);
+        state.channel_gains = vec![1.0, 2.0];
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 8];
+        mix_audio(&mut output, &mut state);
+
+        for f in 0..4 {
+            assert!((output[f * 2 + 1] - 0.6).abs() < 1e-6, "channel 1 boosted");
+        }
+    }
+
+    #[test]
+    fn test_channel_gains_still_saturate() {
+        // A boost cannot push the output past full scale
+        let buffer = create_test_buffer(4, 1, 0.8);
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
+
+        let mut state = MixerState::new(1);
+        state.channel_gains = vec![4.0];
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 4];
+        mix_audio(&mut output, &mut state);
+
+        for &s in &output {
+            assert!((s - state.output_ceiling).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn test_boosted_sample_volume_saturates() {
+        let buffer = create_test_buffer(4, 1, 0.6);
+        let sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            3.0,
+            TEST_FILE.to_string(),
+        );
+
+        let mut state = MixerState::new(1);
+        state.active_samples.push(sample);
+
+        let mut output = vec![0.0f32; 4];
+        mix_audio(&mut output, &mut state);
+
+        for &s in &output {
+            assert!((s - state.output_ceiling).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn test_set_target_voice_volume_allows_boost() {
+        let buffer = create_test_buffer(4, 1, 0.1);
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
+
+        sample.set_target_voice_volume(2.5);
+        assert_eq!(sample.target_voice_volume, 2.5);
+
+        sample.set_target_voice_volume(100.0);
+        assert_eq!(sample.target_voice_volume, crate::config::MAX_GAIN);
+    }
+
+    #[test]
+    fn test_live_input_target_voice_volume_allows_boost() {
+        let consumer = create_test_ring_buffer_with_data(&[0.1f32; 4]);
+        let mut input = LiveInput::new("mic".to_string(), consumer, 1, 1.0, vec![(0, 0)]);
+
+        input.set_target_voice_volume(2.5);
+        assert_eq!(input.target_voice_volume, 2.5);
+
+        input.set_target_voice_volume(100.0);
+        assert_eq!(input.target_voice_volume, crate::config::MAX_GAIN);
+    }
+
+    #[test]
+    fn test_live_input_volume_can_boost() {
+        // A quiet microphone lifted above unity
+        let consumer = create_test_ring_buffer_with_data(&[0.2f32; 4]);
+        let mut input = LiveInput::new("mic".to_string(), consumer, 1, 3.0, vec![(0, 0)]);
+        input.voice_volume = 1.0;
+        input.target_voice_volume = 1.0;
+
+        let mut state = MixerState::new(1);
+        state.live_inputs.push(input);
+
+        let mut output = vec![0.0f32; 4];
+        mix_audio(&mut output, &mut state);
+
+        for &s in &output {
+            assert!((s - 0.6).abs() < 1e-6);
         }
     }
 
@@ -4337,7 +5136,7 @@ mod tests {
 
         // Ramp until we reach target
         while (sample.voice_volume - sample.target_voice_volume).abs() > 0.0001 {
-            sample.advance_voice_volume();
+            sample.advance_volumes();
             let current = sample.voice_volume;
 
             // Verify volume changed by at most RAMP_RATE (0.001)
@@ -4391,7 +5190,7 @@ mod tests {
         // Change target to 0.5 and start ramping
         sample.set_target_voice_volume(0.5);
         for _ in 0..100 {
-            sample.advance_voice_volume();
+            sample.advance_volumes();
         }
         // After 100 frames at 0.001/frame = 0.1 change
         // Volume should be 1.0 - 0.1 = 0.9 (still above 0.5)
@@ -4408,7 +5207,7 @@ mod tests {
 
         // Continue ramping toward 0.2
         for _ in 0..200 {
-            sample.advance_voice_volume();
+            sample.advance_volumes();
         }
         // After 200 more frames at 0.001/frame = 0.2 change
         // Volume should be ~0.9 - 0.2 = 0.7
@@ -4426,7 +5225,7 @@ mod tests {
         // Volume should start increasing
         let vol_before_third = sample.voice_volume;
         for _ in 0..100 {
-            sample.advance_voice_volume();
+            sample.advance_volumes();
         }
         assert!(
             sample.voice_volume > vol_before_third,
@@ -4505,7 +5304,7 @@ mod tests {
 
         // Verify ramping works
         let initial = input.voice_volume;
-        input.advance_voice_volume();
+        input.advance_volumes();
         assert!(
             input.voice_volume < initial,
             "Voice volume should decrease toward target"
@@ -4513,7 +5312,7 @@ mod tests {
 
         // Continue ramping
         for _ in 0..1000 {
-            input.advance_voice_volume();
+            input.advance_volumes();
         }
         assert!(
             (input.voice_volume - 0.3).abs() < 0.01,
@@ -4539,7 +5338,7 @@ mod tests {
         assert_eq!(sample.target_voice_volume, 0.7);
 
         // Advancing should not change anything
-        let result = sample.advance_voice_volume();
+        let result = sample.advance_volumes();
         assert!(!result, "Should return false when at target");
         assert_eq!(sample.voice_volume, 0.7);
     }

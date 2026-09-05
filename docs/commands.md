@@ -42,7 +42,7 @@ Play an audio file.
 | `file` | string | *required* | File path or HTTP/HTTPS URL |
 | `id` | string | auto | Unique ID for targeting this sound later |
 | `voice` | string | auto | Voice group name |
-| `volume` | float | 1.0 | Volume (0.0 to 1.0) |
+| `volume` | float | 1.0 | Volume (0.0 to 4.0, unity is 1.0) |
 | `loop` | boolean | false | Loop playback continuously |
 | `crossfade_ms` | integer | 0 | Crossfade duration at loop boundaries (0 = disabled) |
 | `fade_in` | integer | 0 | Fade-in duration (milliseconds) |
@@ -53,6 +53,10 @@ Play an audio file.
 | `prebuffer_ms` | integer | config | Windowed-source prebuffer override (streamed plays) |
 | `freshness` | string | config | Cache freshness override: `trusting`, `dev`, or `pinned` |
 | `cacheable` | boolean | `true` | HTTP windowed plays only: `true` (default) tees the download to the disk cache so a replay hits disk; `false` treats the source as live (window, never persist). A URL with no `Content-Length` is always live |
+
+Volumes are gains: 1.0 is unity, below that attenuates and above that boosts, up
+to 4.0 (+12 dB). The mixer saturates its output, so a boost loud enough to
+exceed full scale clips rather than wrapping around.
 
 **Channel Mapping:**
 
@@ -121,6 +125,31 @@ Stop all playing audio immediately.
 {"command": "stopall"}
 ```
 
+### fadeall
+
+Fade all playing audio out, then stop it. Samples are removed once their fade
+completes.
+
+```json
+{"command": "fadeall", "time": 2000}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `time` | integer | `1000` | Fade duration in milliseconds. Also accepted as `fade_out_ms` |
+
+`soundFadeAll`, `fadeout`, and `soundFadeOut` are accepted as aliases for
+compatibility with the original app.
+
+Sent without a `time`, it fades everything over one second:
+
+```json
+{"command": "fadeall"}
+```
+
+Live inputs are not affected, the same as with `stopall`. Use `input_mute` for
+a microphone.
+
 ---
 
 ## Sample Targeting Commands
@@ -145,7 +174,8 @@ Stop specific samples.
 | `id` | string | — | Stop sample with this ID |
 | `file` | string | — | Stop all samples playing this file |
 | `voice` | string | — | Stop all samples in this voice |
-| `fade_out_ms` | integer | 0 | Fade-out duration (milliseconds) |
+| `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
+| `fade_out_ms` | integer | 10 | Fade-out duration (milliseconds). The 10 ms default avoids clicks on abrupt stops |
 
 At least one of `internal_id`, `id`, `file`, or `voice` is required. Multiple selectors use OR logic (a sample matches if any one criterion matches). An empty selector matches nothing and is silently a no-op.
 
@@ -167,6 +197,7 @@ Jump to a position in a playing sample.
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target all samples playing this file |
 | `voice` | string | — | Target all samples in this voice |
+| `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
 | `position_ms` | integer | *required* | Position to seek to (milliseconds) |
 
 ### speed
@@ -188,12 +219,17 @@ Change playback speed.
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target samples playing this file |
 | `voice` | string | — | Target samples in this voice |
+| `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
 | `speed` | float | *required* | Playback speed multiplier |
 | `pitch_correction` | boolean | false | Maintain original pitch |
 
 **Speed ranges:**
 - Without pitch correction: -100.0 to 100.0 (negative = reverse)
 - With pitch correction: 0.05 to 8.0 (reverse not supported)
+- `speed: 0` is rejected with an error - use `stop` to end playback.
+  Reverse playback starts from the sample's current position, so a sample
+  still at its beginning finishes immediately; `seek` first to play backwards
+  from a point
 
 ### volume
 
@@ -213,7 +249,8 @@ Adjust volume of specific samples.
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target samples playing this file |
 | `voice` | string | — | Target samples in this voice |
-| `volume` | float | *required* | New volume (0.0 to 1.0) |
+| `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
+| `volume` | float | *required* | New volume (0.0 to 4.0, unity is 1.0) |
 
 ---
 
@@ -262,7 +299,7 @@ Adjust volume for all samples in a voice.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `voice` | string | *required* | Voice name |
-| `volume` | float | *required* | New volume (0.0 to 1.0) |
+| `volume` | float | *required* | New volume (0.0 to 4.0, unity is 1.0) |
 
 ---
 
@@ -331,7 +368,7 @@ Adjust volume for a microphone/input device.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `input` | string | *required* | Input name (voice_id) or index |
-| `volume` | float | *required* | Volume (0.0 to 1.0) |
+| `volume` | float | *required* | Volume (0.0 to 4.0, unity is 1.0) |
 
 ### input_mute
 
@@ -349,6 +386,10 @@ Mute or unmute an input.
 |-----------|------|---------|-------------|
 | `input` | string | *required* | Input name or index |
 | `mute` | boolean | *required* | true = mute, false = unmute |
+
+Muting ramps the level down over ~20ms (no pop), and unmuting restores the
+input's configured or last-set volume - a mic set to 0.7 comes back at 0.7,
+a boosted one comes back boosted.
 
 ---
 

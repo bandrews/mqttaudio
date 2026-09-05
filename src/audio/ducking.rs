@@ -228,11 +228,12 @@ impl DuckingEngine {
     pub fn notify_voice_active(&mut self, voice_id: &str, is_active: bool) {
         tracing::debug!("Voice '{}' activity changed: {}", voice_id, is_active);
 
-        // Update active voices map
+        // Update active voices map. Inactive voices are removed rather than
+        // stored as false, so one-shot auto voices do not accumulate forever.
         if is_active {
             self.active_voices.insert(voice_id.to_string(), true);
         } else {
-            self.active_voices.insert(voice_id.to_string(), false);
+            self.active_voices.remove(voice_id);
         }
 
         // Recalculate all duck states
@@ -243,12 +244,19 @@ impl DuckingEngine {
     /// the engine's own duck states. Retained as the reference path for tests;
     /// the audio thread uses `DuckingApplier::get_multiplier` at runtime.
     #[allow(dead_code)]
+
+    /// Get the current ducking multiplier for a voice.
+    /// This is called from the mixer callback for each sample.
     pub fn get_multiplier(&mut self, voice_id: &str, frames: usize) -> f32 {
-        if let Some(state) = self.duck_states.get_mut(voice_id) {
-            state.advance_and_get_multiplier(frames)
-        } else {
-            // No ducking state = full volume
-            1.0
+        self.duck_states
+            .get_mut(voice_id)
+            .map(|s| s.advance_and_get_multiplier(frames))
+            .unwrap_or(1.0)
+    }
+
+    pub fn advance(&mut self, frames: usize) {
+        for state in self.duck_states.values_mut() {
+            state.advance_and_get_multiplier(frames);
         }
     }
 
@@ -638,7 +646,7 @@ mod tests {
 
         // Advance partway through fade
         let half_fade_frames = 24000; // 0.5s at 48kHz
-        engine.get_multiplier("music", half_fade_frames);
+        engine.advance(half_fade_frames);
 
         // Should be somewhere between 0.1 and 1.0
         let multiplier = engine.peek_multiplier("music");
@@ -652,7 +660,7 @@ mod tests {
         engine.notify_voice_active("narration", false);
 
         // Advance through restore
-        engine.get_multiplier("music", half_fade_frames);
+        engine.advance(half_fade_frames);
 
         // Should be restoring toward 1.0
         let restored = engine.peek_multiplier("music");
@@ -811,16 +819,16 @@ mod tests {
         // Advance in steps and verify gradual change
         let step_frames = 12000; // 0.25s at 48kHz
 
-        engine.get_multiplier("music", step_frames);
+        engine.advance(step_frames);
         let m1 = engine.peek_multiplier("music");
 
-        engine.get_multiplier("music", step_frames);
+        engine.advance(step_frames);
         let m2 = engine.peek_multiplier("music");
 
-        engine.get_multiplier("music", step_frames);
+        engine.advance(step_frames);
         let m3 = engine.peek_multiplier("music");
 
-        engine.get_multiplier("music", step_frames);
+        engine.advance(step_frames);
         let m4 = engine.peek_multiplier("music");
 
         // Should be gradually decreasing
@@ -939,7 +947,7 @@ mod tests {
         engine.notify_voice_active("narration", true);
 
         // Advance halfway through the narration duck (500ms = 24000 frames)
-        engine.get_multiplier("music", 24000);
+        engine.advance(24000);
         let halfway_to_02 = engine.peek_multiplier("music");
 
         // Should be halfway between 1.0 and 0.2 = 0.6
@@ -964,7 +972,7 @@ mod tests {
         );
 
         // Advance halfway through the new duck (250ms = 12000 frames)
-        engine.get_multiplier("music", 12000);
+        engine.advance(12000);
         let halfway_to_01 = engine.peek_multiplier("music");
 
         // Should be halfway between 0.6 and 0.1 = 0.35
@@ -975,7 +983,7 @@ mod tests {
         );
 
         // Complete the fade to 0.1
-        engine.get_multiplier("music", 12000);
+        engine.advance(12000);
         let final_ducked = engine.peek_multiplier("music");
 
         assert!(
@@ -988,7 +996,7 @@ mod tests {
         engine.notify_voice_active("dialog", false);
 
         // Advance partway through restore
-        engine.get_multiplier("music", 24000);
+        engine.advance(24000);
         let restoring = engine.peek_multiplier("music");
 
         // Should be between 0.1 and 0.2

@@ -184,12 +184,16 @@ async fn handle_state_socket(socket: WebSocket, broadcaster: Arc<LogBroadcaster>
 /// itself while broadcasting (it would recurse into the subscriber).
 pub struct WebSocketLogLayer {
     broadcaster: Arc<LogBroadcaster>,
+    min_level: tracing::Level,
 }
 
 impl WebSocketLogLayer {
-    /// Create the layer over the broadcaster `/ws` clients subscribe to.
-    pub fn new(broadcaster: Arc<LogBroadcaster>) -> Self {
-        Self { broadcaster }
+    /// Create a new WebSocket log layer for tracing integration.
+    pub fn new(broadcaster: Arc<LogBroadcaster>, min_level: tracing::Level) -> Self {
+        Self {
+            broadcaster,
+            min_level,
+        }
     }
 }
 
@@ -202,6 +206,11 @@ where
         event: &tracing::Event<'_>,
         _ctx: tracing_subscriber::layer::Context<'_, S>,
     ) {
+        // Check if we should log this level
+        if event.metadata().level() > &self.min_level {
+            return;
+        }
+
         // Format the event as a simple message
         let mut visitor = LogVisitor::default();
         event.record(&mut visitor);
@@ -251,6 +260,27 @@ mod tests {
         let broadcaster = LogBroadcaster::new();
         // Should not panic
         broadcaster.broadcast("test message".to_string());
+    }
+
+    #[test]
+    fn test_websocket_layer_broadcasts_events() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let broadcaster = Arc::new(LogBroadcaster::new());
+        let mut rx = broadcaster.subscribe();
+        let layer = WebSocketLogLayer::new(broadcaster.clone(), tracing::Level::INFO);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("hello ws clients");
+            tracing::debug!("too detailed for the configured level");
+        });
+
+        let msg = rx
+            .try_recv()
+            .expect("info event should reach the broadcaster");
+        assert!(msg.contains("hello ws clients"), "got: {}", msg);
+        assert!(rx.try_recv().is_err(), "debug events are filtered at INFO");
     }
 
     #[test]
@@ -351,7 +381,7 @@ mod tests {
         let broadcaster = Arc::new(LogBroadcaster::new());
         let mut rx = broadcaster.subscribe();
 
-        let layer = WebSocketLogLayer::new(broadcaster.clone());
+        let layer = WebSocketLogLayer::new(broadcaster.clone(), tracing::Level::TRACE);
         let subscriber = tracing_subscriber::registry().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
@@ -375,8 +405,10 @@ mod tests {
             "line should separate target and message with ': ', got: {line}"
         );
         // A second event broadcasts a second distinct line.
-        let subscriber2 =
-            tracing_subscriber::registry().with(WebSocketLogLayer::new(broadcaster.clone()));
+        let subscriber2 = tracing_subscriber::registry().with(WebSocketLogLayer::new(
+            broadcaster.clone(),
+            tracing::Level::TRACE,
+        ));
         tracing::subscriber::with_default(subscriber2, || {
             tracing::info!("back to normal");
         });

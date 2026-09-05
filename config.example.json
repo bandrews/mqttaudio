@@ -14,7 +14,7 @@
       "server: MQTT broker hostname or IP address",
       "port: MQTT broker port (default: 1883)",
       "topic: MQTT topic to subscribe to (required). Supports wildcards like 'audio/#'",
-      "client_id: MQTT client ID. If null, auto-generates 'mqttaudio_<pid>'",
+      "client_id: MQTT client ID. If null, auto-generates a random 'mqttaudio_<hex>' id",
       "reconnect_delay_seconds: Wait time before reconnecting after disconnect"
     ]
   },
@@ -33,8 +33,18 @@
       "side_left": 6,
       "side_right": 7
     },
+    "channel_aliases": {
+      "front_left": 0,
+      "front_right": 1,
+      "center": 2,
+      "lfe": 3,
+      "rear_left": 4,
+      "rear_right": 5,
+      "side_left": 6,
+      "side_right": 7
+    },
     "channel_volumes": {
-      "lfe": 0.7,
+      "lfe": 1.4,
       "side_left": 0.85,
       "side_right": 0.85
     },
@@ -55,10 +65,13 @@
     "revalidate_after_seconds": 300,
 
     "_notes": [
-      "enabled: Enable disk caching of downloaded HTTP files",
+      "enabled: Enable the disk cache for downloaded files. false = downloads",
+      "  play from memory only and are re-fetched after a restart",
       "directory: Directory for cache storage. ~ expands to user home",
-      "revalidate_after_seconds: Time before checking if cached file is stale",
-      "  0 = always check server, 300 = check every 5 minutes, high value = rarely check"
+      "revalidate_after_seconds: How long a cached URL is served before asking the",
+      "  server whether it changed (conditional request via ETag/Last-Modified).",
+      "  0 = check on every access; higher = fewer checks. A changed file is",
+      "  re-downloaded automatically; an unreachable server falls back to the cache"
     ]
   },
 
@@ -70,9 +83,10 @@
 
     "_notes": [
       "allowed_directories: Whitelist of directories for local file access",
-      "Empty array = no local files allowed (HTTP/HTTPS URLs only)",
-      "Paths can use ~ for user home directory",
-      "All paths are validated and path traversal attempts are blocked"
+      "When non-empty, play/precache paths must resolve inside one of these",
+      "directories (symlinks followed, ../ traversal blocked)",
+      "Empty array = local file access is unrestricted",
+      "Paths can use ~ for user home directory"
     ]
   },
 
@@ -85,6 +99,42 @@
       "verbose: Legacy verbose mode. Equivalent to level: 'debug'"
     ]
   },
+
+  "inputs": [
+    {
+      "device": null,
+      "volume": 0.9,
+      "voice_id": "gm_mic",
+      "latency_ms": 25,
+      "channels": null,
+      "sample_rate": null,
+      "activity_threshold": null,
+      "activity_hold_ms": 750,
+      "routes": [
+        { "source_channel": 0, "dest_channel": 4 },
+        { "source_channel": 1, "dest_channel": 4 },
+        { "source_channel": 2, "dest_channel": 5 }
+      ],
+
+      "_notes": [
+        "device: Input device name. null = system default. Use --list-inputs to see options",
+        "  Example: 'plughw:CARD=UMC1820,DEV=0'",
+        "  On Linux prefer the 'plughw:' alias of a card: capture is read as 32-bit float",
+        "  and plughw: converts from the card's native format",
+        "volume: Input volume gain (0.0-4.0, 1.0 = unity)",
+        "voice_id: Voice name, used by input_volume/input_mute commands and ducking rules",
+        "activity_threshold: Peak level (0.0-1.0) above which this input counts as speaking,",
+        "  letting its voice_id trigger ducking rules as primary_voice. null = detection off",
+        "activity_hold_ms: How long activity persists after the level drops (rides out pauses)",
+        "latency_ms: Buffer latency (5-500). 20-30 is a good starting point for live mics",
+        "channels: Capture channels to open. null = smallest count covering every source_channel",
+        "sample_rate: Capture rate to request. null = match the output rate and skip resampling",
+        "routes: source_channel (mic input, 0-indexed) to dest_channel (speaker output)",
+        "  Two source channels sharing a dest_channel are summed there",
+        "  dest_channel may use a name from audio.channel_aliases"
+      ]
+    }
+  ],
 
   "_example_configs": {
     "_minimal": {

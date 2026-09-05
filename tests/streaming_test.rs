@@ -1,3 +1,35 @@
+#[derive(Clone)]
+struct TestCacheOptions {
+    max_memory_mb: u32,
+    disk_enabled: bool,
+    revalidate_after_seconds: u64,
+}
+impl Default for TestCacheOptions {
+    fn default() -> Self {
+        Self {
+            max_memory_mb: 0,
+            disk_enabled: true,
+            revalidate_after_seconds: 300,
+        }
+    }
+}
+fn cache_with_options(
+    path: std::path::PathBuf,
+    options: TestCacheOptions,
+) -> Result<mqttaudio::cache::CacheManager, mqttaudio::cache::disk::CacheError> {
+    mqttaudio::cache::CacheManager::with_disk_cache(
+        path,
+        Default::default(),
+        if options.max_memory_mb == 0 {
+            mqttaudio::config::MemoryCap::Unlimited
+        } else {
+            mqttaudio::config::MemoryCap::Bytes(options.max_memory_mb as usize * 1024 * 1024)
+        },
+        Vec::new(),
+        options.revalidate_after_seconds,
+        options.disk_enabled,
+    )
+}
 // ABOUTME: Integration tests for streaming audio playback (HTTP and local files).
 // ABOUTME: Verifies StreamingBuffer, StreamingDecoder, and CacheManager streaming APIs.
 
@@ -317,6 +349,329 @@ async fn test_cache_manager_streaming_load() {
     assert_eq!(buffer.channels(), 2);
 
     let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_failed_streaming_load_retries_on_next_play() {
+    // A URL whose decode fails must not poison later plays of the same URL:
+    // once the content is fixed on the server, the next play should succeed.
+    let temp_dir = TempDir::new().unwrap();
+    let bad_path = temp_dir.path().join("retry_test.wav");
+    std::fs::write(&bad_path, b"this is not audio data at all, just text").unwrap();
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/retry_test.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
+
+    // Wait for the decode to fail
+    let errored = |buffer: &SampleBuffer| match buffer {
+        SampleBuffer::Streaming(buf) => buf.read().unwrap().has_error(),
+        SampleBuffer::Complete(_) => false,
+    };
+    let mut attempts = 0;
+    while !errored(&buffer) && attempts < 100 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        attempts += 1;
+    }
+    assert!(
+        errored(&buffer),
+        "Decode of garbage data should have failed"
+    );
+
+    // Fix the file on the server, then play the same URL again
+    generate_test_wav(&bad_path, 0.3);
+
+    let buffer2 = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
+
+    let mut attempts = 0;
+    while !buffer2.is_complete() && attempts < 100 {
+        assert!(
+            !errored(&buffer2),
+            "Second play should not have joined the failed load"
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        attempts += 1;
+    }
+    assert!(
+        buffer2.is_complete(),
+        "Second play should load successfully"
+    );
+    assert!(buffer2.frames() > 0);
+
+    let _ = shutdown.send(());
+}
+
+async fn wait_complete(buffer: &SampleBuffer) {
+    let mut attempts = 0;
+    while !buffer.is_complete() && attempts < 200 {
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        attempts += 1;
+    }
+    assert!(buffer.is_complete(), "Buffer should have completed loading");
+}
+
+#[tokio::test]
+async fn test_streamed_url_persists_to_disk_cache() {
+    // A URL played through the streaming path must land in the disk cache so
+    // a restart does not re-download it.
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("persist_stream.wav");
+    generate_test_wav(&wav_path, 0.4);
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/persist_stream.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    {
+        let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+        let buffer = cache_manager
+            .get_or_load_streaming(&url, 48000)
+            .await
+            .unwrap();
+        wait_complete(&buffer).await;
+        cache_manager.cleanup_completed_loads();
+        assert_eq!(
+            cache_manager.disk_stats().entry_count,
+            1,
+            "completed stream should be registered on disk"
+        );
+    }
+
+    // Kill the server: only the disk cache can satisfy the next play
+    let _ = shutdown.send(());
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .expect("second play must be served from the disk cache with the server gone");
+    assert!(buffer.is_complete());
+    assert!(buffer.frames() > 0);
+}
+
+#[tokio::test]
+async fn test_completed_streams_respect_memory_budget() {
+    // Completed streaming loads must enter the size-limited memory cache
+    // instead of accumulating unbounded in the active-load side table.
+    let temp_dir = TempDir::new().unwrap();
+    for i in 0..4 {
+        generate_test_wav(&temp_dir.path().join(format!("budget{}.wav", i)), 1.0);
+    }
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let cache_dir = TempDir::new().unwrap();
+
+    // 1 MB budget; each 1s stereo 48k file decodes to ~384 KB
+    let options = TestCacheOptions {
+        max_memory_mb: 1,
+        ..Default::default()
+    };
+    let mut cache_manager = cache_with_options(cache_dir.path().to_path_buf(), options).unwrap();
+
+    for i in 0..4 {
+        let url = format!("http://127.0.0.1:{}/budget{}.wav", port, i);
+        let buffer = cache_manager
+            .get_or_load_streaming(&url, 48000)
+            .await
+            .unwrap();
+        wait_complete(&buffer).await;
+    }
+    cache_manager.cleanup_completed_loads();
+
+    let stats = cache_manager.memory_stats();
+    assert!(
+        stats.size_bytes <= 1024 * 1024,
+        "memory cache must stay within its budget, got {} bytes",
+        stats.size_bytes
+    );
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_cache_disabled_writes_nothing_to_disk() {
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("nodisk.wav");
+    generate_test_wav(&wav_path, 0.3);
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/nodisk.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let options = TestCacheOptions {
+        disk_enabled: false,
+        ..Default::default()
+    };
+    let mut cache_manager = cache_with_options(cache_dir.path().to_path_buf(), options).unwrap();
+
+    // Streaming play works
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
+    wait_complete(&buffer).await;
+    cache_manager.cleanup_completed_loads();
+
+    // Blocking precache works too
+    cache_manager.precache(&url, 48000).await.unwrap();
+
+    assert_eq!(cache_manager.disk_stats().entry_count, 0);
+    let files_dir = cache_dir.path().join("files");
+    let file_count = files_dir
+        .exists()
+        .then(|| std::fs::read_dir(&files_dir).unwrap().count())
+        .unwrap_or(0);
+    assert_eq!(file_count, 0, "disabled cache must write no files");
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_revalidation_picks_up_changed_file() {
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("reval.wav");
+    generate_test_wav(&wav_path, 0.3);
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/reval.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let options = || TestCacheOptions {
+        revalidate_after_seconds: 0, // always check
+        ..Default::default()
+    };
+
+    {
+        let mut cache_manager =
+            cache_with_options(cache_dir.path().to_path_buf(), options()).unwrap();
+        let buffer = cache_manager
+            .get_or_load_streaming(&url, 48000)
+            .await
+            .unwrap();
+        wait_complete(&buffer).await;
+        cache_manager.cleanup_completed_loads();
+        assert_eq!(cache_manager.disk_stats().entry_count, 1);
+    }
+
+    // Replace the file on the server with a longer one, mtime clearly newer
+    generate_test_wav(&wav_path, 1.0);
+    let f = std::fs::File::options()
+        .append(true)
+        .open(&wav_path)
+        .unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(30))
+        .unwrap();
+    drop(f);
+
+    let mut cache_manager = cache_with_options(cache_dir.path().to_path_buf(), options()).unwrap();
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
+    wait_complete(&buffer).await;
+
+    assert!(
+        buffer.frames() > 30_000,
+        "revalidation should have fetched the longer replacement, got {} frames",
+        buffer.frames()
+    );
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_revalidation_respects_interval() {
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("interval.wav");
+    generate_test_wav(&wav_path, 0.3);
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/interval.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let options = || TestCacheOptions {
+        revalidate_after_seconds: 3600,
+        ..Default::default()
+    };
+
+    {
+        let mut cache_manager =
+            cache_with_options(cache_dir.path().to_path_buf(), options()).unwrap();
+        let buffer = cache_manager
+            .get_or_load_streaming(&url, 48000)
+            .await
+            .unwrap();
+        wait_complete(&buffer).await;
+        cache_manager.cleanup_completed_loads();
+    }
+
+    generate_test_wav(&wav_path, 1.0);
+
+    let mut cache_manager = cache_with_options(cache_dir.path().to_path_buf(), options()).unwrap();
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .unwrap();
+    assert!(
+        buffer.is_complete(),
+        "within the interval the cached copy is served directly"
+    );
+    assert!(
+        buffer.frames() < 30_000,
+        "within the interval the stale copy is expected, got {} frames",
+        buffer.frames()
+    );
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_revalidation_serves_cache_when_server_down() {
+    let temp_dir = TempDir::new().unwrap();
+    let wav_path = temp_dir.path().join("offline.wav");
+    generate_test_wav(&wav_path, 0.3);
+
+    let (port, shutdown) = start_test_server(temp_dir.path().to_path_buf()).await;
+    let url = format!("http://127.0.0.1:{}/offline.wav", port);
+
+    let cache_dir = TempDir::new().unwrap();
+    let options = || TestCacheOptions {
+        revalidate_after_seconds: 0,
+        ..Default::default()
+    };
+
+    {
+        let mut cache_manager =
+            cache_with_options(cache_dir.path().to_path_buf(), options()).unwrap();
+        let buffer = cache_manager
+            .get_or_load_streaming(&url, 48000)
+            .await
+            .unwrap();
+        wait_complete(&buffer).await;
+        cache_manager.cleanup_completed_loads();
+    }
+
+    let _ = shutdown.send(());
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let mut cache_manager = cache_with_options(cache_dir.path().to_path_buf(), options()).unwrap();
+    let buffer = cache_manager
+        .get_or_load_streaming(&url, 48000)
+        .await
+        .expect("a dead server must not make cached audio unplayable");
+    assert!(buffer.is_complete());
+    assert!(buffer.frames() > 0);
 }
 
 #[tokio::test]
@@ -873,6 +1228,35 @@ async fn test_multiple_local_files_concurrent() {
 }
 
 #[tokio::test]
+async fn test_corrupt_packets_do_not_abort_the_decode() {
+    // tests/audio/corrupt_440hz_2s.flac is a valid 2s FLAC with a 200-byte
+    // burst of flipped bits in the middle (FLAC frames are CRC-checked, so
+    // the corruption surfaces as a decode error). Corrupt frames are
+    // recoverable per Symphonia's contract, so the file must still play -
+    // minus a brief dropout - rather than failing outright.
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache_manager = CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/audio/corrupt_440hz_2s.flac"
+    );
+    let buffer = cache_manager
+        .get_or_load_streaming(path, 44100)
+        .await
+        .expect("a corrupt packet must not make the whole file unplayable");
+
+    // The fixture corrupts 8 of ~27 frames; with resync losses roughly two
+    // thirds of the audio survives. The bar here is "plays with dropouts
+    // instead of failing": more than half the 2s file must decode.
+    assert!(
+        buffer.frames() > 44_100,
+        "expected most of the 2s file to decode, got {} frames",
+        buffer.frames()
+    );
+}
+
+#[tokio::test]
 async fn test_nonexistent_file_error() {
     // Test error handling for missing files
     let cache_dir = TempDir::new().unwrap();
@@ -975,7 +1359,7 @@ async fn cacheable_windowed_play_persists_and_replay_hits_disk() {
     .unwrap();
 
     // Tee the cacheable windowed download to disk, exactly as the windowed play does.
-    let (temp_path, final_path) = cm.windowed_persist_paths(&url);
+    let (temp_path, final_path) = cm.windowed_persist_paths(&url).unwrap();
     let open = open_http_stream(&url).await.unwrap();
     assert_eq!(open.content_length(), Some(content_length));
     let content_type = open.content_type().map(|s| s.to_string());
@@ -1461,7 +1845,7 @@ async fn http_full_load_reuses_the_probe_request_and_persists() {
     let content_type = open.content_type().map(|s| s.to_string());
 
     // Persist tee, as the play path builds it for a cacheable source.
-    let (temp_path, final_path) = cm.windowed_persist_paths(&url);
+    let (temp_path, final_path) = cm.windowed_persist_paths(&url).unwrap();
     let (done_tx, done_rx) = oneshot::channel::<u64>();
     let reader = open.into_bounded_reader(Some(PersistTarget {
         temp_path,

@@ -1,8 +1,12 @@
 // ABOUTME: Audio input device handling for microphone capture.
 // ABOUTME: Manages input streams and routes audio to mixer via ring buffers.
 
+use crate::config::ResamplerQuality;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, Stream, SupportedStreamConfig};
+use std::sync::atomic::{AtomicU32, AtomicU64};
+const MAX_REASONABLE_SAMPLE_RATE: u32 = 384000;
+const MAX_REASONABLE_CHANNELS: u16 = 64;
 use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -52,7 +56,9 @@ pub fn input_device_list() -> Result<Vec<InputDeviceInfo>, String> {
     let devices = host.input_devices().map_err(|e| e.to_string())?;
     let mut list = Vec::new();
     for device in devices {
-        let Ok(name) = device.description().map(|d| d.name().to_string()) else {
+        let Ok(name) = device.description().map(|d| {
+            super::device::output_device_identifier(&d, cfg!(target_os = "linux")).to_string()
+        }) else {
             continue;
         };
 
@@ -118,6 +124,7 @@ pub fn list_input_devices() {
     println!("Available audio input devices:");
     match input_device_list() {
         Ok(devices) => {
+            let count = devices.len();
             for (i, device) in devices.iter().enumerate() {
                 println!("  {}. {}", i, device.name);
                 match &device.caps {
@@ -156,34 +163,331 @@ pub fn list_input_devices() {
                     InputCaps::Unknown => {}
                 }
             }
+            if count == 0 {
+                println!("  (none — devices that cannot be opened for capture right now,");
+                println!("   because they are busy or inaccessible to this user, are not listed)");
+            }
         }
         Err(e) => eprintln!("Error listing input devices: {}", e),
     }
 }
 
-/// Get an input device by name, or the default if name is None
+/// Interpret a configured device name as an index into the enumerated input
+/// device list, matching the numbering printed by --list-inputs. Only whole
+/// numbers within range qualify.
+fn parse_device_index(requested: &str, device_count: usize) -> Option<usize> {
+    let index: usize = requested.trim().parse().ok()?;
+    if index < device_count {
+        Some(index)
+    } else {
+        None
+    }
+}
+
+/// Build the device-not-found message: what was requested, which devices could
+/// be opened for capture at that moment, and any direct-ALSA probe diagnosis.
+/// Enumeration only yields devices that open for capture, so a device that is
+/// busy or inaccessible is invisible here even though --list-inputs may have
+/// shown it earlier.
+fn device_not_found_message(requested: &str, available: &[String], probe: Option<&str>) -> String {
+    let mut msg = format!("Input device not found: {}", requested);
+    if available.is_empty() {
+        msg.push_str(
+            "\n  No devices could be opened for capture at this moment; \
+             busy or inaccessible devices are not enumerable.",
+        );
+    } else {
+        msg.push_str(&format!(
+            "\n  Devices currently available for capture: {}",
+            available.join(", ")
+        ));
+    }
+    if let Some(probe) = probe {
+        msg.push_str(&format!("\n  {}", probe));
+    }
+    msg
+}
+
+/// Ask ALSA directly why a capture open of this name fails, to explain why a
+/// device is missing from enumeration (which silently skips any device that
+/// cannot be opened for capture at that moment).
+#[cfg(target_os = "linux")]
+fn probe_capture_open(name: &str) -> Option<String> {
+    use alsa::pcm::PCM;
+    use alsa::Direction;
+
+    match PCM::new(name, Direction::Capture, true) {
+        Ok(_) => Some(format!(
+            "ALSA opens '{}' for capture directly, but its configurations were \
+             rejected during enumeration; its native sample format may be \
+             unsupported. Try the plughw: form of the name.",
+            name
+        )),
+        Err(e) => {
+            let advice = match e.errno() {
+                libc::EBUSY => {
+                    "another process holds this device for capture (a sound \
+                     server such as PipeWire or PulseAudio, or another capture \
+                     application)"
+                }
+                libc::EACCES | libc::EPERM => {
+                    "permission denied; when running as a service, check that \
+                     the service user is in the 'audio' group"
+                }
+                libc::ENOENT | libc::ENODEV | libc::ENXIO => {
+                    "no ALSA device has this name; compare against 'arecord -L'"
+                }
+                _ => "see the ALSA error for details",
+            };
+            Some(format!(
+                "Direct ALSA capture open of '{}' failed: {} — {}",
+                name, e, advice
+            ))
+        }
+    }
+}
+
+/// Decide which enumerated input device a configured name selects: the exact
+/// name first, then the --list-inputs index, then an ALSA card match.
+/// Returns the position in the enumerated name list.
+fn resolve_requested_device(requested: &str, names: &[String]) -> Option<usize> {
+    if let Some(pos) = names.iter().position(|n| n == requested) {
+        return Some(pos);
+    }
+    if let Some(index) = parse_device_index(requested, names.len()) {
+        return Some(index);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(pos) = names
+            .iter()
+            .position(|n| crate::audio::device::try_match_alsa_device(requested, n) == Some(true))
+        {
+            return Some(pos);
+        }
+    }
+    None
+}
+
+/// Get an input device by name, by --list-inputs index, or the default if
+/// name is None
+///
+/// Falls back to ALSA card matching so that names written by hand
+/// ("hw:CARD=UMC1820, DEV=0") still resolve to the enumerated device, the same
+/// way output devices are resolved.
 pub fn get_input_device(name: Option<&str>) -> Result<Device, InputError> {
     let host = cpal::default_host();
 
     match name {
         Some(device_name) => {
-            let devices = host
+            let names: Vec<String> = host
                 .input_devices()
-                .map_err(|e| InputError::DeviceEnumeration(e.to_string()))?;
-
-            for device in devices {
-                if let Ok(n) = device.description().map(|d| d.name().to_string()) {
-                    if n == device_name {
-                        return Ok(device);
-                    }
+                .map_err(|e| InputError::DeviceEnumeration(e.to_string()))?
+                .filter_map(|device| {
+                    device.description().ok().map(|d| {
+                        super::device::output_device_identifier(&d, cfg!(target_os = "linux"))
+                            .to_string()
+                    })
+                })
+                .collect();
+            if let Some(pos) = resolve_requested_device(device_name, &names) {
+                let target = &names[pos];
+                let found = host
+                    .input_devices()
+                    .map_err(|e| InputError::DeviceEnumeration(e.to_string()))?
+                    .find(|device| {
+                        device
+                            .description()
+                            .map(|d| {
+                                super::device::output_device_identifier(
+                                    &d,
+                                    cfg!(target_os = "linux"),
+                                ) == target
+                            })
+                            .unwrap_or(false)
+                    });
+                if let Some(device) = found {
+                    return Ok(device);
                 }
             }
-            Err(InputError::DeviceNotFound(device_name.to_string()))
+
+            #[cfg(target_os = "linux")]
+            let probe = probe_capture_open(device_name);
+            #[cfg(not(target_os = "linux"))]
+            let probe = None;
+
+            Err(InputError::DeviceNotFound {
+                requested: device_name.to_string(),
+                available: names,
+                probe,
+            })
         }
         None => host
             .default_input_device()
             .ok_or(InputError::NoDefaultDevice),
     }
+}
+
+/// Lowest input channel count that can serve every routed source channel
+pub fn required_channels(channel_map: &[(usize, usize)]) -> usize {
+    channel_map
+        .iter()
+        .map(|(src, _)| src + 1)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Choose the channel count to open a capture stream with.
+///
+/// `exact` forces a specific count, for hardware whose capabilities cpal
+/// reports incorrectly. Otherwise the smallest supported count that covers
+/// every routed source channel is used, so a device offering a range is not
+/// opened wider than the routing needs while a device with a fixed layout
+/// (ALSA `hw:` on a multichannel interface) still matches. Returns None when
+/// no supported count satisfies the request.
+pub fn select_channel_count(
+    available: &[u16],
+    exact: Option<usize>,
+    minimum: usize,
+) -> Option<u16> {
+    match exact {
+        Some(requested) => available
+            .iter()
+            .copied()
+            .find(|&ch| ch as usize == requested),
+        None => available
+            .iter()
+            .copied()
+            .filter(|&ch| ch as usize >= minimum.max(1))
+            .min(),
+    }
+}
+
+/// Find a capture configuration for the device.
+///
+/// Only f32 configurations are considered: the capture callback reads f32
+/// samples, and ALSA `hw:` devices that expose integer formats only must be
+/// opened through their `plughw:` alias instead.
+/// Choose the capture rate from a reported range. ALSA plug devices report a
+/// continuous range with an implausible maximum; that is capability-report
+/// noise, not a reason to disqualify the configuration, so the ceiling is
+/// clamped and the preferred rate wins whenever the range covers it.
+fn choose_capture_rate(min_rate: u32, max_rate: u32, preferred: u32) -> u32 {
+    let max_rate = max_rate.min(MAX_REASONABLE_SAMPLE_RATE);
+    preferred.max(min_rate).min(max_rate)
+}
+
+pub fn find_input_config(
+    device: &Device,
+    requested_channels: Option<usize>,
+    minimum_channels: usize,
+    preferred_sample_rate: u32,
+) -> Result<SupportedStreamConfig, InputError> {
+    let supported: Vec<_> = device
+        .supported_input_configs()
+        .map_err(|e| InputError::ConfigError(e.to_string()))?
+        .filter(|c| c.min_sample_rate() <= MAX_REASONABLE_SAMPLE_RATE)
+        .filter(|c| c.channels() <= MAX_REASONABLE_CHANNELS)
+        .collect();
+
+    // Plugin devices often enumerate nothing usable; fall back to whatever the
+    // device reports as its default and let the stream build succeed or fail.
+    if supported.is_empty() {
+        return get_input_config(device);
+    }
+
+    let float_configs: Vec<_> = supported
+        .iter()
+        .filter(|c| input_stream_builder(c.sample_format()).is_some())
+        .collect();
+
+    if float_configs.is_empty() {
+        let formats: Vec<String> = supported
+            .iter()
+            .map(|c| format!("{:?}", c.sample_format()))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        return Err(InputError::ConfigError(format!(
+            "device offers no f32 capture format (has: {}); use the 'plughw:' alias for this card",
+            formats.join(", ")
+        )));
+    }
+
+    let available: Vec<u16> = float_configs.iter().map(|c| c.channels()).collect();
+    let channels = select_channel_count(&available, requested_channels, minimum_channels)
+        .ok_or_else(|| {
+            let mut counts: Vec<u16> = available.clone();
+            counts.sort_unstable();
+            counts.dedup();
+            match requested_channels {
+                Some(ch) => InputError::ConfigError(format!(
+                    "device does not support {} capture channels (supports: {:?})",
+                    ch, counts
+                )),
+                None => InputError::ConfigError(format!(
+                    "routing needs {} capture channels but device supports at most {:?}",
+                    minimum_channels, counts
+                )),
+            }
+        })?;
+
+    let matching: Vec<_> = float_configs
+        .iter()
+        .filter(|c| c.channels() == channels)
+        .collect();
+
+    // Matching the output rate keeps the resampler out of the signal path
+    let exact_rate = matching.iter().find(|c| {
+        choose_capture_rate(
+            c.min_sample_rate(),
+            c.max_sample_rate(),
+            preferred_sample_rate,
+        ) == preferred_sample_rate
+    });
+
+    match exact_rate {
+        Some(c) => Ok(c.with_sample_rate(preferred_sample_rate)),
+        None => {
+            let closest = matching[0];
+            let rate = choose_capture_rate(
+                closest.min_sample_rate(),
+                closest.max_sample_rate(),
+                preferred_sample_rate,
+            );
+            Ok(closest.with_sample_rate(rate))
+        }
+    }
+}
+
+/// Push whole frames into the ring buffer, returning the number of frames written.
+///
+/// A partially written frame would permanently shift the channel interleaving
+/// seen by the mixer, sending each microphone to the wrong output and leaving a
+/// residue that grows until the buffer is full. Frames that do not fit are
+/// counted as dropped instead.
+fn push_frames(
+    producer: &mut HeapProducer<f32>,
+    data: &[f32],
+    channels: usize,
+    dropped_frames: &AtomicU64,
+) -> usize {
+    if channels == 0 {
+        return 0;
+    }
+
+    let frames_in = data.len() / channels;
+    let frames_free = producer.free_len() / channels;
+    let frames_out = frames_in.min(frames_free);
+
+    if frames_out > 0 {
+        producer.push_slice(&data[..frames_out * channels]);
+    }
+    if frames_out < frames_in {
+        dropped_frames.fetch_add((frames_in - frames_out) as u64, Ordering::Relaxed);
+    }
+
+    frames_out
 }
 
 /// Get the default input configuration for a device
@@ -211,6 +515,18 @@ pub fn create_ring_buffer(size: usize) -> (HeapProducer<f32>, HeapConsumer<f32>)
 pub struct InputStreamConfig {
     pub device_name: Option<String>,
     pub latency_ms: u32,
+    /// Exact channel count to open (None = smallest count covering `min_channels`)
+    pub channels: Option<usize>,
+    /// Lowest channel count the configured routing needs
+    pub min_channels: usize,
+    /// Capture rate to request (None = match the output rate when supported)
+    pub sample_rate: Option<u32>,
+    /// Quality preset for capture-rate conversion, from advanced.resampler_quality
+    pub resampler_quality: ResamplerQuality,
+    /// Stream buffer size in frames, matched to the output stream so both
+    /// directions of a shared-clock USB interface run compatible parameters
+    /// (None = device default)
+    pub buffer_size: Option<u32>,
 }
 
 impl Default for InputStreamConfig {
@@ -218,6 +534,11 @@ impl Default for InputStreamConfig {
         Self {
             device_name: None,
             latency_ms: 20, // 20ms default latency buffer
+            channels: None,
+            min_channels: 1,
+            sample_rate: None,
+            resampler_quality: ResamplerQuality::default(),
+            buffer_size: None,
         }
     }
 }
@@ -271,12 +592,31 @@ pub fn create_input_stream_with_fanout(
     let device = get_input_device(config.device_name.as_deref())?;
     let device_name = device
         .description()
-        .map(|d| d.name().to_string())
+        .map(|d| super::device::output_device_identifier(&d, cfg!(target_os = "linux")).to_string())
         .unwrap_or_else(|_| "Unknown".to_string());
-    let supported_config = get_input_config(&device)?;
+    let supported_config = find_input_config(
+        &device,
+        config.channels,
+        config.min_channels,
+        config.sample_rate.unwrap_or(target_sample_rate),
+    )?;
 
     let input_sample_rate = supported_config.sample_rate();
     let channels = supported_config.channels() as usize;
+
+    if channels == 0 {
+        return Err(InputError::ConfigError(format!(
+            "device '{}' reported zero capture channels",
+            device_name
+        )));
+    }
+
+    if channels < config.min_channels {
+        return Err(InputError::ConfigError(format!(
+            "routing needs {} capture channels but '{}' opened with {}",
+            config.min_channels, device_name, channels
+        )));
+    }
 
     // Calculate ring buffer size based on OUTPUT sample rate (after potential resampling)
     let buffer_size = calculate_ring_buffer_size(target_sample_rate, channels, config.latency_ms);
@@ -593,11 +933,11 @@ pub fn resample_block_fanout(
         // Interleave the produced frames into the ring buffer.
         let mut dropped = 0usize;
         for producer in producers.iter_mut() {
-            for frame_idx in 0..out_frames {
+            let writable = out_frames.min(producer.free_len() / channels);
+            dropped += (out_frames - writable) * channels;
+            for frame_idx in 0..writable {
                 for ch in 0..channels {
-                    if producer.push(state.output[ch][frame_idx]).is_err() {
-                        dropped += 1;
-                    }
+                    let _ = producer.push(state.output[ch][frame_idx]);
                 }
             }
         }
@@ -769,7 +1109,11 @@ where
 #[derive(Debug)]
 pub enum InputError {
     DeviceEnumeration(String),
-    DeviceNotFound(String),
+    DeviceNotFound {
+        requested: String,
+        available: Vec<String>,
+        probe: Option<String>,
+    },
     NoDefaultDevice,
     ConfigError(String),
     StreamError(String),
@@ -781,7 +1125,17 @@ impl std::fmt::Display for InputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InputError::DeviceEnumeration(e) => write!(f, "Failed to enumerate devices: {}", e),
-            InputError::DeviceNotFound(name) => write!(f, "Input device not found: {}", name),
+            InputError::DeviceNotFound {
+                requested,
+                available,
+                probe,
+            } => {
+                write!(
+                    f,
+                    "{}",
+                    device_not_found_message(requested, available, probe.as_deref())
+                )
+            }
             InputError::NoDefaultDevice => write!(f, "No default input device available"),
             InputError::ConfigError(e) => write!(f, "Configuration error: {}", e),
             InputError::StreamError(e) => write!(f, "Stream error: {}", e),

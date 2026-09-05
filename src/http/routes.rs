@@ -33,6 +33,44 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// mode) unless `require_auth` is set, in which case it fails closed. A token is
 /// accepted via `Authorization: Bearer <token>` or the `?token=` query param,
 /// compared in constant time.
+
+/// Percent-decode a query parameter value ('+' as space), so tokens with
+/// URL-encoded characters authenticate through the query form.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
+                    .ok()
+                    .and_then(|h| u8::from_str_radix(h, 16).ok());
+                match hex {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Authentication middleware that checks for Bearer token if configured.
 async fn auth_middleware(
     State(state): State<AppState>,
     request: Request<Body>,
@@ -82,6 +120,7 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         .route("/play", post(handlers::handle_play))
         .route("/stop", post(handlers::handle_stop))
         .route("/stopall", post(handlers::handle_stopall))
+        .route("/fadeall", post(handlers::handle_fadeall))
         .route("/volume", post(handlers::handle_volume))
         .route("/seek", post(handlers::handle_seek))
         .route("/speed", post(handlers::handle_speed))

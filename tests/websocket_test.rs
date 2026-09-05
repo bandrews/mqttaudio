@@ -17,8 +17,12 @@ use tokio_tungstenite::tungstenite::Message;
 /// Build an AppState and return it alongside the command receiver (kept alive)
 /// and a clone of the shared log broadcaster (so the test can broadcast after
 /// the client has subscribed).
-fn build_state() -> (AppState, mpsc::Receiver<String>, Arc<LogBroadcaster>) {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<String>(100);
+fn build_state() -> (
+    AppState,
+    mpsc::Receiver<mqttaudio::mqtt::commands::CommandRequest>,
+    Arc<LogBroadcaster>,
+) {
+    let (cmd_tx, cmd_rx) = mpsc::channel::<mqttaudio::mqtt::commands::CommandRequest>(100);
     let status = Arc::new(RwLock::new(StatusSnapshot {
         active_samples: 0,
         output_channels: 2,
@@ -170,8 +174,10 @@ async fn ws_streams_live_tracing_log_lines_through_the_layer() {
 
     // The daemon's wiring: the SAME broadcaster the server serves /ws from,
     // installed as a tracing layer.
-    let subscriber =
-        tracing_subscriber::registry().with(WebSocketLogLayer::new(broadcaster.clone()));
+    let subscriber = tracing_subscriber::registry().with(WebSocketLogLayer::new(
+        broadcaster.clone(),
+        tracing::Level::TRACE,
+    ));
     let dispatch = tracing::Dispatch::new(subscriber);
     {
         let _guard = tracing::dispatcher::set_default(&dispatch);

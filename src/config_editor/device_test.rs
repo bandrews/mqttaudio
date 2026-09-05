@@ -259,6 +259,7 @@ pub fn start_input_test(
         InputStreamConfig {
             device_name: device_name.map(|s| s.to_string()),
             latency_ms,
+            ..InputStreamConfig::default()
         },
         sample_rate,
     )

@@ -60,15 +60,17 @@ Config file example:
 | `/status/talkback` | GET | Applied fail-closed talkback lease state |
 | `/ready` | GET | Readiness of output and configured capture inputs |
 | `/status/cache` | GET | Cache statistics |
+| `/status/inputs` | GET | Live inputs and their capture health |
 
 ### Command Endpoints (Authentication Required if configured)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/command` | POST | Send any command (same JSON as MQTT) |
-| `/play` | POST | Play audio file |
+| `/play` | POST | Play audio file (same parameters as the MQTT `play` command, including `channel_map`) |
 | `/stop` | POST | Stop samples by selector |
 | `/stopall` | POST | Stop all playback |
+| `/fadeall` | POST | Fade out all playback |
 | `/volume` | POST | Set sample volume |
 | `/seek` | POST | Seek to position |
 | `/speed` | POST | Change playback speed |
@@ -84,6 +86,17 @@ Config file example:
 | `/cache/invalidate` | POST | Invalidate specific cache entry |
 | `/cache/reload` | POST | Invalidate then re-precache an entry (fresh + instant) |
 | `/precache` | POST | Pre-cache an audio file |
+| `/input/volume` | POST | Set a live input's volume (`{"input": "mic", "volume": 0.8}`) |
+| `/input/mute` | POST | Mute/unmute a live input (`{"input": "mic", "mute": true}`) |
+
+Command endpoints wait for the command to be processed and report the
+real outcome: `{"success": true, "message": ...}` on success, or an error
+with a matching status code - 400 for malformed requests, 404 when a
+file fails to load or a selector matches nothing, 403 when a path is
+outside `security.allowed_directories`, 409 when a pending play was
+cancelled by a stop, 504 if the result takes longer than 30 seconds.
+Loads run in the background, so a slow download never delays other
+commands (an emergency `stopall` also cancels any loads still in flight).
 
 > **Typed endpoints vs `/command`.** The convenience endpoints above deserialize a fixed set of fields. In
 > particular, `POST /play` accepts only `file`, `id`, `volume`, `voice`, `fade_in`, `start_position_ms`,
@@ -251,10 +264,10 @@ Returns active samples with playback position and timing information:
 | `position` | integer | Current position in frames |
 | `position_ms` | integer | Current position in milliseconds |
 | `total_frames` | integer | Total audio length in frames |
-| `total_ms` | integer | Total audio length in milliseconds |
+| `total_ms` | integer | Total audio length in milliseconds (0 while a compressed HTTP stream's length is still unknown) |
 | `sample_rate` | integer | Sample rate in Hz |
-| `volume` | float | Sample volume (0.0-1.0) |
-| `voice_volume` | float | Voice group volume (0.0-1.0) |
+| `volume` | float | Sample volume (0.0-4.0, 1.0 = unity) |
+| `voice_volume` | float | Voice group volume (0.0-4.0, 1.0 = unity) |
 | `speed` | float | Playback speed multiplier |
 | `loop_mode` | boolean | Whether looping is enabled |
 | `progress_percent` | float | Playback progress (0-100) |
@@ -335,12 +348,17 @@ line (timestamp, level, target, text — the tracing subscriber feeds the socket
 daemon Sprint 14, D62).
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/ws');
+const ws = new WebSocket('ws://localhost:8080/ws?token=your-secret-token');
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
-  console.log(data.message);
+  console.log(data.message); // {type: "connected"|"log", message: ...}
 };
 ```
+
+When `auth_token` is set, `/ws` requires it like the command endpoints.
+Browsers cannot send an Authorization header on a WebSocket, so pass the
+token as the `token` query parameter; omit it entirely when no auth token
+is configured.
 
 ## Example Usage
 
@@ -357,6 +375,11 @@ curl -X POST http://localhost:8080/play \
 
 # Stop all playback
 curl -X POST http://localhost:8080/stopall
+
+# Fade all playback out over 2 seconds
+curl -X POST http://localhost:8080/fadeall \
+  -H "Content-Type: application/json" \
+  -d '{"time": 2000}'
 
 # Get status
 curl http://localhost:8080/status

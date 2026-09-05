@@ -7,6 +7,7 @@ use mqttaudio::cache::CacheManager;
 use mqttaudio::http::{
     create_router, AppState, InputStatus, LogBroadcaster, SampleStatus, StatusSnapshot,
 };
+use mqttaudio::mqtt::commands::CommandRequest;
 use mqttaudio::talkback::TalkbackLease;
 use mqttaudio::voice::VoiceManager;
 use parking_lot::Mutex;
@@ -35,8 +36,20 @@ fn sample_status(
 }
 
 /// Create a test AppState with mock components.
+/// A stand-in command loop acknowledges every request with success (so
+/// handlers that wait for an outcome get one) and forwards the raw payload
+/// to the returned receiver for the tests to assert on.
 fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<String>(100);
+    let (cmd_tx, mut request_rx) = mpsc::channel::<CommandRequest>(100);
+    let (payload_tx, cmd_rx) = mpsc::channel::<String>(100);
+    tokio::spawn(async move {
+        while let Some(request) = request_rx.recv().await {
+            let _ = payload_tx.send(request.payload.clone()).await;
+            if let Some(reply) = request.reply {
+                let _ = reply.send(Ok("accepted".to_string()));
+            }
+        }
+    });
 
     let status = Arc::new(RwLock::new(StatusSnapshot {
         active_samples: 0,
@@ -145,6 +158,7 @@ async fn test_ready_endpoint_distinguishes_liveness_from_input_readiness() {
         applied_volume: None,
         applied_muted: None,
         applied_unmuted_volume: None,
+        health: None,
         ready: false,
         last_error: Some("device missing".to_string()),
     });
@@ -293,6 +307,75 @@ async fn test_stopall_endpoint() {
 }
 
 #[tokio::test]
+async fn test_fadeall_endpoint() {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/fadeall")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"time": 2500}"#))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = rx.try_recv().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&received).unwrap();
+    assert_eq!(parsed["command"], "fadeall");
+    assert_eq!(parsed["message"]["time"], 2500);
+}
+
+#[tokio::test]
+async fn test_fadeall_endpoint_without_time() {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/fadeall")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = rx.try_recv().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&received).unwrap();
+    assert_eq!(parsed["command"], "fadeall");
+}
+
+#[tokio::test]
+async fn test_fadeall_endpoint_emits_a_parseable_command() {
+    // The endpoint and the parser have to agree on the JSON shape, which is
+    // the seam neither side's own tests cover.
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/fadeall")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"time": 3000}"#))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = rx.try_recv().unwrap();
+    match mqttaudio::mqtt::commands::parse_command(&received).unwrap() {
+        mqttaudio::mqtt::commands::AudioCommand::FadeAll { time_ms } => {
+            assert_eq!(time_ms, 3000)
+        }
+        other => panic!("Expected FadeAll, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn test_auth_required_without_token() {
     let (state, _rx) = create_test_state_with_auth("secret_token_123");
     let app = create_router(state, false, false);
@@ -354,6 +437,40 @@ async fn test_auth_with_query_param() {
     let received = rx.try_recv().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&received).unwrap();
     assert_eq!(parsed["command"], "stopall");
+}
+
+#[tokio::test]
+async fn test_websocket_requires_auth_token() {
+    let (state, _rx) = create_test_state_with_auth("secret_token_123");
+    let app = create_router(state, false, true);
+
+    // A bare GET without the token must be rejected before any upgrade
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/ws")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_websocket_route_exists_when_enabled() {
+    let (state, _rx) = create_test_state();
+    let app = create_router(state, false, true);
+
+    // Without upgrade headers the handshake fails, but the route must exist
+    // (anything but 404/401 proves it is reachable without auth configured)
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/ws")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -501,6 +618,67 @@ async fn test_inputs_endpoint() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
     assert!(json["inputs"].is_array());
+}
+
+#[tokio::test]
+async fn test_inputs_endpoint_reports_health() {
+    // Overruns, trims and starvation on a microphone are the first thing to
+    // check when routing sounds wrong, so they belong in the status payload.
+    let (state, _rx) = create_test_state();
+
+    let rb = ringbuf::HeapRb::<f32>::new(400);
+    let (mut producer, consumer) = rb.split();
+    producer.push_slice(&[0.5f32; 20]);
+
+    let mut input = mqttaudio::audio::mixer::LiveInput::new(
+        "mic".to_string(),
+        consumer,
+        2,
+        0.75,
+        vec![(0, 0), (1, 1)],
+    );
+    input.trimmed_frames = 3;
+    input.underrun_frames = 7;
+    input
+        .dropped_frames
+        .store(11, std::sync::atomic::Ordering::Relaxed);
+
+    input.publish_health();
+    state
+        .status
+        .write()
+        .unwrap()
+        .inputs
+        .push(mqttaudio::http::InputStatus {
+            voice_id: input.voice_id.clone(),
+            channels: input.input_channels,
+            volume: input.volume,
+            health: Some(input.health.clone()),
+            ..Default::default()
+        });
+
+    let app = create_router(state, false, false);
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/status/inputs")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let input = &json["inputs"][0];
+    assert_eq!(input["voice_id"], "mic");
+    assert_eq!(input["channels"], 2);
+    assert_eq!(input["backlog_frames"], 10);
+    assert_eq!(input["dropped_frames"], 11);
+    assert_eq!(input["trimmed_frames"], 3);
+    assert_eq!(input["underrun_frames"], 7);
 }
 
 #[tokio::test]
@@ -1215,6 +1393,7 @@ async fn test_inputs_endpoint_reports_muted_toggle_and_channels() {
             applied_volume: None,
             applied_muted: None,
             applied_unmuted_volume: None,
+            health: None,
             ready: true,
             last_error: None,
         });
@@ -1228,6 +1407,7 @@ async fn test_inputs_endpoint_reports_muted_toggle_and_channels() {
             applied_volume: None,
             applied_muted: None,
             applied_unmuted_volume: None,
+            health: None,
             ready: false,
             last_error: Some("device missing".to_string()),
         });
@@ -1575,6 +1755,7 @@ async fn test_metrics_reports_active_voice_and_sample_counts() {
             applied_volume: None,
             applied_muted: None,
             applied_unmuted_volume: None,
+            health: None,
             ready: true,
             last_error: None,
         });

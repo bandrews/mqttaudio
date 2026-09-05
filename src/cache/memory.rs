@@ -137,7 +137,7 @@ impl MemoryCache {
         }
 
         // Replacing an existing entry frees its bytes first.
-        if let Some(old_entry) = self.entries.get(&key) {
+        if let Some(old_entry) = self.entries.remove(&key) {
             self.current_size_bytes -= old_entry.size_bytes;
         }
 
@@ -250,6 +250,32 @@ impl Default for MemoryCache {
 mod tests {
     use super::*;
     use crate::audio::types::DecodedBuffer;
+
+    #[test]
+    fn test_put_replacing_existing_key_keeps_size_consistent() {
+        // Replacing a key must not let the eviction loop double-subtract the
+        // old entry's size (which would wrap current_size_bytes in release)
+        let mut cache = MemoryCache::with_max_size(16_000);
+
+        // Replace a resident entry while another evictable entry consumes headroom.
+        let big = Arc::new(create_test_buffer(2, 1500));
+        cache.put("a".to_string(), big.clone());
+        let size_after_first = cache.current_size_bytes();
+
+        cache.put("b".to_string(), Arc::new(create_test_buffer(1, 500)));
+        cache.put("a".to_string(), big.clone());
+        cache.remove("b");
+        assert_eq!(
+            cache.current_size_bytes(),
+            size_after_first,
+            "replacing a key with an identical buffer must not change the accounted size"
+        );
+        assert_eq!(cache.len(), 1);
+
+        // And the cache must still behave sanely afterwards
+        cache.put("b".to_string(), Arc::new(create_test_buffer(1, 100)));
+        assert!(cache.current_size_bytes() < 20_000);
+    }
 
     fn create_test_buffer(channels: usize, frames: usize) -> DecodedBuffer {
         let data = vec![0.0f32; channels * frames];

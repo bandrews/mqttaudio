@@ -43,7 +43,7 @@ signalsmith-stretch = "0.1"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json"] }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 
 # Lock-free structures
 ringbuf = "0.3"
@@ -80,6 +80,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # Linux-specific: ALSA bindings for device probing
 [target.'cfg(target_os = "linux")'.dependencies]
 alsa = "0.9"
+libc = "0.2"
 
 [dev-dependencies]
 criterion = "0.5"

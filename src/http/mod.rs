@@ -10,6 +10,7 @@ pub use websocket::{LogBroadcaster, WebSocketLogLayer};
 
 use crate::cache::CacheManager;
 use crate::config::HttpConfig;
+use crate::mqtt::commands::CommandRequest;
 use crate::voice::VoiceManager;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -50,6 +51,7 @@ pub struct SampleStatus {
 /// Per-input status the control thread knows for a configured live input.
 #[derive(Clone, Default)]
 pub struct InputStatus {
+    pub health: Option<Arc<crate::audio::mixer::InputHealth>>,
     pub index: usize,
     pub voice_id: String,
     pub volume: f32,
@@ -148,7 +150,7 @@ impl LatencyTracker {
 #[derive(Clone)]
 pub struct AppState {
     /// Channel to send commands (same as MQTT uses)
-    pub cmd_tx: mpsc::Sender<String>,
+    pub cmd_tx: mpsc::Sender<CommandRequest>,
     /// Read-only control-side snapshot of what is playing, for status queries
     pub status: Arc<RwLock<StatusSnapshot>>,
     /// Read-only access to voice manager for status queries
@@ -241,7 +243,7 @@ pub fn exposure_warning(
 #[allow(clippy::too_many_arguments)]
 pub async fn start_server(
     config: &HttpConfig,
-    cmd_tx: mpsc::Sender<String>,
+    cmd_tx: mpsc::Sender<CommandRequest>,
     status: Arc<RwLock<StatusSnapshot>>,
     voice_manager: Arc<Mutex<VoiceManager>>,
     cache_manager: Arc<tokio::sync::Mutex<CacheManager>>,
@@ -337,7 +339,13 @@ pub async fn start_server(
 
     let app = create_router(state, config.cors_permissive, config.websocket_enabled);
 
-    let addr: SocketAddr = format!("{}:{}", config.bind_address, config.port).parse()?;
+    let ip: std::net::IpAddr = config.bind_address.parse().map_err(|e| {
+        format!(
+            "http.bind_address '{}' is not an IP address: {}",
+            config.bind_address, e
+        )
+    })?;
+    let addr = SocketAddr::new(ip, config.port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_addr = listener.local_addr()?;
 

@@ -1,6 +1,7 @@
 // ABOUTME: Audio subsystem module for mqttaudio.
 // ABOUTME: Manages audio playback, mixing, decoding, and resampling.
 
+pub mod activity;
 pub mod bass_management;
 pub mod chunked_resampler;
 pub mod decoder;

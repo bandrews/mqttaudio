@@ -137,7 +137,9 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
                         }) {
                             // Try matching ALSA device names by card number
                             // Supports hw:, plughw:, sysdefault:
-                            if let Some(matched) = try_match_alsa_device(device_name, &n) {
+                            if let Some(matched) =
+                                super::device::try_match_alsa_device(device_name, &n)
+                            {
                                 if matched {
                                     tracing::info!(
                                         "Matched ALSA device '{}' to '{}'",

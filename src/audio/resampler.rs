@@ -106,24 +106,37 @@ pub fn resample(
         }
     }
 
-    // Perform resampling
-    let output_channels = resampler.process(&input_channels, None)?;
+    // Perform resampling, then drain the sinc filter: without the drain the
+    // file's tail stays inside the filter history, and without trimming the
+    // filter delay the output starts with latency silence and everything is
+    // time-shifted by it
+    let mut output_channels = resampler.process(&input_channels, None)?;
+    let delay = resampler.output_delay();
 
-    // Re-interleave output samples
-    let output_frames = output_channels[0].len();
-    let mut output = Vec::with_capacity(output_frames * channels);
+    let tail: Vec<Vec<f32>> = resampler.process_partial::<Vec<f32>>(None, None)?;
+    for (channel, tail_channel) in output_channels.iter_mut().zip(tail) {
+        channel.extend(tail_channel);
+    }
 
-    for frame_idx in 0..output_frames {
-        for ch_buf in &output_channels[..channels] {
-            output.push(ch_buf[frame_idx]);
+    // Re-interleave, skipping the delay and keeping exactly the duration the
+    // input covered
+    let expected_frames = ((frames as f64) * ratio).round() as usize;
+    let available = output_channels[0].len();
+    let end = (delay + expected_frames).min(available);
+    let mut output = Vec::with_capacity(expected_frames * channels);
+
+    for frame_idx in delay..end {
+        for ch_idx in 0..channels {
+            output.push(output_channels[ch_idx][frame_idx]);
         }
     }
 
     tracing::debug!(
-        "Resampled {} frames → {} frames (ratio: {:.4})",
+        "Resampled {} frames → {} frames (ratio: {:.4}, filter delay {} frames)",
         frames,
-        output_frames,
-        ratio
+        output.len() / channels,
+        ratio,
+        delay
     );
 
     Ok(output)
@@ -148,6 +161,42 @@ mod tests {
     }
 
     #[test]
+    fn test_resample_output_is_time_aligned_and_full_length() {
+        // The sinc filter has latency: without draining it and trimming the
+        // delay, every resampled file starts with near-silence and loses its
+        // tail. A DC signal makes both visible.
+        let frames = 4410;
+        let input = vec![1.0f32; frames];
+
+        let out = resample(input, 44100, 48000, 1, ResamplerQuality::Fast).unwrap();
+
+        let expected = (frames as f64 * 48000.0 / 44100.0).round() as usize;
+        assert_eq!(
+            out.len(),
+            expected,
+            "output must cover the whole input duration"
+        );
+
+        // Edge frames taper (the filter sees silence beyond the file), but
+        // the interior must be at level right away and stay there to the end
+        assert!(
+            out[0] > 0.3,
+            "output must start at the signal, not at filter-latency silence, got {}",
+            out[0]
+        );
+        assert!(
+            out[64] > 0.99,
+            "the signal should reach level within the filter half-window, got {}",
+            out[64]
+        );
+        assert!(
+            out[expected - 64] > 0.99,
+            "the file tail must not be dropped, got {}",
+            out[expected - 64]
+        );
+    }
+
+    #[test]
     fn test_upsample_44khz_to_48khz() {
         // Create a simple sine wave at 44.1kHz
         let sample_rate = 44100;
@@ -168,9 +217,9 @@ mod tests {
         let expected_frames = (frames as f32 * 48000.0 / 44100.0) as usize;
         let actual_frames = result.len() / 2;
 
-        // Allow tolerance for resampler latency/buffering (~200 frames = 4ms at 48kHz)
+        // The drain-and-trim keeps output within a frame of the exact duration
         assert!(
-            (actual_frames as i32 - expected_frames as i32).abs() < 200,
+            (actual_frames as i32 - expected_frames as i32).abs() <= 2,
             "Expected ~{} frames, got {}",
             expected_frames,
             actual_frames
@@ -197,9 +246,9 @@ mod tests {
         let expected_frames = (frames as f32 * 44100.0 / 48000.0) as usize;
         let actual_frames = result.len() / 2;
 
-        // Allow tolerance for resampler latency/buffering (~200 frames = 4.5ms at 44.1kHz)
+        // The drain-and-trim keeps output within a frame of the exact duration
         assert!(
-            (actual_frames as i32 - expected_frames as i32).abs() < 200,
+            (actual_frames as i32 - expected_frames as i32).abs() <= 2,
             "Expected ~{} frames, got {}",
             expected_frames,
             actual_frames
@@ -213,17 +262,12 @@ mod tests {
 
         let result = resample(input, 44100, 48000, 1, ResamplerQuality::Fast).unwrap();
 
-        // Mono should work correctly - expected ~1088 frames with some latency
-        // Allow wider bounds due to resampler buffering
+        let expected = (1000.0f64 * 48000.0 / 44100.0).round() as usize;
         assert!(
-            result.len() > 800,
-            "Got {} frames, expected >800",
-            result.len()
-        );
-        assert!(
-            result.len() < 1300,
-            "Got {} frames, expected <1300",
-            result.len()
+            (result.len() as i32 - expected as i32).abs() <= 2,
+            "Got {} frames, expected ~{}",
+            result.len(),
+            expected
         );
     }
 
@@ -278,7 +322,7 @@ mod tests {
         let output = resample(input, sr_in, sr_out, 1, ResamplerQuality::Fast).unwrap();
         // Steady-state window (skip the filter's edge transients).
         let take = 32_768.min(output.len().saturating_sub(2_000));
-        let mid = &output[output.len() - take..];
+        let mid = &output[output.len() - take - 1000..output.len() - 1000];
 
         // Least-squares fit of the tone at f0; what remains is resampler error.
         let n = mid.len();

@@ -29,7 +29,7 @@ async fn subscribes_on_connack_so_a_reconnect_recovers() {
     proc_opts.set_clean_session(true);
     let (proc_client, proc_eventloop) = AsyncClient::new(proc_opts, 10);
 
-    let (tx, mut rx) = mpsc::channel::<String>(50);
+    let (tx, mut rx) = mpsc::channel::<mqttaudio::mqtt::commands::CommandRequest>(50);
     let pc = proc_client.clone();
     let topic_owned = topic.to_string();
     tokio::spawn(async move {
@@ -54,7 +54,7 @@ async fn subscribes_on_connack_so_a_reconnect_recovers() {
         .await
         .expect("timed out: process_mqtt_events did not subscribe on ConnAck")
         .expect("command channel closed");
-    assert_eq!(msg, "hello");
+    assert_eq!(msg.payload, "hello");
 }
 
 /// A burst that overflows the command channel must not stall the event loop:
@@ -74,7 +74,7 @@ async fn command_burst_does_not_stall_the_event_loop() {
     let (proc_client, proc_eventloop) = AsyncClient::new(proc_opts, 10);
 
     // Small channel with no draining during the burst, so it fills immediately.
-    let (tx, mut rx) = mpsc::channel::<String>(4);
+    let (tx, mut rx) = mpsc::channel::<mqttaudio::mqtt::commands::CommandRequest>(4);
     let pc = proc_client.clone();
     let topic_owned = topic.to_string();
     tokio::spawn(async move {
@@ -107,5 +107,5 @@ async fn command_burst_does_not_stall_the_event_loop() {
         .await
         .expect("event loop stalled after the burst")
         .expect("command channel closed");
-    assert_eq!(msg, "final");
+    assert_eq!(msg.payload, "final");
 }

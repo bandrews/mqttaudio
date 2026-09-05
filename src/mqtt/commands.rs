@@ -4,6 +4,80 @@
 use crate::config::{ChannelRef, FreshnessMode, LoadMode};
 use serde::{Deserialize, Serialize};
 
+/// Fade duration used when a fadeall command does not name one
+pub const DEFAULT_FADE_ALL_MS: u32 = 1000;
+
+/// Why a command failed, coarse enough for an HTTP status mapping
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandErrorKind {
+    /// The request itself was malformed (bad JSON, unknown command, bad parameter)
+    InvalidRequest,
+    /// The named file, sample, voice, or input does not exist
+    NotFound,
+    /// The request was valid but not permitted (e.g. path outside allowed_directories)
+    Forbidden,
+    /// Superseded by a later stopall/fadeall before it could take effect
+    Cancelled,
+    /// Something failed on our side
+    Internal,
+}
+
+/// A command failure with a human-readable explanation
+#[derive(Debug, Clone)]
+pub struct CommandError {
+    pub kind: CommandErrorKind,
+    pub message: String,
+}
+
+impl CommandError {
+    pub fn new(kind: CommandErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+/// What actually happened when a command was processed
+pub type CommandOutcome = Result<String, CommandError>;
+
+/// A command traveling to the processing loop, with an optional reply slot.
+/// MQTT publishes send no reply; HTTP requests wait on one so clients learn
+/// whether the command actually worked.
+#[derive(Debug)]
+pub struct CommandRequest {
+    pub payload: String,
+    pub reply: Option<tokio::sync::oneshot::Sender<CommandOutcome>>,
+}
+
+impl CommandRequest {
+    /// A fire-and-forget request (MQTT publishes)
+    pub fn fire_and_forget(payload: String) -> Self {
+        Self {
+            payload,
+            reply: None,
+        }
+    }
+
+    /// A request paired with a receiver for its outcome
+    pub fn with_reply(payload: String) -> (Self, tokio::sync::oneshot::Receiver<CommandOutcome>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                payload,
+                reply: Some(tx),
+            },
+            rx,
+        )
+    }
+}
+
 /// MQTT command envelope supporting both flattened and nested formats.
 /// Flattened: {"command": "play", "file": "test.wav", "volume": 0.8}
 /// Nested (legacy): {"command": "play", "message": {"file": "test.wav", "volume": 0.8}}
@@ -165,6 +239,15 @@ pub struct VoiceFadeOutMessage {
     pub time: u32, // milliseconds
 }
 
+/// Fade-all command parameters
+#[derive(Debug, Deserialize, Serialize)]
+pub struct FadeAllMessage {
+    /// Fade duration in milliseconds. Also accepted as "fade_out_ms",
+    /// matching the field name the stop command uses.
+    #[serde(alias = "fade_out_ms")]
+    pub time: Option<u32>,
+}
+
 /// Voice volume command parameters
 #[derive(Debug, Deserialize, Serialize)]
 pub struct VoiceVolumeMessage {
@@ -322,6 +405,9 @@ pub enum AudioCommand {
         cacheable: Option<bool>, // HTTP windowed: persist to disk (None/true) or treat as live (false)
     },
     StopAll,
+    FadeAll {
+        time_ms: u32,
+    },
     VoiceStop {
         voice: String,
     },
@@ -379,6 +465,7 @@ pub enum ParseError {
     JsonError(serde_json::Error),
     MissingMessage,
     UnknownCommand(String),
+    InvalidParameter(String),
 }
 
 impl std::fmt::Display for ParseError {
@@ -387,6 +474,7 @@ impl std::fmt::Display for ParseError {
             ParseError::JsonError(e) => write!(f, "JSON parse error: {}", e),
             ParseError::MissingMessage => write!(f, "Command missing 'message' field"),
             ParseError::UnknownCommand(cmd) => write!(f, "Unknown command: {}", cmd),
+            ParseError::InvalidParameter(msg) => write!(f, "Invalid parameter: {}", msg),
         }
     }
 }
@@ -440,35 +528,69 @@ pub fn expand_macros(
         Some(_) => return serde_json::to_string(&value).map_err(ParseError::from),
     };
 
-    // Build merged parameters: process macros in forward order, earlier macros take precedence
-    let mut merged = serde_json::Map::new();
+    // Build merged macro parameters: process macros in forward order, earlier macros take precedence
+    let mut macro_params = serde_json::Map::new();
 
     for macro_name in macro_names.iter() {
-        if let Some(macro_params) = macros.get(macro_name) {
-            if let Some(macro_obj) = macro_params.as_object() {
-                for (k, v) in macro_obj {
-                    // Only set if not already present (earlier macros take precedence)
-                    if !merged.contains_key(k) {
-                        merged.insert(k.clone(), v.clone());
+        match macros.get(macro_name) {
+            Some(params) => {
+                if let Some(macro_obj) = params.as_object() {
+                    for (k, v) in macro_obj {
+                        // Only set if not already present (earlier macros take precedence)
+                        if !macro_params.contains_key(k) {
+                            macro_params.insert(k.clone(), v.clone());
+                        }
                     }
                 }
+            }
+            None => {
+                tracing::warn!(
+                    "Unknown macro '{}' referenced by command; ignoring it",
+                    macro_name
+                );
             }
         }
     }
 
-    // Finally merge command parameters (highest priority)
-    for (k, v) in obj.iter() {
-        merged.insert(k.clone(), v.clone());
-    }
+    // Command parameters always win over macro parameters. For the nested
+    // format, parameters are read from the "message" object, so macro
+    // parameters must be merged there to take effect.
+    if let Some(serde_json::Value::Object(message)) = obj.get_mut("message") {
+        for (k, v) in macro_params {
+            if !message.contains_key(&k) {
+                message.insert(k, v);
+            }
+        }
+        serde_json::to_string(&value).map_err(ParseError::from)
+    } else {
+        let mut merged = macro_params;
+        for (k, v) in obj.iter() {
+            merged.insert(k.clone(), v.clone());
+        }
 
-    let result = serde_json::Value::Object(merged);
-    serde_json::to_string(&result).map_err(ParseError::from)
+        let result = serde_json::Value::Object(merged);
+        serde_json::to_string(&result).map_err(ParseError::from)
+    }
 }
 
 /// Parse MQTT JSON payload into an audio command.
 /// Supports both flattened and nested (legacy) formats:
 /// - Flattened: {"command": "play", "file": "test.wav", "volume": 0.8}
 /// - Nested: {"command": "play", "message": {"file": "test.wav", "volume": 0.8}}
+/// Reject a non-numeric internal_id at parse time: the system-assigned ids
+/// are numeric, so a non-numeric value could only ever silently match nothing.
+fn validate_internal_id(internal_id: &Option<String>) -> Result<(), ParseError> {
+    if let Some(iid) = internal_id {
+        if iid.parse::<u64>().is_err() {
+            return Err(ParseError::InvalidParameter(format!(
+                "internal_id '{}' is not numeric - use the internal_id values shown by /status/samples",
+                iid
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
     let mqtt_cmd: MqttCommand = serde_json::from_str(json)?;
 
@@ -483,7 +605,10 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             Ok(AudioCommand::Play {
                 file: play_msg.file,
                 id: play_msg.id,
-                volume: play_msg.volume.unwrap_or(1.0),
+                volume: play_msg
+                    .volume
+                    .unwrap_or(1.0)
+                    .clamp(0.0, crate::config::MAX_GAIN),
                 voice: play_msg.voice,
                 channel_map: play_msg.channel_map,
                 fade_in: play_msg.fade_in,
@@ -498,6 +623,16 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             })
         }
         "stopall" | "soundStopAll" => Ok(AudioCommand::StopAll),
+        "fadeall" | "soundFadeAll" | "fadeout" | "soundFadeOut" => {
+            let time_ms = if mqtt_cmd.has_params() {
+                let msg: FadeAllMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+                msg.time.unwrap_or(DEFAULT_FADE_ALL_MS)
+            } else {
+                DEFAULT_FADE_ALL_MS
+            };
+
+            Ok(AudioCommand::FadeAll { time_ms })
+        }
         "voice_stop" => {
             if !mqtt_cmd.has_params() {
                 return Err(ParseError::MissingMessage);
@@ -605,6 +740,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 return Err(ParseError::MissingMessage);
             }
             let seek_msg: SeekMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            validate_internal_id(&seek_msg.internal_id)?;
 
             Ok(AudioCommand::Seek {
                 selector: SampleSelector {
@@ -621,6 +757,13 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 return Err(ParseError::MissingMessage);
             }
             let speed_msg: SpeedMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            validate_internal_id(&speed_msg.internal_id)?;
+
+            if speed_msg.speed == 0.0 {
+                return Err(ParseError::InvalidParameter(
+                    "speed 0 is not supported - use stop to end playback, or a small value like 0.05 to crawl".to_string(),
+                ));
+            }
 
             Ok(AudioCommand::Speed {
                 selector: SampleSelector {
@@ -638,6 +781,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 return Err(ParseError::MissingMessage);
             }
             let stop_msg: StopMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            validate_internal_id(&stop_msg.internal_id)?;
 
             Ok(AudioCommand::Stop {
                 selector: SampleSelector {
@@ -654,6 +798,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 return Err(ParseError::MissingMessage);
             }
             let vol_msg: VolumeMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            validate_internal_id(&vol_msg.internal_id)?;
 
             Ok(AudioCommand::Volume {
                 selector: SampleSelector {
@@ -891,6 +1036,134 @@ mod tests {
         match cmd {
             AudioCommand::StopAll => {} // OK
             _ => panic!("Expected StopAll command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_allows_boost() {
+        let json = r#"{"command": "play", "file": "quiet.wav", "volume": 2.5}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { volume, .. } => assert_eq!(volume, 2.5),
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_clamps_excessive_volume() {
+        let json = r#"{"command": "play", "file": "quiet.wav", "volume": 100.0}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { volume, .. } => {
+                assert_eq!(volume, crate::config::MAX_GAIN)
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fadeall_command() {
+        let json = r#"{"command": "fadeall", "time": 2000}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, 2000),
+            _ => panic!("Expected FadeAll command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_non_numeric_internal_id_is_rejected() {
+        // internal_id is the system-assigned numeric id from /status/samples;
+        // a non-numeric value can never match anything, so failing loudly
+        // beats the silent "matched no samples" it used to produce
+        for command in ["stop", "seek", "speed", "volume"] {
+            let json = format!(
+                r#"{{"command": "{}", "internal_id": "abc", "position_ms": 1, "speed": 1.0, "volume": 1.0}}"#,
+                command
+            );
+            let err = parse_command(&json).unwrap_err();
+            assert!(
+                err.to_string().contains("internal_id"),
+                "{} should reject a non-numeric internal_id, got: {}",
+                command,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_speed_zero_is_rejected() {
+        // speed 0 would otherwise be coerced to an unintelligible 0.01x
+        // drone; someone sending 0 almost certainly wanted stop or pause
+        let json = r#"{"command": "speed", "id": "x", "speed": 0}"#;
+        let err = parse_command(json).unwrap_err();
+        assert!(
+            err.to_string().contains("speed"),
+            "the error should explain the speed problem, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_fadeout_aliases() {
+        // The legacy app called global fade "fadeout" / "soundFadeOut"
+        for command in ["fadeout", "soundFadeOut"] {
+            let json = format!(r#"{{"command": "{}", "time": 800}}"#, command);
+            let cmd = parse_command(&json).unwrap();
+
+            match cmd {
+                AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, 800),
+                _ => panic!("Expected FadeAll command for {}", command),
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_fadeall_nested() {
+        let json = r#"{"command": "fadeall", "message": {"time": 1500}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, 1500),
+            _ => panic!("Expected FadeAll command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fadeall_without_time() {
+        // "fade everything out" should work as a bare command, the way stopall does
+        let json = r#"{"command": "fadeall"}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, DEFAULT_FADE_ALL_MS),
+            _ => panic!("Expected FadeAll command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_sound_fadeall_alias() {
+        let json = r#"{"command": "soundFadeAll"}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, DEFAULT_FADE_ALL_MS),
+            _ => panic!("Expected FadeAll command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_fadeall_accepts_fade_out_ms() {
+        // "fade_out_ms" is what stop uses for the same idea
+        let json = r#"{"command": "fadeall", "fade_out_ms": 750}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::FadeAll { time_ms } => assert_eq!(time_ms, 750),
+            _ => panic!("Expected FadeAll command"),
         }
     }
 
@@ -2554,7 +2827,35 @@ mod tests {
 
         assert_eq!(value["command"], "play");
         assert!(value["message"].is_object());
-        assert_eq!(value["volume"], 0.1); // Macro param added at top level
+        // Parameters for the nested format are read from "message", so macro
+        // params must land there to take effect
+        assert_eq!(value["message"]["volume"], 0.1);
+        assert_eq!(value["message"]["file"], "test.mp3");
+    }
+
+    #[test]
+    fn test_expand_macros_nested_message_params_win_over_macro() {
+        let macros = make_macros();
+        let json = r#"{"command": "play", "message": {"file": "test.mp3", "volume": 0.9}, "macro": "quiet"}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
+
+        assert_eq!(value["message"]["volume"], 0.9); // Explicit param beats macro
+    }
+
+    #[test]
+    fn test_expand_macros_nested_message_integration_with_parse() {
+        let macros = make_macros();
+        let json = r#"{"command": "play", "message": {"file": "test.mp3"}, "macro": "quiet"}"#;
+
+        let expanded = expand_macros(json, &macros).unwrap();
+        let cmd = parse_command(&expanded).unwrap();
+
+        match cmd {
+            AudioCommand::Play { volume, .. } => assert_eq!(volume, 0.1),
+            _ => panic!("Expected Play command"),
+        }
     }
 
     #[test]
