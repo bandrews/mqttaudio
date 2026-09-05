@@ -1957,7 +1957,8 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     // Use provided voice or auto-generate a unique one.
                     let voice_id = voice.unwrap_or_else(next_auto_voice_id);
 
-                    let is_streaming = !buffer.is_complete();
+                    let is_streaming =
+                        matches!(&buffer, audio::streaming::SampleBuffer::Streaming(_));
                     let (channels, sample_rate, frames) = buffer.metadata_blocking();
                     if channels == 0 || sample_rate == 0 {
                         ctx.fail(
@@ -2907,6 +2908,10 @@ mod tests {
         /// Run a parsed command through `handle_command`, pushing the resulting
         /// audio commands onto the ring (but not yet applying them to the mixer).
         async fn run(&mut self, cmd: AudioCommand) {
+            self.run_prepared(cmd, None).await;
+        }
+
+        async fn run_prepared(&mut self, cmd: AudioCommand, prepared: Option<PreparedPlayback>) {
             let mut ctx = CommandCtx {
                 cache_manager: &self.cache_manager,
                 voice_manager: &self.voice_manager,
@@ -2928,7 +2933,7 @@ mod tests {
                 streaming_upgrades: &mut self.streaming_upgrades,
                 max_block_frames: 512,
                 error: None,
-                prepared: None,
+                prepared,
             };
             handle_command(cmd, &mut ctx).await;
         }
@@ -3455,6 +3460,47 @@ mod tests {
             sample.buffer.is_frame_loaded(sample.position),
             "the gate must hold AddSample until the start position is decoded"
         );
+    }
+
+    #[tokio::test]
+    async fn decode_completed_before_dispatch_still_upgrades_for_pitch_correction() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let command = play(Some("race"), 1.0);
+        let file = match &command {
+            AudioCommand::Play { file, .. } => file.clone(),
+            _ => unreachable!(),
+        };
+        let decoded = fixture
+            .cache_manager
+            .lock()
+            .await
+            .get_or_load(&file, SR)
+            .await
+            .unwrap();
+        let mut buffer = audio::streaming::StreamingBuffer::new(
+            decoded.channels,
+            decoded.sample_rate,
+            Some(decoded.frames),
+        );
+        buffer.append(&decoded.data);
+        buffer.mark_complete();
+        let prepared = audio::streaming::SampleBuffer::Streaming(Arc::new(RwLock::new(buffer)));
+        fixture
+            .run_prepared(command, Some(PreparedPlayback::Full(prepared)))
+            .await;
+        fixture.drain();
+        assert_eq!(
+            fixture.streaming_upgrades.len(),
+            1,
+            "a completed progressive buffer still needs promotion to direct sample access"
+        );
+        fixture.run_upgrades().await;
+        fixture.drain();
+        assert!(fixture.mixer.active_samples[0]
+            .buffer
+            .as_complete()
+            .is_some());
     }
 
     #[tokio::test]

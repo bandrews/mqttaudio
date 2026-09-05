@@ -9,7 +9,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 // reflects a real play/stop within the poll interval.
 // Exercises live log/state delivery and connection recovery against the built release.
 
-const BIN = resolve(process.cwd(), '..', 'target', 'release', 'mqttaudio');
+const BIN = process.env.MQTTAUDIO_BIN ?? resolve(process.cwd(), '..', 'target', 'release', 'mqttaudio');
 const VERSION = readFileSync(resolve(process.cwd(), '..', 'Cargo.toml'), 'utf8').match(
   /^version\s*=\s*"([^"]+)"/m,
 )?.[1];
