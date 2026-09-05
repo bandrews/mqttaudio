@@ -290,6 +290,14 @@ When `config.inputs` is configured to mix a microphone or line input (see
   input's level even when no sample is playing on the voice (previously a no-op).
 - **`input_mute` restores the prior level.** Unmuting returns the input to the volume it had when muted (e.g.
   a calibrated `0.7`), not a hardcoded `1.0`. Setting an explicit `input_volume` clears the muted state.
+- **`/status/inputs` reports applied mute state.** The endpoint exposes explicit `muted` and
+  `unmuted_volume` fields that are reconciled when an input command is queued, so consumers do not infer mute
+  from a zero gain alone.
+- **Configured inputs remain visible when capture cannot open.** Such records report `ready: false` and the
+  concrete `last_error`; input mutations are rejected instead of silently targeting an absent stream.
+- **Talkback uses a daemon-owned expiring lease.** `talkback_acquire` renewals are exclusive to one client and
+  `talkback_release`/`talkback_hard_mute` return the input to silence; a stopped renewer expires to muted without
+  relying on browser cleanup. See the `/status/talkback` HTTP endpoint for applied state.
 - **Inputs can trigger ducking.** A mic whose `voice_id` is a ducking rule's `primary_voice` ducks that
   rule's background voices while its stream is open.
 - **Out-of-range routes warn.** A route reading a source channel the device does not have is logged once at
@@ -307,6 +315,10 @@ mqttaudio runs open by default so it stays easy to use on a trusted LAN. Each of
 - **Restrict local file access** — set `security.allowed_directories` to the folders sounds may be loaded from (paths outside them, and traversal/symlink escapes, are rejected). Empty/unset = any local path is allowed.
 - **Encrypt the MQTT connection** — add an `[mqtt.tls]` block (`ca_path` for a private CA, or omit it for public CAs). Plain TCP stays the default on every port, including 8883.
 - **Require an HTTP token** — set `http.require_auth` to require the bearer token on the status/command/WebSocket endpoints (the health endpoint stays open). A warning is logged if the server binds a non-loopback address without auth.
+
+For container deployments, `MQTTAUDIO_HTTP_BIND_ADDRESS`, `MQTTAUDIO_HTTP_AUTH_TOKEN`, and
+`MQTTAUDIO_HTTP_REQUIRE_AUTH=true` provide the equivalent overrides without putting a secret in the checked-in
+audio config. Requiring auth without a token fails startup closed.
 
 See [Configuration](docs/configuration.md) and [HTTP API](docs/http-api.md) for details.
 
@@ -329,11 +341,15 @@ curl -X POST http://localhost:8080/play \
 The server also exposes observability endpoints (no auth in open mode):
 
 - `GET /version` — build identity (`name`, `version`, and `git_sha` when the build injected `MQTTAUDIO_GIT_SHA`).
+- `GET /ready` — readiness (HTTP 200 only when output and every configured input are ready; `/health` remains
+  the process-liveness probe).
 - `GET /metrics` — operational telemetry: `uptime_seconds`, `clips` (limiter holds), `xruns` (audio
   stream-error/dropout count), active voice/sample/input counts, and a per-voice `ducking` map of resolved
   multipliers. Every value is real, suitable for scraping into a monitor.
 - `GET /status` and `/status/voices` also carry the limiter `clip_count`, the `xruns` counter, and (on
   `/status/voices`) each voice's current `ducking_multiplier`.
+- `GET /status/talkback` includes `now_ms` alongside `lease_expires_at_ms`; both values use the daemon's
+  monotonic clock so a gateway can display a remaining-time hint without using wall time for safety.
 
 ## Production Deployment
 

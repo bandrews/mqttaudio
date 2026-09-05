@@ -8,6 +8,7 @@ mod config_editor;
 mod http;
 mod mqtt;
 mod rt_engine;
+mod talkback;
 mod voice;
 
 use clap::Parser;
@@ -162,6 +163,28 @@ async fn main() {
         args.http_port,
         args.max_cache_mb,
     );
+
+    // Container/deployment environments must be able to enable the internal
+    // HTTP gateway without baking a bearer token into the checked-in venue
+    // config. A requested non-loopback bind always requires auth; an absent
+    // token leaves startup validation failed closed rather than exposing an
+    // unauthenticated daemon on the Compose network.
+    if let Ok(bind_address) = std::env::var("MQTTAUDIO_HTTP_BIND_ADDRESS") {
+        if !bind_address.trim().is_empty() {
+            config.http.bind_address = bind_address;
+        }
+    }
+    if let Ok(auth_token) = std::env::var("MQTTAUDIO_HTTP_AUTH_TOKEN") {
+        if !auth_token.is_empty() {
+            config.http.auth_token = Some(auth_token);
+        }
+    }
+    if std::env::var("MQTTAUDIO_HTTP_REQUIRE_AUTH")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        config.http.require_auth = true;
+        config.http.enabled = true;
+    }
 
     // Initialize logging based on config
     let log_level = match config.logging.level.as_str() {
@@ -504,23 +527,56 @@ async fn main() {
     let mut input_telemetry: Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)> =
         Vec::new();
     let mut cmd_tx = cmd_tx;
+    let mut talkback_lease = talkback::TalkbackLease::default();
+    let talkback_status = std::sync::Arc::new(std::sync::RwLock::new(talkback_lease.status(0)));
+    struct SharedCapture {
+        active: audio::input::ActiveInput,
+        consumers: Vec<ringbuf::HeapConsumer<f32>>,
+    }
+    let mut captures: std::collections::HashMap<
+        (Option<String>, u32),
+        Result<SharedCapture, String>,
+    > = std::collections::HashMap::new();
+    for input_config in &config.inputs {
+        let key = (input_config.device.clone(), input_config.latency_ms);
+        captures.entry(key.clone()).or_insert_with(|| {
+            let stream_config = audio::input::InputStreamConfig {
+                device_name: input_config.device.clone(),
+                latency_ms: input_config.latency_ms,
+            };
+            audio::input::create_input_stream_with_fanout(
+                stream_config,
+                output_sample_rate,
+                config
+                    .inputs
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.device == input_config.device
+                            && candidate.latency_ms == input_config.latency_ms
+                    })
+                    .count(),
+            )
+            .map(|mut active| {
+                let mut consumers = active.take_consumers();
+                consumers.reverse();
+                SharedCapture { active, consumers }
+            })
+            .map_err(|error| error.to_string())
+        });
+    }
+
     for (idx, input_config) in config.inputs.iter().enumerate() {
-        let stream_config = audio::input::InputStreamConfig {
-            device_name: input_config.device.clone(),
-            latency_ms: input_config.latency_ms,
-        };
-
-        match audio::input::create_input_stream(stream_config, output_sample_rate) {
-            Ok(mut active_input) => {
-                tracing::info!(
-                    "Opened input device: {} ({} channels, voice '{}')",
-                    input_config.device.as_deref().unwrap_or("default"),
-                    active_input.channels,
-                    input_config.voice_id
-                );
-
-                // Take ownership of the consumer for the mixer
-                if let Some(consumer) = active_input.take_consumer() {
+        let key = (input_config.device.clone(), input_config.latency_ms);
+        match captures.get_mut(&key) {
+            Some(Ok(capture)) => {
+                let channels = capture.active.channels;
+                if let Some(consumer) = capture.consumers.pop() {
+                    tracing::info!(
+                        "Opened input device: {} ({} channels, voice '{}')",
+                        input_config.device.as_deref().unwrap_or("default"),
+                        channels,
+                        input_config.voice_id
+                    );
                     // Build channel map from routes config (resolve aliases)
                     let channel_map: Vec<(usize, usize)> =
                         match config.resolve_input_routes(&input_config.routes) {
@@ -543,9 +599,7 @@ async fn main() {
                     // Now that the device's channel count is known, warn about any
                     // route reading a source channel the device does not have; the
                     // mixer would otherwise drop it silently (F5).
-                    if let Some(warning) =
-                        out_of_range_input_routes(idx, &channel_map, active_input.channels)
-                    {
+                    if let Some(warning) = out_of_range_input_routes(idx, &channel_map, channels) {
                         tracing::warn!("{}", warning);
                     }
 
@@ -560,23 +614,47 @@ async fn main() {
                     }
 
                     // Create LiveInput for the mixer
-                    let live_input = audio::mixer::LiveInput::new(
+                    let mut live_input = audio::mixer::LiveInput::new(
                         input_config.voice_id.clone(),
                         consumer,
-                        active_input.channels,
+                        channels,
                         input_config.volume,
                         channel_map,
                     );
 
+                    // The audio callback publishes applied input state through
+                    // preallocated atomics. HTTP status reads these values without
+                    // locking or mirroring a requested command as applied.
+                    let applied_volume = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                        input_config.volume.to_bits(),
+                    ));
+                    let applied_muted =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let applied_unmuted_volume = std::sync::Arc::new(
+                        std::sync::atomic::AtomicU32::new(input_config.volume.to_bits()),
+                    );
+                    live_input.set_status_observers(
+                        applied_volume.clone(),
+                        applied_muted.clone(),
+                        applied_unmuted_volume.clone(),
+                    );
+
                     input_statuses.push(http::InputStatus {
-                        index: input_statuses.len(),
+                        index: idx,
                         voice_id: input_config.voice_id.clone(),
                         volume: input_config.volume,
-                        channels: active_input.channels,
+                        channels,
+                        muted: false,
+                        unmuted_volume: input_config.volume,
+                        applied_volume: Some(applied_volume),
+                        applied_muted: Some(applied_muted),
+                        applied_unmuted_volume: Some(applied_unmuted_volume),
+                        ready: true,
+                        last_error: None,
                     });
                     input_telemetry.push((
                         input_config.voice_id.clone(),
-                        std::sync::Arc::clone(&active_input.telemetry),
+                        std::sync::Arc::clone(&capture.active.telemetry),
                     ));
 
                     // Add to the mix via the command ring (drained once the
@@ -599,18 +677,37 @@ async fn main() {
                         &mut cmd_tx,
                         &ducking_snapshot,
                     );
+                } else {
+                    tracing::error!("No logical capture ring available for input {}", idx);
                 }
-
-                // Keep the stream alive by storing it
-                _active_inputs.push(active_input);
             }
-            Err(e) => {
+            Some(Err(error)) => {
                 tracing::error!(
                     "Failed to open input device '{}': {}",
                     input_config.device.as_deref().unwrap_or("default"),
-                    e
+                    error
                 );
+                input_statuses.push(http::InputStatus {
+                    index: idx,
+                    voice_id: input_config.voice_id.clone(),
+                    volume: input_config.volume,
+                    channels: 0,
+                    muted: true,
+                    unmuted_volume: input_config.volume,
+                    applied_volume: None,
+                    applied_muted: None,
+                    applied_unmuted_volume: None,
+                    ready: false,
+                    last_error: Some(error.clone()),
+                });
             }
+            None => unreachable!("capture key was populated in the first pass"),
+        }
+    }
+
+    for result in captures.into_values() {
+        if let Ok(capture) = result {
+            _active_inputs.push(capture.active);
         }
     }
 
@@ -789,6 +886,7 @@ async fn main() {
             config_json.clone(),
             latency_stats.clone(),
             input_telemetry.clone(),
+            talkback_status.clone(),
             log_broadcaster.clone(),
         )
         .await
@@ -864,7 +962,10 @@ async fn main() {
                             playing: &mut playing,
                             snapshot: &status_snapshot,
                             ducking_snapshot: &ducking_snapshot,
-                            inputs: &input_statuses,
+                            inputs: &mut input_statuses,
+                            talkback: &mut talkback_lease,
+                            talkback_status: &talkback_status,
+                            now_ms: start_time.elapsed().as_millis() as u64,
                             output_channels,
                             output_sample_rate,
                             config: &config,
@@ -873,6 +974,7 @@ async fn main() {
                             max_block_frames,
                         };
                         handle_command(cmd, &mut ctx).await;
+                        ctx.refresh_talkback(start_time.elapsed().as_millis() as u64);
                     }
                     Err(e) => {
                         tracing::error!("Failed to parse command: {}", e);
@@ -880,6 +982,20 @@ async fn main() {
                 }
             }
             _ = reaper_tick.tick() => {
+                let now_ms = start_time.elapsed().as_millis() as u64;
+                if let Some(source_id) = talkback_lease.active_source().map(str::to_string) {
+                    if let Some((_transition, status)) = talkback_lease.expire(now_ms) {
+                        if let Some(input) = resolve_talkback_input(&input_statuses, &source_id) {
+                            if cmd_tx
+                                .push(rt_engine::AudioCommand::SetInputMute { input, mute: true })
+                                .is_err()
+                            {
+                                tracing::error!("Audio command ring full while expiring talkback lease");
+                            }
+                        }
+                        *talkback_status.write().unwrap() = status;
+                    }
+                }
                 reap_finished_samples(
                     &mut grave_rx,
                     &mut streamed_grave_rx,
@@ -951,6 +1067,40 @@ fn refresh_snapshot(
     guard.output_channels = output_channels;
     guard.samples = samples;
     guard.inputs = inputs.to_vec();
+}
+
+/// Resolve the same input selector semantics used by the real-time mixer on
+/// the control side so `/status/inputs` reflects the command that was actually
+/// queued. Numeric selectors address the stable configured index; any other
+/// selector addresses the declared voice id. Returning the control-side record
+/// lets callers update the authoritative status without touching the RT state.
+fn find_input_status_mut<'a>(
+    inputs: &'a mut [http::InputStatus],
+    selector: &str,
+) -> Option<&'a mut http::InputStatus> {
+    if let Ok(index) = selector.parse::<usize>() {
+        return inputs.get_mut(index);
+    }
+    inputs.iter_mut().find(|input| input.voice_id == selector)
+}
+
+fn resolve_talkback_input(inputs: &[http::InputStatus], source_id: &str) -> Option<String> {
+    if inputs
+        .iter()
+        .any(|input| input.ready && input.voice_id == source_id)
+    {
+        return Some(source_id.to_string());
+    }
+    // The venue profile uses the semantic GM_MIC name while the checked-in
+    // daemon config historically calls the same first strip `mic`.
+    if source_id == "GM_MIC"
+        && inputs
+            .iter()
+            .any(|input| input.ready && input.voice_id == "mic")
+    {
+        return Some("mic".to_string());
+    }
+    None
 }
 
 /// Build the warning for an input whose resolved routes read source channels the
@@ -1347,7 +1497,10 @@ struct CommandCtx<'a> {
     playing: &'a mut std::collections::HashMap<u64, http::SampleStatus>,
     snapshot: &'a std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
     ducking_snapshot: &'a std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
-    inputs: &'a [http::InputStatus],
+    inputs: &'a mut [http::InputStatus],
+    talkback: &'a mut talkback::TalkbackLease,
+    talkback_status: &'a std::sync::Arc<std::sync::RwLock<talkback::TalkbackStatus>>,
+    now_ms: u64,
     output_channels: usize,
     output_sample_rate: u32,
     config: &'a config::Config,
@@ -1364,9 +1517,12 @@ struct CommandCtx<'a> {
 
 impl CommandCtx<'_> {
     /// Push a resolved command to the audio thread, logging if the ring is full.
-    fn send(&mut self, command: rt_engine::AudioCommand) {
+    fn send(&mut self, command: rt_engine::AudioCommand) -> bool {
         if self.cmd_tx.push(command).is_err() {
             tracing::error!("Audio command ring full; command dropped");
+            false
+        } else {
+            true
         }
     }
 
@@ -1378,6 +1534,11 @@ impl CommandCtx<'_> {
             self.inputs,
             self.output_channels,
         );
+    }
+
+    fn refresh_talkback(&self, now_ms: u64) {
+        let status = self.talkback.status(now_ms);
+        *self.talkback_status.write().unwrap() = status;
     }
 }
 
@@ -2356,7 +2517,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             // A live input shares this voice id even when no sample-backed voice
             // exists. The control plane cannot read the audio thread's live_inputs
             // (D22a), so it checks the configured input voice ids it does own (D35).
-            let input_match = ctx.inputs.iter().any(|i| i.voice_id == voice);
+            let input_match = ctx.inputs.iter().any(|i| i.voice_id == voice && i.ready);
 
             if success || input_match {
                 // For a sample-backed voice send the VoiceManager's clamped stored
@@ -2377,6 +2538,15 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     if status.voice_id == voice {
                         status.voice_volume = target;
                     }
+                }
+                for input_status in ctx
+                    .inputs
+                    .iter_mut()
+                    .filter(|input| input.voice_id == voice && input.ready)
+                {
+                    input_status.volume = target;
+                    input_status.unmuted_volume = target;
+                    input_status.muted = false;
                 }
                 ctx.refresh();
                 tracing::info!("Set voice '{}' volume to {:.2}", voice, target);
@@ -2459,10 +2629,29 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         } => {
             // The audio thread resolves the input by index or voice id and clamps.
             tracing::info!("Set input '{}' volume to {:.2}", input, new_volume);
-            ctx.send(rt_engine::AudioCommand::SetInputVolume {
-                input,
-                volume: new_volume,
+            let input_ready = find_input_status_mut(ctx.inputs, &input)
+                .map(|status| status.ready)
+                .unwrap_or(false);
+            if !input_ready {
+                tracing::warn!(
+                    "Input '{}' is unavailable; volume command was not queued",
+                    input
+                );
+                return;
+            }
+            let volume = new_volume.clamp(0.0, 1.0);
+            let queued = ctx.send(rt_engine::AudioCommand::SetInputVolume {
+                input: input.clone(),
+                volume,
             });
+            if queued {
+                if let Some(status) = find_input_status_mut(ctx.inputs, &input) {
+                    status.volume = volume;
+                    status.unmuted_volume = volume;
+                    status.muted = false;
+                }
+                ctx.refresh();
+            }
         }
         mqtt::commands::AudioCommand::InputMute { input, mute } => {
             // Mute stores the input's current volume and zeroes it; unmute restores
@@ -2473,7 +2662,108 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 input,
                 if mute { "muted" } else { "unmuted" }
             );
-            ctx.send(rt_engine::AudioCommand::SetInputMute { input, mute });
+            let input_ready = find_input_status_mut(ctx.inputs, &input)
+                .map(|status| status.ready)
+                .unwrap_or(false);
+            if !input_ready {
+                tracing::warn!(
+                    "Input '{}' is unavailable; mute command was not queued",
+                    input
+                );
+                return;
+            }
+            if !mute
+                && (ctx.talkback.active_for(&input)
+                    || (input == "mic" && ctx.talkback.active_for("GM_MIC")))
+            {
+                tracing::warn!(
+                    "Input '{}' is owned by an active talkback lease; ordinary unmute was rejected",
+                    input
+                );
+                return;
+            }
+            let queued = ctx.send(rt_engine::AudioCommand::SetInputMute {
+                input: input.clone(),
+                mute,
+            });
+            if queued {
+                if let Some(status) = find_input_status_mut(ctx.inputs, &input) {
+                    if mute {
+                        if !status.muted {
+                            status.unmuted_volume = status.volume;
+                        }
+                        status.volume = 0.0;
+                        status.muted = true;
+                    } else {
+                        status.volume = status.unmuted_volume;
+                        status.muted = false;
+                    }
+                }
+                ctx.refresh();
+            }
+        }
+        mqtt::commands::AudioCommand::TalkbackAcquire(request) => {
+            let Some(input) = resolve_talkback_input(ctx.inputs, &request.source_id) else {
+                tracing::warn!(
+                    "Talkback source '{}' is unavailable; lease was not acquired",
+                    request.source_id
+                );
+                ctx.refresh_talkback(ctx.now_ms);
+                return;
+            };
+            match ctx.talkback.acquire(
+                &request.client_id,
+                &request.source_id,
+                &request.destination,
+                request.gain,
+                request.lease_ms,
+                ctx.now_ms,
+            ) {
+                Ok((_transition, _status)) => {
+                    if !ctx.send(rt_engine::AudioCommand::SetInputMute {
+                        input: input.clone(),
+                        mute: false,
+                    }) {
+                        ctx.talkback.hard_mute(ctx.now_ms);
+                    }
+                    ctx.refresh_talkback(ctx.now_ms);
+                }
+                Err(error) => {
+                    tracing::warn!("Talkback acquire rejected: {}", error);
+                    ctx.refresh_talkback(ctx.now_ms);
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::TalkbackRelease(request) => {
+            let source = ctx.talkback.active_source().map(str::to_string);
+            match ctx
+                .talkback
+                .release(&request.client_id, &request.lease_id, ctx.now_ms)
+            {
+                Ok((_transition, _status)) => {
+                    if let Some(source_id) = source {
+                        if let Some(input) = resolve_talkback_input(ctx.inputs, &source_id) {
+                            let _ = ctx
+                                .send(rt_engine::AudioCommand::SetInputMute { input, mute: true });
+                        }
+                    }
+                    ctx.refresh_talkback(ctx.now_ms);
+                }
+                Err(error) => {
+                    tracing::warn!("Talkback release rejected: {}", error);
+                    ctx.refresh_talkback(ctx.now_ms);
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::TalkbackHardMute => {
+            let source = ctx.talkback.active_source().map(str::to_string);
+            let _ = ctx.talkback.hard_mute(ctx.now_ms);
+            if let Some(source_id) = source {
+                if let Some(input) = resolve_talkback_input(ctx.inputs, &source_id) {
+                    let _ = ctx.send(rt_engine::AudioCommand::SetInputMute { input, mute: true });
+                }
+            }
+            ctx.refresh_talkback(ctx.now_ms);
         }
         mqtt::commands::AudioCommand::Seek {
             selector,
@@ -2719,6 +3009,8 @@ mod tests {
         snapshot: Arc<RwLock<http::StatusSnapshot>>,
         ducking_snapshot: Arc<RwLock<HashMap<String, f32>>>,
         inputs: Vec<http::InputStatus>,
+        talkback: talkback::TalkbackLease,
+        talkback_status: Arc<RwLock<talkback::TalkbackStatus>>,
         config: config::Config,
         latency_stats: Arc<http::PlayLatencyStats>,
         latency: http::LatencyTracker,
@@ -2776,6 +3068,10 @@ mod tests {
                 })),
                 ducking_snapshot: Arc::new(RwLock::new(HashMap::new())),
                 inputs: Vec::new(),
+                talkback: talkback::TalkbackLease::default(),
+                talkback_status: Arc::new(RwLock::new(
+                    talkback::TalkbackLease::default().status(0),
+                )),
                 config: config::Config::default(),
                 latency_stats: latency_stats.clone(),
                 latency: http::LatencyTracker::new(latency_stats),
@@ -2808,7 +3104,10 @@ mod tests {
                 playing: &mut self.playing,
                 snapshot: &self.snapshot,
                 ducking_snapshot: &self.ducking_snapshot,
-                inputs: &self.inputs,
+                inputs: &mut self.inputs,
+                talkback: &mut self.talkback,
+                talkback_status: &self.talkback_status,
+                now_ms: 0,
                 output_channels: 2,
                 output_sample_rate: SR,
                 config: &self.config,
@@ -3322,7 +3621,17 @@ mod tests {
             *start_position_ms = Some(1500);
         }
         fixture.run(cmd).await;
-        fixture.drain();
+        let mut attempts = 0;
+        while attempts < 500 {
+            fixture.drain();
+            if let Some(sample) = fixture.mixer.active_samples.first() {
+                if sample.buffer.is_frame_loaded(sample.position) {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            attempts += 1;
+        }
         let sample = &fixture.mixer.active_samples[0];
         assert_eq!(sample.position, 1500 * 48, "1500ms at 48k");
         assert!(
@@ -3704,6 +4013,8 @@ mod tests {
         );
         // The ramp is gradual, so the current value has not jumped to the target.
         assert!((input.voice_volume - 1.0).abs() < 1e-6);
+        assert_eq!(fixture.inputs[0].volume, 0.4);
+        assert!(!fixture.inputs[0].muted);
     }
 
     #[tokio::test]
@@ -3746,6 +4057,13 @@ mod tests {
             voice_id: voice.to_string(),
             volume,
             channels: 1,
+            muted: false,
+            unmuted_volume: volume,
+            applied_volume: None,
+            applied_muted: None,
+            applied_unmuted_volume: None,
+            ready: true,
+            last_error: None,
         });
     }
 
@@ -3817,6 +4135,9 @@ mod tests {
             .await;
         fixture.drain();
         assert!((fixture.mixer.live_inputs[0].volume - 0.7).abs() < 1e-6);
+        assert_eq!(fixture.inputs[0].volume, 0.7);
+        assert_eq!(fixture.inputs[0].unmuted_volume, 0.7);
+        assert!(!fixture.inputs[0].muted);
 
         // Mute: the input drops to silence.
         fixture
@@ -3827,6 +4148,9 @@ mod tests {
             .await;
         fixture.drain();
         assert_eq!(fixture.mixer.live_inputs[0].volume, 0.0);
+        assert_eq!(fixture.inputs[0].volume, 0.0);
+        assert_eq!(fixture.inputs[0].unmuted_volume, 0.7);
+        assert!(fixture.inputs[0].muted);
 
         // Unmute: the calibrated 0.7 is restored, NOT 1.0.
         fixture
@@ -3841,6 +4165,55 @@ mod tests {
             "unmute must restore the calibrated 0.7, got {}",
             fixture.mixer.live_inputs[0].volume
         );
+        assert_eq!(fixture.inputs[0].volume, 0.7);
+        assert!(!fixture.inputs[0].muted);
+    }
+
+    #[tokio::test]
+    async fn talkback_lease_acquire_release_and_expiry_mute_the_input() {
+        let mut fixture = Fixture::new(vec![]);
+        push_live_input(&mut fixture, "mic", 0.7);
+        fixture
+            .run(AudioCommand::TalkbackAcquire(
+                mqtt::commands::TalkbackAcquireMessage {
+                    client_id: "gm-1".to_string(),
+                    source_id: "GM_MIC".to_string(),
+                    destination: "GUEST_ALL".to_string(),
+                    gain: 0.0,
+                    lease_ms: 500,
+                },
+            ))
+            .await;
+        fixture.drain();
+        assert!(fixture.talkback.status(0).applied_live);
+        assert_eq!(fixture.mixer.live_inputs[0].volume, 0.7);
+
+        fixture
+            .run(AudioCommand::TalkbackRelease(
+                mqtt::commands::TalkbackReleaseMessage {
+                    client_id: "gm-1".to_string(),
+                    lease_id: "lease-0001".to_string(),
+                },
+            ))
+            .await;
+        fixture.drain();
+        assert!(!fixture.talkback.status(0).applied_live);
+        assert_eq!(fixture.mixer.live_inputs[0].volume, 0.0);
+
+        fixture
+            .run(AudioCommand::TalkbackAcquire(
+                mqtt::commands::TalkbackAcquireMessage {
+                    client_id: "gm-1".to_string(),
+                    source_id: "GM_MIC".to_string(),
+                    destination: "GUEST_ALL".to_string(),
+                    gain: 0.0,
+                    lease_ms: 500,
+                },
+            ))
+            .await;
+        fixture.drain();
+        let _ = fixture.talkback.expire(500);
+        assert!(!fixture.talkback.status(500).applied_live);
     }
 
     #[tokio::test]

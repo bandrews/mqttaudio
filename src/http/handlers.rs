@@ -55,6 +55,33 @@ pub async fn handle_health() -> impl IntoResponse {
     }))
 }
 
+/// Readiness is distinct from process liveness: an output stream or a
+/// configured capture input can be unavailable while the HTTP server still
+/// answers `/health`. This endpoint is intentionally small and contains no
+/// secrets or raw audio telemetry.
+pub async fn handle_ready(State(state): State<AppState>) -> impl IntoResponse {
+    let snapshot = state.status.read().unwrap();
+    let output_ready = snapshot.output_channels > 0;
+    let inputs_ready = snapshot.inputs.iter().all(|input| input.ready);
+    let ready = output_ready && inputs_ready;
+    let body = json!({
+        "status": if ready { "ready" } else { "not_ready" },
+        "ready": ready,
+        "checks": { "output": output_ready, "inputs": inputs_ready },
+        "failed_inputs": snapshot.inputs.iter().filter(|input| !input.ready).map(|input| {
+            json!({ "voice_id": input.voice_id, "error": input.last_error })
+        }).collect::<Vec<_>>(),
+    });
+    (
+        if ready {
+            StatusCode::OK
+        } else {
+            StatusCode::SERVICE_UNAVAILABLE
+        },
+        Json(body),
+    )
+}
+
 // =============================================================================
 // Version & Metrics
 // =============================================================================
@@ -700,6 +727,74 @@ pub async fn handle_input_mute(
     }
 }
 
+#[derive(Deserialize)]
+pub struct TalkbackAcquireParams {
+    pub client_id: String,
+    #[serde(default = "default_talkback_source")]
+    pub source_id: String,
+    pub destination: String,
+    pub gain: f32,
+    pub lease_ms: u64,
+}
+
+fn default_talkback_source() -> String {
+    "GM_MIC".to_string()
+}
+
+pub async fn handle_talkback_acquire(
+    State(state): State<AppState>,
+    Json(params): Json<TalkbackAcquireParams>,
+) -> impl IntoResponse {
+    let command = json!({ "command": "talkback_acquire", "message": {
+        "client_id": params.client_id,
+        "source_id": params.source_id,
+        "destination": params.destination,
+        "gain": params.gain,
+        "lease_ms": params.lease_ms
+    }});
+    match send_command(&state, &command.to_string()).await {
+        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CommandResponse::error(&error)),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct TalkbackReleaseParams {
+    pub client_id: String,
+    pub lease_id: String,
+}
+
+pub async fn handle_talkback_release(
+    State(state): State<AppState>,
+    Json(params): Json<TalkbackReleaseParams>,
+) -> impl IntoResponse {
+    let command = json!({ "command": "talkback_release", "message": {
+        "client_id": params.client_id,
+        "lease_id": params.lease_id
+    }});
+    match send_command(&state, &command.to_string()).await {
+        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CommandResponse::error(&error)),
+        ),
+    }
+}
+
+pub async fn handle_talkback_hard_mute(State(state): State<AppState>) -> impl IntoResponse {
+    let command = json!({ "command": "talkback_hard_mute", "message": {} });
+    match send_command(&state, &command.to_string()).await {
+        Ok(()) => (StatusCode::OK, Json(CommandResponse::ok())),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(CommandResponse::error(&error)),
+        ),
+    }
+}
+
 // =============================================================================
 // Status Endpoints
 // =============================================================================
@@ -846,6 +941,7 @@ pub async fn handle_cache_status(State(state): State<AppState>) -> impl IntoResp
 }
 
 pub async fn handle_inputs(State(state): State<AppState>) -> impl IntoResponse {
+    use std::sync::atomic::Ordering;
     let snapshot = state.status.read().unwrap();
 
     let inputs: Vec<Value> = snapshot
@@ -855,14 +951,32 @@ pub async fn handle_inputs(State(state): State<AppState>) -> impl IntoResponse {
             json!({
                 "index": input.index,
                 "voice_id": input.voice_id,
-                "volume": input.volume,
+                "volume": input.applied_volume.as_ref()
+                    .map(|value| f32::from_bits(value.load(Ordering::Relaxed)))
+                    .unwrap_or(input.volume),
                 "channels": input.channels,
-                "muted": input.volume == 0.0
+                "muted": input.applied_muted.as_ref()
+                    .map(|value| value.load(Ordering::Relaxed))
+                    .unwrap_or(input.muted),
+                "unmuted_volume": input.applied_unmuted_volume.as_ref()
+                    .map(|value| f32::from_bits(value.load(Ordering::Relaxed)))
+                    .unwrap_or(input.unmuted_volume),
+                "ready": input.ready,
+                "last_error": input.last_error
             })
         })
         .collect();
 
     Json(json!({ "inputs": inputs }))
+}
+
+pub async fn handle_talkback_status(State(state): State<AppState>) -> impl IntoResponse {
+    let status = state.talkback.read().unwrap().clone();
+    // The lease deadline is on the daemon's monotonic clock. Include the
+    // matching current value so a server-side gateway can derive a short-lived
+    // wall-clock hint without ever using wall time for expiry/safety decisions.
+    let now_ms = state.start_time.elapsed().as_millis() as u64;
+    Json(json!({ "talkback": status, "now_ms": now_ms }))
 }
 
 // =============================================================================

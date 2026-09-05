@@ -54,6 +54,20 @@ pub struct InputStatus {
     pub voice_id: String,
     pub volume: f32,
     pub channels: usize,
+    /// Applied mute state, kept separately from volume so a muted input can
+    /// retain and report its calibrated level for a safe unmute.
+    pub muted: bool,
+    /// The level that will be restored when `muted` is cleared. This is an
+    /// operational value, not a physical calibration claim.
+    pub unmuted_volume: f32,
+    /// Audio-thread applied values. Optional for test fixtures and inputs that
+    /// failed before a stream could be opened.
+    pub applied_volume: Option<Arc<AtomicU32>>,
+    pub applied_muted: Option<Arc<AtomicBool>>,
+    pub applied_unmuted_volume: Option<Arc<AtomicU32>>,
+    /// Whether the capture stream opened successfully.
+    pub ready: bool,
+    pub last_error: Option<String>,
 }
 
 /// Control-side view of what is playing, exposed to the HTTP status handlers.
@@ -182,6 +196,9 @@ pub struct AppState {
     /// Per-input capture-path counters (Sprint 13, D57), for `/metrics`:
     /// (voice id, counters) per configured live input.
     pub input_telemetry: Arc<Vec<(String, Arc<crate::audio::input::InputTelemetry>)>>,
+    /// Applied daemon-enforced talkback lease state. The control loop owns
+    /// transitions; HTTP exposes a read-only snapshot for the gateway/UI.
+    pub talkback: Arc<RwLock<crate::talkback::TalkbackStatus>>,
 }
 
 /// Redact secrets from a serialized config for `GET /config` (DW11):
@@ -237,6 +254,7 @@ pub async fn start_server(
     config_json: Arc<serde_json::Value>,
     latency: Arc<PlayLatencyStats>,
     input_telemetry: Arc<Vec<(String, Arc<crate::audio::input::InputTelemetry>)>>,
+    talkback: Arc<RwLock<crate::talkback::TalkbackStatus>>,
     log_broadcaster: Arc<LogBroadcaster>,
 ) -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
     let state_broadcaster = Arc::new(LogBroadcaster::new());
@@ -266,6 +284,7 @@ pub async fn start_server(
         config_json,
         latency,
         input_telemetry,
+        talkback,
     };
 
     // State-event tick timer (~15 Hz, DW12): only does work when telemetry is on AND

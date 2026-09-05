@@ -57,6 +57,8 @@ Config file example:
 | `/status/samples` | GET | List of active samples |
 | `/status/voices` | GET | List of active voices (with per-voice ducking multiplier) |
 | `/status/inputs` | GET | List of configured live inputs |
+| `/status/talkback` | GET | Applied fail-closed talkback lease state |
+| `/ready` | GET | Readiness of output and configured capture inputs |
 | `/status/cache` | GET | Cache statistics |
 
 ### Command Endpoints (Authentication Required if configured)
@@ -75,6 +77,9 @@ Config file example:
 | `/voice/stop` | POST | Stop a voice |
 | `/input/volume` | POST | Set live-input volume |
 | `/input/mute` | POST | Mute/unmute a live input |
+| `/talkback/acquire` | POST | Acquire or renew a bounded talkback lease |
+| `/talkback/release` | POST | Release the caller's talkback lease |
+| `/talkback/hard-mute` | POST | Priority-mute every active talkback lease |
 | `/cache/clear` | POST | Clear all caches |
 | `/cache/invalidate` | POST | Invalidate specific cache entry |
 | `/cache/reload` | POST | Invalidate then re-precache an entry (fresh + instant) |
@@ -266,7 +271,7 @@ Returns the configured live inputs and their current volume/mute state:
 ```json
 {
   "inputs": [
-    { "index": 0, "voice_id": "gamemaster_mic", "volume": 0.8, "channels": 1, "muted": false }
+    { "index": 0, "voice_id": "gamemaster_mic", "volume": 0.8, "channels": 1, "muted": false, "unmuted_volume": 0.8, "ready": true, "last_error": null }
   ]
 }
 ```
@@ -277,7 +282,38 @@ Returns the configured live inputs and their current volume/mute state:
 | `voice_id` | string | Voice group the input feeds |
 | `volume` | float | Current input volume (0.0-1.0) |
 | `channels` | integer | Input channel count |
-| `muted` | boolean | Derived as `volume == 0.0` |
+| `muted` | boolean | Applied mute state; this is explicit rather than inferred from the current volume |
+| `unmuted_volume` | float | Calibrated level restored when an applied mute is released |
+| `ready` | boolean | Whether the capture stream opened and can accept commands |
+| `last_error` | string / null | Capture/open error when `ready` is false |
+
+### `/status/talkback` Response
+
+The daemon reports the applied lease, not a browser's requested state. A
+lease automatically returns to `muted` when its monotonic expiry is reached or
+the process restarts:
+
+```json
+{
+  "now_ms": 1234,
+  "talkback": {
+    "state": "muted",
+    "applied_live": false,
+    "lease_id": null,
+    "owner_client_id": null,
+    "source_id": null,
+    "destination": null,
+    "gain": 0.0,
+    "lease_expires_at_ms": null,
+    "last_transition": "expired",
+    "last_error": null
+  }
+}
+```
+
+`lease_expires_at_ms` and `now_ms` are monotonic daemon-clock values. A
+gateway may derive a display-only remaining duration from their difference;
+expiry enforcement never uses wall-clock conversion.
 
 ### `/status/cache` Response
 

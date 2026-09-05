@@ -4,6 +4,7 @@
 use futures_util::{SinkExt, StreamExt};
 use mqttaudio::cache::CacheManager;
 use mqttaudio::http::{create_router, AppState, LogBroadcaster, StatusSnapshot};
+use mqttaudio::talkback::TalkbackLease;
 use mqttaudio::voice::VoiceManager;
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -48,6 +49,7 @@ fn build_state() -> (AppState, mpsc::Receiver<String>, Arc<LogBroadcaster>) {
         config_json: Arc::new(serde_json::json!({})),
         latency: Arc::new(mqttaudio::http::PlayLatencyStats::default()),
         input_telemetry: Arc::new(Vec::new()),
+        talkback: Arc::new(RwLock::new(TalkbackLease::default().status(0))),
     };
 
     (state, cmd_rx, log_broadcaster)

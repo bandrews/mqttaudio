@@ -1143,6 +1143,12 @@ impl Config {
                     );
                 }
             }
+            if self.http.require_auth && self.http.auth_token.is_none() {
+                errors.push(
+                    "http.require_auth requires http.auth_token (or MQTTAUDIO_HTTP_AUTH_TOKEN)"
+                        .to_string(),
+                );
+            }
         }
 
         if errors.is_empty() {
@@ -1445,6 +1451,18 @@ mod tests {
         // HTTP-only mode should be valid (no MQTT topic needed)
         let result = config.validate();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_http_require_auth_without_token_fails_closed() {
+        let mut config = Config::default();
+        config.http.enabled = true;
+        config.http.require_auth = true;
+        config.http.port = 8080;
+        let errors = config.validate().unwrap_err();
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("require_auth") && error.contains("auth_token")));
     }
 
     #[test]

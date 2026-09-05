@@ -809,6 +809,13 @@ pub struct LiveInput {
 
     /// Channel routing: vec![(src_channel, dest_channel), ...]
     pub channel_map: Vec<(usize, usize)>,
+
+    /// Optional control-side observers. They are allocated during setup and
+    /// updated with relaxed atomics by the audio callback, so status queries
+    /// can report applied values without locking the mixer.
+    pub applied_volume: Option<Arc<AtomicU32>>,
+    pub applied_muted: Option<Arc<AtomicBool>>,
+    pub applied_unmuted_volume: Option<Arc<AtomicU32>>,
 }
 
 impl LiveInput {
@@ -830,6 +837,33 @@ impl LiveInput {
             voice_volume: 1.0,
             target_voice_volume: 1.0,
             channel_map,
+            applied_volume: None,
+            applied_muted: None,
+            applied_unmuted_volume: None,
+        }
+    }
+
+    pub fn set_status_observers(
+        &mut self,
+        volume: Arc<AtomicU32>,
+        muted: Arc<AtomicBool>,
+        unmuted_volume: Arc<AtomicU32>,
+    ) {
+        self.applied_volume = Some(volume);
+        self.applied_muted = Some(muted);
+        self.applied_unmuted_volume = Some(unmuted_volume);
+        self.publish_status();
+    }
+
+    fn publish_status(&self) {
+        if let Some(volume) = &self.applied_volume {
+            volume.store(self.volume.to_bits(), Ordering::Relaxed);
+        }
+        if let Some(muted) = &self.applied_muted {
+            muted.store(self.muted, Ordering::Relaxed);
+        }
+        if let Some(unmuted_volume) = &self.applied_unmuted_volume {
+            unmuted_volume.store(self.pre_mute_volume.to_bits(), Ordering::Relaxed);
         }
     }
 
@@ -845,6 +879,8 @@ impl LiveInput {
     pub fn set_volume(&mut self, volume: f32) {
         self.volume = volume.clamp(0.0, 1.0);
         self.muted = false;
+        self.pre_mute_volume = self.volume;
+        self.publish_status();
     }
 
     /// Mute or unmute this input. Muting stores the current volume and zeroes it;
@@ -857,10 +893,12 @@ impl LiveInput {
                 self.pre_mute_volume = self.volume;
                 self.volume = 0.0;
                 self.muted = true;
+                self.publish_status();
             }
         } else if self.muted {
             self.volume = self.pre_mute_volume;
             self.muted = false;
+            self.publish_status();
         }
     }
 

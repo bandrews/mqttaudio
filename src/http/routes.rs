@@ -93,7 +93,13 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         .route("/voice/fade_out", post(handlers::handle_voice_fade_out))
         .route("/voice/volume", post(handlers::handle_voice_volume))
         .route("/input/volume", post(handlers::handle_input_volume))
-        .route("/input/mute", post(handlers::handle_input_mute));
+        .route("/input/mute", post(handlers::handle_input_mute))
+        .route("/talkback/acquire", post(handlers::handle_talkback_acquire))
+        .route("/talkback/release", post(handlers::handle_talkback_release))
+        .route(
+            "/talkback/hard-mute",
+            post(handlers::handle_talkback_hard_mute),
+        );
 
     // Build status routes (read-only, no auth required for basic status). These
     // include /version and /metrics, which are gated alongside the status routes
@@ -104,6 +110,7 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         .route("/status/voices", get(handlers::handle_voices))
         .route("/status/cache", get(handlers::handle_cache_status))
         .route("/status/inputs", get(handlers::handle_inputs))
+        .route("/status/talkback", get(handlers::handle_talkback_status))
         .route("/version", get(handlers::handle_version))
         .route("/metrics", get(handlers::handle_metrics))
         // Per-output-channel peak meters poll fallback (Sprint W7).
@@ -117,7 +124,9 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         );
 
     // Health check (no auth)
-    let health_route = Router::new().route("/health", get(handlers::handle_health));
+    let health_route = Router::new()
+        .route("/health", get(handlers::handle_health))
+        .route("/ready", get(handlers::handle_ready));
 
     // Command routes always carry the auth middleware (enforced when a token is
     // set, or always when require_auth locks the whole API).

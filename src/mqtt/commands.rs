@@ -200,6 +200,28 @@ pub struct InputMuteMessage {
     pub mute: bool,
 }
 
+/// Fail-closed talkback lease request. Destination names are validated again
+/// by the daemon state machine; the parser only enforces field types/ranges.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TalkbackAcquireMessage {
+    pub client_id: String,
+    #[serde(default = "default_talkback_source")]
+    pub source_id: String,
+    pub destination: String,
+    pub gain: f32,
+    pub lease_ms: u64,
+}
+
+fn default_talkback_source() -> String {
+    "GM_MIC".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TalkbackReleaseMessage {
+    pub client_id: String,
+    pub lease_id: String,
+}
+
 /// Seek command parameters
 #[derive(Debug, Deserialize, Serialize)]
 pub struct SeekMessage {
@@ -330,6 +352,9 @@ pub enum AudioCommand {
         input: String,
         mute: bool,
     },
+    TalkbackAcquire(TalkbackAcquireMessage),
+    TalkbackRelease(TalkbackReleaseMessage),
+    TalkbackHardMute,
     Seek {
         selector: SampleSelector,
         position_ms: u64,
@@ -558,6 +583,23 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 mute: input_msg.mute,
             })
         }
+        "talkback_acquire" => {
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            Ok(AudioCommand::TalkbackAcquire(serde_json::from_value(
+                mqtt_cmd.get_params(),
+            )?))
+        }
+        "talkback_release" => {
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            Ok(AudioCommand::TalkbackRelease(serde_json::from_value(
+                mqtt_cmd.get_params(),
+            )?))
+        }
+        "talkback_hard_mute" => Ok(AudioCommand::TalkbackHardMute),
         "seek" => {
             if !mqtt_cmd.has_params() {
                 return Err(ParseError::MissingMessage);
@@ -1379,6 +1421,25 @@ mod tests {
             }
             _ => panic!("Expected InputMute command"),
         }
+    }
+
+    #[test]
+    fn test_parse_talkback_lease_commands() {
+        let acquire = parse_command(r#"{"command":"talkback_acquire","message":{"client_id":"gm-1","destination":"GUEST_ALL","gain":0.0,"lease_ms":500}}"#).unwrap();
+        match acquire {
+            AudioCommand::TalkbackAcquire(request) => {
+                assert_eq!(request.client_id, "gm-1");
+                assert_eq!(request.source_id, "GM_MIC");
+                assert_eq!(request.lease_ms, 500);
+            }
+            _ => panic!("Expected TalkbackAcquire command"),
+        }
+        let release = parse_command(r#"{"command":"talkback_release","message":{"client_id":"gm-1","lease_id":"lease-0001"}}"#).unwrap();
+        assert!(matches!(release, AudioCommand::TalkbackRelease(_)));
+        assert!(matches!(
+            parse_command(r#"{"command":"talkback_hard_mute"}"#).unwrap(),
+            AudioCommand::TalkbackHardMute
+        ));
     }
 
     #[test]
