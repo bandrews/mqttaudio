@@ -1,16 +1,19 @@
 import { test, expect } from '@playwright/test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 // Lane B: drive the SPA through the dev proxy against a REAL daemon (spawned by
 // this spec). Verifies connectivity + restart survival and that the dashboard
 // reflects a real play/stop within the poll interval.
-// NOTE: real /ws log LINES are gated on a daemon gap (WebSocketLogLayer not wired;
-// see docs/bugs.md, Sprint W1) — the connectivity claims here use the welcome
-// frame, the live state, and the backoff reconnect.
+// Exercises live log/state delivery and connection recovery against the built release.
 
 const BIN = resolve(process.cwd(), '..', 'target', 'release', 'mqttaudio');
+const VERSION = readFileSync(resolve(process.cwd(), '..', 'Cargo.toml'), 'utf8').match(
+  /^version\s*=\s*"([^"]+)"/m,
+)?.[1];
+if (!VERSION) throw new Error('Cargo.toml has no package version');
 const WAV = resolve(process.cwd(), '..', 'tests', 'audio', 'test_beep_5s.wav');
 const DAEMON_PORT = 8099;
 const HEALTH = `http://127.0.0.1:${DAEMON_PORT}/health`;
@@ -57,7 +60,7 @@ test('connects to a real daemon through the proxy and survives a restart', async
   await page.getByRole('button', { name: /connect/i }).click();
 
   await expect(page.getByText('Log stream')).toBeVisible();
-  await expect(page.getByText('daemon v2.0.0')).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByText(`daemon v${VERSION}`)).toBeVisible({ timeout: 20_000 });
 
   // Kill the daemon: socket closes, the /version re-probe fails -> offline.
   daemon.kill('SIGKILL');
@@ -82,8 +85,8 @@ test('dashboard reflects a real play and stop within the poll interval', async (
   await page.request.post('/api/command', {
     data: { command: 'play', message: { file: WAV, voice: 'beep', loop: true } },
   });
-  await expect(page.getByText('test_beep_5s.wav')).toBeVisible({ timeout: 6_000 });
-  await expect(page.getByText('voice: beep')).toBeVisible();
+  await expect(page.getByText('test_beep_5s.wav', { exact: true })).toBeVisible({ timeout: 6_000 });
+  await expect(page.getByText('voice: beep', { exact: true })).toBeVisible();
 
   // Stop everything; the board returns to empty.
   await page.request.post('/api/command', { data: { command: 'stopall' } });
@@ -105,7 +108,7 @@ test('the console cue launcher plays a real file and Stop All clears it', async 
 
   // The Monitor tab reflects the real play.
   await page.getByRole('tab', { name: 'Monitor' }).click();
-  await expect(page.getByText('test_beep_5s.wav')).toBeVisible({ timeout: 6_000 });
+  await expect(page.getByText('test_beep_5s.wav', { exact: true })).toBeVisible({ timeout: 6_000 });
 
   // Stop All from the console clears it.
   await page.getByRole('tab', { name: 'Console' }).click();
@@ -131,7 +134,7 @@ test('the matrix mixer routes a real play (dest 0/1 on the default device)', asy
   await page.getByRole('button', { name: 'Play routed' }).click();
 
   await page.getByRole('tab', { name: 'Monitor' }).click();
-  await expect(page.getByText('test_beep_5s.wav')).toBeVisible({ timeout: 6_000 });
+  await expect(page.getByText('test_beep_5s.wav', { exact: true })).toBeVisible({ timeout: 6_000 });
 
   await page.request.post('/api/command', { data: { command: 'stopall' } });
 });
@@ -149,7 +152,7 @@ test('the mixer transport shows a real sample and its Stop control clears it', a
 
   // The mixer transport reflects the real sample with seek + speed controls.
   await page.getByRole('tab', { name: 'Mixer' }).click();
-  await expect(page.getByText('test_beep_5s.wav')).toBeVisible({ timeout: 6_000 });
+  await expect(page.getByText('test_beep_5s.wav', { exact: true })).toBeVisible({ timeout: 6_000 });
   await expect(page.getByLabel(/^seek /)).toBeVisible();
 
   // Stop it from the transport card; the monitor clears.

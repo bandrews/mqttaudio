@@ -22,7 +22,8 @@ function spyClient() {
 describe('validation (mirrors the daemon)', () => {
   it('warns on out-of-range volume but does not error', () => {
     expect(validateVolume(0.5)).toEqual({});
-    expect(validateVolume(2).warning).toMatch(/clamp/);
+    expect(validateVolume(2)).toEqual({});
+    expect(validateVolume(5).warning).toMatch(/clamp/);
   });
   it('errors on reverse + pitch correction, warns out of range otherwise', () => {
     expect(validateSpeed(-2, true).error).toMatch(/reverse/);

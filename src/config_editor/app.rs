@@ -561,17 +561,13 @@ impl App {
 
     fn handle_sidebar_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up => {
-                if self.section_idx > 0 {
-                    self.section_idx -= 1;
-                    self.reset_levels();
-                }
+            KeyCode::Up if self.section_idx > 0 => {
+                self.section_idx -= 1;
+                self.reset_levels();
             }
-            KeyCode::Down => {
-                if self.section_idx + 1 < Section::ALL.len() {
-                    self.section_idx += 1;
-                    self.reset_levels();
-                }
+            KeyCode::Down if self.section_idx + 1 < Section::ALL.len() => {
+                self.section_idx += 1;
+                self.reset_levels();
             }
             KeyCode::Right | KeyCode::Enter => self.pane = Pane::Form,
             _ => {}
@@ -600,10 +596,8 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char(' ') => self.activate_row(),
             KeyCode::Delete | KeyCode::Char('u') => self.unset_row(),
-            KeyCode::Char('d') => {
-                if self.level_is_collection() {
-                    self.unset_row();
-                }
+            KeyCode::Char('d') if self.level_is_collection() => {
+                self.unset_row();
             }
             KeyCode::Char('a') => self.add_to_collection(),
             _ => {}
@@ -1003,24 +997,18 @@ impl App {
                 edit.buffer.insert(byte, c);
                 edit.cursor += 1;
             }
-            KeyCode::Backspace => {
-                if edit.cursor > 0 {
-                    edit.cursor -= 1;
-                    let byte = byte_index(&edit.buffer, edit.cursor);
-                    edit.buffer.remove(byte);
-                }
+            KeyCode::Backspace if edit.cursor > 0 => {
+                edit.cursor -= 1;
+                let byte = byte_index(&edit.buffer, edit.cursor);
+                edit.buffer.remove(byte);
             }
-            KeyCode::Delete => {
-                if edit.cursor < edit.buffer.chars().count() {
-                    let byte = byte_index(&edit.buffer, edit.cursor);
-                    edit.buffer.remove(byte);
-                }
+            KeyCode::Delete if edit.cursor < edit.buffer.chars().count() => {
+                let byte = byte_index(&edit.buffer, edit.cursor);
+                edit.buffer.remove(byte);
             }
             KeyCode::Left => edit.cursor = edit.cursor.saturating_sub(1),
-            KeyCode::Right => {
-                if edit.cursor < edit.buffer.chars().count() {
-                    edit.cursor += 1;
-                }
+            KeyCode::Right if edit.cursor < edit.buffer.chars().count() => {
+                edit.cursor += 1;
             }
             KeyCode::Home => edit.cursor = 0,
             KeyCode::End => edit.cursor = edit.buffer.chars().count(),

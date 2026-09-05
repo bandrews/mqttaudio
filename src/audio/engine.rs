@@ -112,13 +112,14 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
 
     match name {
         Some(device_name) => {
-            // First try to find in enumerated devices
+            // First try to find in enumerated devices. The ALSA null device
+            // discards audio and is never matched.
             if let Ok(devices) = host.output_devices() {
                 for device in devices {
                     if let Ok(n) = device.description().map(|d| {
                         output_device_identifier(&d, cfg!(target_os = "linux")).to_string()
                     }) {
-                        if n == device_name {
+                        if n != "null" && n == device_name {
                             return Ok(device);
                         }
                     }
@@ -168,119 +169,6 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
         None => host
             .default_output_device()
             .ok_or_else(|| "No default output device available".into()),
-    }
-}
-
-/// Try to match two ALSA device names
-/// Returns Some(true) if they match, Some(false) if same prefix but different card, None if not comparable
-#[cfg(target_os = "linux")]
-fn try_match_alsa_device(requested: &str, enumerated: &str) -> Option<bool> {
-    // Get prefix (hw:, plughw:, sysdefault:, etc.)
-    let prefixes = [
-        "plughw:",
-        "hw:",
-        "sysdefault:",
-        "dmix:",
-        "front:",
-        "surround",
-    ];
-
-    for prefix in prefixes {
-        if requested.starts_with(prefix) && enumerated.starts_with(prefix) {
-            // Both have the same prefix, compare by card number
-            let req_card = extract_alsa_card_from_name(requested);
-            let enum_card = extract_alsa_card_from_name(enumerated);
-
-            match (req_card, enum_card) {
-                (Some(r), Some(e)) => return Some(r == e),
-                _ => continue,
-            }
-        }
-    }
-
-    None
-}
-
-/// Extract card identifier from ALSA device name
-/// Handles both numeric (hw:1,0) and named (hw:CARD=UMC1820,DEV=0) formats
-#[cfg(target_os = "linux")]
-fn extract_alsa_card_from_name(name: &str) -> Option<AlsaCardId> {
-    // Find prefix end
-    let prefixes = [
-        "plughw:",
-        "hw:",
-        "sysdefault:",
-        "dmix:",
-        "front:",
-        "surround",
-    ];
-
-    for prefix in prefixes {
-        if let Some(rest) = name.strip_prefix(prefix) {
-            // Try "CARD=name" format first
-            if let Some(card_part) = rest.strip_prefix("CARD=") {
-                let card_name = if let Some(comma_pos) = card_part.find(',') {
-                    &card_part[..comma_pos]
-                } else {
-                    card_part
-                };
-                return Some(AlsaCardId::Name(card_name.to_string()));
-            }
-
-            // Try numeric format "N,M" or just "N"
-            let num_part = if let Some(comma_pos) = rest.find(',') {
-                &rest[..comma_pos]
-            } else {
-                rest
-            };
-
-            if let Ok(num) = num_part.parse::<u32>() {
-                return Some(AlsaCardId::Index(num));
-            }
-        }
-    }
-
-    None
-}
-
-/// ALSA card identifier - can be either index or name
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-enum AlsaCardId {
-    Index(u32),
-    Name(String),
-}
-
-#[cfg(target_os = "linux")]
-impl PartialEq for AlsaCardId {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (AlsaCardId::Index(a), AlsaCardId::Index(b)) => a == b,
-            (AlsaCardId::Name(a), AlsaCardId::Name(b)) => a == b,
-            // Cross-compare by looking up card index from name
-            (AlsaCardId::Index(idx), AlsaCardId::Name(name))
-            | (AlsaCardId::Name(name), AlsaCardId::Index(idx)) => {
-                // Try to match card name to index by checking /proc/asound/cards
-                if let Ok(cards) = std::fs::read_to_string("/proc/asound/cards") {
-                    for line in cards.lines() {
-                        // Format: " 1 [UMC1820        ]: USB-Audio - UMC1820"
-                        if let Some(bracket_start) = line.find('[') {
-                            if let Some(bracket_end) = line.find(']') {
-                                let card_id = line[bracket_start + 1..bracket_end].trim();
-                                if card_id == name {
-                                    // Found the card name, extract index
-                                    let idx_str = line[..bracket_start].trim();
-                                    if let Ok(card_idx) = idx_str.parse::<u32>() {
-                                        return card_idx == *idx;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                false
-            }
-        }
     }
 }
 
@@ -442,13 +330,13 @@ fn build_typed_output_stream<T>(
     callback_state: Arc<Mutex<AudioCallbackState>>,
     xruns: Arc<AtomicU64>,
     error_flag: Arc<AtomicBool>,
-) -> Result<cpal::Stream, cpal::BuildStreamError>
+) -> Result<cpal::Stream, cpal::Error>
 where
     T: cpal::SizedSample + cpal::FromSample<f32> + Send + 'static,
 {
     let mut scratch: Vec<f32> = Vec::new();
     device.build_output_stream(
-        config,
+        *config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             scratch.resize(data.len(), 0.0);
             run_mix_callback(&mut scratch, &callback_state);
@@ -460,7 +348,9 @@ where
             tracing::error!("Audio stream error: {}", err);
             xruns.fetch_add(1, Ordering::Relaxed);
             // Signal the supervisor to rebuild; the cpal callback must not do it.
-            error_flag.store(true, Ordering::Relaxed);
+            if super::rebuild::requires_rebuild(err.kind()) {
+                error_flag.store(true, Ordering::Relaxed);
+            }
         },
         None,
     )

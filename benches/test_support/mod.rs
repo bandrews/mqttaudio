@@ -65,7 +65,7 @@ pub fn generate_test_audio(duration_seconds: f32, sample_rate: u32, channels: us
 
 /// Write samples to a WAV file
 fn write_wav_file(path: &std::path::Path, samples: &[f32], sample_rate: u32, channels: u16) {
-    let mut file = std::fs::File::create(path).unwrap();
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
 
     let bits_per_sample: u16 = 16;
     let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
@@ -97,6 +97,7 @@ fn write_wav_file(path: &std::path::Path, samples: &[f32], sample_rate: u32, cha
         let i16_sample = (sample * 32767.0) as i16;
         file.write_all(&i16_sample.to_le_bytes()).unwrap();
     }
+    file.flush().unwrap();
 }
 
 /// Embedded HTTP server for benchmarking HTTP loading

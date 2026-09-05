@@ -577,6 +577,7 @@ pub fn expand_macros(
 /// Supports both flattened and nested (legacy) formats:
 /// - Flattened: {"command": "play", "file": "test.wav", "volume": 0.8}
 /// - Nested: {"command": "play", "message": {"file": "test.wav", "volume": 0.8}}
+///
 /// Reject a non-numeric internal_id at parse time: the system-assigned ids
 /// are numeric, so a non-numeric value could only ever silently match nothing.
 fn validate_internal_id(internal_id: &Option<String>) -> Result<(), ParseError> {

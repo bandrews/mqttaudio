@@ -78,22 +78,12 @@ pub enum LeaseTransition {
     },
 }
 
+#[derive(Default)]
 pub struct TalkbackLease {
     active: Option<Lease>,
     counter: u64,
     last_transition: Option<String>,
     last_error: Option<String>,
-}
-
-impl Default for TalkbackLease {
-    fn default() -> Self {
-        Self {
-            active: None,
-            counter: 0,
-            last_transition: None,
-            last_error: None,
-        }
-    }
 }
 
 impl TalkbackLease {

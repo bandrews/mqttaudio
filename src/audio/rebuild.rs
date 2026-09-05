@@ -73,3 +73,33 @@ mod tests {
         assert_eq!(p.next_delay(), Some(Duration::from_millis(250)));
     }
 }
+
+/// CPAL has already recovered xruns and default-device route changes. Rebuilding
+/// those streams would interrupt working audio; permanent errors need the supervisor.
+pub fn requires_rebuild(kind: cpal::ErrorKind) -> bool {
+    !matches!(
+        kind,
+        cpal::ErrorKind::Xrun | cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied
+    )
+}
+
+#[cfg(test)]
+mod error_tests {
+    #[test]
+    fn recovered_events_keep_the_stream_and_permanent_errors_rebuild() {
+        for kind in [
+            cpal::ErrorKind::Xrun,
+            cpal::ErrorKind::DeviceChanged,
+            cpal::ErrorKind::RealtimeDenied,
+        ] {
+            assert!(!super::requires_rebuild(kind));
+        }
+        for kind in [
+            cpal::ErrorKind::DeviceNotAvailable,
+            cpal::ErrorKind::StreamInvalidated,
+            cpal::ErrorKind::BackendError,
+        ] {
+            assert!(super::requires_rebuild(kind));
+        }
+    }
+}

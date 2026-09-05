@@ -5,6 +5,7 @@ use mqttaudio::{audio, cache, config, config_editor, http, mqtt, rt_engine, talk
 
 use clap::Parser;
 use cpal::traits::DeviceTrait;
+use mqttaudio::loading::{self, PreparedPlayback};
 use tokio::sync::mpsc;
 
 #[derive(Parser, Debug)]
@@ -117,7 +118,10 @@ where
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if args.config.is_none() {
+        args.config = std::env::var("MQTTAUDIO_CONFIG").ok();
+    }
 
     // Handle --configure before logging init: a tracing subscriber writing to
     // stdout would corrupt the editor's raw-mode alternate screen.
@@ -204,7 +208,15 @@ async fn main() {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
 
-        let fmt_layer = build_fmt_layer(&config.logging.format, log_level, std::io::stdout);
+        use tracing_subscriber::Layer;
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level.to_string()));
+        let fmt_layer = build_fmt_layer(
+            &config.logging.format,
+            tracing::Level::TRACE,
+            std::io::stdout,
+        )
+        .with_filter(filter);
         let ws_layer = http::WebSocketLogLayer::new(log_broadcaster.clone(), log_level);
 
         if config.logging.mqtt_topic.is_some() {
@@ -393,6 +405,7 @@ async fn main() {
     // holds the card's capture side, which makes the card invisible to input
     // enumeration and blocks every other capture application. The device is
     // re-resolved when the output stream is built.
+    #[cfg(target_os = "linux")]
     drop(device);
 
     // Create mixer state and voice manager
@@ -531,6 +544,12 @@ async fn main() {
     // reaper logs deltas off-RT, and /metrics sums the totals.
     let mut input_telemetry: Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)> =
         Vec::new();
+    let mut activity_watchers: Vec<(
+        String,
+        Arc<audio::input::InputTelemetry>,
+        Vec<usize>,
+        audio::activity::ActivityDetector,
+    )> = Vec::new();
     let mut cmd_tx = cmd_tx;
     let mut talkback_lease = talkback::TalkbackLease::default();
     let talkback_status = std::sync::Arc::new(std::sync::RwLock::new(talkback_lease.status(0)));
@@ -538,12 +557,16 @@ async fn main() {
         active: audio::input::ActiveInput,
         consumers: Vec<ringbuf::HeapConsumer<f32>>,
     }
-    let mut captures: std::collections::HashMap<
-        (Option<String>, u32),
-        Result<SharedCapture, String>,
-    > = std::collections::HashMap::new();
+    type CaptureKey = (Option<String>, u32, Option<usize>, Option<u32>);
+    let mut captures: std::collections::HashMap<CaptureKey, Result<SharedCapture, String>> =
+        std::collections::HashMap::new();
     for input_config in &config.inputs {
-        let key = (input_config.device.clone(), input_config.latency_ms);
+        let key = (
+            input_config.device.clone(),
+            input_config.latency_ms,
+            input_config.channels,
+            input_config.sample_rate,
+        );
         captures.entry(key.clone()).or_insert_with(|| {
             let stream_config = audio::input::InputStreamConfig {
                 device_name: input_config.device.clone(),
@@ -554,18 +577,20 @@ async fn main() {
                     .filter(|candidate| {
                         candidate.device == input_config.device
                             && candidate.latency_ms == input_config.latency_ms
+                            && candidate.channels == input_config.channels
+                            && candidate.sample_rate == input_config.sample_rate
                     })
                     .flat_map(|candidate| candidate.routes.iter())
                     .filter_map(|route| config.resolve_channel(&route.source_channel).ok())
                     .max()
                     .map_or(1, |ch| ch + 1),
-                sample_rate: Some(output_sample_rate),
+                channels: input_config.channels,
+                sample_rate: input_config.sample_rate.or(Some(output_sample_rate)),
                 buffer_size: match stream_config.buffer_size {
                     cpal::BufferSize::Fixed(frames) => Some(frames),
                     _ => None,
                 },
                 resampler_quality: config.advanced.resampler_quality,
-                ..Default::default()
             };
             audio::input::create_input_stream_with_fanout(
                 stream_config,
@@ -576,6 +601,8 @@ async fn main() {
                     .filter(|candidate| {
                         candidate.device == input_config.device
                             && candidate.latency_ms == input_config.latency_ms
+                            && candidate.channels == input_config.channels
+                            && candidate.sample_rate == input_config.sample_rate
                     })
                     .count(),
             )
@@ -589,7 +616,12 @@ async fn main() {
     }
 
     for (idx, input_config) in config.inputs.iter().enumerate() {
-        let key = (input_config.device.clone(), input_config.latency_ms);
+        let key = (
+            input_config.device.clone(),
+            input_config.latency_ms,
+            input_config.channels,
+            input_config.sample_rate,
+        );
         match captures.get_mut(&key) {
             Some(Ok(capture)) => {
                 let channels = capture.active.channels;
@@ -643,7 +675,8 @@ async fn main() {
                         channels,
                         input_config.volume,
                         channel_map,
-                    );
+                    )
+                    .with_dropped_frames(capture.active.telemetry.dropped_frames.clone());
 
                     // The audio callback publishes applied input state through
                     // preallocated atomics. HTTP status reads these values without
@@ -694,13 +727,31 @@ async fn main() {
                     // as a primary (D4), through the same off-RT notify path as sample
                     // voices. The stream is open for the process lifetime, so the voice
                     // is active for it; signal-gated activation is Sprint 8 (D36).
-                    notify_voice_activity(
-                        &input_config.voice_id,
-                        true,
-                        ducking_engine.as_mut(),
-                        &mut cmd_tx,
-                        &ducking_snapshot,
-                    );
+                    if let Some(threshold) = input_config.activity_threshold {
+                        let sources = input_config
+                            .routes
+                            .iter()
+                            .filter_map(|route| config.resolve_channel(&route.source_channel).ok())
+                            .collect();
+                        activity_watchers.push((
+                            input_config.voice_id.clone(),
+                            capture.active.telemetry.clone(),
+                            sources,
+                            audio::activity::ActivityDetector::new(
+                                threshold,
+                                input_config.activity_hold_ms,
+                                std::time::Instant::now(),
+                            ),
+                        ));
+                    } else {
+                        notify_voice_activity(
+                            &input_config.voice_id,
+                            true,
+                            ducking_engine.as_mut(),
+                            &mut cmd_tx,
+                            &ducking_snapshot,
+                        );
+                    }
                 } else {
                     tracing::error!("No logical capture ring available for input {}", idx);
                 }
@@ -730,10 +781,8 @@ async fn main() {
         }
     }
 
-    for result in captures.into_values() {
-        if let Ok(capture) = result {
-            _active_inputs.push(capture.active);
-        }
+    for capture in captures.into_values().flatten() {
+        _active_inputs.push(capture.active);
     }
 
     // The bundle the cpal callback owns. The control thread never locks this.
@@ -934,8 +983,17 @@ async fn main() {
     if let Some((client, eventloop)) = mqtt_connection {
         let mqtt_cmd_tx = text_tx.clone();
         let mqtt_topic = config.mqtt.topic.clone().unwrap_or_default();
+        let reconnect_delay =
+            std::time::Duration::from_secs(config.mqtt.reconnect_delay_seconds.max(1));
         tokio::spawn(async move {
-            mqtt::client::process_mqtt_events(client, mqtt_topic, eventloop, mqtt_cmd_tx).await;
+            mqtt::client::process_mqtt_events(
+                client,
+                mqtt_topic,
+                eventloop,
+                mqtt_cmd_tx,
+                reconnect_delay,
+            )
+            .await;
         });
         tracing::info!(
             "Ready to receive MQTT commands on topic: {}",
@@ -958,16 +1016,37 @@ async fn main() {
     // cache entries out-of-band so a play never blocks on the network. Idle when
     // freshness is pinned.
     let mut freshness_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut loads = tokio::task::JoinSet::new();
+    let load_permit = Arc::new(tokio::sync::Semaphore::new(4));
+    let mut load_generation: u64 = 0;
+    let mut freshness_task: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
         tokio::select! {
-            maybe_payload = text_rx.recv() => {
-                let payload = match maybe_payload {
-                    Some(p) => p,
-                    None => break, // command channel closed
+            incoming = async {
+                tokio::select! {
+                    result = loads.join_next(), if !loads.is_empty() => {
+                        match result { Some(Ok(ready)) => Some(ready), _ => None }
+                    }
+                    request = text_rx.recv() => request.map(|request| (request, None, load_generation)),
+                }
+            } => {
+                let Some((request, prepared, generation)) = incoming else { continue; };
+                let mqtt::commands::CommandRequest { payload, reply } = request;
+                if reply.as_ref().is_some_and(|reply| reply.is_closed()) { continue; }
+                if generation != load_generation {
+                    if let Some(reply) = reply { let _ = reply.send(Err(mqtt::commands::CommandError::new(mqtt::commands::CommandErrorKind::Cancelled, "Superseded by stopall/fadeall"))); }
+                    continue;
+                }
+                let prepared = match prepared {
+                    Some(Err(error)) => {
+                        tracing::error!("Load failed: {}", error);
+                        if let Some(reply) = reply { let _ = reply.send(Err(error)); }
+                        continue;
+                    }
+                    Some(Ok(prepared)) => Some(prepared),
+                    None => None,
                 };
-
-                let mqtt::commands::CommandRequest { payload, reply } = payload;
                 // Expand macros before parsing
                 let expanded = match mqtt::commands::expand_macros(&payload, &config.macros) {
                     Ok(e) => e,
@@ -980,6 +1059,26 @@ async fn main() {
 
                 match mqtt::commands::parse_command(&expanded) {
                     Ok(cmd) => {
+                        if matches!(cmd, mqtt::commands::AudioCommand::StopAll | mqtt::commands::AudioCommand::FadeAll { .. }) {
+                            load_generation = load_generation.wrapping_add(1);
+                            loads.abort_all();
+                        }
+                        if loading::needs_preparation(&cmd) && prepared.is_none() {
+                            if loads.len() >= 32 {
+                                if let Some(reply) = reply { let _ = reply.send(Err(mqtt::commands::CommandError::new(mqtt::commands::CommandErrorKind::Internal, "Too many concurrent loads"))); }
+                                continue;
+                            }
+                            let config = config.clone();
+                            let cache = cache_manager.clone();
+                            let permit = load_permit.clone();
+                            loads.spawn(async move {
+                                let mut reply = loading::PendingReply(reply);
+                                let _permit = permit.acquire_owned().await.expect("load semaphore stays open");
+                                let result = loading::prepare(&cmd, &config, &cache, output_sample_rate).await;
+                                (mqtt::commands::CommandRequest { payload, reply: reply.0.take() }, Some(result), generation)
+                            });
+                            continue;
+                        }
                         let mut ctx = CommandCtx {
                             cache_manager: &cache_manager,
                             voice_manager: &voice_manager,
@@ -1001,6 +1100,7 @@ async fn main() {
                             streaming_upgrades: &mut streaming_upgrades,
                             max_block_frames,
                             error: None,
+                            prepared,
                         };
                         handle_command(cmd, &mut ctx).await;
                         if let Some(reply) = reply {
@@ -1016,6 +1116,15 @@ async fn main() {
                 }
             }
             _ = reaper_tick.tick() => {
+                let mut capture_peaks = std::collections::HashMap::new();
+                for (voice_id, telemetry, channels, detector) in &mut activity_watchers {
+                    let peaks = capture_peaks.entry(Arc::as_ptr(telemetry)).or_insert_with(|| telemetry.peak_levels.iter()
+                        .map(|peak| f32::from_bits(peak.swap(0, std::sync::atomic::Ordering::Relaxed))).collect::<Vec<_>>());
+                    let level = channels.iter().filter_map(|&ch| peaks.get(ch)).copied().fold(0.0f32, f32::max);
+                    if let Some(active) = detector.update(level, std::time::Instant::now()) {
+                        notify_voice_activity(voice_id, active, ducking_engine.as_mut(), &mut cmd_tx, &ducking_snapshot);
+                    }
+                }
                 let now_ms = start_time.elapsed().as_millis() as u64;
                 if let Some(source_id) = talkback_lease.active_source().map(str::to_string) {
                     if let Some((_transition, status)) = talkback_lease.expire(now_ms) {
@@ -1067,18 +1176,19 @@ async fn main() {
                     } else {
                         std::time::Duration::from_secs(config.cache.revalidate_after_seconds)
                     };
-                    let n = cache_manager.lock().await.revalidate_stale_http(window).await;
-                    if n > 0 {
-                        tracing::info!(
-                            "Freshness tick refreshed {} stale HTTP cache entr{}",
-                            n,
-                            if n == 1 { "y" } else { "ies" }
-                        );
+                    if freshness_task.as_ref().is_none_or(|task| task.is_finished()) {
+                        let cache = cache_manager.clone();
+                        freshness_task = Some(tokio::spawn(async move {
+                            let n = cache.lock().await.revalidate_stale_http(window).await;
+                            if n > 0 { tracing::info!("Freshness tick refreshed {} entries", n); }
+                        }));
                     }
                 }
             }
             _ = shutdown_signal() => {
                 tracing::info!("Shutdown signal received");
+                loads.abort_all();
+                if let Some(task) = freshness_task.take() { task.abort(); }
                 shutdown(&mut cmd_tx, &cache_manager).await;
                 break;
             }
@@ -1435,7 +1545,9 @@ async fn upgrade_completed_streaming_plays(
         return;
     }
 
-    let mut cache = cache_manager.lock().await;
+    let Ok(mut cache) = cache_manager.try_lock() else {
+        return;
+    };
     cache.cleanup_completed_loads();
 
     let mut remaining = Vec::with_capacity(upgrades.len());
@@ -1548,6 +1660,7 @@ struct CommandCtx<'a> {
     /// pitch scratch (D56/D58).
     max_block_frames: usize,
     error: Option<mqtt::commands::CommandError>,
+    prepared: Option<PreparedPlayback>,
 }
 
 impl CommandCtx<'_> {
@@ -1583,93 +1696,6 @@ impl CommandCtx<'_> {
         let status = self.talkback.status(now_ms);
         *self.talkback_status.write().unwrap() = status;
     }
-}
-
-/// Start a windowed streamed play of a local file: spawn the bounded-ring producer,
-/// gate on a prebuffer for a glitch-free start, then hand a `StreamedSource` to the
-/// audio thread. Streamed voices play forward only — seek/loop-crossfade/reverse/
-/// speed/pitch do not apply (the producer loops by re-opening; the seek/speed command
-/// arms warn for these voices). Bypasses the cache, so it enforces the file allowlist.
-#[allow(clippy::too_many_arguments)]
-async fn handle_stream_play(
-    file: String,
-    id: Option<String>,
-    volume: f32,
-    voice: Option<String>,
-    channel_map: Option<Vec<mqtt::commands::ChannelMapping>>,
-    fade_in: Option<u32>,
-    loop_mode: bool,
-    window_ms: Option<u32>,
-    prebuffer_ms: Option<u32>,
-    mut stages: PlayStages,
-    ctx: &mut CommandCtx<'_>,
-) {
-    // The caller decided to window this play (Sprint 11, D50).
-    stages.decision();
-    let config = ctx.config;
-    let output_sample_rate = ctx.output_sample_rate;
-
-    // A streamed play bypasses the cache, so enforce the file allowlist here.
-    if !config::Config::is_path_allowed(
-        std::path::Path::new(&file),
-        &config.security.allowed_directories,
-    ) {
-        tracing::error!(
-            "Streamed play of {} rejected: not permitted by allowed_directories",
-            file
-        );
-        return;
-    }
-
-    // Window + prebuffer (per-play override beats config).
-    let window_ms = window_ms.unwrap_or(config.cache.stream_window_ms);
-    let prebuffer_ms = prebuffer_ms.unwrap_or(config.cache.stream_prebuffer_ms);
-    let deadline_ms = config.cache.stream_prebuffer_deadline_ms.max(prebuffer_ms);
-    let rate = output_sample_rate as usize;
-    let window_frames = (window_ms as usize * rate / 1000).max(1);
-    let prebuffer_frames = prebuffer_ms as usize * rate / 1000;
-    let quality = config.advanced.resampler_quality;
-
-    // Open + probe is blocking, so run it off the async runtime; the producer then
-    // streams on its own dedicated thread.
-    let spawn_file = file.clone();
-    let handles = match tokio::task::spawn_blocking(move || {
-        audio::streamed_source::spawn_local_file_stream(
-            spawn_file,
-            output_sample_rate,
-            quality,
-            window_frames,
-            loop_mode,
-        )
-    })
-    .await
-    {
-        Ok(Ok(h)) => h,
-        Ok(Err(e)) => {
-            tracing::error!("Failed to start streamed source for {}: {}", file, e);
-            return;
-        }
-        Err(e) => {
-            tracing::error!("Streamed source spawn task failed for {}: {}", file, e);
-            return;
-        }
-    };
-
-    finish_streamed_play(
-        handles,
-        file,
-        id,
-        volume,
-        voice,
-        channel_map,
-        fade_in,
-        loop_mode,
-        prebuffer_frames,
-        deadline_ms,
-        stages,
-        ctx,
-    )
-    .await;
 }
 
 /// Gate a freshly-spawned streamed source on its prebuffer, then build the StreamedSource
@@ -1815,268 +1841,6 @@ async fn finish_streamed_play(
     );
 }
 
-/// For a local file with mode Auto/Full, decide whether to window it instead of fully
-/// loading it. Skips the decision (returns false) when the asset is already resident
-/// (a cache hit serves it directly, full-feature); otherwise probes the header off the
-/// async thread and applies the load-strategy decision against the live memory-budget
-/// headroom, so an over-budget asset is force-windowed (the never-OOM guarantee).
-async fn should_window_local(file: &str, mode: config::LoadMode, ctx: &CommandCtx<'_>) -> bool {
-    let config = ctx.config;
-    let rate = ctx.output_sample_rate;
-
-    let (resident, headroom, cached_probe) = {
-        let cache_mgr = ctx.cache_manager.lock().await;
-        (
-            cache_mgr.is_resident(file),
-            cache_mgr.memory_headroom(),
-            cache_mgr.cached_probe(file),
-        )
-    };
-    if resident {
-        return false; // already decoded: serve from cache with full features
-    }
-
-    // The probe cache (D54) skips the header open+parse on replays — windowed
-    // plays never enter the memory cache, so they probe on every play otherwise.
-    let probe = match cached_probe {
-        Some(probe) => Some(probe),
-        None => {
-            let quality = config.advanced.resampler_quality;
-            let file_owned = file.to_string();
-            let probe = tokio::task::spawn_blocking(move || {
-                cache::strategy::probe_local_file(&file_owned, rate, quality)
-            })
-            .await
-            .ok()
-            .flatten();
-            if let Some(probe) = probe {
-                ctx.cache_manager.lock().await.store_probe(file, probe);
-            }
-            probe
-        }
-    };
-
-    let Some(probe) = probe else {
-        return false; // header unreadable: let the full-load path surface the error
-    };
-
-    let strategy = cache::strategy::decide(
-        mode,
-        config.cache.load_mode,
-        &probe,
-        config.cache.full_load_max_bytes,
-        config.cache.full_load_max_seconds,
-        headroom,
-    );
-
-    if strategy == cache::strategy::Strategy::Windowed {
-        match probe.est_decoded_bytes {
-            Some(bytes) => tracing::info!(
-                "Windowing {} (estimated {:.0} MB decoded; cache headroom {:.0} MB)",
-                file,
-                bytes as f64 / (1024.0 * 1024.0),
-                headroom as f64 / (1024.0 * 1024.0)
-            ),
-            None => tracing::info!("Windowing {} per the configured load_mode", file),
-        }
-        true
-    } else {
-        false
-    }
-}
-
-/// How the HTTP play path resolved a Play (D55).
-enum HttpPlayOutcome {
-    /// Handled as a windowed streamed source; nothing more to do.
-    Windowed,
-    /// Not windowed: the probe's open response was reused to start a progressive
-    /// full load on a single request; proceed with this buffer.
-    FullLoad(audio::streaming::SampleBuffer),
-    /// Not handled here (cached, or the open failed): take the cache load path.
-    Fallthrough,
-}
-
-/// Build the disk-persist tee for a cacheable HTTP download (finite
-/// Content-Length, not overridden `cacheable: false`) and spawn the watcher that
-/// registers the finalized file with the disk cache. Shared by the windowed and
-/// reused-request full-load paths.
-async fn make_persist_target(
-    open: &cache::http_stream::OpenHttpStream,
-    file: &str,
-    cacheable: Option<bool>,
-    ctx: &CommandCtx<'_>,
-) -> Option<cache::http_stream::PersistTarget> {
-    let is_cacheable = open.content_length().is_some() && cacheable != Some(false);
-    if !is_cacheable {
-        return None;
-    }
-    let etag = open.etag().map(|s| s.to_string());
-    let last_modified = open.last_modified().map(|s| s.to_string());
-    let content_type = open.content_type().map(|s| s.to_string());
-    let (temp_path, final_path) = ctx
-        .cache_manager
-        .lock()
-        .await
-        .windowed_persist_paths(file)?;
-    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<u64>();
-    let cache_manager = std::sync::Arc::clone(ctx.cache_manager);
-    let url = file.to_string();
-    tokio::spawn(async move {
-        // Resolves only when the download finalized cleanly (temp renamed into place).
-        if let Ok(file_size) = done_rx.await {
-            let mut guard = cache_manager.lock().await;
-            match guard.record_streamed_download(&url, file_size, etag, last_modified, content_type)
-            {
-                Ok(()) => tracing::info!(
-                    "Persisted streamed {} to disk cache ({} bytes)",
-                    url,
-                    file_size
-                ),
-                Err(e) => tracing::warn!("Failed to register persisted stream {}: {}", url, e),
-            }
-        }
-    });
-    Some(cache::http_stream::PersistTarget {
-        temp_path,
-        final_path,
-        done: done_tx,
-    })
-}
-
-/// For an HTTP URL, decide whether to window the play (bounded memory) and, if so, start
-/// a windowed download and register the streamed source. Returns true if it handled the
-/// play; false means the caller should fall back to the full (cache) load — the URL is
-/// already cached, the decision was a full load, or the open failed.
-///
-/// The cache state is read under a brief lock; the network open + decode spawn run
-/// without holding it. Only the windowed branch downloads a body, so a full-load
-/// fallback costs just the response headers. A live stream (no Content-Length) always
-/// windows — it has no finite end to full-load.
-#[allow(clippy::too_many_arguments)]
-async fn try_windowed_http_play(
-    file: &str,
-    id: Option<String>,
-    volume: f32,
-    voice: Option<String>,
-    channel_map: Option<Vec<mqtt::commands::ChannelMapping>>,
-    fade_in: Option<u32>,
-    mode: config::LoadMode,
-    window_ms: Option<u32>,
-    prebuffer_ms: Option<u32>,
-    cacheable: Option<bool>,
-    mut stages: PlayStages,
-    ctx: &mut CommandCtx<'_>,
-) -> HttpPlayOutcome {
-    let config = ctx.config;
-    let output_sample_rate = ctx.output_sample_rate;
-
-    // A cached URL serves full-featured from the cache; never window it.
-    let (cached, headroom) = {
-        let cm = ctx.cache_manager.lock().await;
-        (cm.is_cached(file), cm.memory_headroom())
-    };
-    if cached {
-        return HttpPlayOutcome::Fallthrough;
-    }
-
-    // Open the response (headers only) to learn the size, then decide.
-    let open = match cache::http_stream::open_http_stream(file).await {
-        Ok(o) => o,
-        Err(e) => {
-            tracing::error!(
-                "Windowed HTTP open failed for {}: {}; falling back to full load",
-                file,
-                e
-            );
-            return HttpPlayOutcome::Fallthrough;
-        }
-    };
-    let content_length = open.content_length();
-    let windowed = content_length.is_none()
-        || cache::strategy::decide(
-            mode,
-            config.cache.load_mode,
-            &cache::strategy::probe_http(content_length, file),
-            config.cache.full_load_max_bytes,
-            config.cache.full_load_max_seconds,
-            headroom,
-        ) == cache::strategy::Strategy::Windowed;
-    if !windowed {
-        // Full load on the SAME request (D55): reuse the probe's open response
-        // instead of dropping it and paying a second GET. The download is teed
-        // to the disk cache when cacheable, so a replay needs no network at all.
-        let persist = make_persist_target(&open, file, cacheable, ctx).await;
-        let estimated_frames = content_length.map(|len| (len / 4) as usize);
-        let reader = open.into_bounded_reader(persist);
-        let buffer = ctx
-            .cache_manager
-            .lock()
-            .await
-            .start_streaming_load_from_reader(file, reader, output_sample_rate, estimated_frames);
-        return HttpPlayOutcome::FullLoad(buffer);
-    }
-    // Committed to a windowed HTTP play (Sprint 11, D50).
-    stages.decision();
-
-    // Window + prebuffer (per-play override beats config).
-    let window_ms = window_ms.unwrap_or(config.cache.stream_window_ms);
-    let prebuffer_ms = prebuffer_ms.unwrap_or(config.cache.stream_prebuffer_ms);
-    let deadline_ms = config.cache.stream_prebuffer_deadline_ms.max(prebuffer_ms);
-    let rate = output_sample_rate as usize;
-    let window_frames = (window_ms as usize * rate / 1000).max(1);
-    let prebuffer_frames = prebuffer_ms as usize * rate / 1000;
-    let quality = config.advanced.resampler_quality;
-
-    // A cacheable source (a finite Content-Length, not overridden to live) is teed to
-    // disk while it plays, so the next play of this URL hits disk with no extra request.
-    // A live stream (no Content-Length) or an explicit `cacheable: false` is never
-    // persisted. Registration happens off this path, after the download finalizes.
-    let persist = make_persist_target(&open, file, cacheable, ctx).await;
-
-    let reader = open.into_bounded_reader(persist);
-    let label = file.to_string();
-    let handles = match tokio::task::spawn_blocking(move || {
-        audio::streamed_source::spawn_stream_from_source(
-            reader,
-            label,
-            output_sample_rate,
-            quality,
-            window_frames,
-        )
-    })
-    .await
-    {
-        Ok(Ok(h)) => h,
-        Ok(Err(e)) => {
-            tracing::error!("Failed to start windowed HTTP source for {}: {}", file, e);
-            // The stream was consumed; do not double-download via full load.
-            return HttpPlayOutcome::Windowed;
-        }
-        Err(e) => {
-            tracing::error!("Windowed HTTP spawn task failed for {}: {}", file, e);
-            return HttpPlayOutcome::Windowed;
-        }
-    };
-
-    // HTTP windowed plays are forward-only and do not loop.
-    finish_streamed_play(
-        handles,
-        file.to_string(),
-        id,
-        volume,
-        voice,
-        channel_map,
-        fade_in,
-        false,
-        prebuffer_frames,
-        deadline_ms,
-        stages,
-        ctx,
-    )
-    .await;
-    HttpPlayOutcome::Windowed
-}
-
 /// Whether a selector targets a voice that currently has a windowed/streamed source.
 /// Streamed voices are forward-only, so seek/speed/pitch do not apply. Best-effort:
 /// it matches on the selector's voice (the common case) and is used only to warn — a
@@ -2101,6 +1865,42 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
     use audio::mixer::ActiveSample;
 
     tracing::info!("Processing command: {:?}", cmd);
+    use mqtt::commands::{AudioCommand as ParsedCommand, CommandErrorKind};
+    if let ParsedCommand::Seek { selector, .. }
+    | ParsedCommand::Speed { selector, .. }
+    | ParsedCommand::Stop { selector, .. }
+    | ParsedCommand::Volume { selector, .. } = &cmd
+    {
+        if selector.is_empty() {
+            ctx.fail(
+                CommandErrorKind::InvalidRequest,
+                "Command has no sample selector",
+            );
+            return;
+        }
+        if !ctx
+            .playing
+            .values()
+            .any(|sample| sample_status_matches(selector, sample))
+        {
+            ctx.fail(CommandErrorKind::NotFound, "No sample matches the selector");
+            return;
+        }
+    }
+
+    if loading::needs_preparation(&cmd) && ctx.prepared.is_none() {
+        match loading::prepare(&cmd, config, cache_manager, output_sample_rate).await {
+            Ok(prepared) => ctx.prepared = Some(prepared),
+            Err(error) => {
+                ctx.error = Some(error);
+                return;
+            }
+        }
+    }
+    if matches!(ctx.prepared, Some(PreparedPlayback::Done)) {
+        ctx.prepared.take();
+        return;
+    }
 
     match cmd {
         mqtt::commands::AudioCommand::Play {
@@ -2113,90 +1913,41 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             start_position_ms,
             loop_mode,
             crossfade_ms,
-            mode,
-            window_ms,
-            prebuffer_ms,
-            freshness,
-            cacheable,
+            mode: _,
+            window_ms: _,
+            prebuffer_ms: _,
+            freshness: _,
+            cacheable: _,
         } => {
             // Stage clock for this play's latency event (Sprint 11, D50).
             let mut stages = PlayStages::begin();
 
-            // Windowed streaming gives bounded memory (O(window)) and low time-to-first-
-            // sample for big/long assets. `mode=stream` forces it; `auto`/`full` are
-            // decided from a cheap probe and the live memory budget, which force-windows
-            // an over-budget asset so a full load can never blow the cap (never-OOM).
-            // Local files probe the header; HTTP probes Content-Length on the same
-            // connection, and an unknown-size live stream always windows.
-            let is_http = file.starts_with("http://") || file.starts_with("https://");
-            // A full-load buffer already started over the probe's reused HTTP
-            // request (D55), when the HTTP path resolved that way.
-            let mut preopened_http: Option<audio::streaming::SampleBuffer> = None;
-            if is_http {
-                match try_windowed_http_play(
-                    &file,
-                    id.clone(),
-                    volume,
-                    voice.clone(),
-                    channel_map.clone(),
-                    fade_in,
-                    mode,
-                    window_ms,
-                    prebuffer_ms,
-                    cacheable,
-                    stages,
-                    ctx,
-                )
-                .await
-                {
-                    HttpPlayOutcome::Windowed => return,
-                    HttpPlayOutcome::FullLoad(buffer) => preopened_http = Some(buffer),
-                    // Cached or open failed: fall through to the full (cache) load.
-                    HttpPlayOutcome::Fallthrough => {}
-                }
-            } else {
-                let go_windowed =
-                    mode == config::LoadMode::Stream || should_window_local(&file, mode, ctx).await;
-                if go_windowed {
-                    handle_stream_play(
-                        file,
+            let buffer_result = match ctx.prepared.take() {
+                Some(PreparedPlayback::Stream(handles)) => {
+                    let handles = handles.into_handles();
+                    stages.decision();
+                    finish_streamed_play(
+                        handles,
+                        file.clone(),
                         id,
                         volume,
                         voice,
                         channel_map,
                         fade_in,
-                        loop_mode,
-                        window_ms,
-                        prebuffer_ms,
+                        loop_mode && !file.starts_with("http"),
+                        0,
+                        0,
                         stages,
                         ctx,
                     )
                     .await;
                     return;
                 }
-            }
-
-            // The decision is full-load from here (Sprint 11, D50).
-            stages.decision();
-
-            // Load file (full in-memory load, with streaming support for faster startup).
-            // A per-play freshness override beats the configured default. The
-            // reused-request HTTP buffer (D55) skips the cache load entirely.
-            let buffer_result = match preopened_http {
-                Some(buffer) => Ok(buffer),
-                None => {
-                    let resolved_freshness = freshness.unwrap_or(config.cache.freshness);
-                    let mut cache_mgr = cache_manager.lock().await;
-                    let result = cache_mgr
-                        .get_or_load_streaming_with_freshness(
-                            &file,
-                            output_sample_rate,
-                            resolved_freshness,
-                        )
-                        .await;
-                    drop(cache_mgr);
-                    result
+                Some(PreparedPlayback::Full(buffer)) => {
+                    stages.decision();
+                    Ok(buffer)
                 }
+                _ => Err("Missing prepared playback".to_string()),
             };
 
             match buffer_result {
@@ -2207,9 +1958,14 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     let voice_id = voice.unwrap_or_else(next_auto_voice_id);
 
                     let is_streaming = !buffer.is_complete();
-                    let frames = buffer.frames();
-                    let sample_rate = buffer.sample_rate();
-                    let channels = buffer.channels();
+                    let (channels, sample_rate, frames) = buffer.metadata_blocking();
+                    if channels == 0 || sample_rate == 0 {
+                        ctx.fail(
+                            CommandErrorKind::Internal,
+                            "Decoded audio metadata is unavailable",
+                        );
+                        return;
+                    }
                     let duration_secs = if frames > 0 && sample_rate > 0 {
                         frames as f32 / sample_rate as f32
                     } else {
@@ -2367,49 +2123,12 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             .unwrap_or(usize::MAX)
                             .saturating_sub(1);
                         sample.position = target_frame.min(max_frame);
-                        if is_streaming && !buffer.is_frame_loaded(sample.position) {
-                            // Gate (D51): a start beyond the loaded edge would play
-                            // silence until the decode reaches it; hold the start
-                            // (bounded by the prebuffer deadline, like the windowed
-                            // gate) so seek-starts keep the instant semantics a
-                            // full decode used to give.
-                            if let Some(notify) = buffer.notifier() {
-                                let deadline = tokio::time::Instant::now()
-                                    + std::time::Duration::from_millis(
-                                        config.cache.stream_prebuffer_deadline_ms as u64,
-                                    );
-                                loop {
-                                    let notified = notify.notified();
-                                    tokio::pin!(notified);
-                                    notified.as_mut().enable();
-                                    if buffer.is_frame_loaded(sample.position)
-                                        || buffer.is_complete()
-                                    {
-                                        break;
-                                    }
-                                    if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                                        tracing::warn!(
-                                            "Start position {}ms of {} not decoded within the \
-                                             deadline; starting with silence until it loads",
-                                            start_ms,
-                                            file
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-                            tracing::debug!(
-                                "Starting at position {}ms (frame {})",
-                                start_ms,
-                                sample.position
-                            );
-                        } else {
-                            tracing::debug!(
-                                "Starting at position {}ms (frame {})",
-                                start_ms,
-                                sample.position
-                            );
-                        }
+
+                        tracing::debug!(
+                            "Starting at position {}ms (frame {})",
+                            start_ms,
+                            sample.position
+                        );
                     }
 
                     // Apply fade in if requested
@@ -2527,6 +2246,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             drop(voice_mgr);
 
             if sample_ids.is_empty() {
+                ctx.fail(
+                    mqtt::commands::CommandErrorKind::NotFound,
+                    format!("Voice '{}' not found or already empty", voice),
+                );
                 tracing::warn!("Voice '{}' not found or already empty", voice);
             } else {
                 tracing::info!(
@@ -2548,6 +2271,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             drop(voice_mgr);
 
             if sample_ids.is_empty() {
+                ctx.fail(
+                    mqtt::commands::CommandErrorKind::NotFound,
+                    format!("Voice '{}' not found or already empty", voice),
+                );
                 tracing::warn!("Voice '{}' not found or already empty", voice);
             } else {
                 tracing::info!(
@@ -2583,7 +2310,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 let target = if success {
                     actual_volume
                 } else {
-                    new_volume.clamp(0.0, 1.0)
+                    new_volume.clamp(0.0, config::MAX_GAIN)
                 };
                 // The audio thread ramps samples and live inputs in this voice
                 // toward the new target (SetVoiceVolume covers both).
@@ -2609,6 +2336,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 ctx.refresh();
                 tracing::info!("Set voice '{}' volume to {:.2}", voice, target);
             } else {
+                ctx.fail(
+                    mqtt::commands::CommandErrorKind::NotFound,
+                    format!("Voice '{}' not found", voice),
+                );
                 tracing::warn!("Voice '{}' not found", voice);
             }
         }
@@ -2691,13 +2422,17 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 .map(|status| status.ready)
                 .unwrap_or(false);
             if !input_ready {
+                ctx.fail(
+                    mqtt::commands::CommandErrorKind::NotFound,
+                    format!("Input {} is unavailable", input),
+                );
                 tracing::warn!(
                     "Input '{}' is unavailable; volume command was not queued",
                     input
                 );
                 return;
             }
-            let volume = new_volume.clamp(0.0, 1.0);
+            let volume = new_volume.clamp(0.0, config::MAX_GAIN);
             let queued = ctx.send(rt_engine::AudioCommand::SetInputVolume {
                 input: input.clone(),
                 volume,
@@ -2724,6 +2459,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 .map(|status| status.ready)
                 .unwrap_or(false);
             if !input_ready {
+                ctx.fail(
+                    mqtt::commands::CommandErrorKind::NotFound,
+                    format!("Input {} is unavailable", input),
+                );
                 tracing::warn!(
                     "Input '{}' is unavailable; mute command was not queued",
                     input
@@ -2734,6 +2473,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 && (ctx.talkback.active_for(&input)
                     || (input == "mic" && ctx.talkback.active_for("GM_MIC")))
             {
+                ctx.fail(
+                    mqtt::commands::CommandErrorKind::Forbidden,
+                    "Input is owned by an active talkback lease",
+                );
                 tracing::warn!(
                     "Input '{}' is owned by an active talkback lease; ordinary unmute was rejected",
                     input
@@ -2766,6 +2509,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     "Talkback source '{}' is unavailable; lease was not acquired",
                     request.source_id
                 );
+                ctx.fail(
+                    mqtt::commands::CommandErrorKind::NotFound,
+                    "Talkback source unavailable",
+                );
                 ctx.refresh_talkback(ctx.now_ms);
                 return;
             };
@@ -2787,6 +2534,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     ctx.refresh_talkback(ctx.now_ms);
                 }
                 Err(error) => {
+                    ctx.fail(
+                        mqtt::commands::CommandErrorKind::Forbidden,
+                        error.to_string(),
+                    );
                     tracing::warn!("Talkback acquire rejected: {}", error);
                     ctx.refresh_talkback(ctx.now_ms);
                 }
@@ -2808,6 +2559,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     ctx.refresh_talkback(ctx.now_ms);
                 }
                 Err(error) => {
+                    ctx.fail(
+                        mqtt::commands::CommandErrorKind::Forbidden,
+                        error.to_string(),
+                    );
                     tracing::warn!("Talkback release rejected: {}", error);
                     ctx.refresh_talkback(ctx.now_ms);
                 }
@@ -2944,7 +2699,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             } else {
                 tracing::info!("Set volume to {:.2} for matching samples", volume);
                 // Keep the snapshot's per-sample volume in step.
-                let clamped = volume.clamp(0.0, 1.0);
+                let clamped = volume.clamp(0.0, config::MAX_GAIN);
                 for status in ctx.playing.values_mut() {
                     if sample_status_matches(&selector, status) {
                         status.volume = clamped;
@@ -3173,6 +2928,7 @@ mod tests {
                 streaming_upgrades: &mut self.streaming_upgrades,
                 max_block_frames: 512,
                 error: None,
+                prepared: None,
             };
             handle_command(cmd, &mut ctx).await;
         }
@@ -3338,7 +3094,9 @@ mod tests {
             "seek on a streamed voice must push no command"
         );
 
-        // A seek on a normal voice still pushes (positive control).
+        // A seek on a playing normal voice still pushes (positive control).
+        fixture.run(play(Some("other"), 1.0)).await;
+        fixture.drain();
         fixture.run(seek_voice("other", 1000)).await;
         assert!(
             matches!(

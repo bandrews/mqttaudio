@@ -24,8 +24,6 @@ OPTIONS:
   -d, --device <DEVICE>        Device ID from --list-devices (ALSA ID on Linux)
   -r, --sample-rate <RATE>     Output sample rate (config default: 48000)
   -n, --channels <COUNT>       Number of output channels (config default: auto-detect)
-  --lfe-channel <INDEX>        LFE (subwoofer) channel index for bass management
-  --crossover-frequency <HZ>   Crossover frequency for bass management (config default: 80)
   --log-topic <TOPIC>          MQTT topic to publish log messages to
   --http-port <PORT>           Enable the HTTP REST/WebSocket server on this port
   --max-cache-mb <MB>          Override the memory cache cap in MiB (0 = auto-detect a bounded cap)
@@ -250,7 +248,7 @@ for platform examples and ALSA prefix guidance.
 | `buffer_size` | integer | `512` | Buffer size in frames for output and capture streams (lower = less latency, more CPU) |
 | `channels` | integer | auto-detect | Number of output channels |
 | `channel_aliases` | object | `{}` | Named aliases for channel numbers |
-| `channel_volumes` | object | `{}` | Per-output-channel calibration gain, `0.0`–`1.0`, keyed by channel number or alias |
+| `channel_volumes` | object | `{}` | Per-output-channel calibration gain, `0.0`–`4.0`, keyed by channel number or alias |
 | `output_ceiling_db` | number | `-1.0` | Limiter ceiling in dBFS (`-60.0`–`0.0`); the output peak is held at or below this level |
 | `master_gain` | number | `1.0` | Linear gain applied to the whole bus before limiting (`0.0`–`8.0`) |
 

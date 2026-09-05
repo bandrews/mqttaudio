@@ -142,6 +142,7 @@ pub async fn process_mqtt_events(
     topic: String,
     mut eventloop: EventLoop,
     command_tx: mpsc::Sender<super::commands::CommandRequest>,
+    reconnect_delay: Duration,
 ) {
     tracing::info!("Starting MQTT event loop");
 
@@ -189,7 +190,7 @@ pub async fn process_mqtt_events(
             Err(e) => {
                 tracing::error!("MQTT error: {}", e);
                 // Wait before reconnecting
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                tokio::time::sleep(reconnect_delay).await;
             }
         }
     }
@@ -333,7 +334,14 @@ mod tests {
         // Spawn event processor with its own client clone for resubscribe.
         let proc_client = client.clone();
         tokio::spawn(async move {
-            process_mqtt_events(proc_client, "test/topic".to_string(), eventloop, tx).await;
+            process_mqtt_events(
+                proc_client,
+                "test/topic".to_string(),
+                eventloop,
+                tx,
+                Duration::from_secs(1),
+            )
+            .await;
         });
 
         // Publish a test message
@@ -352,5 +360,13 @@ mod tests {
             .await
             .expect("Timeout waiting for message")
             .expect("Channel closed");
+    }
+
+    #[tokio::test]
+    async fn test_connect_mqtt_with_configured_client_id() {
+        let mut cfg = config("localhost", 1883);
+        cfg.client_id = Some("my-client".into());
+        let result = connect_mqtt(&cfg, "test/topic").await;
+        assert!(result.is_ok());
     }
 }

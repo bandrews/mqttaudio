@@ -1,5 +1,10 @@
 # mqttaudio
 
+The `v2.1` branch is the consolidated **2.1.0-rc.1** release candidate. Development
+and release testing should use this branch; `main` remains the 2.0 line until the
+candidate is accepted. See the [integration and validation record](docs/releases/v2.1-rc1.md).
+
+
 A high-performance audio player controlled via MQTT or HTTP and built in Rust for speed and reliability. 
 
 Originally built for interactive installations, escape rooms, and immersive entertainment, but potentially useful to all!

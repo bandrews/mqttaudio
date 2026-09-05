@@ -33,7 +33,6 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// mode) unless `require_auth` is set, in which case it fails closed. A token is
 /// accepted via `Authorization: Bearer <token>` or the `?token=` query param,
 /// compared in constant time.
-
 /// Percent-decode a query parameter value ('+' as space), so tokens with
 /// URL-encoded characters authenticate through the query form.
 fn percent_decode(value: &str) -> String {
@@ -100,7 +99,7 @@ async fn auth_middleware(
     if let Some(query) = request.uri().query() {
         for param in query.split('&') {
             if let Some(token) = param.strip_prefix("token=") {
-                if ct_eq(token, expected_token) {
+                if ct_eq(&percent_decode(token), expected_token) {
                     return Ok(next.run(request).await);
                 }
             }
@@ -197,9 +196,15 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
     } else {
         app = app.merge(status_routes).merge(authenticated_commands);
         if websocket_enabled {
-            app = app
-                .route("/ws", get(websocket::handle_websocket))
-                .route("/ws/state", get(websocket::handle_state_websocket));
+            app = app.merge(
+                Router::new()
+                    .route("/ws", get(websocket::handle_websocket))
+                    .route("/ws/state", get(websocket::handle_state_websocket))
+                    .layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        auth_middleware,
+                    )),
+            );
         }
     }
 

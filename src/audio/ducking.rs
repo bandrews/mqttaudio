@@ -244,7 +244,6 @@ impl DuckingEngine {
     /// the engine's own duck states. Retained as the reference path for tests;
     /// the audio thread uses `DuckingApplier::get_multiplier` at runtime.
     #[allow(dead_code)]
-
     /// Get the current ducking multiplier for a voice.
     /// This is called from the mixer callback for each sample.
     pub fn get_multiplier(&mut self, voice_id: &str, frames: usize) -> f32 {

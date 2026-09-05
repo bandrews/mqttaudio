@@ -63,6 +63,9 @@ pub fn input_device_list() -> Result<Vec<InputDeviceInfo>, String> {
         };
 
         // Query all supported configs to find max channels
+        if name == "null" {
+            continue;
+        }
         let caps = if let Ok(configs) = device.supported_input_configs() {
             let mut max_channels = 0u16;
             let mut sample_rates: Vec<(u32, u32)> = Vec::new();
@@ -289,6 +292,7 @@ pub fn get_input_device(name: Option<&str>) -> Result<Device, InputError> {
                             .to_string()
                     })
                 })
+                .filter(|name| name != "null")
                 .collect();
             if let Some(pos) = resolve_requested_device(device_name, &names) {
                 let target = &names[pos];
@@ -365,9 +369,7 @@ pub fn select_channel_count(
 
 /// Find a capture configuration for the device.
 ///
-/// Only f32 configurations are considered: the capture callback reads f32
-/// samples, and ALSA `hw:` devices that expose integer formats only must be
-/// opened through their `plughw:` alias instead.
+/// Supported native formats are converted to f32 by the typed capture callback.
 /// Choose the capture rate from a reported range. ALSA plug devices report a
 /// continuous range with an implausible maximum; that is capability-report
 /// noise, not a reason to disqualify the configuration, so the ceiling is
@@ -409,7 +411,7 @@ pub fn find_input_config(
             .into_iter()
             .collect();
         return Err(InputError::ConfigError(format!(
-            "device offers no f32 capture format (has: {}); use the 'plughw:' alias for this card",
+            "device offers no supported capture format (has: {}); use the 'plughw:' alias for this card",
             formats.join(", ")
         )));
     }
@@ -466,6 +468,7 @@ pub fn find_input_config(
 /// seen by the mixer, sending each microphone to the wrong output and leaving a
 /// residue that grows until the buffer is full. Frames that do not fit are
 /// counted as dropped instead.
+#[cfg(test)]
 fn push_frames(
     producer: &mut HeapProducer<f32>,
     data: &[f32],
@@ -512,6 +515,7 @@ pub fn create_ring_buffer(size: usize) -> (HeapProducer<f32>, HeapConsumer<f32>)
 }
 
 /// Input stream configuration
+#[derive(Clone)]
 pub struct InputStreamConfig {
     pub device_name: Option<String>,
     pub latency_ms: u32,
@@ -551,6 +555,7 @@ pub struct ActiveInput {
     pub channels: usize,
     /// Capture-path counters (D57), drained/logged off-RT and surfaced on /metrics.
     pub telemetry: Arc<InputTelemetry>,
+    pub sample_rate: u32,
 }
 
 impl ActiveInput {
@@ -620,10 +625,6 @@ pub fn create_input_stream_with_fanout(
 
     // Calculate ring buffer size based on OUTPUT sample rate (after potential resampling)
     let buffer_size = calculate_ring_buffer_size(target_sample_rate, channels, config.latency_ms);
-    let rings: Vec<(HeapProducer<f32>, HeapConsumer<f32>)> = (0..consumer_count)
-        .map(|_| create_ring_buffer(buffer_size))
-        .collect();
-    let (producers, consumers): (Vec<_>, Vec<_>) = rings.into_iter().unzip();
 
     if input_sample_rate != target_sample_rate {
         tracing::warn!(
@@ -648,15 +649,36 @@ pub fn create_input_stream_with_fanout(
     // clocked devices stay drift-bounded, even at equal nominal rates (D33). The
     // device sample format is handled orthogonally: a typed callback converts the
     // native format to f32 before the resampler sees it (D37).
-    let (stream, telemetry) = build_resampling_input_stream(
-        &device,
-        supported_config,
-        sample_format,
-        producers,
-        input_sample_rate,
-        target_sample_rate,
-        channels,
-    )?;
+    let build = |requested_buffer: Option<u32>| -> Result<_, InputError> {
+        let rings: Vec<(HeapProducer<f32>, HeapConsumer<f32>)> = (0..consumer_count)
+            .map(|_| create_ring_buffer(buffer_size))
+            .collect();
+        let (producers, consumers): (Vec<_>, Vec<_>) = rings.into_iter().unzip();
+        let mut options = config.clone();
+        options.buffer_size = requested_buffer;
+        let (stream, telemetry) = build_resampling_input_stream(
+            &device,
+            supported_config,
+            sample_format,
+            producers,
+            input_sample_rate,
+            target_sample_rate,
+            channels,
+            &options,
+        )?;
+        Ok((stream, telemetry, consumers))
+    };
+    let (stream, telemetry, consumers) = match build(config.buffer_size) {
+        Ok(built) => built,
+        Err(error) if config.buffer_size.is_some() => {
+            tracing::warn!(
+                "Capture rejected the requested buffer size: {}; retrying the device default",
+                error
+            );
+            build(None)?
+        }
+        Err(error) => return Err(error),
+    };
 
     stream
         .play()
@@ -666,6 +688,7 @@ pub fn create_input_stream_with_fanout(
         stream,
         consumers,
         channels,
+        sample_rate: input_sample_rate,
         telemetry,
     })
 }
@@ -744,6 +767,8 @@ const STEER_FILL_SMOOTHING: f64 = 0.05;
 /// totals on `/metrics`.
 #[derive(Default)]
 pub struct InputTelemetry {
+    pub dropped_frames: Arc<AtomicU64>,
+    pub peak_levels: Vec<AtomicU32>,
     /// Resampler `process_into_buffer` failures (the chunk was dropped).
     pub resample_errors: std::sync::atomic::AtomicU64,
     /// Interleaved samples dropped because the ring was full (overflow).
@@ -794,16 +819,32 @@ impl ResampleState {
         channels: usize,
         ring_capacity: usize,
     ) -> Result<Self, InputError> {
+        Self::with_quality(
+            input_rate,
+            output_rate,
+            channels,
+            ring_capacity,
+            ResamplerQuality::Maximum,
+        )
+    }
+
+    pub fn with_quality(
+        input_rate: u32,
+        output_rate: u32,
+        channels: usize,
+        ring_capacity: usize,
+        quality: ResamplerQuality,
+    ) -> Result<Self, InputError> {
         use rubato::{
             Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
             WindowFunction,
         };
 
         let params = SincInterpolationParameters {
-            sinc_len: 256,
+            sinc_len: quality.sinc_len(),
             f_cutoff: 0.95,
             interpolation: SincInterpolationType::Linear,
-            oversampling_factor: 256,
+            oversampling_factor: quality.oversampling_factor(),
             window: WindowFunction::BlackmanHarris2,
         };
 
@@ -833,7 +874,10 @@ impl ResampleState {
             ring_capacity,
             smoothed_fill: -1.0,
             last_ratio: nominal_ratio,
-            telemetry: Arc::new(InputTelemetry::default()),
+            telemetry: Arc::new(InputTelemetry {
+                peak_levels: (0..channels).map(|_| AtomicU32::new(0)).collect(),
+                ..Default::default()
+            }),
         })
     }
 
@@ -944,6 +988,10 @@ pub fn resample_block_fanout(
         if dropped > 0 {
             state
                 .telemetry
+                .dropped_frames
+                .fetch_add((dropped / channels) as u64, Ordering::Relaxed);
+            state
+                .telemetry
                 .overflow_dropped_samples
                 .fetch_add(dropped as u64, Ordering::Relaxed);
         }
@@ -996,6 +1044,7 @@ fn steer_ratio(state: &mut ResampleState, producer: &HeapProducer<f32>) {
 /// a non-f32 device opens (D37). The format choice is orthogonal to resampling:
 /// the typed callback converts the native samples to f32, then the same
 /// [`resample_block`] drives the drift-steered resampler regardless of format.
+#[allow(clippy::too_many_arguments)]
 fn build_resampling_input_stream(
     device: &Device,
     config: SupportedStreamConfig,
@@ -1004,6 +1053,7 @@ fn build_resampling_input_stream(
     input_rate: u32,
     output_rate: u32,
     channels: usize,
+    options: &InputStreamConfig,
 ) -> Result<(Stream, Arc<InputTelemetry>), InputError> {
     match input_stream_builder(sample_format) {
         Some(InputSampleHandling::F32) => build_typed_resampling_input_stream::<f32>(
@@ -1013,6 +1063,7 @@ fn build_resampling_input_stream(
             input_rate,
             output_rate,
             channels,
+            options,
         ),
         Some(InputSampleHandling::I16) => build_typed_resampling_input_stream::<i16>(
             device,
@@ -1021,6 +1072,7 @@ fn build_resampling_input_stream(
             input_rate,
             output_rate,
             channels,
+            options,
         ),
         Some(InputSampleHandling::U16) => build_typed_resampling_input_stream::<u16>(
             device,
@@ -1029,6 +1081,7 @@ fn build_resampling_input_stream(
             input_rate,
             output_rate,
             channels,
+            options,
         ),
         Some(InputSampleHandling::I32) => build_typed_resampling_input_stream::<i32>(
             device,
@@ -1037,6 +1090,7 @@ fn build_resampling_input_stream(
             input_rate,
             output_rate,
             channels,
+            options,
         ),
         None => Err(InputError::UnsupportedFormat(format!(
             "{:?}",
@@ -1049,6 +1103,7 @@ fn build_resampling_input_stream(
 /// callback converts `T` to f32 into a reused scratch buffer and feeds it to the
 /// resampler. RT-safe in steady state: the scratch grows only on the first (or a
 /// larger) block, and `resample_block` itself does no heap work.
+#[allow(clippy::too_many_arguments)]
 fn build_typed_resampling_input_stream<T>(
     device: &Device,
     config: SupportedStreamConfig,
@@ -1056,6 +1111,7 @@ fn build_typed_resampling_input_stream<T>(
     input_rate: u32,
     output_rate: u32,
     channels: usize,
+    options: &InputStreamConfig,
 ) -> Result<(Stream, Arc<InputTelemetry>), InputError>
 where
     T: cpal::SizedSample,
@@ -1065,7 +1121,13 @@ where
         .first()
         .map(|producer| producer.capacity())
         .unwrap_or(0);
-    let mut state = ResampleState::new(input_rate, output_rate, channels, ring_capacity)?;
+    let mut state = ResampleState::with_quality(
+        input_rate,
+        output_rate,
+        channels,
+        ring_capacity,
+        options.resampler_quality,
+    )?;
     let telemetry = state.telemetry();
     let callback_telemetry = Arc::clone(&telemetry);
 
@@ -1080,9 +1142,13 @@ where
     };
     let mut scratch: Vec<f32> = Vec::with_capacity(max_block_frames.max(1) * channels);
 
+    let mut stream_config: cpal::StreamConfig = config.into();
+    if let Some(frames) = options.buffer_size {
+        stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
+    }
     let stream = device
         .build_input_stream(
-            &config.into(),
+            stream_config,
             move |data: &[T], _: &cpal::InputCallbackInfo| {
                 if data.len() > scratch.capacity() {
                     // Pathological device: a block beyond the advertised maximum
@@ -1092,6 +1158,10 @@ where
                         .fetch_add(1, Ordering::Relaxed);
                 }
                 convert_input_block::<T>(data, &mut scratch, |f32s| {
+                    for (i, &value) in f32s.iter().enumerate() {
+                        callback_telemetry.peak_levels[i % channels]
+                            .fetch_max(value.abs().to_bits(), Ordering::Relaxed);
+                    }
                     resample_block_fanout(&mut state, f32s, &mut producers);
                 });
             },
@@ -1241,4 +1311,240 @@ mod tests {
     // - test_list_input_devices
     // - test_get_default_input_device
     // - test_create_input_stream
+
+    #[test]
+    fn test_parse_device_index() {
+        assert_eq!(parse_device_index("0", 3), Some(0));
+        assert_eq!(parse_device_index("2", 3), Some(2));
+        assert_eq!(parse_device_index(" 1 ", 3), Some(1));
+        assert_eq!(parse_device_index("3", 3), None, "out of range");
+        assert_eq!(parse_device_index("0", 0), None, "no devices");
+        assert_eq!(parse_device_index("-1", 3), None);
+        assert_eq!(parse_device_index("hw:CARD=UMC1820,DEV=0", 3), None);
+        assert_eq!(parse_device_index("", 3), None);
+    }
+
+    #[test]
+    fn test_resolve_requested_device_prefers_exact_name() {
+        let names = vec![
+            "hw:CARD=UMC1820,DEV=0".to_string(),
+            "plughw:CARD=UMC1820,DEV=0".to_string(),
+        ];
+        assert_eq!(
+            resolve_requested_device("plughw:CARD=UMC1820,DEV=0", &names),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_requested_device("hw:CARD=UMC1820,DEV=0", &names),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_resolve_requested_device_by_index() {
+        let names = vec![
+            "hw:CARD=UMC1820,DEV=0".to_string(),
+            "plughw:CARD=UMC1820,DEV=0".to_string(),
+        ];
+        assert_eq!(resolve_requested_device("1", &names), Some(1));
+        assert_eq!(resolve_requested_device("2", &names), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_resolve_requested_device_by_alsa_card() {
+        let names = vec![
+            "hw:CARD=Headset,DEV=0".to_string(),
+            "hw:CARD=UMC1820,DEV=0".to_string(),
+        ];
+        assert_eq!(
+            resolve_requested_device("hw:CARD=UMC1820, DEV=0", &names),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn test_resolve_requested_device_unmatched() {
+        let names = vec!["hw:CARD=UMC1820,DEV=0".to_string()];
+        assert_eq!(
+            resolve_requested_device("hw:CARD=Missing,DEV=0", &names),
+            None
+        );
+        assert_eq!(resolve_requested_device("anything", &[]), None);
+    }
+
+    #[test]
+    fn test_choose_capture_rate_honors_preferred_within_plugin_range() {
+        // ALSA plug devices report a continuous range with an absurd maximum;
+        // the preferred rate inside the plausible part of the range wins.
+        assert_eq!(choose_capture_rate(4000, 4294967295, 48000), 48000);
+        assert_eq!(choose_capture_rate(4000, 4294967295, 44100), 44100);
+    }
+
+    #[test]
+    fn test_choose_capture_rate_clamps_to_range() {
+        assert_eq!(choose_capture_rate(44100, 44100, 48000), 44100);
+        assert_eq!(choose_capture_rate(48000, 192000, 44100), 48000);
+        assert_eq!(choose_capture_rate(8000, 4294967295, 500000), 384000);
+    }
+
+    #[test]
+    fn test_device_not_found_message_lists_available_devices() {
+        let available = vec!["hw:CARD=UMC1820,DEV=0".to_string(), "default".to_string()];
+        let msg = device_not_found_message("plughw:CARD=UMC1820,DEV=0", &available, None);
+        assert!(msg.contains("plughw:CARD=UMC1820,DEV=0"));
+        assert!(msg.contains("hw:CARD=UMC1820,DEV=0"));
+        assert!(msg.contains("default"));
+    }
+
+    #[test]
+    fn test_device_not_found_message_explains_empty_enumeration() {
+        let msg = device_not_found_message("hw:CARD=X,DEV=0", &[], None);
+        assert!(msg.contains("hw:CARD=X,DEV=0"));
+        assert!(msg.to_lowercase().contains("no devices"));
+    }
+
+    #[test]
+    fn test_device_not_found_message_includes_probe_result() {
+        let msg = device_not_found_message(
+            "hw:CARD=X,DEV=0",
+            &[],
+            Some("Direct ALSA capture open failed: EBUSY"),
+        );
+        assert!(msg.contains("Direct ALSA capture open failed: EBUSY"));
+    }
+
+    #[test]
+    fn test_device_not_found_error_display_carries_details() {
+        let err = InputError::DeviceNotFound {
+            requested: "plughw:CARD=UMC1820,DEV=0".to_string(),
+            available: vec!["hw:CARD=UMC1820,DEV=0".to_string()],
+            probe: Some("probe detail".to_string()),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Input device not found"));
+        assert!(msg.contains("plughw:CARD=UMC1820,DEV=0"));
+        assert!(msg.contains("hw:CARD=UMC1820,DEV=0"));
+        assert!(msg.contains("probe detail"));
+    }
+
+    #[test]
+    fn test_get_input_device_error_reports_requested_name_and_probe() {
+        // A card name no system has, so this fails everywhere. The error must
+        // carry the requested name and, on Linux, a direct-ALSA diagnosis of
+        // why the capture open fails.
+        match get_input_device(Some("hw:CARD=NoSuchCardExists,DEV=0")) {
+            Err(InputError::DeviceNotFound {
+                requested, probe, ..
+            }) => {
+                assert_eq!(requested, "hw:CARD=NoSuchCardExists,DEV=0");
+                #[cfg(target_os = "linux")]
+                assert!(
+                    probe.is_some(),
+                    "Linux probe should always produce a diagnosis"
+                );
+                #[cfg(not(target_os = "linux"))]
+                assert!(probe.is_none());
+            }
+            Err(other) => panic!("expected DeviceNotFound, got: {}", other),
+            Ok(_) => panic!("nonexistent device resolved"),
+        }
+    }
+
+    #[test]
+    fn test_push_frames_writes_only_whole_frames() {
+        // Room for 2 whole 4-channel frames plus 2 stray samples. Writing the
+        // stray samples would rotate the channel order for every later read.
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut producer, consumer) = create_ring_buffer(10);
+
+        let data = vec![1.0f32; 16]; // 4 frames
+        let written = push_frames(&mut producer, &data, 4, &dropped);
+
+        assert_eq!(written, 2, "only whole frames are written");
+        assert_eq!(consumer.len(), 8, "ring buffer holds whole frames only");
+        assert_eq!(dropped.load(Ordering::Relaxed), 2, "two frames did not fit");
+    }
+
+    #[test]
+    fn test_push_frames_writes_everything_when_it_fits() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut producer, consumer) = create_ring_buffer(64);
+
+        let data = vec![0.25f32; 16]; // 4 frames of 4 channels
+        let written = push_frames(&mut producer, &data, 4, &dropped);
+
+        assert_eq!(written, 4);
+        assert_eq!(consumer.len(), 16);
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_push_frames_keeps_alignment_when_saturated() {
+        // A device that keeps producing while the reader is stalled must never
+        // leave the buffer holding a partial frame.
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut producer, consumer) = create_ring_buffer(27);
+        let channels = 5;
+        let data = vec![1.0f32; 5 * channels];
+
+        for _ in 0..10 {
+            push_frames(&mut producer, &data, channels, &dropped);
+            assert_eq!(
+                consumer.len() % channels,
+                0,
+                "ring buffer must always hold a whole number of frames"
+            );
+        }
+
+        assert!(
+            dropped.load(Ordering::Relaxed) > 0,
+            "saturation should be counted"
+        );
+    }
+
+    #[test]
+    fn test_push_frames_ignores_trailing_partial_input() {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let (mut producer, consumer) = create_ring_buffer(64);
+
+        let data = vec![0.5f32; 14]; // 3 whole 4-channel frames plus 2 samples
+        let written = push_frames(&mut producer, &data, 4, &dropped);
+
+        assert_eq!(written, 3);
+        assert_eq!(consumer.len(), 12);
+    }
+
+    #[test]
+    fn test_select_channel_count_uses_smallest_that_covers_routing() {
+        // An interface offering a range should not be opened wider than the
+        // routing needs.
+        assert_eq!(select_channel_count(&[1, 2, 8, 18], None, 3), Some(8));
+        assert_eq!(select_channel_count(&[1, 2, 8, 18], None, 1), Some(1));
+    }
+
+    #[test]
+    fn test_select_channel_count_accepts_fixed_hardware_layout() {
+        // ALSA hw: devices expose only their native layout
+        assert_eq!(select_channel_count(&[18, 20], None, 2), Some(18));
+        assert_eq!(select_channel_count(&[18, 20], None, 19), Some(20));
+    }
+
+    #[test]
+    fn test_select_channel_count_rejects_unreachable_routing() {
+        assert_eq!(select_channel_count(&[1, 2], None, 4), None);
+        assert_eq!(select_channel_count(&[], None, 1), None);
+    }
+
+    #[test]
+    fn test_select_channel_count_honours_explicit_request() {
+        assert_eq!(select_channel_count(&[2, 8, 18], Some(8), 1), Some(8));
+        assert_eq!(select_channel_count(&[2, 8, 18], Some(4), 1), None);
+    }
+
+    #[test]
+    fn test_required_channels_covers_highest_routed_source() {
+        assert_eq!(required_channels(&[(0, 0), (17, 3), (2, 1)]), 18);
+        assert_eq!(required_channels(&[]), 0);
+    }
 }

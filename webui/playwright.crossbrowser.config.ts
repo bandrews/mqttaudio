@@ -21,7 +21,7 @@ export default defineConfig({
     { name: 'firefox', use: { ...devices['Desktop Firefox'] } },
   ],
   webServer: {
-    command: `pnpm exec vite --port ${PORT} --strictPort`,
+    command: `node node_modules/vite/bin/vite.js --port ${PORT} --strictPort`,
     url: `http://localhost:${PORT}`,
     reuseExistingServer: false,
     timeout: 120_000,

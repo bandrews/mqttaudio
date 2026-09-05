@@ -102,7 +102,6 @@ impl HttpStreamReader {
 
     /// Check if the download is complete. Exercised by the http_stream tests.
     #[allow(dead_code)]
-
     /// Whether the download finished or failed (nothing left to cancel)
     fn download_settled(&self) -> bool {
         let guard = self.buffer.lock().unwrap();

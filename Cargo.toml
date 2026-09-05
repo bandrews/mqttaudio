@@ -1,6 +1,6 @@
 [package]
 name = "mqttaudio"
-version = "2.0.0"
+version = "2.1.0-rc.1"
 edition = "2021"
 authors = ["Mo Fang Heavy Industries LLC"]
 description = "MQTT-controlled multichannel audio player for interactive entertainment"
@@ -8,7 +8,7 @@ license = "MIT"
 
 [dependencies]
 # Audio I/O
-cpal = "0.17"
+cpal = "0.18"
 
 # Audio decoding
 symphonia = { version = "0.5", features = ["all"] }
@@ -20,7 +20,7 @@ rubato = "0.14"
 rumqttc = "0.24"
 
 # HTTP client
-reqwest = { version = "0.11", features = ["stream"] }
+reqwest = { version = "0.11", features = ["stream", "json"] }
 
 # JSON parsing
 serde = { version = "1.0", features = ["derive"] }
@@ -79,7 +79,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 # Linux-specific: ALSA bindings for device probing
 [target.'cfg(target_os = "linux")'.dependencies]
-alsa = "0.9"
+alsa = "0.11"
 libc = "0.2"
 
 [dev-dependencies]

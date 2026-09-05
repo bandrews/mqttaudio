@@ -33,7 +33,7 @@ async fn subscribes_on_connack_so_a_reconnect_recovers() {
     let pc = proc_client.clone();
     let topic_owned = topic.to_string();
     tokio::spawn(async move {
-        process_mqtt_events(pc, topic_owned, proc_eventloop, tx).await;
+        process_mqtt_events(pc, topic_owned, proc_eventloop, tx, Duration::from_secs(1)).await;
     });
 
     // Let the processor connect and subscribe on its first ConnAck.
@@ -78,7 +78,7 @@ async fn command_burst_does_not_stall_the_event_loop() {
     let pc = proc_client.clone();
     let topic_owned = topic.to_string();
     tokio::spawn(async move {
-        process_mqtt_events(pc, topic_owned, proc_eventloop, tx).await;
+        process_mqtt_events(pc, topic_owned, proc_eventloop, tx, Duration::from_secs(1)).await;
     });
     tokio::time::sleep(Duration::from_millis(800)).await;
 

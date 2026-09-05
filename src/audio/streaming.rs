@@ -228,6 +228,24 @@ impl SampleBuffer {
         }
     }
 
+    /// Read creation-time metadata consistently on a loading/control thread.
+    /// Audio callbacks use the nonblocking accessors instead.
+    pub fn metadata_blocking(&self) -> (usize, u32, usize) {
+        match self {
+            Self::Complete(buffer) => (buffer.channels, buffer.sample_rate, buffer.frames),
+            Self::Streaming(buffer) => buffer
+                .read()
+                .map(|buffer| {
+                    (
+                        buffer.channels,
+                        buffer.sample_rate,
+                        buffer.frames_available(),
+                    )
+                })
+                .unwrap_or((0, 0, 0)),
+        }
+    }
+
     /// Get the channel count, waiting out loader lock contention.
     /// For command-thread use at sample creation; the audio callback must use
     /// channels(), which never blocks.

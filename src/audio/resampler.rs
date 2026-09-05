@@ -126,8 +126,8 @@ pub fn resample(
     let mut output = Vec::with_capacity(expected_frames * channels);
 
     for frame_idx in delay..end {
-        for ch_idx in 0..channels {
-            output.push(output_channels[ch_idx][frame_idx]);
+        for channel in output_channels.iter().take(channels) {
+            output.push(channel[frame_idx]);
         }
     }
 

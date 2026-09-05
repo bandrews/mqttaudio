@@ -55,13 +55,29 @@ fixed layout regardless of routing.
 `volume` is a gain: 1.0 passes the microphone through untouched, below that
 attenuates and above that boosts, up to 4.0 (+12 dB). Boosting is how you lift
 a quiet lavalier or a preamp that will not go loud enough; the mixer saturates
-its output, so too much gain clips rather than wrapping.
+its output at the configured ceiling, so additional gain engages the limiter.
 
 ### Sample rate
 
 `sample_rate` is normally left out. The capture stream is opened at the output
-rate whenever the device supports it, which keeps the resampler out of the
-signal path entirely.
+rate whenever the device supports it. Capture still uses asynchronous sample-rate
+conversion to compensate for clock drift between independently clocked devices.
+The configured output buffer size is also requested for capture, with a fallback
+to the device default if it is rejected.
+
+### Shared devices and activity detection
+
+Input entries with the same device, latency, channel-count setting, and sample-rate
+setting share one physical capture stream. Each receives its own ring buffer and
+routing, so several microphones on one multichannel interface do not compete to
+open the same ALSA device.
+
+Set `activity_threshold` (greater than 0 and at most 1) and `activity_hold_ms` on an
+input to trigger its ducking rules only while its routed microphone channels are
+active. Without a threshold, the configured input voice stays active while open.
+`/status/inputs` reports applied mute/volume state, readiness, capture drops,
+backlog, trimmed frames, and underruns. Talkback lease status is available at
+`/status/talkback`; an expired or released lease mutes its microphone.
 
 ## Finding Input Devices
 
@@ -90,10 +106,9 @@ On Linux, prefer the `plughw:` alias of a card over `hw:`:
 "device": "plughw:CARD=UMC1820,DEV=0"
 ```
 
-Capture is read as 32-bit float. `plughw:` converts from the card's native
-format; a bare `hw:` device that only offers integer formats is rejected at
-startup with the format it does offer. `hw:` works where the card exposes a
-float format natively.
+Capture supports native f32, i16, u16, and i32 formats and converts them to the
+mixer's floating-point format. `plughw:` supplies ALSA conversion when a card
+needs it; `hw:` can be used when the negotiated format is supported directly.
 
 Names are matched exactly first, then as a `--list-inputs` index, then by ALSA
 card, so `"hw:CARD=UMC1820, DEV=0"`, `"hw:1,0"`, and `"0"` (the index from the

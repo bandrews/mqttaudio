@@ -369,6 +369,7 @@ fn registry_covers_every_config_field() {
         "bass_management": { "source_channels": [0, 1] },
         "inputs": [
             { "device": "mic", "volume": 0.8, "voice_id": "mic", "latency_ms": 20,
+              "channels": 2, "sample_rate": 48000, "activity_threshold": 0.05, "activity_hold_ms": 500,
               "routes": [ { "source_channel": 0, "dest_channel": "lfe" } ] }
         ],
         "macros": { "boom": { "volume": 1.0 } }

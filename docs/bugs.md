@@ -470,16 +470,11 @@ A full quality review lives in `docs/quality-review-2026-08/`: its
 fixed-vs-deferred, and `summary.md` is the short version. The deferred items
 there (D1-D30) are the current backlog of known issues beyond this file.
 
-## Two input entries cannot share one capture device
+## Shared physical capture (resolved in 2.1)
 
-Each `inputs` entry opens its own capture stream. Two entries naming the same
-ALSA `hw:` device will not both open it, so several microphones on one
-interface must share a single entry, and therefore share one volume, one
-`voice_id` and one ducking behaviour.
-
-Supporting it means fanning one capture stream out to several `LiveInput`
-readers rather than the single-producer/single-consumer ring buffer used today.
-Documented as a limitation in `docs/features/microphone-input.md` instead.
+Matching input entries now share one capture stream and fan out to independent
+logical strips. Device, latency, requested channel count, and requested sample
+rate must match; routes and per-strip volume/voice remain independent.
 
 ## `fadeall` does not fade live inputs
 
@@ -487,16 +482,22 @@ Documented as a limitation in `docs/features/microphone-input.md` instead.
 microphone keeps running through it, which is usually what you want but is
 worth knowing. `input_mute` is the per-microphone control.
 
-## The audio callback locks a std Mutex
+## Audio/control lock contention (resolved in 2.1)
 
-`mix_audio` runs under `mixer_state.lock()`, which the HTTP handlers, the
-command loop and the input health monitor also take. A non-realtime thread
-holding that lock while the audio thread waits on it is a priority inversion
-that shows up as an output glitch. It has not caused a reported problem, but it
-is the reason to keep every other lock holder short.
+The real-time engine receives prepared commands through its ring. HTTP status and
+microphone health use snapshots and atomics. The callback's parking_lot mutex is
+not shared with control/HTTP work. Allocation and render harnesses cover this path.
 
-## `mqtt::client::tests::test_mqtt_event_processing` needs a live broker
+## Input device reconnection still requires field validation
 
-The test publishes to `localhost:1883` and fails without a broker running. It
-is a real integration test, not a broken one, but it makes `cargo test` fail on
-a machine that has no MQTT server.
+CPAL 0.18.2 recovers ALSA xruns. The output supervisor rebuilds permanently failed
+output streams with backoff; it leaves recovered xruns and automatic route changes
+running. Input streams do not yet have equivalent automatic rebuild on USB device
+loss. Restart after reconnecting a lost microphone. Physical unplug/replug and
+multichannel USB duplex behavior remain release-candidate field checks.
+
+## Broker-backed tests
+
+MQTT/TLS tests are enabled with `MQTTAUDIO_BROKER_TESTS=1` and
+`MQTTAUDIO_TLS_CA`. The Linux validation container starts a private broker and
+runs these checks. Device-opening checks require a separate explicit invocation.

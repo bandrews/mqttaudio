@@ -164,8 +164,8 @@ impl DiskCache {
             .collect();
 
         let path = url.split(['?', '#']).next().unwrap_or(url);
-        let extension = if let Some(last_part) = path.split('/').last() {
-            if let Some(ext) = last_part.split('.').last() {
+        let extension = if let Some(last_part) = path.split('/').next_back() {
+            if let Some(ext) = last_part.split('.').next_back() {
                 // Only use common audio extensions
                 match ext.to_lowercase().as_str() {
                     "wav" | "mp3" | "ogg" | "flac" => ext.to_lowercase(),

@@ -3,6 +3,17 @@
 
 use std::fmt;
 
+/// The identifier a config names a device by: the backend's driver id (the
+/// ALSA pcm id such as "plughw:CARD=UMC1820,DEV=0") where one exists,
+/// otherwise the device's display name.
+pub fn device_identifier(device: &cpal::Device) -> String {
+    use cpal::traits::DeviceTrait;
+    device
+        .description()
+        .map(|d| output_device_identifier(&d, cfg!(target_os = "linux")).to_string())
+        .unwrap_or_else(|_| device.to_string())
+}
+
 /// Category of audio device, used for filtering and display
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DeviceCategory {
@@ -399,12 +410,9 @@ fn extract_alsa_card_from_name(name: &str) -> Option<AlsaCardId> {
     ];
 
     for prefix in prefixes {
-        if name.starts_with(prefix) {
-            let rest = &name[prefix.len()..];
-
+        if let Some(rest) = name.strip_prefix(prefix) {
             // Try "CARD=name" format first
-            if rest.starts_with("CARD=") {
-                let card_part = &rest[5..];
+            if let Some(card_part) = rest.strip_prefix("CARD=") {
                 let card_name = if let Some(comma_pos) = card_part.find(',') {
                     &card_part[..comma_pos]
                 } else {

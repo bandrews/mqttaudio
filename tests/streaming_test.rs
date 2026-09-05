@@ -456,6 +456,7 @@ async fn test_streamed_url_persists_to_disk_cache() {
         .get_or_load_streaming(&url, 48000)
         .await
         .expect("second play must be served from the disk cache with the server gone");
+    wait_complete(&buffer).await;
     assert!(buffer.is_complete());
     assert!(buffer.frames() > 0);
 }
@@ -528,10 +529,11 @@ async fn test_cache_disabled_writes_nothing_to_disk() {
 
     assert_eq!(cache_manager.disk_stats().entry_count, 0);
     let files_dir = cache_dir.path().join("files");
-    let file_count = files_dir
-        .exists()
-        .then(|| std::fs::read_dir(&files_dir).unwrap().count())
-        .unwrap_or(0);
+    let file_count = if files_dir.exists() {
+        std::fs::read_dir(&files_dir).unwrap().count()
+    } else {
+        0
+    };
     assert_eq!(file_count, 0, "disabled cache must write no files");
 
     let _ = shutdown.send(());
@@ -623,6 +625,7 @@ async fn test_revalidation_respects_interval() {
         .get_or_load_streaming(&url, 48000)
         .await
         .unwrap();
+    wait_complete(&buffer).await;
     assert!(
         buffer.is_complete(),
         "within the interval the cached copy is served directly"
@@ -670,6 +673,7 @@ async fn test_revalidation_serves_cache_when_server_down() {
         .get_or_load_streaming(&url, 48000)
         .await
         .expect("a dead server must not make cached audio unplayable");
+    wait_complete(&buffer).await;
     assert!(buffer.is_complete());
     assert!(buffer.frames() > 0);
 }
@@ -1245,6 +1249,8 @@ async fn test_corrupt_packets_do_not_abort_the_decode() {
         .get_or_load_streaming(path, 44100)
         .await
         .expect("a corrupt packet must not make the whole file unplayable");
+
+    wait_complete(&buffer).await;
 
     // The fixture corrupts 8 of ~27 frames; with resync losses roughly two
     // thirds of the audio survives. The bar here is "plays with dropouts

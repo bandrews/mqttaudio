@@ -652,7 +652,7 @@ mod tests {
         let output_frames = output.len() / 2;
 
         assert!(
-            (output_frames as i32 - input_frames as i32).abs() <= 2,
+            (output_frames as i32 - input_frames).abs() <= 2,
             "Expected ~{} frames, got {}",
             input_frames,
             output_frames

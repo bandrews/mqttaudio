@@ -939,7 +939,6 @@ impl Config {
     /// indices or aliases; entries that resolve outside the channel range (or to an
     /// unknown alias) are skipped with a warning so a misconfiguration never aborts
     /// startup or panics the audio thread.
-
     /// Resolve bass management channel references to numeric indices
     pub fn resolve_bass_management(&self) -> Result<ResolvedBassManagement, String> {
         let lfe = self.resolve_channel(&self.bass_management.lfe_channel)?;
@@ -3540,5 +3539,18 @@ mod tests {
         }"#;
         let config: Config = serde_json::from_str(json).expect("old configs must keep parsing");
         assert_eq!(config.audio.channel_aliases.get("front_left"), Some(&0));
+    }
+
+    #[test]
+    fn test_cache_max_memory_mb_unlimited() {
+        let json = r#"{
+            "mqtt": {"topic": "test"},
+            "cache": {
+                "max_memory_mb": 0
+            }
+        }"#;
+
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.cache.max_memory_mb, 0);
     }
 }

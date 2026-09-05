@@ -549,7 +549,7 @@ pub static INPUT_ROUTE_META: StructListMeta = StructListMeta {
 };
 
 /// Fields of one microphone input.
-pub static INPUT_FIELDS: [SubFieldSpec; 5] = [
+pub static INPUT_FIELDS: [SubFieldSpec; 9] = [
     SubFieldSpec {
         key: "device",
         label: "device",
@@ -560,8 +560,8 @@ pub static INPUT_FIELDS: [SubFieldSpec; 5] = [
     SubFieldSpec {
         key: "volume",
         label: "volume",
-        kind: FieldKind::Float { min: 0.0, max: 1.0 },
-        help: "Input volume (0.0 - 1.0). Default 1.0.",
+        kind: FieldKind::Float { min: 0.0, max: 4.0 },
+        help: "Input gain (0.0 - 4.0). Default 1.0.",
     },
     SubFieldSpec {
         key: "voice_id",
@@ -584,6 +584,22 @@ pub static INPUT_FIELDS: [SubFieldSpec; 5] = [
         kind: FieldKind::UInt { min: 5, max: 500 },
         help: "Buffer latency in milliseconds (5 - 500). Lower is more immediate but \
                risks dropouts. Default 20.",
+    },
+    SubFieldSpec {
+        key: "channels", label: "channels", kind: FieldKind::UInt { min: 1, max: 64 },
+        help: "Optional capture channel count. Unset chooses the smallest supported layout covering all routed source channels.",
+    },
+    SubFieldSpec {
+        key: "sample_rate", label: "sample_rate", kind: FieldKind::UInt { min: 8000, max: 384000 },
+        help: "Optional capture rate in Hz. Unset requests the output rate. Drift correction remains active between devices.",
+    },
+    SubFieldSpec {
+        key: "activity_threshold", label: "activity_threshold", kind: FieldKind::Float { min: 0.0, max: 1.0 },
+        help: "Optional microphone activity threshold, greater than 0 and at most 1. Ducking follows the routed microphone channels above this level. Unset keeps the input voice active while open.",
+    },
+    SubFieldSpec {
+        key: "activity_hold_ms", label: "activity_hold_ms", kind: FieldKind::UInt { min: 0, max: u32::MAX as u64 },
+        help: "How long the microphone stays active for ducking after its level falls below the threshold, in milliseconds.",
     },
 ];
 
@@ -638,8 +654,8 @@ pub static MACRO_PARAM_FIELDS: [SubFieldSpec; 14] = [
     SubFieldSpec {
         key: "volume",
         label: "volume",
-        kind: FieldKind::Float { min: 0.0, max: 1.0 },
-        help: "Playback volume (0.0 - 1.0).",
+        kind: FieldKind::Float { min: 0.0, max: 4.0 },
+        help: "Playback gain (0.0 - 4.0).",
     },
     SubFieldSpec {
         key: "voice",
@@ -741,7 +757,7 @@ pub fn macro_param_spec(key: &str) -> Option<&'static SubFieldSpec> {
 /// Every config field the editor can set, in display order. The coverage test
 /// in tests/config_editor_test.rs asserts this stays complete as the config
 /// schema grows.
-pub static REGISTRY: [FieldSpec; 54] = [
+pub static REGISTRY: [FieldSpec; 55] = [
     // --- MQTT ---
     FieldSpec {
         section: Section::Mqtt,
@@ -843,6 +859,13 @@ pub static REGISTRY: [FieldSpec; 54] = [
     },
     FieldSpec {
         section: Section::Audio,
+        label: "channel_names",
+        path: &["audio", "channel_names"],
+        kind: FieldKind::MapToJson,
+        help: "Optional display labels: channel number to JSON string (e.g. 0 = \"Front left\"). Routing uses channel_aliases; channel volume keys also accept these labels.",
+    },
+    FieldSpec {
+        section: Section::Audio,
         label: "channel_aliases",
         path: &["audio", "channel_aliases"],
         kind: FieldKind::MapToUInt,
@@ -852,8 +875,8 @@ pub static REGISTRY: [FieldSpec; 54] = [
         section: Section::Audio,
         label: "channel_volumes",
         path: &["audio", "channel_volumes"],
-        kind: FieldKind::MapToFloat { min: 0.0, max: 1.0 },
-        help: "Per-channel calibration gain (key: channel number or alias, value 0.0 - 1.0). Unlisted channels stay at 1.0.",
+        kind: FieldKind::MapToFloat { min: 0.0, max: 4.0 },
+        help: "Per-channel calibration gain (key: channel number or alias, value 0.0 - 4.0). Unlisted channels stay at 1.0.",
     },
     FieldSpec {
         section: Section::Audio,

@@ -89,7 +89,14 @@ async fn test_commands_still_arrive_after_broker_restart() {
     let (tx, mut rx) = mpsc::channel(10);
     let processor_client = client.clone();
     let processor = tokio::spawn(async move {
-        process_mqtt_events(processor_client, topic.to_string(), eventloop, tx).await;
+        process_mqtt_events(
+            processor_client,
+            topic.to_string(),
+            eventloop,
+            tx,
+            Duration::from_secs(1),
+        )
+        .await;
     });
 
     // Sanity: commands arrive on the first connection

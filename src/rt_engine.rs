@@ -289,7 +289,7 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
         AudioCommand::SetVolumeMatching { selector, volume } => {
             for sample in state.active_samples.iter_mut() {
                 if sample_matches(selector, sample) {
-                    sample.volume = volume.clamp(0.0, 1.0);
+                    sample.set_target_volume(*volume);
                 }
             }
         }
@@ -875,11 +875,20 @@ mod tests {
             &mut state,
             AudioCommand::SetVolumeMatching {
                 selector: selector_voice("music"),
-                volume: 2.0,
+                volume: 10.0,
             },
             48000,
         );
-        assert_eq!(state.active_samples[0].volume, 1.0);
+        assert_eq!(
+            state.active_samples[0].volume, 1.0,
+            "gain must ramp from the current level"
+        );
+        assert_eq!(
+            state.active_samples[0].target_volume,
+            crate::config::MAX_GAIN
+        );
+        state.active_samples[0].advance_volumes();
+        assert!(state.active_samples[0].volume > 1.0 && state.active_samples[0].volume < 1.01);
     }
 
     #[test]

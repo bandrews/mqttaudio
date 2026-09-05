@@ -9,7 +9,7 @@ export interface FieldIssue {
 
 export function validateVolume(v: number): FieldIssue {
   if (!Number.isFinite(v)) return { error: 'volume must be a number' };
-  if (v < 0 || v > 1) return { warning: `volume ${v} is outside [0,1]; the daemon will clamp it` };
+  if (v < 0 || v > 4) return { warning: `volume ${v} is outside [0,4]; the daemon will clamp it` };
   return {};
 }
 

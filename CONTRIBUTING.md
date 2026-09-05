@@ -8,7 +8,7 @@ This document explains how to set up your development environment and run tests.
 
 ### Prerequisites
 
-- Rust 1.70+
+- Rust 1.95 (matches the Linux validation image)
 - Node.js (for interactive integration tests)
 - ffmpeg (for generating test audio files)
 

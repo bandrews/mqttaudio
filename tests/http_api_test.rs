@@ -1271,10 +1271,10 @@ async fn test_volume_missing_required_volume_returns_4xx() {
 
 #[tokio::test]
 async fn test_command_send_failure_returns_500_with_success_false() {
-    let (state, cmd_rx) = create_test_state();
-    // Dropping the receiver closes the command channel; the next send() fails,
-    // driving `handle_command` into its 500 + CommandResponse::error branch.
-    drop(cmd_rx);
+    let (mut state, _payload_rx) = create_test_state();
+    let (sender, receiver) = mpsc::channel(1);
+    drop(receiver);
+    state.cmd_tx = sender;
     let app = create_router(state, false, false);
 
     let command = serde_json::json!({ "command": "stopall", "message": {} });

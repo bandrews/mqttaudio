@@ -235,7 +235,7 @@ impl ActiveSample {
     ) -> Self {
         let buffer = buffer.into();
         // Default channel mapping: 1:1 for available channels
-        let channel_map = (0..buffer.channels()).map(|ch| (ch, ch)).collect();
+        let channel_map = (0..buffer.channels_blocking()).map(|ch| (ch, ch)).collect();
 
         Self {
             id,
@@ -287,7 +287,7 @@ impl ActiveSample {
     ) -> Self {
         let buffer = buffer.into();
         // Default channel mapping: 1:1 for available channels
-        let channel_map = (0..buffer.channels()).map(|ch| (ch, ch)).collect();
+        let channel_map = (0..buffer.channels_blocking()).map(|ch| (ch, ch)).collect();
 
         Self {
             id,
@@ -1052,7 +1052,6 @@ impl LiveInput {
 
     /// Mute or unmute this input, ramping to avoid a pop. Unmute restores
     /// the configured (or last set) volume rather than snapping to 1.0.
-
     /// Whether this input is muted (or on its way there)
     pub fn is_muted(&self) -> bool {
         self.muted
@@ -1164,7 +1163,7 @@ impl StreamedSource {
             file_path,
             consumer,
             input_channels,
-            volume: volume.clamp(0.0, 1.0),
+            volume: volume.clamp(0.0, crate::config::MAX_GAIN),
             voice_volume: 1.0,
             target_voice_volume: 1.0,
             channel_map,
@@ -1215,7 +1214,7 @@ impl StreamedSource {
 
     /// Set target voice volume for smooth ramping.
     pub fn set_target_voice_volume(&mut self, target: f32) {
-        self.target_voice_volume = target.clamp(0.0, 1.0);
+        self.target_voice_volume = target.clamp(0.0, crate::config::MAX_GAIN);
     }
 
     /// Advance voice volume toward target by one frame (linear ramp, matching the
@@ -2215,6 +2214,52 @@ mod tests {
     }
 
     const TEST_FILE: &str = "test.wav";
+    #[test]
+    fn sample_creation_waits_for_stream_metadata_instead_of_mapping_zero_channels() {
+        use std::sync::{mpsc, RwLock};
+        use std::time::Duration;
+        for with_id in [false, true] {
+            let streaming = Arc::new(RwLock::new(crate::audio::streaming::StreamingBuffer::new(
+                2,
+                48000,
+                Some(100),
+            )));
+            let guard = streaming.write().unwrap();
+            let buffer = SampleBuffer::Streaming(streaming.clone());
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                let sample = if with_id {
+                    ActiveSample::new_with_id(
+                        1,
+                        "voice".into(),
+                        buffer,
+                        1.0,
+                        1.0,
+                        "file.wav".into(),
+                        None,
+                        false,
+                        0,
+                    )
+                } else {
+                    ActiveSample::new(1, "voice".into(), buffer, 1.0, 1.0, "file.wav".into())
+                };
+                let _ = done_tx.send(sample.channel_map);
+            });
+            started_rx.recv().unwrap();
+            assert!(
+                done_rx.recv_timeout(Duration::from_millis(30)).is_err(),
+                "sample was created with unavailable channel metadata"
+            );
+            drop(guard);
+            assert_eq!(
+                done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                vec![(0, 0), (1, 1)]
+            );
+            worker.join().unwrap();
+        }
+    }
 
     #[test]
     fn test_sample_volume_change_ramps_instead_of_jumping() {
@@ -3980,8 +4025,8 @@ mod tests {
         // Two microphones on separate capture devices, each its own voice, so
         // they can be levelled and ducked independently while summing to the
         // same speaker.
-        let consumer1 = create_test_ring_buffer_with_data(&vec![0.4f32; 8]);
-        let consumer2 = create_test_ring_buffer_with_data(&vec![0.6f32; 8]);
+        let consumer1 = create_test_ring_buffer_with_data(&[0.4f32; 8]);
+        let consumer2 = create_test_ring_buffer_with_data(&[0.6f32; 8]);
 
         let mut mic1 = LiveInput::new("mic_north".to_string(), consumer1, 1, 0.5, vec![(0, 2)]);
         mic1.voice_volume = 1.0;

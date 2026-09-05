@@ -231,7 +231,27 @@ impl CacheManager {
     /// evicting evictable entries). The load-strategy decision force-windows an asset
     /// whose estimated decoded size exceeds this.
     pub fn memory_headroom(&self) -> usize {
-        self.memory_cache.fit_headroom()
+        let headroom = self.memory_cache.fit_headroom();
+        if self.memory_cache.max_size_bytes().is_none() {
+            return headroom;
+        }
+        let reserved = self.active_loads.values().fold(0usize, |sum, load| {
+            let bytes = load.buffer.try_read().ok().map_or(headroom, |buffer| {
+                buffer
+                    .total_frames
+                    .map_or(headroom, |frames| {
+                        frames.saturating_mul(buffer.channels).saturating_mul(4)
+                    })
+                    .max(
+                        buffer
+                            .frames_available()
+                            .saturating_mul(buffer.channels)
+                            .saturating_mul(4),
+                    )
+            });
+            sum.saturating_add(bytes)
+        });
+        headroom.saturating_sub(reserved)
     }
 
     /// The resolved hard memory cap in bytes, or `None` if the budget is unlimited.
@@ -905,8 +925,22 @@ impl CacheManager {
         // Determine if this is an HTTP URL or local file
         let is_url = file_path.starts_with("http://") || file_path.starts_with("https://");
         let local_path = if is_url {
-            if self.disk_cache.is_none() {
-                // Disk cache disabled: stream into memory and wait for it
+            if let Some(disk) = self.disk_cache.as_mut() {
+                if disk.is_cached(file_path) {
+                    let _ = disk
+                        .revalidate_if_due(
+                            file_path,
+                            std::time::Duration::from_secs(self.revalidate_after_seconds),
+                        )
+                        .await;
+                    let entry = disk
+                        .get_entry(file_path)
+                        .ok_or("Cached file disappeared during revalidation")?;
+                    disk.get_cached_file_path(entry)
+                } else {
+                    disk.download_and_cache(file_path).await?
+                }
+            } else {
                 let buffer = self
                     .get_or_load_streaming(file_path, target_sample_rate)
                     .await
@@ -915,39 +949,6 @@ impl CacheManager {
                     return Ok(decoded);
                 }
                 return self.wait_for_streaming(file_path, buffer).await;
-            } else if self.disk_cache.as_ref().unwrap().is_cached(file_path) {
-                tracing::debug!("Disk cache hit for: {}", file_path);
-                let _ = self
-                    .disk_cache
-                    .as_mut()
-                    .unwrap()
-                    .revalidate_if_due(
-                        file_path,
-                        std::time::Duration::from_secs(self.revalidate_after_seconds),
-                    )
-                    .await;
-                let entry = self
-                    .disk_cache
-                    .as_ref()
-                    .unwrap()
-                    .get_entry(file_path)
-                    .unwrap();
-                self.disk_cache
-                    .as_ref()
-                    .unwrap()
-                    .get_cached_file_path(entry)
-            } else {
-                // Download and cache
-                tracing::info!("Cache miss, downloading: {}", file_path);
-                let path = self
-                    .disk_cache
-                    .as_mut()
-                    .unwrap()
-                    .download_and_cache(file_path)
-                    .await?;
-                // Log stats after download
-                self.log_stats();
-                path
             }
         } else {
             // Local file path
@@ -1566,5 +1567,33 @@ mod tests {
             frames2 > frames1 + 50_000,
             "reload must serve the republished (longer) file, got {frames2} vs {frames1}"
         );
+    }
+    #[test]
+    fn pending_decodes_reserve_memory_before_their_samples_arrive() {
+        let directory = TempDir::new().unwrap();
+        let mut cache = CacheManager::with_resolved_cap(
+            directory.path().into(),
+            ResamplerQuality::Fast,
+            MemoryCap::Bytes(40_000),
+            Vec::new(),
+            300,
+        )
+        .unwrap();
+        cache.active_loads.insert(
+            "pending.wav".into(),
+            ActiveLoad {
+                buffer: Arc::new(RwLock::new(StreamingBuffer::new(2, 48000, Some(8000)))),
+                path: "pending.wav".into(),
+                generation: None,
+                pending_disk_write: None,
+            },
+        );
+        assert_eq!(
+            cache.memory_headroom(),
+            0,
+            "pending PCM cannot be promised to another full load"
+        );
+        cache.active_loads.clear();
+        assert_eq!(cache.memory_headroom(), 40_000);
     }
 }
