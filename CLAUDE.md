@@ -110,6 +110,9 @@ When asked to do something, just do it - including obvious follow-up actions nee
   actual purpose.
 
 # Testing
+
+- Run validation locally, including Docker-based Linux tests and local browser tests. GitHub Actions is intentionally disabled to avoid hosted CI costs and quota usage. Do not add or enable GitHub Actions workflows, or re-enable Actions for this repository, unless the user explicitly requests it.
+
 - FOR EVERY NEW FEATURE OR BUGFIX in the server layer, YOU MUST follow Test Driven Development :
     1. Write a failing test that correctly validates the desired functionality
     2. Run the test to confirm it fails as expected

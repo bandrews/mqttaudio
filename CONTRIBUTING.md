@@ -30,6 +30,9 @@ cargo build --release  # Release build
 
 ## Running Tests
 
+Run validation locally, including the Docker-based Linux validation and local browser suites. GitHub Actions is intentionally disabled for this repository to avoid hosted CI costs and quota usage. Do not add or enable Actions workflows or re-enable repository Actions without an explicit maintainer request.
+
+
 ### Unit Tests
 
 ```bash
