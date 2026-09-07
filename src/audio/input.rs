@@ -556,6 +556,9 @@ pub struct ActiveInput {
     /// Capture-path counters (D57), drained/logged off-RT and surfaced on /metrics.
     pub telemetry: Arc<InputTelemetry>,
     pub sample_rate: u32,
+    /// Backlog the mixer tolerates before trimming, from the ring and resampler
+    /// geometry.
+    pub max_backlog_frames: usize,
 }
 
 impl ActiveInput {
@@ -623,8 +626,22 @@ pub fn create_input_stream_with_fanout(
         )));
     }
 
+    let minimum_latency = minimum_latency_ms(input_sample_rate, target_sample_rate);
+    let latency_ms = if config.latency_ms < minimum_latency {
+        tracing::warn!(
+            "Input device '{}' latency_ms {} is below the {} ms its ring needs to hold one \
+             resampler burst; using {} ms",
+            device_name,
+            config.latency_ms,
+            minimum_latency,
+            minimum_latency
+        );
+        minimum_latency
+    } else {
+        config.latency_ms
+    };
     // Calculate ring buffer size based on OUTPUT sample rate (after potential resampling)
-    let buffer_size = calculate_ring_buffer_size(target_sample_rate, channels, config.latency_ms);
+    let buffer_size = calculate_ring_buffer_size(target_sample_rate, channels, latency_ms);
 
     if input_sample_rate != target_sample_rate {
         tracing::warn!(
@@ -642,7 +659,7 @@ pub fn create_input_stream_with_fanout(
         input_sample_rate,
         channels,
         sample_format,
-        config.latency_ms
+        latency_ms
     );
 
     // Every input runs through async sample-rate conversion so two independently
@@ -656,7 +673,7 @@ pub fn create_input_stream_with_fanout(
         let (producers, consumers): (Vec<_>, Vec<_>) = rings.into_iter().unzip();
         let mut options = config.clone();
         options.buffer_size = requested_buffer;
-        let (stream, telemetry) = build_resampling_input_stream(
+        let (stream, telemetry, max_backlog_frames) = build_resampling_input_stream(
             &device,
             supported_config,
             sample_format,
@@ -666,9 +683,9 @@ pub fn create_input_stream_with_fanout(
             channels,
             &options,
         )?;
-        Ok((stream, telemetry, consumers))
+        Ok((stream, telemetry, max_backlog_frames, consumers))
     };
-    let (stream, telemetry, consumers) = match build(config.buffer_size) {
+    let (stream, telemetry, max_backlog_frames, consumers) = match build(config.buffer_size) {
         Ok(built) => built,
         Err(error) if config.buffer_size.is_some() => {
             tracing::warn!(
@@ -690,6 +707,7 @@ pub fn create_input_stream_with_fanout(
         channels,
         sample_rate: input_sample_rate,
         telemetry,
+        max_backlog_frames,
     })
 }
 
@@ -792,8 +810,12 @@ pub struct ResampleState {
     output: Vec<Vec<f32>>,
     /// Nominal output/input ratio; the steered ratio is a small deviation of this.
     nominal_ratio: f64,
-    /// Capacity of the destination ring buffer in samples (interleaved).
-    ring_capacity: usize,
+    /// Output frames one resampler chunk publishes at the nominal ratio, the burst
+    /// the ring absorbs on top of its steady fill.
+    burst_frames: usize,
+    /// Ring fill (interleaved samples) the drift-control loop steers toward: the
+    /// middle of the span a burst still fits above.
+    fill_target: usize,
     /// Smoothed ring fill in interleaved samples; `-1.0` until first measured.
     smoothed_fill: f64,
     /// Most recent ratio commanded by the drift-control loop (== nominal until
@@ -864,6 +886,9 @@ impl ResampleState {
         // Reusable output buffer with capacity for the largest possible chunk.
         let output = resampler.output_buffer_allocate(true);
 
+        let burst_frames = resample_burst_frames(input_rate, output_rate);
+        let fill_target = ring_capacity.saturating_sub(burst_frames * channels) / 2;
+
         Ok(Self {
             resampler,
             channels,
@@ -871,7 +896,8 @@ impl ResampleState {
             filled: 0,
             output,
             nominal_ratio,
-            ring_capacity,
+            burst_frames,
+            fill_target,
             smoothed_fill: -1.0,
             last_ratio: nominal_ratio,
             telemetry: Arc::new(InputTelemetry {
@@ -893,6 +919,32 @@ impl ResampleState {
     pub fn nominal_ratio(&self) -> f64 {
         self.nominal_ratio
     }
+
+    /// Backlog the mixer tolerates before trimming: the highest fill the loop
+    /// parks at while its authority still covers the drift, plus one burst landing
+    /// on top. Beyond this the drift exceeds what steering can absorb and trimming
+    /// is the right response.
+    pub fn backlog_ceiling_frames(&self) -> usize {
+        let target_frames = self.fill_target / self.channels;
+        let parked_max = target_frames as f64 * (1.0 + STEER_MAX_DEVIATION / STEER_GAIN);
+        parked_max.ceil() as usize + self.burst_frames
+    }
+}
+
+/// Output frames one resampler chunk publishes at the nominal ratio.
+fn resample_burst_frames(input_rate: u32, output_rate: u32) -> usize {
+    (RESAMPLE_CHUNK_SIZE as f64 * output_rate as f64 / input_rate as f64).ceil() as usize
+}
+
+/// Smallest `latency_ms` whose ring holds the steering target plus one resampler
+/// burst. Below this the capture side drops at the ring on every chunk, so a
+/// configured value under it is raised.
+pub fn minimum_latency_ms(input_rate: u32, output_rate: u32) -> u32 {
+    let burst = resample_burst_frames(input_rate, output_rate);
+    let frames_per_ms = (output_rate / 1000).max(1) as usize;
+    // The ring holds 4 * latency_ms * frames_per_ms frames; two bursts leave the
+    // target one burst of headroom on each side.
+    (2 * burst).div_ceil(4 * frames_per_ms) as u32
 }
 
 /// Resample one block of interleaved capture `data` into `producer`.
@@ -998,19 +1050,20 @@ pub fn resample_block_fanout(
     }
 }
 
-/// Nudge the resampler ratio toward keeping the ring buffer ~half-full (D33).
+/// Nudge the resampler ratio toward keeping the ring buffer at its fill target
+/// (D33).
 ///
 /// Two independently-clocked devices drift; left alone the ring monotonically
 /// fills or drains until it clicks (overflow) or starves (underrun silence). A
 /// slow proportional loop on the smoothed fill error corrects that: when the
-/// ring runs above half-full the consumer is slower than the producer, so we
+/// ring runs above the target the consumer is slower than the producer, so we
 /// reduce the output ratio (emit fewer frames) and vice versa. The commanded
 /// deviation is clamped to [`STEER_MAX_DEVIATION`], well inside the resampler's
 /// `RESAMPLE_MAX_RELATIVE`, so it is inaudible as pitch.
 fn steer_ratio(state: &mut ResampleState, producer: &HeapProducer<f32>) {
     use rubato::Resampler;
 
-    if state.ring_capacity == 0 {
+    if state.fill_target == 0 {
         return;
     }
 
@@ -1021,10 +1074,10 @@ fn steer_ratio(state: &mut ResampleState, producer: &HeapProducer<f32>) {
         state.smoothed_fill + STEER_FILL_SMOOTHING * (fill - state.smoothed_fill)
     };
 
-    let half = state.ring_capacity as f64 / 2.0;
-    // Normalized error: +1.0 when full, -1.0 when empty.
-    let err = (state.smoothed_fill - half) / half;
-    // Above half-full => slow the output (ratio < nominal); below => speed it up.
+    let target = state.fill_target as f64;
+    // Normalized error: -1.0 when empty, +1.0 at twice the target.
+    let err = (state.smoothed_fill - target) / target;
+    // Above the target => slow the output (ratio < nominal); below => speed it up.
     let deviation = (-STEER_GAIN * err).clamp(-STEER_MAX_DEVIATION, STEER_MAX_DEVIATION);
     let new_ratio = state.nominal_ratio * (1.0 + deviation);
 
@@ -1054,7 +1107,7 @@ fn build_resampling_input_stream(
     output_rate: u32,
     channels: usize,
     options: &InputStreamConfig,
-) -> Result<(Stream, Arc<InputTelemetry>), InputError> {
+) -> Result<(Stream, Arc<InputTelemetry>, usize), InputError> {
     match input_stream_builder(sample_format) {
         Some(InputSampleHandling::F32) => build_typed_resampling_input_stream::<f32>(
             device,
@@ -1112,7 +1165,7 @@ fn build_typed_resampling_input_stream<T>(
     output_rate: u32,
     channels: usize,
     options: &InputStreamConfig,
-) -> Result<(Stream, Arc<InputTelemetry>), InputError>
+) -> Result<(Stream, Arc<InputTelemetry>, usize), InputError>
 where
     T: cpal::SizedSample,
     f32: cpal::FromSample<T>,
@@ -1130,6 +1183,7 @@ where
     )?;
     let telemetry = state.telemetry();
     let callback_telemetry = Arc::clone(&telemetry);
+    let max_backlog_frames = state.backlog_ceiling_frames();
 
     // Pre-size the conversion scratch to the largest block the device says it can
     // deliver (D58), clamped to a sane cap; `Unknown` gets the cap. The resize in
@@ -1172,7 +1226,7 @@ where
         )
         .map_err(|e| InputError::StreamError(e.to_string()))?;
 
-    Ok((stream, telemetry))
+    Ok((stream, telemetry, max_backlog_frames))
 }
 
 /// Error types for input operations

@@ -97,14 +97,16 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
   compile. It now pins `rust:1.95-bookworm` (matching the validate image), so both images build the same code;
   this is resolved. Left on record so the version coupling between the two Dockerfiles is documented.
 
-- **Drift control uses a pure-proportional loop, so the ring settles near — not exactly at — half-full (Sprint 8 — LOW, by design).**
+- **Drift control uses a pure-proportional loop, so the ring settles near — not exactly at — its target (Sprint 8 — LOW, by design).**
   `steer_ratio` (`src/audio/input.rs`) is a P controller on the smoothed ring fill. Holding a steady clock
   mismatch requires a steady non-zero ratio deviation, which a P loop produces only with a steady non-zero fill
-  error: the ring therefore parks at an offset from half (e.g. ~±20% of half at a 1% mismatch, less for realistic
-  ppm-scale drift) rather than dead-centre. This satisfies D33's goal (bounded fill, never 0/capacity) and keeps
-  the loop simple and provably stable. If a future need wants the fill pinned to half-full (e.g. to maximize
-  symmetric headroom), add a small integral term (PI) with anti-windup — note it here rather than building it now
-  (YAGNI). Covered by `tests/input_resample_test.rs::steering_converges_to_true_clock_ratio`.
+  error: the ring therefore parks at an offset from the target (e.g. ~±20% of the target at a 1% mismatch, ±40%
+  at the 2% authority limit, less for realistic ppm-scale drift) rather than dead-centre. This satisfies D33's
+  goal (bounded fill, never 0/capacity) and keeps the loop simple and provably stable; the mixer's trim ceiling
+  (`ResampleState::backlog_ceiling_frames`) allows for the full offset plus one burst. If a future need wants the
+  fill pinned to the target (e.g. to maximize symmetric headroom), add a small integral term (PI) with anti-windup
+  — note it here rather than building it now (YAGNI). Covered by
+  `tests/input_resample_test.rs::steering_converges_to_true_clock_ratio`.
 
 - **No final low-pass on the summed LFE bus (Sprint 7 — LOW, YAGNI per D32).** Bass management low-passes each
   source channel before summing into the LFE, but the LFE *output bus* itself is not low-passed after
@@ -501,3 +503,22 @@ multichannel USB duplex behavior remain release-candidate field checks.
 MQTT/TLS tests are enabled with `MQTTAUDIO_BROKER_TESTS=1` and
 `MQTTAUDIO_TLS_CA`. The Linux validation container starts a private broker and
 runs these checks. Device-opening checks require a separate explicit invocation.
+
+## Live-input drift steering and the mixer backlog ceiling (resolved in 2.1)
+
+`steer_ratio` (`src/audio/input.rs`) parked the ring near half-full while `LiveInput::new`
+(`src/audio/mixer.rs`) set `max_backlog_frames` to exactly half the ring. The mixer trims
+whenever the backlog exceeds that ceiling by more than one output block, but the resampler
+publishes `RESAMPLE_CHUNK_SIZE` (1024) frames in one burst, so with the default
+`audio.buffer_size` of 512 every burst landed above the ceiling once the loop had settled:
+a ~11 ms trim about 1.4 times per second and a steered ratio of about +1.5% (pitch up),
+because the trims kept the smoothed fill below target. The trim came from main (`5ad2650`)
+and the steering from Sprint 8 (`68b9cec`); the merge reconciled both without noticing that
+the ceiling equalled the target, and the rc validation ran no sustained mic-through-mixer
+session. Now `ResampleState` owns the geometry: the loop targets the middle of the span that
+leaves one burst of room above, `backlog_ceiling_frames` is that target at the 2% authority
+limit plus one burst, and the capture path passes it to `LiveInput::new`. `minimum_latency_ms`
+raises a `latency_ms` whose ring cannot hold two bursts, with a warning. Covered by the
+`run_mixer_sim` tests in `tests/input_resample_test.rs` (equal clocks at 256/512/1024-frame
+blocks, ±1.5% inside the authority, 4% beyond it) and
+`minimum_latency_holds_the_target_plus_one_burst`.

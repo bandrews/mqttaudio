@@ -789,7 +789,7 @@ mod tests {
     fn live_input(voice: &str, volume: f32) -> LiveInput {
         use ringbuf::HeapRb;
         let consumer = HeapRb::<f32>::new(16).split().1;
-        LiveInput::new(voice.to_string(), consumer, 1, volume, vec![(0, 0)])
+        LiveInput::new(voice.to_string(), consumer, 1, volume, vec![(0, 0)], 8)
     }
 
     #[test]

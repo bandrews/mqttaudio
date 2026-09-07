@@ -36,7 +36,7 @@ Add inputs to your config file:
 | `volume` | Input volume (0.0 to 4.0, unity is 1.0) |
 | `voice_id` | Voice name for ducking integration |
 | `routes` | Channel routing (source → destination) |
-| `latency_ms` | Buffer latency (5-500ms) |
+| `latency_ms` | Buffer latency (5-500ms). Raised with a warning when the ring cannot hold one resampler chunk (11 ms at 48 kHz) |
 | `channels` | Capture channels to open. Omit to let the routes decide |
 | `sample_rate` | Capture rate to request. Omit to match the output rate |
 
@@ -308,6 +308,11 @@ The `latency_ms` setting controls the input buffer size:
 
 For live microphones, use the lowest stable setting (typically 20-30ms).
 
+Capture runs through a resampler that publishes audio in 1024-frame chunks, so
+the ring must hold at least two chunks. A `latency_ms` below that minimum (11 ms
+at a 48 kHz output, 12 ms at 44.1 kHz) is raised to it when the input opens, with
+a warning naming the value used.
+
 ## Sample Rate and Clock-Drift Handling
 
 An input device and the output device are clocked by independent oscillators. Even when their nominal sample
@@ -316,12 +321,15 @@ long session the input's ring buffer slowly fills or drains until it overflows (
 dropout). To stay glitch-free over the long-running sessions this daemon is built for, **every input runs
 through an asynchronous sample-rate converter**, not just inputs whose rate differs from the output.
 
-The converter's resampling ratio is gently steered from the measured ring-buffer fill toward half-full: if
-the ring is trending full the input is producing slightly faster than the output consumes, so the converter
-emits marginally fewer frames, and vice versa. The correction authority is a small fraction of a percent —
-far more than enough to track real oscillator drift (tens of parts per million) yet small enough to be
-inaudible as pitch. The result is a ring-buffer fill that stays bounded indefinitely instead of drifting to a
-boundary.
+The converter's resampling ratio is gently steered from the measured ring-buffer fill toward a target: the
+middle of the span that still leaves room for one resampler chunk to land on top. If the ring is trending
+full the input is producing slightly faster than the output consumes, so the converter emits marginally
+fewer frames, and vice versa. The correction authority is 2% — far more than enough to track real
+oscillator drift (tens of parts per million) yet small enough to be inaudible as pitch. The result is a
+ring-buffer fill that stays bounded indefinitely instead of drifting to a boundary.
+
+The mixer's trim ceiling (`max_backlog_frames`) sits above the highest fill the steering can park at plus
+one chunk, so trimming only starts once the clock mismatch exceeds what the steering can absorb.
 
 If the input device's nominal rate differs from the output you'll also see a warning that the rate conversion
 adds latency:
@@ -428,10 +436,12 @@ A handful of `underrun_frames` at startup is normal while the buffer primes.
 - Check CPU usage - a stalled audio callback shows up here first
 
 **Trims (`trimmed_frames` climbing steadily):**
-- Input and output clocks are drifting apart, which happens when the microphone
-  and the speakers are on different devices. Trimming keeps latency bounded, at
-  the cost of an occasional discontinuity. Putting capture and playback on the
-  same interface removes the drift
+- Input and output clocks differ by more than the 2% the drift control can
+  absorb. Ordinary drift between two devices is far smaller than that, so steady
+  trimming usually means capture opened at a rate the card is not actually
+  running at (see the choppy-audio entry above). Trimming keeps latency bounded,
+  at the cost of an occasional discontinuity. Putting capture and playback on the
+  same interface removes the drift entirely
 
 **Audio is delayed:**
 - Reduce `latency_ms`

@@ -503,7 +503,7 @@ Microphone/input device configuration.
 | `volume` | float | `1.0` | Input volume (0.0 to 4.0, unity is 1.0) |
 | `voice_id` | string | — | Voice name for ducking integration |
 | `routes` | array | *required* | Channel routing (source → dest, can use aliases) |
-| `latency_ms` | integer | `20` | Buffer latency (5-500ms) |
+| `latency_ms` | integer | `20` | Buffer latency (5-500ms). Raised with a warning when the ring cannot hold one resampler chunk (11 ms at 48 kHz) |
 | `activity_threshold` | float | `null` | Peak level (0.0-1.0) above which this input counts as speaking for ducking rules; `null` disables activity detection |
 | `activity_hold_ms` | integer | `750` | How long activity persists after the level drops (0-10000ms) |
 | `channels` | integer | *auto* | Capture channels to open (1-64). Defaults to the smallest count that covers every `source_channel` |

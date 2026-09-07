@@ -903,24 +903,24 @@ pub struct LiveInput {
 }
 
 impl LiveInput {
-    /// Create a new live input with the given routing
+    /// Create a new live input with the given routing. `max_backlog_frames` is the
+    /// backlog the mixer tolerates before trimming; the capture path derives it
+    /// from its ring and resampler geometry.
     pub fn new(
         voice_id: String,
         consumer: HeapConsumer<f32>,
         input_channels: usize,
         volume: f32,
         channel_map: Vec<(usize, usize)>,
+        max_backlog_frames: usize,
     ) -> Self {
-        let channels = input_channels.max(1);
-        let capacity_frames = consumer.capacity() / channels;
-
         Self {
             voice_id,
             consumer,
             input_channels,
             volume,
             target_volume: volume,
-            max_backlog_frames: capacity_frames / 2,
+            max_backlog_frames,
             trimmed_frames: 0,
             underrun_frames: 0,
             dropped_frames: Arc::new(AtomicU64::new(0)),
@@ -2294,7 +2294,7 @@ mod tests {
         // Unmuting must restore the level the input was configured/boosted
         // to, not snap to 1.0
         let (_producer, consumer) = crate::audio::input::create_ring_buffer(1024);
-        let mut input = LiveInput::new("mic".to_string(), consumer, 2, 0.7, vec![(0, 0)]);
+        let mut input = test_live_input("mic".to_string(), consumer, 2, 0.7, vec![(0, 0)]);
 
         input.set_muted(true);
         assert!(input.is_muted());
@@ -3474,6 +3474,25 @@ mod tests {
         consumer
     }
 
+    /// A live input whose backlog ceiling is half its ring.
+    fn test_live_input(
+        voice_id: String,
+        consumer: HeapConsumer<f32>,
+        input_channels: usize,
+        volume: f32,
+        channel_map: Vec<(usize, usize)>,
+    ) -> LiveInput {
+        let max_backlog_frames = consumer.capacity() / input_channels.max(1) / 2;
+        LiveInput::new(
+            voice_id,
+            consumer,
+            input_channels,
+            volume,
+            channel_map,
+            max_backlog_frames,
+        )
+    }
+
     /// Interleaved test data where each sample's value identifies its channel
     fn channel_marked_frames(frames: usize, channels: usize) -> Vec<f32> {
         (0..frames * channels)
@@ -3489,7 +3508,7 @@ mod tests {
             .collect();
         let consumer = create_test_ring_buffer_with_data(&data);
 
-        let live_input = LiveInput::new(
+        let live_input = test_live_input(
             "mic".to_string(),
             consumer,
             2, // stereo input
@@ -3518,7 +3537,7 @@ mod tests {
         let data = vec![1.0f32; 10];
         let consumer = create_test_ring_buffer_with_data(&data);
 
-        let live_input = LiveInput::new(
+        let live_input = test_live_input(
             "mic".to_string(),
             consumer,
             1,   // mono input
@@ -3544,7 +3563,7 @@ mod tests {
         let consumer = create_test_ring_buffer_with_data(&data);
 
         // Route mono input to channels 2 and 3 (4-channel output)
-        let live_input = LiveInput::new("mic".to_string(), consumer, 1, 1.0, vec![(0, 2), (0, 3)]);
+        let live_input = test_live_input("mic".to_string(), consumer, 1, 1.0, vec![(0, 2), (0, 3)]);
 
         let mut state = MixerState::new(4);
         state.live_inputs.push(live_input);
@@ -3565,7 +3584,7 @@ mod tests {
         let data = vec![0.8f32; 10]; // 5 stereo frames
         let consumer = create_test_ring_buffer_with_data(&data);
 
-        let live_input = LiveInput::new("mic".to_string(), consumer, 2, 1.0, vec![(0, 0), (1, 1)]);
+        let live_input = test_live_input("mic".to_string(), consumer, 2, 1.0, vec![(0, 0), (1, 1)]);
 
         let mut state = MixerState::new(2);
         state.live_inputs.push(live_input);
@@ -3615,7 +3634,7 @@ mod tests {
         // click probe).
         let data = vec![0.8f32; REAL_FRAMES * CHANNELS];
         let consumer = create_test_ring_buffer_with_data(&data);
-        let mut live_input = LiveInput::new(
+        let mut live_input = test_live_input(
             "mic".to_string(),
             consumer,
             CHANNELS,
@@ -3665,7 +3684,7 @@ mod tests {
         // (b) The voice-volume ramp advanced for EVERY frame of the block, silent
         // frames included — matching a full-block ramp, not one that stalled at the
         // underrun. Compute the full-block expectation with an independent ramp.
-        let mut reference = LiveInput::new(
+        let mut reference = test_live_input(
             "ref".to_string(),
             {
                 use ringbuf::HeapRb;
@@ -3705,7 +3724,7 @@ mod tests {
         let data = vec![0.4f32; 20]; // 10 stereo frames
         let consumer = create_test_ring_buffer_with_data(&data);
 
-        let live_input = LiveInput::new("mic".to_string(), consumer, 2, 1.0, vec![(0, 0), (1, 1)]);
+        let live_input = test_live_input("mic".to_string(), consumer, 2, 1.0, vec![(0, 0), (1, 1)]);
 
         let mut state = MixerState::new(2);
         state.active_samples.push(sample);
@@ -3725,7 +3744,7 @@ mod tests {
         let data = vec![1.0f32; 10];
         let consumer = create_test_ring_buffer_with_data(&data);
 
-        let mut live_input = LiveInput::new(
+        let mut live_input = test_live_input(
             "mic".to_string(),
             consumer,
             1,
@@ -3753,11 +3772,11 @@ mod tests {
         // Two microphones mixing to same outputs
         let data1 = vec![0.2f32; 10];
         let consumer1 = create_test_ring_buffer_with_data(&data1);
-        let live_input1 = LiveInput::new("mic1".to_string(), consumer1, 1, 1.0, vec![(0, 0)]);
+        let live_input1 = test_live_input("mic1".to_string(), consumer1, 1, 1.0, vec![(0, 0)]);
 
         let data2 = vec![0.3f32; 10];
         let consumer2 = create_test_ring_buffer_with_data(&data2);
-        let live_input2 = LiveInput::new("mic2".to_string(), consumer2, 1, 1.0, vec![(0, 0)]);
+        let live_input2 = test_live_input("mic2".to_string(), consumer2, 1, 1.0, vec![(0, 0)]);
 
         let mut state = MixerState::new(1);
         state.live_inputs.push(live_input1);
@@ -3781,7 +3800,7 @@ mod tests {
         let data = channel_marked_frames(frames, channels);
         let consumer = create_test_ring_buffer_with_data(&data);
 
-        let live_input = LiveInput::new(
+        let live_input = test_live_input(
             "mic".to_string(),
             consumer,
             channels,
@@ -3821,7 +3840,7 @@ mod tests {
         let data = channel_marked_frames(6, channels);
         let consumer = create_test_ring_buffer_with_data(&data);
 
-        let live_input = LiveInput::new("mic".to_string(), consumer, channels, 1.0, vec![(3, 0)]);
+        let live_input = test_live_input("mic".to_string(), consumer, channels, 1.0, vec![(3, 0)]);
 
         let mut state = MixerState::new(1);
         state.live_inputs.push(live_input);
@@ -3851,7 +3870,7 @@ mod tests {
         let data = vec![0.5f32; 380]; // 190 frames queued
         let consumer = create_test_ring_buffer_with_capacity(&data, capacity);
 
-        let live_input = LiveInput::new(
+        let live_input = test_live_input(
             "mic".to_string(),
             consumer,
             channels,
@@ -3886,7 +3905,7 @@ mod tests {
         let data = vec![0.5f32; 20]; // 10 frames
         let consumer = create_test_ring_buffer_with_capacity(&data, 400);
 
-        let live_input = LiveInput::new(
+        let live_input = test_live_input(
             "mic".to_string(),
             consumer,
             channels,
@@ -3909,7 +3928,7 @@ mod tests {
         let data = vec![0.8f32; 10]; // 5 stereo frames
         let consumer = create_test_ring_buffer_with_data(&data);
 
-        let live_input = LiveInput::new("mic".to_string(), consumer, 2, 1.0, vec![(0, 0), (1, 1)]);
+        let live_input = test_live_input("mic".to_string(), consumer, 2, 1.0, vec![(0, 0), (1, 1)]);
 
         let mut state = MixerState::new(2);
         state.live_inputs.push(live_input);
@@ -3926,7 +3945,7 @@ mod tests {
         // starved, otherwise a mute applied during a dropout never completes.
         let consumer = create_test_ring_buffer_with_data(&[]);
 
-        let mut live_input = LiveInput::new("mic".to_string(), consumer, 1, 1.0, vec![(0, 0)]);
+        let mut live_input = test_live_input("mic".to_string(), consumer, 1, 1.0, vec![(0, 0)]);
         live_input.set_target_voice_volume(0.0);
         let before = live_input.voice_volume;
 
@@ -3950,7 +3969,7 @@ mod tests {
         // Source channel 7 does not exist on a stereo input; destination 9
         // does not exist on a stereo output. Both routes must be skipped
         // without disturbing the valid one.
-        let live_input = LiveInput::new(
+        let live_input = test_live_input(
             "mic".to_string(),
             consumer,
             2,
@@ -3979,7 +3998,7 @@ mod tests {
         let data = channel_marked_frames(frames, channels);
         let consumer = create_test_ring_buffer_with_data(&data);
 
-        let mut mics = LiveInput::new(
+        let mut mics = test_live_input(
             "gamemaster".to_string(),
             consumer,
             channels,
@@ -4028,11 +4047,11 @@ mod tests {
         let consumer1 = create_test_ring_buffer_with_data(&[0.4f32; 8]);
         let consumer2 = create_test_ring_buffer_with_data(&[0.6f32; 8]);
 
-        let mut mic1 = LiveInput::new("mic_north".to_string(), consumer1, 1, 0.5, vec![(0, 2)]);
+        let mut mic1 = test_live_input("mic_north".to_string(), consumer1, 1, 0.5, vec![(0, 2)]);
         mic1.voice_volume = 1.0;
         mic1.target_voice_volume = 1.0;
 
-        let mut mic2 = LiveInput::new("mic_south".to_string(), consumer2, 1, 1.0, vec![(0, 2)]);
+        let mut mic2 = test_live_input("mic_south".to_string(), consumer2, 1, 1.0, vec![(0, 2)]);
         mic2.voice_volume = 0.5;
         mic2.target_voice_volume = 0.5;
 
@@ -4172,7 +4191,7 @@ mod tests {
     #[test]
     fn test_live_input_target_voice_volume_allows_boost() {
         let consumer = create_test_ring_buffer_with_data(&[0.1f32; 4]);
-        let mut input = LiveInput::new("mic".to_string(), consumer, 1, 1.0, vec![(0, 0)]);
+        let mut input = test_live_input("mic".to_string(), consumer, 1, 1.0, vec![(0, 0)]);
 
         input.set_target_voice_volume(2.5);
         assert_eq!(input.target_voice_volume, 2.5);
@@ -4185,7 +4204,7 @@ mod tests {
     fn test_live_input_volume_can_boost() {
         // A quiet microphone lifted above unity
         let consumer = create_test_ring_buffer_with_data(&[0.2f32; 4]);
-        let mut input = LiveInput::new("mic".to_string(), consumer, 1, 3.0, vec![(0, 0)]);
+        let mut input = test_live_input("mic".to_string(), consumer, 1, 3.0, vec![(0, 0)]);
         input.voice_volume = 1.0;
         input.target_voice_volume = 1.0;
 
@@ -5342,7 +5361,7 @@ mod tests {
         let data = vec![1.0f32; 100];
         let consumer = create_test_ring_buffer_with_data(&data);
 
-        let mut input = LiveInput::new("mic".to_string(), consumer, 1, 1.0, vec![(0, 0)]);
+        let mut input = test_live_input("mic".to_string(), consumer, 1, 1.0, vec![(0, 0)]);
 
         // Set target volume
         input.set_target_voice_volume(0.3);

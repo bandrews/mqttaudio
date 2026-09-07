@@ -636,6 +636,7 @@ async fn test_inputs_endpoint_reports_health() {
         2,
         0.75,
         vec![(0, 0), (1, 1)],
+        100,
     );
     input.trimmed_frames = 3;
     input.underrun_frames = 7;

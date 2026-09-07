@@ -5,6 +5,22 @@ All notable changes to mqttaudio will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Live inputs no longer trim on every resampler chunk.** The drift-control loop steered the capture ring
+  toward half-full while the mixer's trim ceiling was also half the ring, so with the default
+  `audio.buffer_size` every 1024-frame resampler burst crossed the ceiling once the loop had settled: an
+  11 ms dropout about 1.4 times per second and a permanent +1.5% pitch shift on every microphone. The loop
+  now targets the middle of the span that leaves room for one burst, and the capture path hands the mixer a
+  ceiling above the highest fill the steering can park at plus one burst, so trimming only starts when the
+  clock mismatch exceeds the 2% steering authority. `max_backlog_frames` in `/status/inputs` reports the new
+  ceiling.
+- **`latency_ms` too small for the resampler is raised instead of dropping audio.** A ring that cannot hold
+  the steering target plus one 1024-frame burst dropped at the producer on every chunk. The minimum (11 ms
+  at a 48 kHz output) is now applied when the input opens, with a warning naming the value used.
+
 ## [2.1.0-rc.1] - 2026-09-04
 
 This release candidate consolidates the v2.1 development line, the August main

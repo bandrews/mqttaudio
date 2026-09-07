@@ -675,6 +675,7 @@ async fn main() {
                         channels,
                         input_config.volume,
                         channel_map,
+                        capture.active.max_backlog_frames,
                     )
                     .with_dropped_frames(capture.active.telemetry.dropped_frames.clone());
 
@@ -3914,6 +3915,7 @@ mod tests {
             1,
             volume,
             vec![(0, 0)],
+            8,
         ));
         fixture.inputs.push(http::InputStatus {
             index,

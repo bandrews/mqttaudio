@@ -320,6 +320,7 @@ fn live_input_underrun_mix_is_allocation_free_after_warmup() {
         CHANNELS,
         1.0,
         vec![(0, 0), (1, 1)],
+        1024,
     );
     let mut state = SceneBuilder::new(2).live_input(input).build();
     let mut block = vec![0.0f32; BLOCK * 2];

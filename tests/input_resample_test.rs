@@ -3,8 +3,9 @@
 
 use mqttaudio::audio::input::{
     calculate_ring_buffer_size, convert_input_block, create_ring_buffer, input_stream_builder,
-    resample_block, ResampleState,
+    minimum_latency_ms, resample_block, ResampleState,
 };
+use mqttaudio::audio::mixer::{mix_audio, LiveInput, MixerState};
 use mqttaudio::audio::test_support::{band_energy, rms};
 
 /// Outcome of a drift simulation run.
@@ -411,4 +412,197 @@ fn ring_overflow_bumps_the_telemetry_counter_instead_of_logging() {
         0,
         "well-formed chunks must not count as resample errors"
     );
+}
+
+/// Outcome of running the capture path and the mixer's live-input path together.
+struct MixerSimResult {
+    /// Trim events after warmup, and the frames they discarded.
+    trims: usize,
+    trimmed_frames: u64,
+    /// Highest backlog the mixer saw at the start of a callback after warmup.
+    peak_backlog_frames: usize,
+    /// Output frames the mixer had no captured audio for, after warmup.
+    underrun_frames: u64,
+    /// Frames the capture side could not hand over because the ring was full.
+    dropped_frames: u64,
+    final_ratio: f64,
+    max_backlog_frames: usize,
+}
+
+/// Feed the drift-steered resampler and drain it through `mix_audio`, the way
+/// the daemon does: capture delivers `block` frames per callback (the capture
+/// stream is opened with the output buffer size) and the output callback
+/// consumes `block` frames. `mismatch` is the capture clock's excess over the
+/// output clock (+0.01 = capture runs 1% fast). Runs for `seconds`, ignoring the
+/// first five for the loop to settle.
+fn run_mixer_sim(block: usize, latency_ms: u32, mismatch: f64, seconds: usize) -> MixerSimResult {
+    let rate = 48_000u32;
+    let channels = 1usize;
+    let ring_size = calculate_ring_buffer_size(rate, channels, latency_ms);
+    let (mut producer, consumer) = create_ring_buffer(ring_size);
+    let capacity = producer.capacity();
+    let mut state = ResampleState::new(rate, rate, channels, capacity).expect("resampler");
+    let max_backlog_frames = state.backlog_ceiling_frames();
+
+    let mut mixer = MixerState::new(channels);
+    mixer.live_inputs.push(LiveInput::new(
+        "mic".to_string(),
+        consumer,
+        channels,
+        1.0,
+        vec![(0, 0)],
+        max_backlog_frames,
+    ));
+
+    let mut output = vec![0.0f32; block * channels];
+    let callbacks_per_second = rate as usize / block;
+    let warmup_callbacks = callbacks_per_second * 5;
+    let mut capture_acc = 0.0f64;
+    let mut trims = 0usize;
+    let mut trimmed_frames = 0u64;
+    let mut peak_backlog_frames = 0usize;
+    let mut underruns_at_warmup = 0u64;
+
+    for callback in 0..callbacks_per_second * seconds {
+        capture_acc += block as f64 * (1.0 + mismatch);
+        let frames_in = capture_acc.floor() as usize;
+        capture_acc -= frames_in as f64;
+        resample_block(
+            &mut state,
+            &vec![0.1f32; frames_in * channels],
+            &mut producer,
+        );
+
+        let before = mixer.live_inputs[0].trimmed_frames;
+        let backlog = mixer.live_inputs[0].backlog_frames();
+        mix_audio(&mut output, &mut mixer);
+        let input = &mixer.live_inputs[0];
+        if callback == warmup_callbacks {
+            underruns_at_warmup = input.underrun_frames;
+        }
+        if callback >= warmup_callbacks {
+            let trimmed = input.trimmed_frames - before;
+            if trimmed > 0 {
+                trims += 1;
+                trimmed_frames += trimmed;
+            }
+            peak_backlog_frames = peak_backlog_frames.max(backlog);
+        }
+    }
+
+    let input = &mixer.live_inputs[0];
+    MixerSimResult {
+        trims,
+        trimmed_frames,
+        peak_backlog_frames,
+        underrun_frames: input.underrun_frames - underruns_at_warmup,
+        dropped_frames: state
+            .telemetry()
+            .dropped_frames
+            .load(std::sync::atomic::Ordering::Relaxed),
+        final_ratio: state.current_ratio(),
+        max_backlog_frames,
+    }
+}
+
+/// The drift-steered resampler and the mixer's backlog ceiling must agree on
+/// where the ring sits. With both device clocks equal the loop parks the ring at
+/// its target and each resampler burst lands on top of that, so the mixer must
+/// never trim: a trim here is a self-inflicted dropout, not drift compensation.
+/// Checked at the daemon's default `audio.buffer_size` and at the smaller and
+/// larger blocks an interface may run.
+#[test]
+fn steady_equal_rate_capture_is_never_trimmed_by_the_mixer() {
+    for block in [256usize, 512, 1024] {
+        let r = run_mixer_sim(block, 20, 0.0, 30);
+        assert_eq!(
+            r.trimmed_frames, 0,
+            "block {block}: mixer trimmed {} frames in {} callbacks after warmup \
+             (ceiling {} frames, peak backlog {} frames, steered ratio {:.5})",
+            r.trimmed_frames, r.trims, r.max_backlog_frames, r.peak_backlog_frames, r.final_ratio,
+        );
+        assert_eq!(
+            r.underrun_frames, 0,
+            "block {block}: mixer starved after warmup"
+        );
+        assert_eq!(
+            r.dropped_frames, 0,
+            "block {block}: capture dropped at the ring"
+        );
+        assert!(
+            (r.final_ratio - 1.0).abs() < 0.001,
+            "block {block}: equal clocks should idle near the nominal ratio, got {}",
+            r.final_ratio
+        );
+    }
+}
+
+/// While the clock mismatch is inside the steering authority the ratio absorbs
+/// it and the mixer still has no reason to trim: the ceiling leaves room for the
+/// proportional loop's steady-state offset plus one burst.
+#[test]
+fn drift_within_steering_authority_is_absorbed_without_trims() {
+    for mismatch in [0.015f64, -0.015] {
+        let r = run_mixer_sim(512, 20, mismatch, 40);
+        assert_eq!(
+            r.trimmed_frames, 0,
+            "mismatch {mismatch}: mixer trimmed {} frames in {} callbacks (ceiling {}, peak \
+             backlog {}, ratio {:.5})",
+            r.trimmed_frames, r.trims, r.max_backlog_frames, r.peak_backlog_frames, r.final_ratio,
+        );
+        assert_eq!(r.underrun_frames, 0, "mismatch {mismatch}: mixer starved");
+        assert_eq!(
+            r.dropped_frames, 0,
+            "mismatch {mismatch}: capture dropped at the ring"
+        );
+    }
+}
+
+/// Past the steering authority the backlog would grow without bound; the mixer's
+/// ceiling is the safety net that keeps latency bounded by discarding the oldest
+/// audio. A callback can still find one burst above the ceiling, landed since
+/// the previous trim, so that is the latency bound.
+#[test]
+fn drift_beyond_steering_authority_is_trimmed_to_the_ceiling() {
+    let r = run_mixer_sim(512, 25, 0.04, 30);
+    assert!(r.trims > 0, "a 4% fast capture clock must be trimmed");
+    assert!(
+        r.peak_backlog_frames <= r.max_backlog_frames + 1024,
+        "backlog {} exceeded the ceiling {} plus one burst",
+        r.peak_backlog_frames,
+        r.max_backlog_frames
+    );
+}
+
+/// A ring must hold the steering target plus one resampler burst, otherwise the
+/// capture side drops at the ring on every chunk. The minimum latency follows
+/// from the burst size at the nominal ratio and the output rate.
+#[test]
+fn minimum_latency_holds_the_target_plus_one_burst() {
+    // 1024-frame burst at 48 kHz: 2 bursts / (4 * 48 frames per ms) = 10.67 ms.
+    assert_eq!(minimum_latency_ms(48_000, 48_000), 11);
+    // 44.1 kHz counts 44 frames per ms in the ring sizing.
+    assert_eq!(minimum_latency_ms(44_100, 44_100), 12);
+    // Capture at 44.1 kHz into a 48 kHz output: the burst grows with the ratio.
+    assert_eq!(minimum_latency_ms(44_100, 48_000), 12);
+    // Capture at 96 kHz into 48 kHz: half the burst, half the latency.
+    assert_eq!(minimum_latency_ms(96_000, 48_000), 6);
+
+    for (input_rate, output_rate) in [(48_000, 48_000), (44_100, 48_000), (96_000, 48_000)] {
+        let latency = minimum_latency_ms(input_rate, output_rate);
+        let capacity = calculate_ring_buffer_size(output_rate, 1, latency);
+        let state = ResampleState::new(input_rate, output_rate, 1, capacity).expect("resampler");
+        let burst = (1024.0 * output_rate as f64 / input_rate as f64).ceil() as usize;
+        assert!(
+            state.backlog_ceiling_frames() <= capacity,
+            "{input_rate}->{output_rate}: ceiling {} does not fit the ring {}",
+            state.backlog_ceiling_frames(),
+            capacity
+        );
+        assert!(
+            capacity >= 2 * burst,
+            "{input_rate}->{output_rate}: ring {} at {latency} ms holds fewer than two bursts",
+            capacity
+        );
+    }
 }
