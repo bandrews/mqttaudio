@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Per-route `gain` in `channel_map` now applies to streamed plays.** A windowed play (`mode: "stream"`,
+  or a file long or large enough for `auto` to window) resolved its routes but discarded each route's
+  `gain`, so the mix ran at unity while a fully loaded play of the same command honoured it. The streamed
+  source now carries the same per-route gains as a loaded sample, resolved and clamped by one path.
 - **Live inputs no longer trim on every resampler chunk.** The drift-control loop steered the capture ring
   toward half-full while the mixer's trim ceiling was also half the ring, so with the default
   `audio.buffer_size` every 1024-frame resampler burst crossed the ceiling once the loop had settled: an

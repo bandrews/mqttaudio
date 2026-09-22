@@ -71,7 +71,7 @@ export function CueLauncher() {
 
   const volIssue = volume.trim() ? validateVolume(Number(volume)) : {};
   const preview = JSON.stringify({ command: 'play', message: params }, null, 2);
-  const streamGainNote = mode === 'stream';
+  const streamForwardOnlyNote = mode === 'stream';
 
   return (
     <Paper variant="outlined" sx={{ p: 2 }}>
@@ -123,8 +123,8 @@ export function CueLauncher() {
           <FormControlLabel control={<Switch checked={cacheable} onChange={(e) => setCacheable(e.target.checked)} />} label="cacheable" />
         </Stack>
         <TextField size="small" label="macro(s) — comma separated" value={macros} onChange={(e) => setMacros(e.target.value)} helperText="Command params win over macros; macro definitions come from config (Sprint W8)." />
-        {streamGainNote && (
-          <Alert severity="info">mode=stream is forward-only: seek, loop-crossfade, reverse, variable speed, and per-route channel gain do not apply.</Alert>
+        {streamForwardOnlyNote && (
+          <Alert severity="info">mode=stream is forward-only: seek, loop-crossfade, reverse, and variable speed do not apply.</Alert>
         )}
         <Box component="pre" sx={{ m: 0, p: 1, bgcolor: 'background.default', borderRadius: 1, fontSize: 12, overflowX: 'auto' }} aria-label="play JSON preview">
           {preview}

@@ -388,10 +388,7 @@ impl ActiveSample {
     /// The gain for channel-map route `route_idx`, or unity when no per-route gain
     /// was configured for it (D29).
     fn channel_route_gain(&self, route_idx: usize) -> f32 {
-        self.channel_route_gains
-            .get(route_idx)
-            .copied()
-            .unwrap_or(1.0)
+        channel_route_gain(&self.channel_route_gains, route_idx)
     }
 
     /// Attach the latency probe (Sprint 11, D50): the instant the play path
@@ -1113,6 +1110,11 @@ pub struct StreamedSource {
     /// Channel routing: vec![(src_channel, dest_channel), ...].
     pub channel_map: Vec<(usize, usize)>,
 
+    /// Optional per-route gain parallel to `channel_map` (D29), with the same
+    /// semantics as `ActiveSample::channel_route_gains`: a route beyond the vector's
+    /// length (including every route when it is empty, the default) reads as unity.
+    channel_route_gains: Vec<f32>,
+
     /// Fade state (in/out/none). A completed fade-out drives the source to silence
     /// and then to completion even if the ring still holds audio.
     pub fade_state: FadeState,
@@ -1167,6 +1169,7 @@ impl StreamedSource {
             voice_volume: 1.0,
             target_voice_volume: 1.0,
             channel_map,
+            channel_route_gains: Vec::new(),
             fade_state: FadeState::None,
             producer_done,
             stop_flag,
@@ -1174,6 +1177,19 @@ impl StreamedSource {
             first_mix_latency: None,
             first_mix_published: false,
         }
+    }
+
+    /// Set the optional per-route gains, parallel to `channel_map` (D29). Entries
+    /// beyond the vector's length read as unity, so passing fewer gains than routes
+    /// (or none) leaves those routes at unity.
+    pub fn set_channel_route_gains(&mut self, gains: Vec<f32>) {
+        self.channel_route_gains = gains;
+    }
+
+    /// The gain for channel-map route `route_idx`, or unity when no per-route gain
+    /// was configured for it (D29).
+    pub fn channel_route_gain(&self, route_idx: usize) -> f32 {
+        channel_route_gain(&self.channel_route_gains, route_idx)
     }
 
     /// Attach the latency probe (Sprint 11, D50): the instant the play path
@@ -2050,8 +2066,16 @@ fn apply_pitch_block(
 /// a click (F3). The held frame is the last one read this block, faded out.
 const UNDERRUN_FADE_FRAMES: usize = 64;
 
+/// The gain for channel-map route `route_idx` in `gains`, or unity when the route has
+/// no entry (D29). A gain vector shorter than the channel map, including an empty
+/// one, therefore leaves the unlisted routes at unity.
+fn channel_route_gain(gains: &[f32], route_idx: usize) -> f32 {
+    gains.get(route_idx).copied().unwrap_or(1.0)
+}
+
 /// Consume one frame from a ring voice's `consumer` and mix it into `output` at
-/// `frame_idx` through `channel_map`, scaled by `gain`. On an underrun (fewer than
+/// `frame_idx` through `channel_map`, scaled by `gain` and by each route's entry in
+/// `route_gains` (unity where absent, D29). On an underrun (fewer than
 /// `input_channels` samples queued) it does not cut to hard silence (an audible
 /// click): it holds the last frame read this block (`last_frame`) and fades it
 /// toward zero over `UNDERRUN_FADE_FRAMES` (`underrun_frames` carries the elapsed
@@ -2064,6 +2088,7 @@ fn mix_ring_voice_frame(
     consumer: &mut HeapConsumer<f32>,
     input_channels: usize,
     channel_map: &[(usize, usize)],
+    route_gains: &[f32],
     output: &mut [f32],
     frame_idx: usize,
     output_channels: usize,
@@ -2093,12 +2118,13 @@ fn mix_ring_voice_frame(
     };
 
     let final_gain = gain * fade_gain;
-    for &(src_ch, dest_ch) in channel_map {
+    for (route_idx, &(src_ch, dest_ch)) in channel_map.iter().enumerate() {
         if src_ch >= input_channels || dest_ch >= output_channels || src_ch >= 64 {
             continue;
         }
         let dest_idx = frame_idx * output_channels + dest_ch;
-        output[dest_idx] += last_frame[src_ch] * final_gain;
+        output[dest_idx] +=
+            last_frame[src_ch] * final_gain * channel_route_gain(route_gains, route_idx);
     }
 }
 
@@ -2141,6 +2167,7 @@ fn mix_live_input_into_output(
             &mut input.consumer,
             input.input_channels,
             &input.channel_map,
+            &[],
             output,
             frame_idx,
             output_channels,
@@ -2182,6 +2209,7 @@ fn mix_streamed_source_into_output(
             &mut source.consumer,
             source.input_channels,
             &source.channel_map,
+            &source.channel_route_gains,
             output,
             frame_idx,
             output_channels,
@@ -5482,6 +5510,24 @@ mod tests {
         // silence and stays there.
         assert!(output[66 * 2].abs() < 1e-6);
         assert!(output[69 * 2].abs() < 1e-6);
+    }
+
+    #[test]
+    fn streamed_source_mix_applies_per_route_gains() {
+        // A mono source fanned out to both outputs, with a per-route gain on the
+        // first route only (D29). Route 0 (src 0 -> dest 0) is scaled by 0.25; route
+        // 1 (src 0 -> dest 1) has no gain entry, so it reads as unity, exactly like
+        // the sample path when the gain vector is shorter than the channel map.
+        let mut src = streamed_with_data(&[0.8, 0.0, 0.8, 0.0], 2, true);
+        src.channel_map = vec![(0, 0), (0, 1)];
+        src.set_channel_route_gains(vec![0.25]);
+        let mut output = vec![0.0f32; 4];
+        mix_streamed_source_into_output(&mut src, &mut output, 2, 2, (1.0, 1.0));
+
+        assert!((output[0] - 0.2).abs() < 1e-6, "dest 0 got {}", output[0]);
+        assert!((output[1] - 0.8).abs() < 1e-6, "dest 1 got {}", output[1]);
+        assert!((output[2] - 0.2).abs() < 1e-6, "dest 0 got {}", output[2]);
+        assert!((output[3] - 0.8).abs() < 1e-6, "dest 1 got {}", output[3]);
     }
 
     #[test]

@@ -84,8 +84,9 @@ numeric string (`"3"` → index 3), or an alias string resolved against `audio.c
   return (`main.rs:1733-1736`). Command returns 200; no sound.
 - **Empty `channel_map: []` is valid and produces silence** (no routes). Distinct from *omitted* (omitted =
   default 1:1 over decoded channels, `main.rs:1264`).
-- **CAVEAT — per-route `gain` is ignored on `mode:stream` plays.** Only the full-load path calls
-  `set_channel_route_gains` (`main.rs:1744-1765`); the streamed path drops `gain` (`main.rs:1247-1278`).
+- Per-route `gain` applies on both the full-load and the `mode:stream` paths: each resolves the map and
+  its gains through the same helper (`channel_route_gains` in `main.rs`) and hands them to
+  `ActiveSample`/`StreamedSource::set_channel_route_gains`.
 - `channel_map` is **not** on the typed `/play` endpoint — reach it via `/command` (DW10).
 
 ## 5. REST endpoints

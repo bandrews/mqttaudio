@@ -434,8 +434,9 @@ progress, so they aren't lost. Each entry names the owning sprint where known.
 
 - **Sprint 6 per-route downmix gain (D29) covers sample channel maps, not live-input routes.** The optional
   per-route `gain` (default 1.0) is wired through the Play `channel_map` (`ChannelMapping.gain`) into
-  `ActiveSample::channel_route_gains` and applied in both the normal and pitch-corrected sample mix loops
-  (`src/audio/mixer.rs`); an absent gain reads as unity, so existing 1:1/sum routing is bit-identical
+  `ActiveSample::channel_route_gains` and `StreamedSource::channel_route_gains` and applied in the normal
+  and pitch-corrected sample mix loops and the streamed ring mix (`src/audio/mixer.rs`); an absent gain
+  reads as unity, so existing 1:1/sum routing is bit-identical
   (`test_channel_route_gains_default_to_unity`, `test_quad_to_stereo_downmix_with_route_gains`). This is the
   exact location of the F7 finding (the sample downmix sum at `output[dest_idx] += …`). Live-input routes
   (`config.inputs[].routes`, `InputRouteConfig`) are a separate config surface and are **not** given a

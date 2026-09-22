@@ -129,8 +129,7 @@ export function MatrixMixer() {
           </Alert>
         )}
         <Alert severity="info">
-          Per-route gain is ignored on windowed/streamed plays (mode=stream or an auto-windowed large file). An
-          unknown channel alias silently aborts the play; numeric destinations always apply, and out-of-range
+          An unknown channel alias silently aborts the play; numeric destinations always apply, and out-of-range
           destinations are skipped.
         </Alert>
         <Box component="pre" sx={{ m: 0, p: 1, bgcolor: 'background.default', borderRadius: 1, fontSize: 12, overflowX: 'auto' }} aria-label="matrix JSON preview">

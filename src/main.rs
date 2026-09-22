@@ -1248,6 +1248,27 @@ fn resolve_talkback_input(inputs: &[http::InputStatus], source_id: &str) -> Opti
     None
 }
 
+/// Per-route gains for a Play `channel_map`, parallel to its routes (D29). A route
+/// with no gain defaults to unity, leaving plain 1:1 mappings unchanged. A value is
+/// clamped to a sane finite, non-negative range (matching audio.master_gain) so a
+/// bad value can never push NaN/Inf or a wild level onto the bus. Returns an empty
+/// vector when every route is unity, which the mixer reads as unity throughout, so
+/// a map without gains stores nothing.
+fn channel_route_gains(map: &[mqtt::commands::ChannelMapping]) -> Vec<f32> {
+    let gains: Vec<f32> = map
+        .iter()
+        .map(|m| match m.gain {
+            Some(g) if g.is_finite() => g.clamp(0.0, 8.0),
+            _ => 1.0,
+        })
+        .collect();
+    if gains.iter().all(|&g| g == 1.0) {
+        Vec::new()
+    } else {
+        gains
+    }
+}
+
 /// Build the warning for an input whose resolved routes read source channels the
 /// device does not have, or `None` when every source is within range (F5). The
 /// device channel count is only known once the stream opens, so this runs at input
@@ -1754,7 +1775,7 @@ async fn finish_streamed_play(
 
     // Channel routing: resolve aliases if given, else default 1:1 over decoded channels.
     let channels = handles.channels;
-    let resolved_map: Vec<(usize, usize)> = match channel_map {
+    let (resolved_map, route_gains): (Vec<(usize, usize)>, Vec<f32>) = match channel_map {
         Some(map) => {
             let mut out = Vec::with_capacity(map.len());
             for m in &map {
@@ -1769,9 +1790,9 @@ async fn finish_streamed_play(
                     }
                 }
             }
-            out
+            (out, channel_route_gains(&map))
         }
-        None => (0..channels).map(|c| (c, c)).collect(),
+        None => ((0..channels).map(|c| (c, c)).collect(), Vec::new()),
     };
 
     let mut source = audio::mixer::StreamedSource::new(
@@ -1789,6 +1810,7 @@ async fn finish_streamed_play(
     // Start at the voice's current level (no ramp), like a sample play.
     source.voice_volume = voice_volume;
     source.target_voice_volume = voice_volume;
+    source.set_channel_route_gains(route_gains);
     if let Some(fade_ms) = fade_in {
         source.set_fade(audio::mixer::FadeState::fade_in(
             fade_ms,
@@ -2072,18 +2094,6 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             }
                         };
                         tracing::debug!("Using custom channel mapping: {:?}", mapping);
-                        // Per-route downmix gains parallel to the resolved map (D29);
-                        // a route with no gain defaults to unity, leaving plain 1:1
-                        // mappings unchanged. Clamp to a sane finite, non-negative
-                        // range (matching audio.master_gain) so a bad value can never
-                        // push NaN/Inf or a wild level onto the bus.
-                        let route_gains: Vec<f32> = map
-                            .iter()
-                            .map(|m| match m.gain {
-                                Some(g) if g.is_finite() => g.clamp(0.0, 8.0),
-                                _ => 1.0,
-                            })
-                            .collect();
                         let mut sample = ActiveSample::new_with_mapping(
                             sample_id,
                             voice_id.clone(),
@@ -2096,9 +2106,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             loop_mode,
                             crossfade_samples,
                         );
-                        if route_gains.iter().any(|&g| g != 1.0) {
-                            sample.set_channel_route_gains(route_gains);
-                        }
+                        sample.set_channel_route_gains(channel_route_gains(&map));
                         sample
                     } else {
                         // Default channel mapping (1:1)
@@ -3026,6 +3034,32 @@ mod tests {
     }
 
     #[test]
+    fn channel_route_gains_default_to_unity_and_clamp() {
+        // D29: a route without a gain is unity; a finite gain is clamped to the
+        // 0.0..=8.0 range the bus allows; a non-finite gain falls back to unity so it
+        // can never push NaN/Inf onto the bus.
+        let route = |gain: Option<f32>| mqtt::commands::ChannelMapping {
+            src: config::ChannelRef::Index(0),
+            dest: config::ChannelRef::Index(0),
+            gain,
+        };
+        let map = vec![
+            route(None),
+            route(Some(0.5)),
+            route(Some(100.0)),
+            route(Some(-1.0)),
+            route(Some(f32::INFINITY)),
+            route(Some(f32::NAN)),
+        ];
+        assert_eq!(
+            channel_route_gains(&map),
+            vec![1.0, 0.5, 8.0, 0.0, 1.0, 1.0]
+        );
+        // A map whose routes are all unity stores no gains at all.
+        assert!(channel_route_gains(&[route(None), route(Some(1.0))]).is_empty());
+    }
+
+    #[test]
     fn auto_voice_ids_are_unique_within_a_millisecond() {
         // F5/D41: two Plays with no explicit voice must get distinct ids even when
         // generated in the same millisecond. `next_auto_voice_id` is called back to
@@ -3084,6 +3118,35 @@ mod tests {
         assert_eq!(fixture.mixer.streamed_sources[0].voice_id, "bed");
         // The voice is tracked so the seek/speed gate can warn for it.
         assert!(fixture.streamed_voices.contains("bed"));
+    }
+
+    #[tokio::test]
+    async fn stream_play_with_channel_map_applies_per_route_gains() {
+        // D29 on the windowed path: a per-route `gain` in the Play channel_map
+        // reaches the StreamedSource, and a route without one reads as unity.
+        let mut fixture = Fixture::new(vec![]);
+        let mut play = play_stream(Some("bed"));
+        if let AudioCommand::Play { channel_map, .. } = &mut play {
+            *channel_map = Some(vec![
+                mqtt::commands::ChannelMapping {
+                    src: config::ChannelRef::Index(0),
+                    dest: config::ChannelRef::Index(0),
+                    gain: Some(0.5),
+                },
+                mqtt::commands::ChannelMapping {
+                    src: config::ChannelRef::Index(0),
+                    dest: config::ChannelRef::Index(1),
+                    gain: None,
+                },
+            ]);
+        }
+        fixture.run(play).await;
+        fixture.drain();
+
+        let source = &fixture.mixer.streamed_sources[0];
+        assert_eq!(source.channel_map, vec![(0, 0), (0, 1)]);
+        assert_eq!(source.channel_route_gain(0), 0.5);
+        assert_eq!(source.channel_route_gain(1), 1.0);
     }
 
     #[tokio::test]

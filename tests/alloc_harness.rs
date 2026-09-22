@@ -207,6 +207,60 @@ fn first_mix_latency_publish_is_allocation_free() {
 }
 
 #[test]
+fn streamed_route_gain_mix_is_allocation_free() {
+    // D29 on the windowed path: a StreamedSource with per-route gains (a custom
+    // channel map with a downmix route) mixes through the ring path with a slice
+    // lookup per route, set off-RT at construction, so the armed region must add no
+    // heap work on the audio thread.
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let mut mixer = SceneBuilder::new(2).build();
+    let (mut producer, consumer) = create_ring_buffer(BLOCK * 2 * 16);
+    let seed = vec![0.3f32; BLOCK * 2 * 12];
+    producer.push_slice(&seed);
+    let mut source = StreamedSource::new(
+        1,
+        "bed".to_string(),
+        "stream.wav".to_string(),
+        None,
+        consumer,
+        2,
+        1.0,
+        vec![(0, 0), (1, 1), (0, 1)], // a downmix route (src 0 -> dest 1) to gain
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    // Per-route gains (the Vec is allocated here, off the armed region below).
+    source.set_channel_route_gains(vec![0.5, 0.5, 0.5]);
+    mixer.streamed_sources.push(source);
+
+    let mut block = vec![0.0f32; BLOCK * 2];
+
+    // Warm up off the armed region.
+    mix_audio(&mut block, &mut mixer);
+
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..8 {
+            mix_audio(&mut block, &mut mixer);
+        }
+    });
+
+    assert_eq!(
+        allocs, 0,
+        "streamed route-gain mix path allocated {allocs} times across 8 blocks"
+    );
+    assert_eq!(
+        deallocs, 0,
+        "streamed route-gain mix path freed {deallocs} times across 8 blocks"
+    );
+    // The gains were applied inside the armed region: dest 0 carries src 0 at half
+    // gain, dest 1 sums src 1 and src 0 at half gain each.
+    assert!((block[0] - 0.15).abs() < 1e-4, "dest 0 got {}", block[0]);
+    assert!((block[1] - 0.3).abs() < 1e-4, "dest 1 got {}", block[1]);
+}
+
+#[test]
 fn streamed_first_mix_latency_publish_is_allocation_free() {
     // Sprint 11 (D50): the windowed StreamedSource publishes its first-mix latency
     // on the first block in which it pops real frames from the ring; the publish

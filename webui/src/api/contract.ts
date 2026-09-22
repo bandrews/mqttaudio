@@ -7,7 +7,7 @@
 /** A channel reference: a numeric index, a numeric string, or a configured alias. */
 export type ChannelRef = number | string;
 
-/** One channel-map route. `gain` defaults to unity; ignored on `mode:stream` plays. */
+/** One channel-map route. `gain` defaults to unity. */
 export interface ChannelMapping {
   src: ChannelRef;
   dest: ChannelRef;
