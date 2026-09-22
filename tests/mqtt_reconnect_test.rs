@@ -62,7 +62,10 @@ async fn publish_until_received(
 
 fn rand_suffix() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos()
 }
 
 #[tokio::test]
@@ -72,19 +75,26 @@ async fn test_commands_still_arrive_after_broker_restart() {
 
     let mut broker = start_broker(port);
 
-    let (client, eventloop) = connect_mqtt("127.0.0.1", port, topic, None, None, None)
-        .await
-        .expect("initial connect should succeed");
+    let (client, eventloop) = connect_mqtt(
+        &mqttaudio::config::MqttConfig {
+            server: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        },
+        topic,
+    )
+    .await
+    .expect("initial connect should succeed");
 
     let (tx, mut rx) = mpsc::channel(10);
     let processor_client = client.clone();
     let processor = tokio::spawn(async move {
         process_mqtt_events(
             processor_client,
-            eventloop,
             topic.to_string(),
-            Duration::from_secs(1),
+            eventloop,
             tx,
+            Duration::from_secs(1),
         )
         .await;
     });

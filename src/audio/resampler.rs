@@ -1,8 +1,11 @@
 // ABOUTME: Sample rate conversion using rubato.
 // ABOUTME: Converts audio to match output device sample rate.
 
-use rubato::{Resampler, ResamplerConstructionError, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
 use crate::config::ResamplerQuality;
+use rubato::{
+    Resampler, ResamplerConstructionError, SincFixedIn, SincInterpolationParameters,
+    SincInterpolationType, WindowFunction,
+};
 
 #[derive(Debug)]
 pub enum ResampleError {
@@ -64,7 +67,9 @@ pub fn resample(
     }
 
     if channels == 0 {
-        return Err(ResampleError::InvalidInput("Channel count must be > 0".to_string()));
+        return Err(ResampleError::InvalidInput(
+            "Channel count must be > 0".to_string(),
+        ));
     }
 
     tracing::info!(
@@ -88,11 +93,8 @@ pub fn resample(
     };
 
     let mut resampler = SincFixedIn::<f32>::new(
-        ratio,
-        2.0, // Max relative ratio difference (allows 2x speedup/slowdown)
-        params,
-        frames,
-        channels,
+        ratio, 2.0, // Max relative ratio difference (allows 2x speedup/slowdown)
+        params, frames, channels,
     )?;
 
     // De-interleave input samples
@@ -124,8 +126,8 @@ pub fn resample(
     let mut output = Vec::with_capacity(expected_frames * channels);
 
     for frame_idx in delay..end {
-        for ch_idx in 0..channels {
-            output.push(output_channels[ch_idx][frame_idx]);
+        for channel in output_channels.iter().take(channels) {
+            output.push(channel[frame_idx]);
         }
     }
 
@@ -169,13 +171,29 @@ mod tests {
         let out = resample(input, 44100, 48000, 1, ResamplerQuality::Fast).unwrap();
 
         let expected = (frames as f64 * 48000.0 / 44100.0).round() as usize;
-        assert_eq!(out.len(), expected, "output must cover the whole input duration");
+        assert_eq!(
+            out.len(),
+            expected,
+            "output must cover the whole input duration"
+        );
 
         // Edge frames taper (the filter sees silence beyond the file), but
         // the interior must be at level right away and stay there to the end
-        assert!(out[0] > 0.3, "output must start at the signal, not at filter-latency silence, got {}", out[0]);
-        assert!(out[64] > 0.99, "the signal should reach level within the filter half-window, got {}", out[64]);
-        assert!(out[expected - 64] > 0.99, "the file tail must not be dropped, got {}", out[expected - 64]);
+        assert!(
+            out[0] > 0.3,
+            "output must start at the signal, not at filter-latency silence, got {}",
+            out[0]
+        );
+        assert!(
+            out[64] > 0.99,
+            "the signal should reach level within the filter half-window, got {}",
+            out[64]
+        );
+        assert!(
+            out[expected - 64] > 0.99,
+            "the file tail must not be dropped, got {}",
+            out[expected - 64]
+        );
     }
 
     #[test]
@@ -245,8 +263,12 @@ mod tests {
         let result = resample(input, 44100, 48000, 1, ResamplerQuality::Fast).unwrap();
 
         let expected = (1000.0f64 * 48000.0 / 44100.0).round() as usize;
-        assert!((result.len() as i32 - expected as i32).abs() <= 2,
-            "Got {} frames, expected ~{}", result.len(), expected);
+        assert!(
+            (result.len() as i32 - expected as i32).abs() <= 2,
+            "Got {} frames, expected ~{}",
+            result.len(),
+            expected
+        );
     }
 
     #[test]
@@ -270,7 +292,68 @@ mod tests {
             let result = resample(input.clone(), 44100, 48000, 1, quality);
             assert!(result.is_ok(), "Quality {:?} failed", quality);
             let output = result.unwrap();
-            assert!(output.len() > 800, "Quality {:?} produced too few samples", quality);
+            assert!(
+                output.len() > 800,
+                "Quality {:?} produced too few samples",
+                quality
+            );
         }
+    }
+
+    /// Pins the rate-conversion quality floor that closed R1 (D59, Sprint 14):
+    /// at the Fast preset, a 15 kHz tone resampled 44.1k→48k keeps its
+    /// off-tone residual below -50 dBFS. Measured 2026-06-09: Linear and Cubic
+    /// sinc interpolation are identical to ~0.015% at our oversampling factors
+    /// (≥64) — the floor is the sinc filter itself — so the interpolation type
+    /// stays `Linear` and THIS bound is the property worth guarding.
+    #[test]
+    fn fast_preset_off_tone_residual_stays_below_minus_50_dbfs() {
+        let sr_in = 44100u32;
+        let sr_out = 48000u32;
+        let f0 = 15_000.0f64;
+        let amp = 0.5f32;
+        let frames = 44_100usize;
+        let input: Vec<f32> = (0..frames)
+            .map(|i| {
+                ((i as f64 / sr_in as f64 * f0 * std::f64::consts::TAU).sin() * amp as f64) as f32
+            })
+            .collect();
+
+        let output = resample(input, sr_in, sr_out, 1, ResamplerQuality::Fast).unwrap();
+        // Steady-state window (skip the filter's edge transients).
+        let take = 32_768.min(output.len().saturating_sub(2_000));
+        let mid = &output[output.len() - take - 1000..output.len() - 1000];
+
+        // Least-squares fit of the tone at f0; what remains is resampler error.
+        let n = mid.len();
+        let (mut cs, mut sn) = (0.0f64, 0.0f64);
+        for (i, &x) in mid.iter().enumerate() {
+            let ph = i as f64 / sr_out as f64 * f0 * std::f64::consts::TAU;
+            cs += x as f64 * ph.cos();
+            sn += x as f64 * ph.sin();
+        }
+        let a = 2.0 * cs / n as f64;
+        let b = 2.0 * sn / n as f64;
+        let tone_amp = (a * a + b * b).sqrt();
+        assert!(
+            (tone_amp - amp as f64).abs() < 0.01,
+            "the tone must survive resampling at full level, got {tone_amp}"
+        );
+
+        let mut resid_sq = 0.0f64;
+        for (i, &x) in mid.iter().enumerate() {
+            let ph = i as f64 / sr_out as f64 * f0 * std::f64::consts::TAU;
+            let fit = a * ph.cos() + b * ph.sin();
+            let r = x as f64 - fit;
+            resid_sq += r * r;
+        }
+        let residual_rms = (resid_sq / n as f64).sqrt();
+        // Measured ~9.3e-4 (≈ -60.6 dB re the 0.5 tone); bound at -50 dBFS
+        // (3.16e-3) leaves honest headroom without letting a regression slip.
+        assert!(
+            residual_rms < 3.16e-3,
+            "Fast-preset resample residual regressed: {residual_rms} (≈{:.1} dBFS)",
+            20.0 * (residual_rms / 1.0).log10()
+        );
     }
 }

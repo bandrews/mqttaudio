@@ -330,7 +330,10 @@ mod tests {
 
         // Volume should clamp at both ends
         manager.set_voice_volume("ambience", 100.0);
-        assert_eq!(manager.get_voice_volume("ambience"), Some(crate::config::MAX_GAIN));
+        assert_eq!(
+            manager.get_voice_volume("ambience"),
+            Some(crate::config::MAX_GAIN)
+        );
 
         manager.set_voice_volume("ambience", -0.5);
         assert_eq!(manager.get_voice_volume("ambience"), Some(0.0));

@@ -1,10 +1,6 @@
 // ABOUTME: Incremental sample rate conversion for streaming audio.
 // ABOUTME: Processes audio in chunks, enabling playback before full file loads.
 
-// Allow dead_code until Phase 10 connects streaming to main.rs.
-// This code is tested via integration tests and will be integrated soon.
-#![allow(dead_code)]
-
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
@@ -86,7 +82,13 @@ impl ChunkedResampler {
         channels: usize,
         quality: ResamplerQuality,
     ) -> Result<Self, ChunkedResampleError> {
-        Self::with_chunk_size(input_rate, output_rate, channels, quality, Self::DEFAULT_CHUNK_SIZE)
+        Self::with_chunk_size(
+            input_rate,
+            output_rate,
+            channels,
+            quality,
+            Self::DEFAULT_CHUNK_SIZE,
+        )
     }
 
     /// Create a new chunked resampler with custom chunk size.
@@ -126,11 +128,8 @@ impl ChunkedResampler {
         };
 
         let resampler = SincFixedIn::<f32>::new(
-            ratio,
-            2.0, // Max relative ratio (allows pitch adjustment)
-            params,
-            chunk_size,
-            channels,
+            ratio, 2.0, // Max relative ratio (allows pitch adjustment)
+            params, chunk_size, channels,
         )?;
 
         let input_buffer = vec![Vec::new(); channels];
@@ -284,17 +283,24 @@ impl ChunkedResampler {
         Ok(output)
     }
 
-    /// Get the number of frames currently buffered
+    /// Get the number of frames currently buffered. Test-only accessor exercising
+    /// the internal accumulator; production code drives the resampler through
+    /// `push`/`flush` and never inspects the buffer depth.
+    #[cfg(test)]
     pub fn buffered_frames(&self) -> usize {
-        self.input_buffer.get(0).map(|b| b.len()).unwrap_or(0)
+        self.input_buffer.first().map(|b| b.len()).unwrap_or(0)
     }
 
-    /// Get the chunk size in frames
+    /// Get the chunk size in frames. Test-only accessor (the chunk size is fixed at
+    /// construction; production code does not read it back).
+    #[cfg(test)]
     pub fn chunk_size(&self) -> usize {
         self.chunk_size
     }
 
-    /// Get the resampling ratio (output/input)
+    /// Get the resampling ratio (output/input). Test-only accessor used to assert the
+    /// computed ratio; production code does not read it back.
+    #[cfg(test)]
     pub fn ratio(&self) -> f64 {
         self.ratio
     }
@@ -308,8 +314,7 @@ mod tests {
     fn test_chunked_output_is_time_aligned_and_full_length() {
         // Same contract as the one-shot resampler: the sinc filter's delay
         // must not shift the stream, and its tail must be drained on flush
-        let mut resampler =
-            ChunkedResampler::new(44100, 48000, 1, ResamplerQuality::Fast).unwrap();
+        let mut resampler = ChunkedResampler::new(44100, 48000, 1, ResamplerQuality::Fast).unwrap();
 
         let input = vec![1.0f32; 4410];
         let mut out = Vec::new();
@@ -324,11 +329,20 @@ mod tests {
         assert!(
             (out.len() as i32 - expected as i32).abs() <= 2,
             "expected ~{} frames, got {}",
-            expected, out.len()
+            expected,
+            out.len()
         );
-        assert!(out[0] > 0.3, "stream must start at the signal, got {}", out[0]);
+        assert!(
+            out[0] > 0.3,
+            "stream must start at the signal, got {}",
+            out[0]
+        );
         assert!(out[64] > 0.99, "got {}", out[64]);
-        assert!(out[out.len() - 64] > 0.99, "the tail must not be dropped, got {}", out[out.len() - 64]);
+        assert!(
+            out[out.len() - 64] > 0.99,
+            "the tail must not be dropped, got {}",
+            out[out.len() - 64]
+        );
     }
 
     #[test]
@@ -348,8 +362,7 @@ mod tests {
 
     #[test]
     fn test_construction_invalid_chunk_size() {
-        let result =
-            ChunkedResampler::with_chunk_size(44100, 48000, 2, ResamplerQuality::Fast, 0);
+        let result = ChunkedResampler::with_chunk_size(44100, 48000, 2, ResamplerQuality::Fast, 0);
         assert!(result.is_err());
     }
 
@@ -518,7 +531,11 @@ mod tests {
             ResamplerQuality::Maximum,
         ] {
             let result = ChunkedResampler::new(44100, 48000, 2, quality);
-            assert!(result.is_ok(), "Failed to create resampler with {:?}", quality);
+            assert!(
+                result.is_ok(),
+                "Failed to create resampler with {:?}",
+                quality
+            );
         }
     }
 
@@ -635,7 +652,7 @@ mod tests {
         let output_frames = output.len() / 2;
 
         assert!(
-            (output_frames as i32 - input_frames as i32).abs() <= 2,
+            (output_frames as i32 - input_frames).abs() <= 2,
             "Expected ~{} frames, got {}",
             input_frames,
             output_frames

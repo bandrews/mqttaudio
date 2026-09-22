@@ -54,7 +54,9 @@ where
 
         // Extract message from the event
         let mut message = String::new();
-        let mut visitor = MessageVisitor { message: &mut message };
+        let mut visitor = MessageVisitor {
+            message: &mut message,
+        };
         event.record(&mut visitor);
 
         let entry = LogEntry {
@@ -109,7 +111,10 @@ pub fn spawn_log_publisher(
             };
 
             // Publish to MQTT (fire and forget)
-            if let Err(e) = client.publish(&topic, QoS::AtMostOnce, false, json.as_bytes()).await {
+            if let Err(e) = client
+                .publish(&topic, QoS::AtMostOnce, false, json.as_bytes())
+                .await
+            {
                 // Only print if it's not a channel closed error
                 if !matches!(e, rumqttc::ClientError::Request(_)) {
                     eprintln!("Failed to publish log to MQTT: {}", e);

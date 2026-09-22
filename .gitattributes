@@ -1,0 +1,4 @@
+# Files executed on Linux or copied into the validation image must keep LF
+# endings even on checkouts with core.autocrlf enabled.
+*.sh text eol=lf
+docker/** text eol=lf
