@@ -9,7 +9,7 @@
 //! resolution) stays on the control thread; only the finished value travels across the ring.
 
 use crate::audio::ducking::DuckTargetChange;
-use crate::audio::mixer::{ActiveSample, FadeState, LiveInput, MixerState, StreamedSource};
+use crate::audio::mixer::{ActiveSample, LiveInput, MixerState, StreamedSource};
 use crate::mqtt::commands::SampleSelector;
 use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
 
@@ -198,36 +198,36 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
         }
         AudioCommand::FadeOutAll { fade_ms } => {
             for sample in state.active_samples.iter_mut() {
-                sample.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
+                sample.start_fade_out(*fade_ms, output_sample_rate);
             }
             // Stop-all / shutdown fades windowed sources too.
             for source in state.streamed_sources.iter_mut() {
-                source.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
+                source.start_fade_out(*fade_ms, output_sample_rate);
             }
         }
         AudioCommand::FadeOutSamples { ids, fade_ms } => {
             for sample in state.active_samples.iter_mut() {
                 if ids.contains(&sample.id) {
-                    sample.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
+                    sample.start_fade_out(*fade_ms, output_sample_rate);
                 }
             }
             // A streamed source shares the sample id space (it is registered with the
             // voice manager), so a voice stop fades it the same way.
             for source in state.streamed_sources.iter_mut() {
                 if ids.contains(&source.id) {
-                    source.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
+                    source.start_fade_out(*fade_ms, output_sample_rate);
                 }
             }
         }
         AudioCommand::FadeOutMatching { selector, fade_ms } => {
             for sample in state.active_samples.iter_mut() {
                 if sample_matches(selector, sample) {
-                    sample.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
+                    sample.start_fade_out(*fade_ms, output_sample_rate);
                 }
             }
             for source in state.streamed_sources.iter_mut() {
                 if streamed_matches(selector, source) {
-                    source.set_fade(FadeState::fade_out(*fade_ms, output_sample_rate));
+                    source.start_fade_out(*fade_ms, output_sample_rate);
                 }
             }
         }
@@ -564,6 +564,7 @@ fn apply_input_mute(state: &mut MixerState, input: &str, mute: bool) {
 mod tests {
     use super::*;
     use crate::audio::ducking::{DuckTargetChange, DuckingApplier};
+    use crate::audio::mixer::FadeState;
     use crate::audio::types::DecodedBuffer;
     use std::sync::Arc;
 
@@ -766,6 +767,70 @@ mod tests {
         );
         assert!(is_fading_out(&state.active_samples[0]));
         assert!(!is_fading_out(&state.active_samples[1]));
+    }
+
+    /// A fade advanced `frames` frames, standing in for a fade the mixer has
+    /// been running for that long.
+    fn advanced(mut fade: FadeState, frames: usize) -> FadeState {
+        for _ in 0..frames {
+            fade.advance();
+        }
+        fade
+    }
+
+    #[test]
+    fn fade_out_starts_from_the_current_fade_in_level() {
+        // A stop that arrives while a sound is still fading in continues down
+        // from where it is instead of jumping to full level for the stop fade.
+        let mut sample = sample(1, "music", None, "a");
+        sample.set_fade(advanced(FadeState::fade_in(1000, 1000), 250));
+        let mut source = streamed_with(2, "music", &[], false);
+        source.set_fade(advanced(FadeState::fade_in(1000, 1000), 500));
+        let mut state = state_with(vec![sample]);
+        state.streamed_sources.push(source);
+
+        apply_command(
+            &mut state,
+            AudioCommand::FadeOutMatching {
+                selector: selector_voice("music"),
+                fade_ms: 10,
+            },
+            48000,
+        );
+
+        let sample_level = state.active_samples[0].fade_state.multiplier();
+        let source_level = state.streamed_sources[0].fade_state.multiplier();
+        assert!(
+            (sample_level - 0.25).abs() < 1e-6,
+            "sample fade-out should start at 0.25, got {sample_level}"
+        );
+        assert!(
+            (source_level - 0.5).abs() < 1e-6,
+            "streamed fade-out should start at 0.5, got {source_level}"
+        );
+    }
+
+    #[test]
+    fn a_second_fade_out_continues_from_the_first() {
+        // stopall during a long voice_fade_out must not jump back to full level.
+        let mut sample = sample(1, "music", None, "a");
+        sample.set_fade(advanced(FadeState::fade_out(1000, 1000), 400));
+        let mut state = state_with(vec![sample]);
+
+        apply_command(&mut state, AudioCommand::FadeOutAll { fade_ms: 10 }, 48000);
+
+        let fade = &state.active_samples[0].fade_state;
+        assert!(
+            (fade.multiplier() - 0.6).abs() < 1e-6,
+            "second fade-out should start at 0.6, got {}",
+            fade.multiplier()
+        );
+        let finished = advanced(fade.clone(), 480);
+        assert_eq!(
+            finished.multiplier(),
+            0.0,
+            "the second fade-out still reaches silence over its own duration"
+        );
     }
 
     #[test]

@@ -31,6 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later play into that voice starts at voice volume 1.0, and `voice_stop`, `voice_fade_out` and
   `voice_volume` report it as not found. With ducking rules configured, the ducking engine likewise
   stops tracking voices that have gone idle.
+- **Stopping a sound mid-fade continues from its current level.** A `stop`, `stopall` or `voice_stop` that
+  arrived while a sound was still fading in, or a second fade-out during a long `voice_fade_out` or
+  `fadeall`, restarted the fade from full volume, briefly playing the sound at full level. Fade-outs
+  now start from the sound's current level and still last the requested time.
+- **`config.example.json` loads.** It declared `audio.channel_aliases` twice, which the daemon rejects,
+  so the documented starting config exited with a parse error. Its notes now give the correct channel
+  volume range and input behavior, and its example input routes a mono microphone to two outputs.
 - **Configuration errors are reported accurately.** An out-of-range `audio.channel_volumes` entry
   names the real limit (`4`) instead of the text `MAX_GAIN`, and an out-of-range
   `ducking_rules[].target_volume` is reported once instead of twice.

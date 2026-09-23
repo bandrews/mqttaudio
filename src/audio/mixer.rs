@@ -18,8 +18,12 @@ pub enum FadeState {
     None,
     /// Fading in: (frames_elapsed, total_fade_frames)
     In { elapsed: usize, duration: usize },
-    /// Fading out: (frames_elapsed, total_fade_frames)
-    Out { elapsed: usize, duration: usize },
+    /// Fading out from `start` to silence: (frames_elapsed, total_fade_frames, start_level)
+    Out {
+        elapsed: usize,
+        duration: usize,
+        start: f32,
+    },
 }
 
 impl FadeState {
@@ -38,6 +42,23 @@ impl FadeState {
         FadeState::Out {
             elapsed: 0,
             duration: duration_frames,
+            start: 1.0,
+        }
+    }
+
+    /// A fade out that starts at this fade's current level, so a stop that
+    /// arrives mid-fade continues down from where the sound is instead of
+    /// jumping back to full level
+    pub fn fade_out_from_here(&self, duration_ms: u32, sample_rate: u32) -> Self {
+        match FadeState::fade_out(duration_ms, sample_rate) {
+            FadeState::Out {
+                elapsed, duration, ..
+            } => FadeState::Out {
+                elapsed,
+                duration,
+                start: self.multiplier(),
+            },
+            other => other,
         }
     }
 
@@ -57,11 +78,15 @@ impl FadeState {
                 }
                 (*elapsed as f32 / *duration as f32).min(1.0)
             }
-            FadeState::Out { elapsed, duration } => {
+            FadeState::Out {
+                elapsed,
+                duration,
+                start,
+            } => {
                 if *duration == 0 {
                     return 0.0;
                 }
-                (1.0 - (*elapsed as f32 / *duration as f32)).max(0.0)
+                start * (1.0 - (*elapsed as f32 / *duration as f32)).max(0.0)
             }
         }
     }
@@ -74,7 +99,9 @@ impl FadeState {
                     *elapsed += 1;
                 }
             }
-            FadeState::Out { elapsed, duration } => {
+            FadeState::Out {
+                elapsed, duration, ..
+            } => {
                 if *elapsed < *duration {
                     *elapsed += 1;
                 }
@@ -89,7 +116,9 @@ impl FadeState {
         match self {
             FadeState::None => true,
             FadeState::In { elapsed, duration } => elapsed >= duration,
-            FadeState::Out { elapsed, duration } => elapsed >= duration,
+            FadeState::Out {
+                elapsed, duration, ..
+            } => elapsed >= duration,
         }
     }
 }
@@ -378,6 +407,11 @@ impl ActiveSample {
         self.fade_state = fade_state;
     }
 
+    /// Begin fading out over `fade_ms`, continuing from the current fade level
+    pub fn start_fade_out(&mut self, fade_ms: u32, sample_rate: u32) {
+        self.fade_state = self.fade_state.fade_out_from_here(fade_ms, sample_rate);
+    }
+
     /// Set the optional per-route downmix gains, parallel to `channel_map` (D29).
     /// Entries beyond the vector's length read as unity, so passing fewer gains than
     /// routes (or none) leaves those routes at unity.
@@ -630,7 +664,10 @@ impl ActiveSample {
     /// Looping samples only finish when fade out is complete
     pub fn is_finished(&self) -> bool {
         // Fade out complete - always finishes, even for looping samples
-        if let FadeState::Out { elapsed, duration } = self.fade_state {
+        if let FadeState::Out {
+            elapsed, duration, ..
+        } = self.fade_state
+        {
             if elapsed >= duration {
                 return true;
             }
@@ -1222,6 +1259,11 @@ impl StreamedSource {
         self.fade_state = fade_state;
     }
 
+    /// Begin fading out over `fade_ms`, continuing from the current fade level
+    pub fn start_fade_out(&mut self, fade_ms: u32, sample_rate: u32) {
+        self.fade_state = self.fade_state.fade_out_from_here(fade_ms, sample_rate);
+    }
+
     /// Ask the producer task to stop and stop feeding the ring. Called off the audio
     /// thread when the source is reaped.
     pub fn signal_stop(&self) {
@@ -1252,7 +1294,10 @@ impl StreamedSource {
     /// finishes only once the producer has signalled EOF and the ring has drained
     /// below a full frame.
     pub fn is_finished(&self) -> bool {
-        if let FadeState::Out { elapsed, duration } = self.fade_state {
+        if let FadeState::Out {
+            elapsed, duration, ..
+        } = self.fade_state
+        {
             if elapsed >= duration {
                 return true;
             }
@@ -2911,6 +2956,7 @@ mod tests {
         sample.fade_state = FadeState::Out {
             elapsed: 100,
             duration: 100,
+            start: 1.0,
         };
 
         // Now should be finished (fade out complete)
@@ -3229,7 +3275,8 @@ mod tests {
             fade_out,
             FadeState::Out {
                 elapsed: 0,
-                duration: 22050
+                duration: 22050,
+                start: 1.0,
             }
         );
     }
@@ -3278,6 +3325,7 @@ mod tests {
         let fade_start = FadeState::Out {
             elapsed: 0,
             duration: 10,
+            start: 1.0,
         };
         assert_eq!(fade_start.multiplier(), 1.0);
 
@@ -3285,6 +3333,7 @@ mod tests {
         let fade_30 = FadeState::Out {
             elapsed: 3,
             duration: 10,
+            start: 1.0,
         };
         assert!((fade_30.multiplier() - 0.7).abs() < 0.01);
 
@@ -3292,6 +3341,7 @@ mod tests {
         let fade_50 = FadeState::Out {
             elapsed: 5,
             duration: 10,
+            start: 1.0,
         };
         assert_eq!(fade_50.multiplier(), 0.5);
 
@@ -3299,6 +3349,7 @@ mod tests {
         let fade_100 = FadeState::Out {
             elapsed: 10,
             duration: 10,
+            start: 1.0,
         };
         assert_eq!(fade_100.multiplier(), 0.0);
 
@@ -3306,6 +3357,7 @@ mod tests {
         let fade_over = FadeState::Out {
             elapsed: 15,
             duration: 10,
+            start: 1.0,
         };
         assert_eq!(fade_over.multiplier(), 0.0);
     }
@@ -3410,6 +3462,7 @@ mod tests {
         sample.set_fade(FadeState::Out {
             elapsed: 0,
             duration: 10,
+            start: 1.0,
         });
 
         let mut state = MixerState::new(2);
@@ -3456,6 +3509,7 @@ mod tests {
         sample.set_fade(FadeState::Out {
             elapsed: 0,
             duration: 5,
+            start: 1.0,
         });
 
         assert!(!sample.is_finished());
@@ -3480,6 +3534,7 @@ mod tests {
         let fade_out = FadeState::Out {
             elapsed: 0,
             duration: 0,
+            start: 1.0,
         };
         assert_eq!(fade_out.multiplier(), 0.0); // Instant silence
     }
@@ -5485,6 +5540,7 @@ mod tests {
         src.set_fade(FadeState::Out {
             elapsed: 10,
             duration: 10,
+            start: 1.0,
         });
         assert!(src.is_finished());
     }
@@ -5538,6 +5594,7 @@ mod tests {
         src.set_fade(FadeState::Out {
             elapsed: 0,
             duration: 10,
+            start: 1.0,
         });
         let mut output = vec![0.0f32; 20];
         mix_streamed_source_into_output(&mut src, &mut output, 10, 2, (1.0, 1.0));
