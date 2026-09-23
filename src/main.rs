@@ -2746,9 +2746,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                         displaced: None,
                     });
                 }
-                // Pitch correction stays dormant while a cold play's progressive
-                // load is still filling (the mixer needs slice access); it engages
-                // when the D51 upgrade lands. Tell the operator instead of
+                // Pitch correction stays dormant while a cold play is on its
+                // progressive buffer (the mixer needs slice access); it engages
+                // when the D51 upgrade lands, which needs the decode to finish and
+                // be kept in the memory cache. Tell the operator instead of
                 // silently doing nothing in the meantime.
                 if pitch_correction {
                     for upgrade in ctx.streaming_upgrades.iter() {
@@ -2757,10 +2758,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             .get(&upgrade.internal_id)
                             .map(|s| sample_status_matches(&selector, s))
                             .unwrap_or(false);
-                        if matches && !upgrade.buffer.is_complete() {
+                        if matches {
                             tracing::warn!(
-                                "Pitch correction for {} is deferred: its cold play is \
-                                 still loading; it engages when the load completes",
+                                "Pitch correction for {} is deferred until its first decode \
+                                 finishes and the decoded file is kept in memory",
                                 upgrade.file
                             );
                         }
@@ -3850,8 +3851,44 @@ mod tests {
         assert!(
             warnings
                 .iter()
-                .any(|w| w.contains("deferred") && w.contains("still loading")),
+                .any(|w| w.contains("deferred") && w.contains("first decode")),
             "a still-loading pitch target must warn, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pitch_on_a_decoded_but_unswapped_cold_play_warns_at_dispatch() {
+        // Pitch correction needs the complete buffer the upgrade pass swaps in, so a
+        // cold play whose decode has finished but has not been swapped yet (or never
+        // will be, when the file is not kept in memory) must warn as well.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain();
+
+        let mut decoded = audio::streaming::StreamingBuffer::new(2, SR, None);
+        decoded.mark_complete();
+        assert_eq!(fixture.streaming_upgrades.len(), 1);
+        fixture.streaming_upgrades[0].buffer =
+            audio::streaming::SampleBuffer::Streaming(Arc::new(RwLock::new(decoded)));
+
+        let warnings = run_capturing_warnings(
+            &mut fixture,
+            AudioCommand::Speed {
+                selector: SampleSelector {
+                    internal_id: None,
+                    id: None,
+                    file: None,
+                    voice: Some("v".to_string()),
+                },
+                speed: 1.2,
+                pitch_correction: true,
+            },
+        )
+        .await;
+        assert!(
+            warnings.iter().any(|w| w.contains("deferred")),
+            "a decoded but unswapped pitch target must warn, got {warnings:?}"
         );
     }
 

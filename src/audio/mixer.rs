@@ -1713,8 +1713,10 @@ fn mix_sample_into_output(
     duck: (f32, f32),
 ) -> bool {
     // Use pitch-corrected path if pitch corrector is enabled
-    // Note: pitch correction requires Complete buffers (direct data slice access)
-    if sample.pitch_corrector.is_some() && sample.buffer.is_complete() {
+    // Note: pitch correction requires Complete buffers (direct data slice access);
+    // a progressive buffer, even one that has finished decoding, plays on the
+    // normal path until the control thread swaps in its Complete buffer
+    if sample.pitch_corrector.is_some() && matches!(sample.buffer, SampleBuffer::Complete(_)) {
         mix_sample_with_pitch_correction(sample, output, frames, output_channels, duck);
         return true;
     }
@@ -2351,6 +2353,47 @@ mod tests {
             );
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn pitch_correction_on_a_finished_progressive_buffer_keeps_playing() {
+        // A cold play's progressive buffer can finish decoding before the control
+        // thread swaps in the complete buffer, or without that swap ever coming.
+        // The stretcher needs the complete buffer, so until then the sound must
+        // keep playing, and fading, on the normal path instead of stalling silent.
+        use std::sync::RwLock;
+        let frames = 48000;
+        let mut streaming = crate::audio::streaming::StreamingBuffer::new(2, 48000, Some(frames));
+        streaming.append(&vec![0.5f32; frames * 2]);
+        streaming.mark_complete();
+        let buffer = SampleBuffer::Streaming(Arc::new(RwLock::new(streaming)));
+        let mut sample =
+            ActiveSample::new(1, "t".to_string(), buffer, 1.0, 1.0, TEST_FILE.to_string());
+        assert!(sample.set_speed_with_mode(1.2, true));
+        assert!(sample.pitch_corrector.is_some());
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+        let mut output = vec![0.0f32; 512 * 2];
+        mix_audio(&mut output, &mut state);
+        assert!(
+            output.iter().any(|s| s.abs() > 0.1),
+            "the sound went silent"
+        );
+        assert!(
+            state.active_samples[0].position > 0,
+            "the sound stopped advancing"
+        );
+
+        state.active_samples[0].start_fade_out(10, 48000);
+        for _ in 0..4 {
+            output.fill(0.0);
+            mix_audio(&mut output, &mut state);
+        }
+        assert!(
+            state.active_samples[0].is_finished(),
+            "a fade-out must still end the sound"
+        );
     }
 
     #[test]

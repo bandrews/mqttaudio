@@ -88,6 +88,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A windowed play warns about options it cannot honor.** A windowed (streamed) play always starts at
   the beginning, loops without a crossfade, and plays a URL only once; `start_position_ms`,
   `crossfade_ms`, and `loop` on a URL were dropped silently and now log a warning.
+- **Pitch correction no longer silences a sound whose first decode has just finished.** A `speed` with
+  `pitch_correction` on a sound still being decoded for its first play made it go silent once the decode
+  finished, until the decoded file was swapped in, and for good when the file was not kept in the memory
+  cache (too large, changed or invalidated meanwhile). The silent sound also stopped advancing, so its
+  fades never ended, `stop`, `stopall` and `voice_stop` could not remove it, and it held its voice's
+  ducking. It now keeps playing, without pitch correction, until the decoded file is in place; the
+  warning at the `speed` command says so.
 - **`/status/samples` reports a cold play's real length once it has decoded.** The status kept the
   header's estimate of `total_frames` and `total_ms` until some other play or stop refreshed it.
 - **The startup log names the configuration file.** The message was written before logging started, so
