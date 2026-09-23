@@ -88,6 +88,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A windowed play warns about options it cannot honor.** A windowed (streamed) play always starts at
   the beginning, loops without a crossfade, and plays a URL only once; `start_position_ms`,
   `crossfade_ms`, and `loop` on a URL were dropped silently and now log a warning.
+- **Reverse loops with a crossfade no longer jump at the wrap.** Played backwards, a looping sound with
+  `crossfade_ms` blended its tail into its head approaching the start, then wrapped back to the very end
+  and played that tail again at full level: a jump and a repeat on every pass. It now continues just
+  below the blended tail, mirroring forward loops.
 - **Pitch correction no longer silences a sound whose first decode has just finished.** A `speed` with
   `pitch_correction` on a sound still being decoded for its first play made it go silent once the decode
   finished, until the decoded file was swapped in, and for good when the file was not kept in the memory

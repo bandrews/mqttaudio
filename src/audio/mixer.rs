@@ -767,7 +767,9 @@ impl ActiveSample {
     /// The frame a forward loop restarts from after wrapping. With an active
     /// crossfade the tail has already faded the head `[0..cf_samples]` in, so the
     /// next pass begins at `cf_samples` (a true overlap-add: the head is not
-    /// replayed at full level). Without a crossfade, loops restart at 0.
+    /// replayed at full level). Without a crossfade, loops restart at 0. A reverse
+    /// loop mirrors this: it resumes just below the last `cf_samples` of the tail,
+    /// which the crossfade already blended into the head.
     fn loop_restart_frame(&self) -> usize {
         if self.crossfade_active() {
             self.crossfade_samples
@@ -787,8 +789,13 @@ impl ActiveSample {
         if let Some(buffer_frames) = self.loop_boundary() {
             // Handle looping
             if new_pos < 0.0 {
-                // Reverse playback wrapped past start - loop to end
-                let wrapped = new_pos % buffer_frames as f64 + buffer_frames as f64;
+                // Reverse playback wrapped past start - loop to end. With an active
+                // crossfade the tail [buffer_frames - restart, buffer_frames) has
+                // already been mixed into the head, so the next pass resumes just
+                // below it; the repeating section is then [0, buffer_frames - restart).
+                let restart = self.loop_restart_frame() as f64;
+                let period = buffer_frames as f64 - restart;
+                let wrapped = new_pos.rem_euclid(period);
                 self.position = wrapped as usize % buffer_frames;
                 self.fractional_position = wrapped.fract();
             } else if new_pos >= buffer_frames as f64 {
@@ -1730,7 +1737,8 @@ fn mix_sample_into_output(
     // rather than wrapping against its growing prefix.
     let loop_mode = sample.loop_boundary().is_some();
     // Frame the forward loop restarts from (past the overlapped head when a
-    // crossfade is active); 0 for a plain loop. Constant for the whole block.
+    // crossfade is active); 0 for a plain loop. A reverse loop skips as many frames
+    // of the tail. Constant for the whole block.
     let loop_restart = sample.loop_restart_frame() as f64;
 
     // Calculate current precise position (integer + fractional parts)
@@ -1744,8 +1752,11 @@ fn mix_sample_into_output(
         // the blended head is not played twice)
         if loop_mode && buffer_frames > 0 {
             if src_pos < 0.0 {
-                // Wrap from start to end
-                src_pos = src_pos % buffer_frames as f64 + buffer_frames as f64;
+                // Wrap from start to end, just below the tail the crossfade already
+                // blended into the head (the whole buffer without a crossfade),
+                // matching advance_position.
+                let period = buffer_frames as f64 - loop_restart;
+                src_pos = src_pos.rem_euclid(period);
             } else if src_pos >= buffer_frames as f64 {
                 // Wrap from end to the restart frame (past the overlapped head
                 // under an active crossfade), matching advance_position.
@@ -2950,6 +2961,53 @@ mod tests {
                 v
             );
         }
+    }
+
+    #[test]
+    fn test_reverse_crossfade_loop_plays_tail_only_once_per_loop() {
+        // Tail frames [7, 10) are 0.9 markers, the rest 0.1. Played backwards with
+        // a 3-frame crossfade, the tail is heard only inside the blend at the head -
+        // hearing 0.9 at full level right after the reverse wrap is the double-play.
+        let mut data = Vec::new();
+        for frame in 0..10 {
+            let v = if frame >= 7 { 0.9 } else { 0.1 };
+            data.extend([v, v]);
+        }
+        let buffer = Arc::new(DecodedBuffer::new(data, 2, 48000));
+
+        let mut sample = ActiveSample::new(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            TEST_FILE.to_string(),
+        );
+        sample.loop_mode = true;
+        sample.crossfade_samples = 3;
+        sample.speed = -1.0;
+        sample.position = 4;
+
+        let mut state = MixerState::new(2);
+        state.active_samples.push(sample);
+
+        // Positions played: 4, 3 (plain 0.1), 2, 1, 0 (head blended with tail),
+        // then the wrap - which must land at frame 6 (0.1), not 9 (0.9)
+        let mut output = vec![0.0f32; 8 * 2];
+        mix_audio(&mut output, &mut state);
+
+        for frame in 5..8 {
+            let v = output[frame * 2];
+            assert!(
+                (v - 0.1).abs() < 0.05,
+                "frame {} after the reverse wrap should be before the blended tail (0.1), got {}",
+                frame,
+                v
+            );
+        }
+        // The next block continues where this one left off: 6, 5, 4 were played,
+        // so it starts at 3.
+        assert_eq!(state.active_samples[0].position, 3);
     }
 
     #[test]
