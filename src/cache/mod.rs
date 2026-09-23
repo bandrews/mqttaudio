@@ -962,6 +962,9 @@ impl CacheManager {
                 )
                 .into());
             }
+            // Remember the file's mtime+size before the decode, as the streaming
+            // path does, so a later edit is picked up by the freshness check.
+            self.record_local_stat(file_path);
             PathBuf::from(file_path)
         };
 
@@ -1484,6 +1487,41 @@ mod tests {
         assert!(
             b2.frames() > frames1 + 50_000,
             "trusting must reload the changed (longer) file, got {} vs {}",
+            b2.frames(),
+            frames1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_precached_at_startup_is_reloaded_after_an_edit() {
+        // The blocking startup precache is the default; its files must pick up
+        // edits the same way files first loaded by a play do.
+        if !wavs_present() {
+            eprintln!("skipping: test WAVs not found");
+            return;
+        }
+        let work = TempDir::new().unwrap();
+        let asset = work.path().join("asset.wav");
+        std::fs::copy(SHORT_WAV, &asset).unwrap();
+        let asset_str = asset.to_string_lossy().into_owned();
+
+        let cache_dir = TempDir::new().unwrap();
+        let mut cm =
+            CacheManager::with_quality(cache_dir.path().to_path_buf(), ResamplerQuality::Fast)
+                .unwrap();
+        cm.precache(&asset_str, 48000).await.unwrap();
+        let frames1 = cm.get_cached(&asset_str).unwrap().frames;
+
+        std::fs::copy(LONG_WAV, &asset).unwrap();
+
+        let b2 = cm
+            .get_or_load_streaming_with_freshness(&asset_str, 48000, FreshnessMode::Trusting)
+            .await
+            .unwrap();
+        wait_complete(&b2).await;
+        assert!(
+            b2.frames() > frames1 + 50_000,
+            "the edited (longer) file must be reloaded, got {} vs {}",
             b2.frames(),
             frames1
         );

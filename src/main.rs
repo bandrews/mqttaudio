@@ -1986,6 +1986,24 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 Some(PreparedPlayback::Stream(handles)) => {
                     let handles = handles.into_handles();
                     stages.decision();
+                    // A windowed source plays forward from the start of the file,
+                    // and its loop restarts the file without a crossfade.
+                    if let Some(start_ms) = start_position_ms.filter(|&ms| ms > 0) {
+                        tracing::warn!(
+                            "Play of {} is windowed (streamed), which starts at the beginning; \
+                             start_position_ms {} is ignored",
+                            file,
+                            start_ms
+                        );
+                    }
+                    if crossfade_ms > 0 {
+                        tracing::warn!(
+                            "Play of {} is windowed (streamed), which has no loop crossfade; \
+                             crossfade_ms {} is ignored",
+                            file,
+                            crossfade_ms
+                        );
+                    }
                     finish_streamed_play(
                         handles,
                         file.clone(),
@@ -3838,6 +3856,35 @@ mod tests {
         assert_eq!(
             error.map(|e| e.kind),
             Some(mqtt::commands::CommandErrorKind::InvalidRequest)
+        );
+    }
+
+    #[tokio::test]
+    async fn windowed_play_warns_about_the_options_it_ignores() {
+        // A windowed play starts at the beginning and loops without a crossfade;
+        // asking for either must be visible rather than silently dropped.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let mut play = play_stream(Some("bed"));
+        if let AudioCommand::Play {
+            start_position_ms,
+            loop_mode,
+            crossfade_ms,
+            ..
+        } = &mut play
+        {
+            *start_position_ms = Some(500);
+            *loop_mode = true;
+            *crossfade_ms = 50;
+        }
+        let warnings = run_capturing_warnings(&mut fixture, play).await;
+        assert!(
+            warnings.iter().any(|w| w.contains("start_position_ms")),
+            "got {warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("crossfade_ms")),
+            "got {warnings:?}"
         );
     }
 

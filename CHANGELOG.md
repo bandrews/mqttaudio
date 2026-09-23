@@ -78,6 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cache.stream_window_ms` and `cache.stream_prebuffer_ms`: `window_ms` 100-60000, and `prebuffer_ms`
   no larger than the window. A zero window underran constantly and a huge one allocated outside the
   memory budget.
+- **Edits to files loaded by the startup precache are picked up.** The default blocking precache did not
+  record the file's size and modification time, so after an edit the cached copy kept playing until a
+  `cache_reload` or restart. It now records them like any other load.
+- **A windowed play warns about options it cannot honor.** A windowed (streamed) play always starts at
+  the beginning and loops without a crossfade; `start_position_ms` and `crossfade_ms` were dropped
+  silently and now log a warning.
 - **The startup log names the configuration file.** The message was written before logging started, so
   it never appeared; the daemon now logs which file it loaded, or that it found none.
 - **Talkback reports an out-of-range `gain` as a gain error** instead of the lease-duration message.
