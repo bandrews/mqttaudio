@@ -214,6 +214,22 @@ impl BassManagement {
                 output_channels
             );
         }
+        if config.enabled {
+            let missing: Vec<usize> = config
+                .source_channels
+                .iter()
+                .copied()
+                .filter(|&ch| ch >= output_channels)
+                .collect();
+            if !missing.is_empty() {
+                tracing::warn!(
+                    "bass management source channels {:?} are out of range for {} output channels \
+                     and contribute no bass",
+                    missing,
+                    output_channels
+                );
+            }
+        }
 
         let lp_coeffs = BiquadCoefficients::lowpass(config.crossover_frequency_hz, sample_rate);
         let hp_coeffs = BiquadCoefficients::highpass(config.crossover_frequency_hz, sample_rate);
@@ -1007,6 +1023,39 @@ mod tests {
         assert!(
             msg.contains("bass management") && msg.contains('8') && msg.contains('4'),
             "warning should name bass management and the out-of-range channels, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn out_of_range_source_channels_warn_at_construction() {
+        // A source channel the device does not have contributes nothing; say so
+        // once at startup rather than silently extracting less bass.
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer {
+            warnings: warnings.clone(),
+        });
+
+        let config = BassManagementConfig {
+            enabled: true,
+            lfe_channel: 3,
+            crossover_frequency_hz: 80.0,
+            source_channels: vec![0, 1, 6, 7], // 6 and 7 do not exist on 4 channels
+            remove_bass_from_sources: true,
+            lfe_gain: 1.0,
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            let _bm = BassManagement::new(config, 48000, 4);
+        });
+
+        let warnings = warnings.lock().unwrap();
+        assert_eq!(warnings.len(), 1, "one warning expected, got {warnings:?}");
+        let msg = &warnings[0];
+        assert!(
+            msg.contains("[6, 7]") && msg.contains('4'),
+            "warning should name the missing channels and the device width, got {msg:?}"
         );
     }
 

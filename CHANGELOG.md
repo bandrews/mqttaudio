@@ -63,6 +63,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`config.example.json` loads.** It declared `audio.channel_aliases` twice, which the daemon rejects,
   so the documented starting config exited with a parse error. Its notes now give the correct channel
   volume range and input behavior, and its example input routes a mono microphone to two outputs.
+- **Startup exits when nothing can send it commands.** If the HTTP server failed to start (for example
+  because its port was in use) and MQTT was not configured or could not connect, the daemon kept running
+  with no way to control it. It now exits with an error, so a service manager can restart it.
+- **Commands that target nothing are logged.** A `stop`, `seek`, `speed` or `volume` with no selector, or
+  whose selector matched no playing sample, failed silently over MQTT (HTTP callers already got 400 or
+  404). These now log a warning, as do a full load queue and missing decoded metadata.
+- **Out-of-range bass-management source channels are reported.** A `source_channels` entry beyond the
+  device's channel count contributes no bass; startup now logs a warning naming it, as it already did for
+  an out-of-range `lfe_channel`.
+- **Talkback reports an out-of-range `gain` as a gain error** instead of the lease-duration message.
 - **More configuration mistakes are caught at startup.** `http.bind_address` must be an IP address: a
   host name such as `localhost` used to pass validation and then fail when the HTTP server started,
   leaving the daemon running without it. `bass_management.lfe_gain` must be a finite value between 0.0
@@ -70,6 +80,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Configuration errors are reported accurately.** An out-of-range `audio.channel_volumes` entry
   names the real limit (`4`) instead of the text `MAX_GAIN`, and an out-of-range
   `ducking_rules[].target_volume` is reported once instead of twice.
+
+### Security
+
+- **`POST /telemetry` requires the auth token when one is set.** Turning telemetry on changes daemon
+  state and adds real-time work, so it is protected like the command endpoints. `GET /telemetry` stays
+  open unless `http.require_auth` is set.
 
 ### Removed
 

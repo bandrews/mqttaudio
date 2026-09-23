@@ -137,7 +137,10 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         .route(
             "/talkback/hard-mute",
             post(handlers::handle_talkback_hard_mute),
-        );
+        )
+        // Turning telemetry on changes daemon state and adds real-time work, so
+        // it is guarded like a command; GET /telemetry stays with the status routes.
+        .route("/telemetry", post(handlers::handle_telemetry_set));
 
     // Build status routes (read-only, no auth required for basic status). These
     // include /version and /metrics, which are gated alongside the status routes
@@ -155,11 +158,8 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         .route("/status/meters", get(handlers::handle_meters))
         // Read-only running config, secrets redacted (Sprint W8, DW11).
         .route("/config", get(handlers::handle_config))
-        // Telemetry opt-in (Sprint W6, DW3): GET reads the flag, POST sets it.
-        .route(
-            "/telemetry",
-            get(handlers::handle_telemetry_get).post(handlers::handle_telemetry_set),
-        );
+        // Whether live-position and meter telemetry is on (Sprint W6, DW3).
+        .route("/telemetry", get(handlers::handle_telemetry_get));
 
     // Health check (no auth)
     let health_route = Router::new()

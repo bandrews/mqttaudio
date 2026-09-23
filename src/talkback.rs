@@ -22,6 +22,7 @@ pub enum LeaseError {
     InvalidSource,
     InvalidDestination,
     InvalidDuration,
+    InvalidGain,
     AlreadyOwned { owner_client_id: String },
     NotOwner,
     LeaseNotFound,
@@ -34,6 +35,7 @@ impl std::fmt::Display for LeaseError {
             Self::InvalidSource => write!(f, "source_id must be GM_MIC"),
             Self::InvalidDestination => write!(f, "destination is not allowlisted"),
             Self::InvalidDuration => write!(f, "lease_ms must be between 250 and 2000"),
+            Self::InvalidGain => write!(f, "gain must be between -60 and 12 dB"),
             Self::AlreadyOwned { owner_client_id } => {
                 write!(f, "talkback is owned by {owner_client_id}")
             }
@@ -105,11 +107,11 @@ impl TalkbackLease {
         if !allowed_destination(destination) {
             return Err(self.fail(LeaseError::InvalidDestination));
         }
-        if !(MIN_LEASE_MS..=MAX_LEASE_MS).contains(&lease_ms)
-            || !gain.is_finite()
-            || !(-60.0..=12.0).contains(&gain)
-        {
+        if !(MIN_LEASE_MS..=MAX_LEASE_MS).contains(&lease_ms) {
             return Err(self.fail(LeaseError::InvalidDuration));
+        }
+        if !gain.is_finite() || !(-60.0..=12.0).contains(&gain) {
+            return Err(self.fail(LeaseError::InvalidGain));
         }
         if let Some(active) = &mut self.active {
             if active.owner_client_id != client_id {
@@ -338,5 +340,14 @@ mod tests {
             lease.release("other", "lease-0001", 0).unwrap_err(),
             LeaseError::NotOwner
         );
+    }
+
+    #[test]
+    fn out_of_range_gain_is_reported_as_a_gain_error() {
+        let mut lease = TalkbackLease::default();
+        let error = lease
+            .acquire("gm", "GM_MIC", "GUEST_ALL", 20.0, 500, 0)
+            .unwrap_err();
+        assert!(error.to_string().contains("gain"), "got {error}");
     }
 }

@@ -938,6 +938,7 @@ async fn main() {
     let (text_tx, mut text_rx) = mpsc::channel::<mqtt::commands::CommandRequest>(100);
 
     // Start HTTP server if enabled
+    let mut http_serving = false;
     if config.http.enabled {
         let http_cmd_tx = text_tx.clone();
         match http::start_server(
@@ -961,6 +962,7 @@ async fn main() {
         .await
         {
             Ok(addr) => {
+                http_serving = true;
                 tracing::info!("HTTP REST API available at http://{}", addr);
                 if config.http.websocket_enabled {
                     tracing::info!("WebSocket logs available at ws://{}/ws", addr);
@@ -968,9 +970,12 @@ async fn main() {
             }
             Err(e) => {
                 tracing::error!("Failed to start HTTP server: {}", e);
-                // Continue without HTTP server - not fatal
             }
         }
+    }
+    if let Some(error) = no_command_interface_error(mqtt_connection.is_some(), http_serving) {
+        tracing::error!("{}", error);
+        std::process::exit(1);
     }
 
     // Spawn MQTT event processor if connected
@@ -1059,6 +1064,7 @@ async fn main() {
                         }
                         if loading::needs_preparation(&cmd) && prepared.is_none() {
                             if loads.len() >= 32 {
+                                tracing::warn!("Too many concurrent loads; command rejected");
                                 if let Some(reply) = reply { let _ = reply.send(Err(mqtt::commands::CommandError::new(mqtt::commands::CommandErrorKind::Internal, "Too many concurrent loads"))); }
                                 continue;
                             }
@@ -1188,6 +1194,20 @@ async fn main() {
                 break;
             }
         }
+    }
+}
+
+/// The error to exit with when startup left no way to receive commands, or `None`
+/// when MQTT is connected or the HTTP server is serving. Without either the daemon
+/// would sit idle, so it exits and a service manager can retry.
+fn no_command_interface_error(mqtt_connected: bool, http_serving: bool) -> Option<&'static str> {
+    if mqtt_connected || http_serving {
+        None
+    } else {
+        Some(
+            "No command interface is available (MQTT is not connected and the HTTP server is \
+             not running); exiting",
+        )
     }
 }
 
@@ -1896,6 +1916,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
     | ParsedCommand::Volume { selector, .. } = &cmd
     {
         if selector.is_empty() {
+            tracing::warn!("Command has no sample selector; ignoring it");
             ctx.fail(
                 CommandErrorKind::InvalidRequest,
                 "Command has no sample selector",
@@ -1907,6 +1928,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             .values()
             .any(|sample| sample_status_matches(selector, sample))
         {
+            tracing::warn!("No sample matches the selector {:?}", selector);
             ctx.fail(CommandErrorKind::NotFound, "No sample matches the selector");
             return;
         }
@@ -1985,6 +2007,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                         matches!(&buffer, audio::streaming::SampleBuffer::Streaming(_));
                     let (channels, sample_rate, frames) = buffer.metadata_blocking();
                     if channels == 0 || sample_rate == 0 {
+                        tracing::error!("Decoded audio metadata is unavailable for {}", file);
                         ctx.fail(
                             CommandErrorKind::Internal,
                             "Decoded audio metadata is unavailable",
@@ -4754,6 +4777,44 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(output.trim()).is_err(),
             "text format must not be JSON, got: {output:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_selector_that_matches_nothing_is_logged() {
+        // MQTT commands get no reply, so a stop/seek/speed/volume that targets
+        // nothing has to say so in the log.
+        use tracing_subscriber::layer::SubscriberExt;
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = build_fmt_layer("text", tracing::Level::WARN, BufferWriter(buffer.clone()));
+        let _logs = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+
+        let mut fixture = Fixture::new(vec![]);
+        fixture
+            .run(AudioCommand::Stop {
+                selector: SampleSelector {
+                    internal_id: None,
+                    id: Some("nothing-playing".to_string()),
+                    file: None,
+                    voice: None,
+                },
+                fade_out_ms: None,
+            })
+            .await;
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("No sample matches the selector"),
+            "the failure must be logged, got {output:?}"
+        );
+    }
+
+    #[test]
+    fn startup_without_any_command_interface_is_an_error() {
+        // A daemon that can receive no commands would sit idle; startup exits so a
+        // service manager can retry.
+        assert!(no_command_interface_error(false, false).is_some());
+        assert!(no_command_interface_error(true, false).is_none());
+        assert!(no_command_interface_error(false, true).is_none());
     }
 
     #[test]

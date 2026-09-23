@@ -1153,6 +1153,42 @@ async fn test_require_auth_protects_status_routes() {
 }
 
 #[tokio::test]
+async fn enabling_telemetry_requires_the_token_when_one_is_set() {
+    // Turning telemetry on changes daemon state and adds real-time work, so it is
+    // guarded like a command; reading the flag stays open like the status routes.
+    let (state, _rx) = create_test_state_with_auth("tok-12345");
+    let flag = state.telemetry_enabled.clone();
+    let app = create_router(state, false, false);
+
+    let set = |auth: Option<&str>| {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/telemetry")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(token) = auth {
+            req = req.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        req.body(Body::from(r#"{"enabled": true}"#)).unwrap()
+    };
+
+    let resp = app.clone().oneshot(set(None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(!flag.load(std::sync::atomic::Ordering::Relaxed));
+
+    let resp = app.clone().oneshot(set(Some("tok-12345"))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(flag.load(std::sync::atomic::Ordering::Relaxed));
+
+    let read = Request::builder()
+        .method(Method::GET)
+        .uri("/telemetry")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(read).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_health_open_even_under_require_auth() {
     let (state, _rx) = create_test_state_require_auth("tok");
     let app = create_router(state, false, false);
