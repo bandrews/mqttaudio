@@ -10,18 +10,7 @@ dedicated unprivileged user, restarts it on failure, and locks it down: the file
 read-only apart from a writable state directory, home directories are hidden, and only ALSA sound
 devices are accessible.
 
-```bash
-cargo build --release
-sudo install -Dm755 target/release/mqttaudio /usr/local/bin/mqttaudio
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin mqttaudio
-sudo install -Dm640 -o root -g mqttaudio your-config.json /etc/mqttaudio/config.json
-sudo install -Dm644 packaging/mqttaudio.service /etc/systemd/system/mqttaudio.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now mqttaudio
-sudo journalctl -u mqttaudio -f
-```
-
-Before starting it, point the disk cache at the state directory the unit makes writable:
+First make sure your config points the disk cache at the state directory the unit makes writable:
 
 ```json
 "cache": { "directory": "/var/lib/mqttaudio/cache" }
@@ -33,15 +22,32 @@ in a loop. (Setting `"cache": {"enabled": false}` also works, at the cost of re-
 files after every restart.) For the same reason, keep sound files outside `/home`, `/root` and
 `/run/user`.
 
+Then install and start it:
+
+```bash
+cargo build --release
+sudo install -Dm755 target/release/mqttaudio /usr/local/bin/mqttaudio
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups audio mqttaudio
+sudo install -Dm640 -o root -g mqttaudio your-config.json /etc/mqttaudio/config.json
+sudo install -Dm644 packaging/mqttaudio.service /etc/systemd/system/mqttaudio.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now mqttaudio
+sudo journalctl -u mqttaudio -f
+```
+
 The config file is installed readable only by root and the service group because it may hold the
-MQTT password and the HTTP token.
+MQTT password and the HTTP token. The config editor keeps a file's permission bits but not its
+group, so after `sudo mqttaudio --configure --config /etc/mqttaudio/config.json`, restore it with
+`sudo chgrp mqttaudio /etc/mqttaudio/config.json`.
 
 What the unit does:
 
 - **Restarts.** `Restart=on-failure`. The daemon exits non-zero when it cannot recover the output
   device after retrying with backoff, so systemd restarts it.
-- **Device access.** The service user joins the `audio` group and may use ALSA character devices
-  only. If an input device reports "Permission denied", check that group membership. A system
+- **Device access.** The unit gives the service the `audio` group (`SupplementaryGroups=audio`) and
+  allows ALSA character devices only. The `useradd` above also puts the user in `audio`, so commands
+  run with `sudo -u mqttaudio` can open the same devices. If a device reports "Permission denied",
+  check the ownership of `/dev/snd`. A system
   service has no desktop session, so sound-server devices (`default`, `pipewire`, `pulse`) are
   usually unavailable: pick a hardware device such as `plughw:CARD=...` from `--list-devices`.
 - **Memory backstop.** `MemoryMax=75%` caps the whole process. The daemon already bounds its
@@ -71,9 +77,9 @@ docker run --device /dev/snd -v /srv/mqttaudio:/config -p 8080:8080 mqttaudio
 ```
 
 - The image runs `mqttaudio --config /config/mqttaudio.json`.
-- Its health check calls `GET /ready` on port 8080, so enable the HTTP server on that port and
-  bind an address reachable inside the container (for example `"bind_address": "0.0.0.0"` or
-  `MQTTAUDIO_HTTP_BIND_ADDRESS=0.0.0.0`).
+- Its health check calls `GET /ready` on `127.0.0.1:8080` inside the container, so enable the HTTP
+  server on port 8080. To reach the API through `-p 8080:8080`, also listen on all interfaces
+  (`"bind_address": "0.0.0.0"` or `MQTTAUDIO_HTTP_BIND_ADDRESS=0.0.0.0`), with a token.
 - With `MQTTAUDIO_HTTP_REQUIRE_AUTH=true` the health check also requires
   `MQTTAUDIO_HTTP_AUTH_TOKEN` in the container environment, and reports unhealthy without it even
   when the token is in the config file (`/ready` itself never needs a token).
@@ -89,7 +95,7 @@ mqttaudio runs open by default so it is easy to try on a trusted network. Each o
 |------|---------|
 | Any local file the daemon can read is playable | `security.allowed_directories`: only paths inside these directories play (symlinks and `..` are resolved first). HTTP(S) URLs are not restricted; limit outbound traffic with a firewall if that matters |
 | MQTT traffic and credentials in cleartext | `mqtt.tls` (with `ca_path` for a private CA); a warning is logged when credentials go to a non-loopback broker without TLS |
-| Anyone who can reach the HTTP port can send commands | `http.auth_token` protects the command endpoints; `http.require_auth` extends it to status, metrics and WebSockets. Keep `http.bind_address` on loopback unless it must be remote; a warning is logged for a non-loopback bind without authentication |
+| Anyone who can reach the HTTP port can send commands | `http.auth_token` protects the command endpoints and the WebSockets; `http.require_auth` extends it to the status routes, `/metrics`, `/version` and `/config` (`/health` and `/ready` stay open). Keep `http.bind_address` on loopback unless it must be remote; a warning is logged for a non-loopback bind without authentication |
 
 The HTTP server speaks plain HTTP. Put a reverse proxy in front of it for TLS
 ([HTTP API: HTTPS](http-api.md#https)).

@@ -44,7 +44,7 @@ Then add it to the config's `inputs` list:
 | `routes` | *required* | Which capture channel (from 0) plays on which output channel (number or alias) |
 | `voice_id` | `"mic"` | The input's voice, for `voice_volume`, the `input_*` commands and ducking |
 | `volume` | `1.0` | Gain, `0.0`–`4.0` |
-| `latency_ms` | `20` | Target delay from capture to output, `5`–`500` |
+| `latency_ms` | `20` | Capture buffering, `5`–`500`; see [Latency and clock drift](#latency-and-clock-drift) |
 | `channels` | smallest count covering the routes | Capture channels to open |
 | `sample_rate` | the output rate | Capture rate to ask for |
 | `activity_threshold` | none | Level that makes the input count as active for ducking |
@@ -131,8 +131,8 @@ therefore passes through a sample-rate converter whose ratio is steered, within 
 buffer between capture and output is. That keeps the buffer, and so the delay, steady over sessions of
 any length, even when both devices nominally run at the same rate.
 
-`latency_ms` sets the target delay. The converter hands over audio in blocks of 1024 frames, so the
-buffer must hold at least two: a smaller `latency_ms` is raised to the minimum (11 ms at a 48 kHz
+`latency_ms` sets the capture buffering. The converter hands over audio in blocks of 1024 frames, so
+the buffer must hold at least two: a smaller `latency_ms` is raised to the minimum (11 ms at a 48 kHz
 output, 12 ms at 44.1 kHz) with a warning naming the value used. The real delay from microphone to
 speaker is roughly twice `latency_ms` plus about 11 ms of conversion.
 

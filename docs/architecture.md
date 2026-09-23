@@ -13,9 +13,12 @@ mqttaudio is one process with two halves:
 - **The audio thread** is the output device's callback. It owns all mixer state and does nothing
   that can block: no allocation, no contended lock, no I/O, no logging.
 
-The two halves talk only through lock-free single-producer/single-consumer rings (the `ringbuf`
-crate) and atomics. The control plane never reads mixer state. It keeps its own view of what is
-playing, updated from what it sent and from what the audio thread hands back.
+The two halves talk through lock-free single-producer/single-consumer rings (the `ringbuf` crate)
+and atomics, with two exceptions: a cold full-load play's progressive buffer is an
+`Arc<RwLock<StreamingBuffer>>` shared with its decoder, which the audio thread only `try_read`s, and the
+output callback's own state sits behind a mutex that only the callback locks. The control plane never
+reads mixer state. It keeps its own view of what is playing, updated from what it sent and from what
+the audio thread hands back.
 
 ```
  MQTT client ──┐                                         ┌── HTTP status / metrics
@@ -26,7 +29,7 @@ playing, updated from what it sent and from what the audio thread hands back.
  │  macro expansion → parse → prepare (load task) → handle_command              │
  │  voice registry · ducking engine · status snapshot · reaper tick (20 ms)     │
  └───────────────┬──────────────────────────────────────────────▲──────────────┘
-                 │ command ring (AudioCommand, fully resolved)   │ graveyard rings
+                 │ command ring (AudioCommand)                   │ graveyard rings
                  ▼                                               │ (finished samples,
  ┌─────────────────────────────────────────────────────────────────────────────┐ spent commands)
  │ Audio callback (src/audio/engine.rs → src/audio/mixer.rs)                    │
@@ -43,15 +46,18 @@ playing, updated from what it sent and from what the audio thread hands back.
 | What | Where | Notes |
 |------|-------|-------|
 | Control loop | `main()` in `src/main.rs` | One tokio task: commands, load results, the 20 ms reaper tick, the 30 s cache-freshness tick, shutdown |
+| Freshness pass | spawned from the control loop | Revalidates in-memory downloads every 30 s (not when freshness is `pinned`) |
 | MQTT event loop | `src/mqtt/client.rs` | Re-subscribes on every reconnect; drops (and counts) commands if the control loop falls behind |
 | HTTP server | `src/http/` | axum; command endpoints wait up to 30 s for the control loop's reply |
 | Load tasks | `src/loading.rs` | One task per `play`/`precache`/cache command; up to 32 in flight, 4 of them loading at once; `stopall`/`fadeall` abort them |
 | Progressive decoders | `src/cache/mod.rs` | Blocking-pool tasks that decode a full-load file into a growing buffer |
+| Download tasks | `src/cache/http_stream.rs`, `src/loading.rs` | Async tasks that feed HTTP bodies to decoders, tee them to the disk cache, and register finished downloads |
 | Streamed-decode threads | `src/audio/streamed_source.rs` | One dedicated thread per windowed play, filling a bounded ring |
 | Output supervisor | `spawn_output_supervisor` in `src/audio/engine.rs` | Owns the output stream; rebuilds it with backoff after a fatal device error, then exits the process if it cannot recover |
 | Audio callback | cpal's output thread | Runs `run_mix_callback` |
 | Capture callbacks | cpal's input threads | Convert, resample and write into per-input rings |
 | State tick | `src/http/mod.rs` | ~15 Hz `/ws/state` broadcaster; idle unless telemetry is on and a client is connected |
+| MQTT log publisher | `src/mqtt/logger.rs` | Publishes log records when `logging.mqtt_topic` is set |
 
 ## A command's life
 
@@ -63,9 +69,11 @@ playing, updated from what it sent and from what the audio thread hands back.
    `loading::prepare` in a load task, so a slow download never delays `stopall` or a volume
    change. `stopall`/`fadeall` bump a generation counter; a load that finishes afterwards is
    discarded and its HTTP caller gets `409`.
-4. **Resolve.** `handle_command` does everything that allocates or looks things up: voice and
-   sample ids, channel-alias resolution, ducking targets, pitch-corrector construction. The result
-   is a fully built `rt_engine::AudioCommand` (for example `AddSample(ActiveSample)`).
+4. **Resolve.** `handle_command` does the work that allocates or needs control-side state: voice
+   and sample ids, channel-alias resolution, ducking targets, pitch-corrector construction. The
+   result is a built `rt_engine::AudioCommand` (for example `AddSample(ActiveSample)`). Commands that
+   pick sounds or inputs, such as `stop` or `input_mute`, carry their selector, which the audio
+   thread matches against what it is playing.
 5. **Apply.** The audio callback drains up to 64 commands at the top of each block and applies
    them to `MixerState`. Commands that own heap memory are moved back to the reaper on the
    command-return ring instead of being freed on the audio thread.
@@ -81,9 +89,10 @@ budget's headroom):
 
 - **Memory-cache hit.** The decoded buffer is shared by `Arc`; the play starts on the next block.
 - **Full load (cold).** A progressive decoder fills a `SampleBuffer::Streaming` in the background
-  and the play starts as soon as the requested start position is decoded. When the decode
-  finishes, the buffer is promoted into the memory cache and the playing sample is switched to the
-  complete buffer (`UpgradeSampleBuffer`), which restores seek, loop crossfade and pitch correction.
+  and the play starts as soon as the requested start position is decoded. Seeking works on the
+  progressive buffer, and looping starts once the decode has finished. The finished decode is then
+  promoted into the memory cache, if it fits, and the playing sample is switched to the complete
+  buffer (`UpgradeSampleBuffer`), which pitch correction needs.
 - **Windowed.** A `StreamedSource` plays from a fixed-size ring that a dedicated thread keeps
   filled, so memory stays at the window size however long the asset is. Windowed voices play
   forward only.
@@ -112,10 +121,10 @@ Last-Modified revalidation.
 
 The callback then converts the bus to the device's sample format (`build_output_stream`).
 
-Mixer storage is reserved up front so the audio thread never grows it. Samples have a hard cap of
-256 (`MAX_VOICES`): at the cap a new play replaces the oldest non-looping sample, or is dropped if
-every sample loops. Streamed sources (64) and live inputs (16) have reserved capacity but no cap
-yet; see [Known issues](bugs.md).
+Mixer storage is reserved up front. Samples have a hard cap of 256 (`MAX_VOICES`): at the cap a new
+play replaces the oldest non-looping sample, or is dropped if every sample loops. Streamed sources
+(64) and live inputs (16) have reserved capacity but no cap yet, and the output callback sizes its
+bus on its first block; see [Known issues](bugs.md).
 
 ## Live inputs
 
@@ -125,8 +134,10 @@ ratio is steered from the ring's fill level, which absorbs clock drift between t
 output devices. Input entries that share a capture stream each get their own ring and appear in
 the mixer as separate `LiveInput`s with their own routes, volume and voice id.
 
-Applied input state (volume, mute, health counters, peak levels) is published through atomics, so
-`/status/inputs` reports what the audio thread applied, not what was last requested.
+Applied input state (volume, mute, health counters) is published through atomics, so
+`/status/inputs` reports what the audio thread applied, not what was last requested. The capture
+callbacks also publish each channel's peak level, which the reaper tick reads for activity
+detection.
 
 ## What the control plane can see
 
@@ -134,9 +145,9 @@ The control plane never locks mixer state. HTTP status comes from:
 
 - **The status snapshot** (`http::StatusSnapshot`), rebuilt by the control loop whenever it adds
   or reaps a sample.
-- **Atomics written by the audio thread:** the limiter clip counter, the xrun counter, first-mix
-  latency probes, and, when telemetry is enabled (`POST /telemetry`), each sample's playback
-  position and the output peak meters.
+- **Atomics written by the audio thread:** the limiter clip counter, first-mix latency probes,
+  and, when telemetry is enabled (`POST /telemetry`), each sample's playback position and the output
+  peak meters. The stream-error (xrun) counter is bumped by cpal's error callback.
 - **The voice registry** (`src/voice.rs`) and the ducking snapshot, both owned by the control
   loop.
 
@@ -146,7 +157,7 @@ Code that runs in the audio callback or a capture callback must not:
 
 - allocate or free memory,
 - take a lock that another thread can hold for long (the callback's own mutex is uncontended:
-  only the supervisor takes it, during a rebuild),
+  only the output callback locks it),
 - do I/O, log, or make blocking system calls.
 
 `tests/alloc_harness.rs` counts allocations and frees on the mix, command and ducking paths and
@@ -160,7 +171,7 @@ shipped to the audio thread ready to use.
 |------|----------|
 | `src/main.rs` | CLI, startup, the control loop and command dispatch (`handle_command`) |
 | `src/lib.rs` | The library crate the binary, tests and benchmarks build on |
-| `src/config.rs` | Config structs, defaults, validation, CLI and environment overrides |
+| `src/config.rs` | Config structs, defaults, validation and command-line overrides (`main.rs` applies the environment overrides) |
 | `src/loading.rs` | Off-loop preparation of play and cache commands |
 | `src/rt_engine.rs` | The control-to-audio command set and rings |
 | `src/voice.rs` | Voice registry: voice ids, sample ids, voice volumes |
@@ -198,4 +209,9 @@ shipped to the audio thread ready to use.
 | tracing, tracing-subscriber | Logging |
 | parking_lot | Non-poisoning mutexes |
 | sysinfo | Available-memory detection for the cache budget |
-| alsa (Linux) | Device capability probing |
+| sha2 | Disk-cache file names |
+| chrono | Disk-cache timestamps |
+| dirs | Config and home directory paths |
+| rand | Random MQTT client ids |
+| futures, futures-util, bytes | HTTP body streaming |
+| alsa, libc (Linux) | Device capability probing and capture-open diagnostics |

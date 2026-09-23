@@ -19,11 +19,14 @@ You need:
   [HTTP API](http-api.md).
 
 ```bash
-git clone https://github.com/bandrews/mqttaudio.git
+git clone -b v2.1 https://github.com/bandrews/mqttaudio.git
 cd mqttaudio
 cargo build --release
 ./target/release/mqttaudio --version
 ```
+
+The default branch, `main`, still holds 2.0; this documentation describes the `v2.1` release
+candidate.
 
 The binary is `target/release/mqttaudio`. The examples below assume it is on your `PATH` or that you
 run them from `target/release/`.
@@ -155,7 +158,7 @@ Or write it by hand:
 ```json
 {
   "mqtt": {"server": "localhost", "topic": "audio/commands"},
-  "audio": {"device": "plughw:CARD=HD,DEV=0"},
+  "audio": {"device": "plughw:CARD=HD,DEV=0", "channels": 8},
   "security": {"allowed_directories": ["/opt/sounds"]}
 }
 ```

@@ -33,7 +33,7 @@ Build it (Rust 1.88 or newer, plus the platform packages listed in
 [Getting Started](docs/getting-started.md#build-it)):
 
 ```bash
-git clone https://github.com/bandrews/mqttaudio.git
+git clone -b v2.1 https://github.com/bandrews/mqttaudio.git
 cd mqttaudio
 cargo build --release
 ```
@@ -46,7 +46,8 @@ Find your output device and start the daemon:
 ```
 
 On Linux the device is an ALSA ID such as `plughw:CARD=HD,DEV=0`, copied from `--list-devices`;
-leave `--device` out to use the system default. Then send it a command:
+leave `--device` out to use the system default. With a `plughw:` device, also pass the card's channel
+count with `--channels`. Then send it a command:
 
 ```bash
 mosquitto_pub -t audio/commands -m '{"command": "play", "file": "/opt/sounds/doorbell.wav"}'

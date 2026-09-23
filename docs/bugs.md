@@ -18,14 +18,15 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
   configured routes at its configured volume. The destination allowlist (`GUEST_ALL`, `ROOM_1`,
   `ROOM_2A`, `ROOM_2B`, `ROOM_3`, `ROOM_4`) is hard-coded in `src/talkback.rs`.
 - **Ordinary commands can reopen the microphone.** Without an active lease, `input_mute` unmutes it.
-  With a lease, the guard compares the `input` string with the source's voice id, so selecting the
-  input by number (`"0"`) bypasses it.
+  With a lease, the unmute guard compares the `input` string with the source's voice id, so selecting
+  the input by number (`"0"`) bypasses it, and `input_volume`, which also unmutes, has no guard at all.
 - **A lease can fail open.** If the audio command queue is full when a lease expires, is released
-  or is hard-muted, the mute is dropped (logged at `error` on expiry, silently otherwise) and the
-  microphone stays live.
+  or is hard-muted, the mute is dropped (logged at `error`; release and hard-mute answer `500`) while
+  the lease is already cleared, so `/status/talkback` reports `muted` and the microphone stays live.
 - **Rough edges:** the acquire reply does not carry the `lease_id` (read `/status/talkback`), so an
-  MQTT-only client cannot release; every refusal, including a malformed `lease_ms`, answers `403`
-  rather than `400`; an expired lease keeps refusing other clients for up to one 20 ms tick.
+  MQTT-only client cannot release; refusals from the lease rules, including an out-of-range
+  `lease_ms`, answer `403` rather than `400`; an expired lease keeps refusing other clients for up to
+  one 20 ms tick.
 
 ### Playback and commands
 
@@ -34,14 +35,21 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 - **The seek/speed gate for windowed voices is too broad.** `selector_targets_streamed_voice`
   (`src/main.rs`) skips the whole command when the selector's `voice` has had a windowed sound since
   the voice was last idle, including fully loaded sounds that could seek.
-- **Reverse loops with a crossfade may jump at the wrap.** The per-frame mix loop in
-  `mix_sample_into_output` wraps a reverse loop to the buffer's end, while the position update
-  (`wrap_loop_position`) wraps to just before the crossfaded tail, so the two disagree for one block.
-  No test covers reverse looping with `crossfade_ms`.
-- **Pitch correction never engages on a cold play whose file is not kept in memory.** The upgrade to
-  a complete buffer happens only when the decode is promoted into the memory cache; a file larger
-  than the free budget stays on its progressive buffer, and the warning that correction "engages when
-  the load completes" is then wrong.
+- **Pitch correction never engages on a cold play whose file is not kept in memory.** The stretcher
+  needs the complete buffer that the upgrade pass swaps in once the decode is promoted into the memory
+  cache. A file larger than the free budget, or one changed or invalidated during its decode, is never
+  promoted, so that play continues without pitch correction (the `speed` command's warning says it is
+  deferred).
+- **A play can leave phantom state when the audio command queue is full.** The play paths register
+  the voice, its activity count, ducking and the status entry before sending the sound to the audio
+  thread, and do not undo them when the send fails (the HTTP caller gets `500`). The phantom stays in
+  `/status/samples` and keeps its voice active, holding any ducking, until restart. The 1024-slot
+  queue fills only when the audio thread stops draining it, for example while the output device is
+  being rebuilt.
+- **A cold play can drop a block under lock contention.** A progressive buffer is shared with the
+  decoder through a `RwLock`; the audio thread only `try_read`s it, and when the decoder holds the
+  write lock (including while its storage grows) that sound's block is silent while its position
+  still advances.
 - **Routes to a missing output are silent.** A `channel_map` or input route whose `dest` is beyond the
   device's channel count is dropped without a warning.
 - **`/status/samples` reports the requested `speed`**, not the clamped value.
@@ -57,17 +65,23 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
   log success when the result is then too big to keep.
 - **Freshness does not match decision D46.** D46 says a play never waits on the network, `dev`
   checks on every play, and `pinned` checks nothing. In the code, a play of a URL that is only on
-  disk revalidates in the foreground (up to 5 s) in every mode, `dev` only shortens the background
-  pass, and the background pass holds the cache lock across its network requests, which stalls
-  `/metrics`, `/status`, `/status/cache` and new loads while a server is slow.
+  disk revalidates in the foreground in every mode once it is due: the conditional request is bounded
+  at 5 s, but a `200` answer is discarded and the whole file downloaded again (30 s header and 60 s
+  stall limits, no overall limit) before the play continues. `dev` only shortens the background pass.
+  Both paths hold the cache lock across their network requests, which stalls `/metrics`, `/status`,
+  `/status/cache` and new loads while a server is slow.
 - **Headroom drops to zero during a load of unknown length.** `memory_headroom` reserves the whole
-  free budget for such a load, so every play decided meanwhile is windowed.
+  free budget for such a load (and for a load whose lock is momentarily write-held), so plays decided
+  meanwhile are windowed unless they have no size estimate or are already in memory.
 - **`cache_clear` does not cancel loads in progress**, which then fill the cache again, and it
   deletes the temporary files of downloads still running, whose completion then fails with a
   warning. `cache_invalidate` racing a windowed download's completion can likewise leave the old
   entry registered.
 - **Promotion copies the decoded buffer.** `cleanup_completed_loads` promotes with `to_vec()`, a
-  transient second copy bounded by `full_load_max_bytes`.
+  transient second copy of the whole decode, made before the memory cache decides whether to keep it.
+  Full loads are not all bounded by `full_load_max_bytes` (`mode: "full"`, files without a size
+  estimate, cached URLs, edits, precache), and the copy runs on the control loop when the upgrade pass
+  triggers it.
 - **The disk cache has no size limit or eviction.**
 
 ### Live inputs
@@ -88,6 +102,9 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 - **Streamed sources and live inputs have no hard cap.** `MixerState` reserves 64 streamed sources
   and 16 live inputs, but only full-load samples are capped (256, `MAX_VOICES`). Past the reserve the
   audio thread grows the vector, allocating in the callback.
+- **The output callback's mix bus can allocate.** It starts empty and is resized inside the callback
+  (`build_typed_output_stream` in `src/audio/engine.rs`), so the first block allocates, and so does any
+  larger block when the device picks its own buffer size. The allocation harness does not cover it.
 
 ### HTTP API
 
@@ -96,7 +113,8 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
   pages must use `?token=`. Mirroring the requested headers would fix it.
 - **Cross-site requests in open mode.** With no `auth_token`, any web page the operator opens can
   send the body-less `POST /stopall`, `/cache/clear` and `/talkback/hard-mute` to a daemon on
-  `localhost`. Setting a token closes this.
+  `localhost`, and read the log stream on `/ws` (no `Origin` check). With `cors_permissive` on, every
+  JSON command route is reachable cross-site too. Setting a token closes this.
 - **The 30-second command timeout starts after queuing**, so a request can wait longer while the
   command queue is full.
 
@@ -110,6 +128,9 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 
 - **Saving validates the file alone.** A config that relies on `MQTTAUDIO_HTTP_AUTH_TOKEN` to satisfy
   `http.require_auth` cannot be saved.
+- **Saving keeps permission bits but not the owner or group.** Editing a service's
+  `root:mqttaudio 0640` config with `sudo` leaves it `root:root 0640`, which the service cannot read
+  until the group is restored.
 - **Formatting is not preserved.** Keys are written in alphabetical order, and `<file>.bak` keeps
   only the previous save.
 
@@ -120,15 +141,16 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
   never needs a token, and it assumes port 8080 while `http.port` defaults to `0`.
 - **No declared minimum Rust version.** Dependencies need Rust 1.88 (ratatui 0.30, time 0.3.47), but
   `Cargo.toml` has no `rust-version` and no build checks it.
-- **A binary unit test failed once under full-suite load** (`605 passed; 1 failed`, name not
-  captured) and passed on every rerun. The suite has timing-sensitive tests; capture the name if it
-  recurs.
+- **A unit test failed once under full-suite load** (recorded when the binary still compiled its
+  own copy of every module; name not captured) and passed on every rerun. The suites have
+  timing-sensitive tests; capture the name if it recurs.
 
 ### Code health
 
 - `handle_command` (`src/main.rs`) still has arms for `precache` and the cache commands, which
   `loading::prepare` completes first, and empty-selector branches in `seek`, `speed`, `stop` and
   `volume` that the selector pre-check makes unreachable.
+- `dasp` is declared in `Cargo.toml` but not used anywhere.
 - `CacheError`'s variant names carry a targeted `#[allow(clippy::enum_variant_names)]`
   (`src/cache/disk.rs`).
 - The ALSA name matcher (`try_match_alsa_device` in `src/audio/device.rs`) compares only the card, not
@@ -142,7 +164,8 @@ These are deliberate trade-offs, recorded so they are not mistaken for bugs.
 - **Speeds above 1.0 without pitch correction alias.** The fast speed path interpolates (Catmull-Rom)
   but does not low-pass before skipping samples (D27). Pitch correction is band-limited.
 - **Every live input goes through the drift-controlling resampler**, even at matching rates, adding
-  its chunking delay (about 11 ms) for a buffer that never drifts to a click (D33). The steering is
+  its delay (it hands over 1024-frame chunks, 21 ms at 48 kHz) for a buffer that never drifts to a
+  click (D33). The steering is
   proportional, so the buffer settles near, not exactly at, its target; the trim ceiling allows for
   the offset.
 - **`fadeall` and `stopall` leave live inputs running.** Use `input_mute`.

@@ -121,7 +121,7 @@ that is not on this machine without TLS.
 |---------|---------|-------------|
 | `device` | system default | Output device, as printed by `--list-devices`. On Linux that is an ALSA name such as `plughw:CARD=UMC1820,DEV=0`, not the card's description |
 | `sample_rate` | `48000` | Output rate, `8000`–`192000` Hz. A rate the device lacks is replaced by the nearest one it has; the log shows the rate in use |
-| `channels` | the most the device offers, up to 32 | Output channel count. A count the device lacks is raised to the next one it has |
+| `channels` | the most the device offers, up to 32 | Output channel count. A count the device lacks is raised to the next one it has. ALSA plugin devices such as `plughw:` and `default` accept any count, so without this they open 32 channels: set it to the card's real count |
 | `buffer_size` | `512` | Frames per audio block, `64`–`8192`; used when the device accepts it, otherwise the device's own size. Smaller blocks lower latency and raise the risk of dropouts |
 | `channel_aliases` | `{}` | Names for output channels, usable wherever a channel number is |
 | `channel_names` | `{}` | Display labels, keyed by channel number: `{"6": "booth"}`. Accepted as `channel_volumes` keys, but not as channel names in routes |
@@ -155,7 +155,7 @@ signal passes unchanged; above that it is compressed smoothly into the ceiling. 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | `true` | Keep downloaded files in `directory` so replays and restarts skip the download |
-| `directory` | `~/.mqttaudio/cache` | Disk cache location (`~` expands). It must be writable while `enabled` is on, or startup fails |
+| `directory` | `~/.mqttaudio/cache` | Disk cache location (`~` expands). While `enabled` is on it is created at startup if missing, and startup fails if it cannot be; an existing directory that is not writable only shows up as errors when the cache writes |
 | `precache` | `[]` | Files, directories (their `.wav`, `.mp3`, `.ogg` and `.flac` files, not subdirectories) and URLs to load at startup |
 | `precache_blocking` | `true` | `true`: finish loading each precache entry before starting. `false`: start loading each entry, then begin taking commands while they finish |
 | `max_memory_mb` | `0` | Memory cache budget in MiB. `0` sizes it automatically: 40% of available memory, at least 128 MiB and at most 1024 MiB |
@@ -266,7 +266,7 @@ input:
 | `routes` | *required* | Which capture channel plays on which output channel. `dest_channel` may be an alias |
 | `voice_id` | `"mic"` | Voice the input plays in, for `voice_volume`, `input_*` commands and ducking rules |
 | `volume` | `1.0` | Input volume, `0.0`–`4.0` |
-| `latency_ms` | `20` | Target delay between capture and output, `5`–`500`. Raised, with a warning, to the smallest value that works (11 ms at 48 kHz) |
+| `latency_ms` | `20` | Capture buffering, `5`–`500`; the microphone-to-speaker delay is roughly twice this plus about 11 ms. Raised, with a warning, to the smallest value that works (11 ms at 48 kHz) |
 | `channels` | smallest count that covers the routes | Capture channel count to open, `1`–`64`; must be one the device offers |
 | `sample_rate` | the output rate | Capture rate to ask for, `8000`–`192000` |
 | `activity_threshold` | none | Peak level (above `0.0`, up to `1.0`) at which the input counts as active for ducking rules. Without it the input is active whenever it is open |
@@ -360,13 +360,16 @@ create a particular file; otherwise it opens the file the daemon would load.
 - A help pane explains the selected section or setting, its range and default.
 - Settings that refer to something else are picked from lists: channels from your aliases, voices
   from those named elsewhere in the config, and fixed choices from their options.
-- The output device picker lists real devices and plays a test tone, a 50 Hz bass tone or a sweep on
-  any channel through the real signal path (channel volumes, master gain, limiter and bass
-  management from the file being edited), with meters. The input picker shows live levels.
+- The output device picker lists real devices and plays a 440 Hz test tone or a 50 Hz bass tone on
+  any channel, or the test tone on every channel in turn, through the real signal path (channel
+  volumes, master gain, limiter and bass management from the file being edited), with meters. The
+  input picker shows live levels.
 - Saving checks the file with the same rules as startup, except that command-line options and
   environment variables are not applied. It writes only the settings you have set, keeps settings
   it does not know, copies the previous file to `<file>.bak` (replacing an older backup), and keeps
-  the file's permissions. Keys come out in alphabetical order.
+  the file's permission bits. The saved file belongs to whoever ran the editor, so restore the group
+  of a service's config afterwards (see [Deployment](deployment.md#run-under-systemd)). Keys come out
+  in alphabetical order.
 
 Restart mqttaudio to apply the saved file.
 

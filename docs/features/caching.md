@@ -33,8 +33,9 @@ whole decode: it starts as soon as its start position is decoded and the rest de
 background. When the decode finishes, the file enters the memory cache.
 
 While that first decode is still running, a `seek` past the decoded part plays silence until the
-decode catches up, looping waits until the end has been decoded, and pitch correction starts only
-when the decode is complete.
+decode catches up, and looping waits until the end has been decoded. Pitch correction starts only
+once the finished decode has entered the memory cache and been swapped in; a file too large to keep
+plays on without it.
 
 A **windowed** play streams: a background thread decodes into a buffer `cache.stream_window_ms` long
 (1.5 s by default), and memory stays at that size however long the file is. A windowed play starts

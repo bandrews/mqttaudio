@@ -3,7 +3,7 @@
 # Install:
 #   sudo install -Dm644 packaging/mqttaudio.service /etc/systemd/system/mqttaudio.service
 #   sudo install -Dm755 target/release/mqttaudio /usr/local/bin/mqttaudio
-#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin mqttaudio
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin --groups audio mqttaudio
 #   sudo install -Dm640 -o root -g mqttaudio your-config.json /etc/mqttaudio/config.json
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now mqttaudio

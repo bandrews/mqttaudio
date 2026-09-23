@@ -43,7 +43,7 @@ device. Neither runs the web UI suites (see [docs/webui/README.md](docs/webui/RE
 ### Running tests directly
 
 ```bash
-cargo test                     # everything that needs no broker or audio device
+cargo test                     # everything except the broker and audio-device tests (needs mosquitto on PATH)
 cargo test --lib config::      # one module's unit tests
 cargo test --test http_api_test
 ```
@@ -53,7 +53,7 @@ Some tests only run when asked:
 | Variable | Enables |
 |----------|---------|
 | `MQTTAUDIO_BROKER_TESTS=1` | Tests against a broker on `localhost:1883` |
-| `MQTTAUDIO_TLS_CA=<ca.pem>` | The TLS connection test against `localhost:8883` (certificate for `localhost`) |
+| `MQTTAUDIO_TLS_CA=<ca.pem>`, together with `MQTTAUDIO_BROKER_TESTS=1` | The TLS connection test against `localhost:8883` (certificate for `localhost`) |
 | `MQTTAUDIO_DEVICE_TESTS=1` with `cargo test -- --include-ignored` | Tests that open the default audio device |
 
 `tests/daemon_control_test.rs` is also `#[ignore]`d: it drives a built daemon against a real device.
@@ -65,7 +65,9 @@ Some tests only run when asked:
   through listening tests.
 - `tests/scripts/stress_test.sh` sends bursts of MQTT commands (needs `mosquitto_pub` and a running
   daemon on topic `audio/test`, started from the repository root).
-- `tests/scripts/demo_ducking.sh` demonstrates ducking with tones; run it from `tests/scripts/`.
+- `tests/scripts/demo_ducking.sh` demonstrates ducking with tones. Run it from `tests/scripts/` with a
+  broker on `localhost` and `mosquitto_pub` installed; it stops any running `mqttaudio` and starts its
+  own with `cargo run --release`.
 - [docs/sprints/MANUAL-VERIFICATION.md](docs/sprints/MANUAL-VERIFICATION.md) lists the checks that
   need real hardware.
 
