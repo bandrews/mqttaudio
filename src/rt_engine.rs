@@ -533,12 +533,13 @@ fn streamed_matches(selector: &SampleSelector, source: &StreamedSource) -> bool 
     )
 }
 
-/// Resolve a live input by numeric index first, then by voice id, and apply `f` to
-/// the first match. Shared by the input volume and mute handlers so both select an
-/// input the same way.
+/// Resolve a live input by its configured index first, then by voice id, and apply
+/// `f` to the first match. The index is the input's position in the configured
+/// `inputs` list, which stays stable when an earlier input failed to open. Shared by
+/// the input volume and mute handlers so both select an input the same way.
 fn with_live_input(state: &mut MixerState, input: &str, f: impl FnOnce(&mut LiveInput)) {
     if let Ok(idx) = input.parse::<usize>() {
-        if let Some(live) = state.live_inputs.get_mut(idx) {
+        if let Some(live) = state.live_inputs.iter_mut().find(|l| l.index == idx) {
             f(live);
             return;
         }
@@ -854,7 +855,7 @@ mod tests {
     fn live_input(voice: &str, volume: f32) -> LiveInput {
         use ringbuf::HeapRb;
         let consumer = HeapRb::<f32>::new(16).split().1;
-        LiveInput::new(voice.to_string(), consumer, 1, volume, vec![(0, 0)], 8)
+        LiveInput::new(0, voice.to_string(), consumer, 1, volume, vec![(0, 0)], 8)
     }
 
     #[test]

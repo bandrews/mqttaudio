@@ -369,6 +369,7 @@ fn live_input_underrun_mix_is_allocation_free_after_warmup() {
     const CHANNELS: usize = 2;
     let (mut producer, consumer) = create_ring_buffer(4096);
     let input = LiveInput::new(
+        0,
         "mic".to_string(),
         consumer,
         CHANNELS,

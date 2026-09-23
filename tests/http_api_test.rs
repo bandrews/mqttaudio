@@ -631,6 +631,7 @@ async fn test_inputs_endpoint_reports_health() {
     producer.push_slice(&[0.5f32; 20]);
 
     let mut input = mqttaudio::audio::mixer::LiveInput::new(
+        0,
         "mic".to_string(),
         consumer,
         2,

@@ -446,6 +446,7 @@ fn run_mixer_sim(block: usize, latency_ms: u32, mismatch: f64, seconds: usize) -
 
     let mut mixer = MixerState::new(channels);
     mixer.live_inputs.push(LiveInput::new(
+        0,
         "mic".to_string(),
         consumer,
         channels,

@@ -662,6 +662,7 @@ async fn main() {
 
                     // Create LiveInput for the mixer
                     let mut live_input = audio::mixer::LiveInput::new(
+                        idx,
                         input_config.voice_id.clone(),
                         consumer,
                         channels,
@@ -3972,8 +3973,9 @@ mod tests {
     fn push_live_input(fixture: &mut Fixture, voice: &str, volume: f32) {
         use ringbuf::HeapRb;
         let consumer = HeapRb::<f32>::new(16).split().1;
-        let index = fixture.mixer.live_inputs.len();
+        let index = fixture.inputs.len();
         fixture.mixer.live_inputs.push(audio::mixer::LiveInput::new(
+            index,
             voice.to_string(),
             consumer,
             1,
@@ -3995,6 +3997,51 @@ mod tests {
             ready: true,
             last_error: None,
         });
+    }
+
+    #[tokio::test]
+    async fn numeric_input_selector_addresses_the_configured_entry() {
+        // Input numbers are positions in the configured `inputs` list. An entry
+        // that failed to open has no live input in the mixer, so "1" must still
+        // reach the second configured entry, not the second input that opened.
+        let mut fixture = Fixture::new(vec![]);
+        fixture.inputs.push(http::InputStatus {
+            index: 0,
+            voice_id: "broken".to_string(),
+            volume: 1.0,
+            channels: 0,
+            muted: true,
+            unmuted_volume: 1.0,
+            applied_volume: None,
+            applied_muted: None,
+            applied_unmuted_volume: None,
+            health: None,
+            ready: false,
+            last_error: Some("device unavailable".to_string()),
+        });
+        push_live_input(&mut fixture, "b", 1.0);
+        push_live_input(&mut fixture, "c", 1.0);
+
+        fixture
+            .run(AudioCommand::InputVolume {
+                input: "1".to_string(),
+                volume: 0.5,
+            })
+            .await;
+        fixture
+            .run(AudioCommand::InputMute {
+                input: "2".to_string(),
+                mute: true,
+            })
+            .await;
+        fixture.drain();
+
+        let volumes: Vec<f32> = fixture.mixer.live_inputs.iter().map(|i| i.volume).collect();
+        assert_eq!(
+            volumes,
+            vec![0.5, 0.0],
+            "input 1 is \"b\" and input 2 is \"c\""
+        );
     }
 
     #[test]

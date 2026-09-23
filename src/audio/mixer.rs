@@ -893,6 +893,10 @@ pub struct InputHealth {
 
 /// Active live input (microphone) being mixed
 pub struct LiveInput {
+    /// Position of this input in the configured `inputs` list, which numeric
+    /// input selectors address
+    pub index: usize,
+
     /// Voice ID this input belongs to (for ducking)
     pub voice_id: String,
 
@@ -941,6 +945,7 @@ impl LiveInput {
     /// backlog the mixer tolerates before trimming; the capture path derives it
     /// from its ring and resampler geometry.
     pub fn new(
+        index: usize,
         voice_id: String,
         consumer: HeapConsumer<f32>,
         input_channels: usize,
@@ -949,6 +954,7 @@ impl LiveInput {
         max_backlog_frames: usize,
     ) -> Self {
         Self {
+            index,
             voice_id,
             consumer,
             input_channels,
@@ -3567,6 +3573,7 @@ mod tests {
     ) -> LiveInput {
         let max_backlog_frames = consumer.capacity() / input_channels.max(1) / 2;
         LiveInput::new(
+            0,
             voice_id,
             consumer,
             input_channels,

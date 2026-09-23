@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later play into that voice starts at voice volume 1.0, and `voice_stop`, `voice_fade_out` and
   `voice_volume` report it as not found. With ducking rules configured, the ducking engine likewise
   stops tracking voices that have gone idle.
+- **Numeric input selectors address the configured input.** `input_volume` and `input_mute` with
+  `"input": "1"` meant the second *configured* input to the control side but the second input that
+  *opened* to the audio thread. When an earlier input failed to open, the command changed the wrong
+  microphone (or none) and still reported success. Both sides now use the input's position in the
+  `inputs` list.
 - **Stopping a sound mid-fade continues from its current level.** A `stop`, `stopall` or `voice_stop` that
   arrived while a sound was still fading in, or a second fade-out during a long `voice_fade_out` or
   `fadeall`, restarted the fade from full volume, briefly playing the sound at full level. Fade-outs
