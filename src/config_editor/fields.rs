@@ -446,10 +446,7 @@ pub static DUCKING_RULE_FIELDS: [SubFieldSpec; 4] = [
     SubFieldSpec {
         key: "fade_duration_ms",
         label: "fade_duration_ms",
-        kind: FieldKind::UInt {
-            min: 0,
-            max: u32::MAX as u64,
-        },
+        kind: FieldKind::UInt { min: 0, max: 60000 },
         help: "How long the fade down (and back up) takes, in milliseconds. 500 is a gentle \
                dip; 0 is instant.",
     },
@@ -602,11 +599,11 @@ pub static INPUT_FIELDS: [SubFieldSpec; 9] = [
                risks dropouts. Default 20.",
     },
     SubFieldSpec {
-        key: "channels", label: "channels", kind: FieldKind::UInt { min: 1, max: 64 },
+        key: "channels", label: "channels", kind: FieldKind::OptionalUInt { min: 1, max: 64 },
         help: "Optional capture channel count. Unset chooses the smallest supported layout covering all routed source channels.",
     },
     SubFieldSpec {
-        key: "sample_rate", label: "sample_rate", kind: FieldKind::UInt { min: 8000, max: 384000 },
+        key: "sample_rate", label: "sample_rate", kind: FieldKind::OptionalUInt { min: 8000, max: 192000 },
         help: "Optional capture rate in Hz. Unset requests the output rate. Drift correction remains active between devices.",
     },
     SubFieldSpec {
@@ -614,7 +611,7 @@ pub static INPUT_FIELDS: [SubFieldSpec; 9] = [
         help: "Optional microphone activity threshold, greater than 0 and at most 1. Ducking follows the routed microphone channels above this level. Unset keeps the input voice active while open.",
     },
     SubFieldSpec {
-        key: "activity_hold_ms", label: "activity_hold_ms", kind: FieldKind::UInt { min: 0, max: u32::MAX as u64 },
+        key: "activity_hold_ms", label: "activity_hold_ms", kind: FieldKind::UInt { min: 0, max: 10000 },
         help: "How long the microphone stays active for ducking after its level falls below the threshold, in milliseconds.",
     },
 ];

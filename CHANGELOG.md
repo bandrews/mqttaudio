@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   created with default permissions, so a config readable only by its owner (for example one holding
   `mqtt.password` or `http.auth_token`) became readable by other users. The saved file now keeps the
   permissions of the file it replaces.
+- **The config editor enforces the daemon's limits while editing.** An input's `sample_rate` (now up to
+  192000), `activity_hold_ms` (up to 10000) and a ducking rule's `fade_duration_ms` (up to 60000) accepted
+  values the daemon rejects, which only surfaced when saving. An input's `channels` and `sample_rate` can
+  be cleared back to automatic by entering nothing.
 - **Clearing `mqtt.tls.ca_path` in the config editor keeps TLS on.** Removing the CA path also removed
   the then-empty `tls` section, silently switching the broker connection to plain TCP. The section
   stays, so TLS continues with the system root store; the `tls` switch turns TLS off.

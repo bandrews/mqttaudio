@@ -177,6 +177,26 @@ fn parse_json_value_validates() {
     assert!(parse_field_value(&FieldKind::MapToJson, "{nope").is_err());
 }
 
+#[test]
+fn editor_limits_match_the_daemon_validation() {
+    // Values the daemon would reject must be refused while editing, not only at save.
+    use mqttaudio::config_editor::fields::{DUCKING_RULE_FIELDS, INPUT_FIELDS};
+    let kind = |fields: &'static [SubFieldSpec], key: &str| {
+        &fields.iter().find(|f| f.key == key).unwrap().kind
+    };
+    let input = |key| kind(&INPUT_FIELDS, key);
+    assert!(parse_field_value(input("sample_rate"), "192000").is_ok());
+    assert!(parse_field_value(input("sample_rate"), "384000").is_err());
+    assert!(parse_field_value(input("activity_hold_ms"), "10000").is_ok());
+    assert!(parse_field_value(input("activity_hold_ms"), "10001").is_err());
+    let rule = |key| kind(&DUCKING_RULE_FIELDS, key);
+    assert!(parse_field_value(rule("fade_duration_ms"), "60000").is_ok());
+    assert!(parse_field_value(rule("fade_duration_ms"), "60001").is_err());
+    // Optional capture settings clear back to automatic with empty input.
+    assert_eq!(parse_field_value(input("channels"), ""), Ok(None));
+    assert_eq!(parse_field_value(input("sample_rate"), ""), Ok(None));
+}
+
 // --- Save ---
 
 #[test]
