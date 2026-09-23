@@ -1,6 +1,6 @@
 {
   "_comment": "mqttaudio Example Configuration File",
-  "_usage": "Copy this file to config.json or ~/.config/mqttaudio/config.json and customize for your setup",
+  "_usage": "Copy this file to ./mqttaudio.json (or pass its path with --config) and customize it for your setup",
   "_editor": "Prefer a guided setup? Run 'mqttaudio --configure' to build or edit a config interactively, with explanations, pickers, and live device testing",
 
   "mqtt": {
@@ -13,7 +13,7 @@
     "_notes": [
       "server: MQTT broker hostname or IP address",
       "port: MQTT broker port (default: 1883)",
-      "topic: MQTT topic to subscribe to (required). Supports wildcards like 'audio/#'",
+      "topic: MQTT topic to subscribe to. Required unless the HTTP server is enabled. Supports wildcards like 'audio/#'",
       "client_id: MQTT client ID. If null, auto-generates a random 'mqttaudio_<hex>' id",
       "reconnect_delay_seconds: Wait time before reconnecting after disconnect"
     ]
@@ -23,16 +23,6 @@
     "device": null,
     "sample_rate": 48000,
     "buffer_size": 512,
-    "channel_aliases": {
-      "front_left": 0,
-      "front_right": 1,
-      "center": 2,
-      "lfe": 3,
-      "rear_left": 4,
-      "rear_right": 5,
-      "side_left": 6,
-      "side_right": 7
-    },
     "channel_aliases": {
       "front_left": 0,
       "front_right": 1,
@@ -55,7 +45,7 @@
       "buffer_size: Audio buffer size in frames. Smaller = lower latency but higher CPU",
       "  Common values: 256 (low latency), 512 (balanced), 1024 (high compatibility)",
       "channel_aliases: Optional mapping of friendly channel names to channel indices",
-      "channel_volumes: Per-channel calibration (0.0-1.0) to compensate for hardware differences"
+      "channel_volumes: Per-channel calibration gain (0.0-4.0, 1.0 = unity), keyed by channel number or alias"
     ]
   },
 
@@ -96,7 +86,7 @@
 
     "_notes": [
       "level: Log level - 'error', 'warn', 'info', 'debug', or 'trace'",
-      "verbose: Legacy verbose mode. Equivalent to level: 'debug'"
+      "verbose: true raises the level to at least 'debug' (same as the --verbose flag)"
     ]
   },
 
@@ -112,26 +102,24 @@
       "activity_hold_ms": 750,
       "routes": [
         { "source_channel": 0, "dest_channel": 4 },
-        { "source_channel": 1, "dest_channel": 4 },
-        { "source_channel": 2, "dest_channel": 5 }
+        { "source_channel": 0, "dest_channel": 5 }
       ],
 
       "_notes": [
         "device: Input device name. null = system default. Use --list-inputs to see options",
         "  Example: 'plughw:CARD=UMC1820,DEV=0'",
-        "  On Linux prefer the 'plughw:' alias of a card: capture is read as 32-bit float",
-        "  and plughw: converts from the card's native format",
+        "  On Linux prefer a card's 'plughw:' alias, which converts formats and rates the hardware lacks",
         "volume: Input volume gain (0.0-4.0, 1.0 = unity)",
         "voice_id: Voice name, used by input_volume/input_mute commands and ducking rules",
-        "activity_threshold: Peak level (0.0-1.0) above which this input counts as speaking,",
+        "activity_threshold: Peak level (above 0, up to 1.0) above which this input counts as speaking,",
         "  letting its voice_id trigger ducking rules as primary_voice. null = detection off",
         "activity_hold_ms: How long activity persists after the level drops (rides out pauses)",
         "latency_ms: Buffer latency (5-500). 20-30 is a good starting point for live mics",
         "channels: Capture channels to open. null = smallest count covering every source_channel",
-        "sample_rate: Capture rate to request. null = match the output rate and skip resampling",
+        "sample_rate: Capture rate to request. null = the output rate (drift correction still runs)",
         "routes: source_channel (mic input, 0-indexed) to dest_channel (speaker output)",
-        "  Two source channels sharing a dest_channel are summed there",
-        "  dest_channel may use a name from audio.channel_aliases"
+        "  One source may feed several outputs; sources sharing a dest_channel are summed there",
+        "  Either side may use a name from audio.channel_aliases"
       ]
     }
   ],

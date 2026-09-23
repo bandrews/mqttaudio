@@ -1692,6 +1692,15 @@ mod tests {
     }
 
     #[test]
+    fn example_config_loads_and_validates() {
+        // config.example.json is the documented starting point, so it must load
+        // exactly as the daemon loads a config file and pass validation.
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.json");
+        let config = Config::from_file(path).expect("config.example.json must parse");
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    #[test]
     fn out_of_range_ducking_target_is_reported_once() {
         let mut config = Config::default();
         config.mqtt.topic = Some("test".to_string());
