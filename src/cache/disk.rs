@@ -53,7 +53,16 @@ impl Default for CacheMetadata {
 pub struct DiskCache {
     cache_dir: PathBuf,
     metadata: CacheMetadata,
+    /// When each URL's most recent failed freshness check happened, so an
+    /// unreachable server is retried once per revalidation window rather than on
+    /// every check
+    failed_revalidations: HashMap<String, std::time::Instant>,
 }
+
+/// How long a freshness check may wait for the server. Checks run while the
+/// caller holds the cache, so a slow server costs at most this, once per
+/// revalidation window.
+const REVALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Debug)]
 #[allow(clippy::enum_variant_names)] // descriptive variant names; renaming deferred to Sprint 9
@@ -136,6 +145,7 @@ impl DiskCache {
         Ok(Self {
             cache_dir,
             metadata,
+            failed_revalidations: HashMap::new(),
         })
     }
 
@@ -400,8 +410,14 @@ impl DiskCache {
             }
         }
 
-        let client = reqwest::Client::new();
-        let mut req = client.get(url);
+        // Skip while a recent failed check is still inside the window.
+        if let Some(failed) = self.failed_revalidations.get(url) {
+            if failed.elapsed() < revalidate_after {
+                return Ok(false);
+            }
+        }
+
+        let mut req = super::http_stream::http_client().get(url);
         if let Some(etag) = &entry.etag {
             req = req.header(reqwest::header::IF_NONE_MATCH, etag);
         }
@@ -409,8 +425,9 @@ impl DiskCache {
             req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
         }
 
-        let changed = match req.send().await {
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
+        let changed = match tokio::time::timeout(REVALIDATION_TIMEOUT, req.send()).await {
+            Ok(Ok(resp)) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
+                self.failed_revalidations.remove(url);
                 if let Some(e) = self.metadata.entries.get_mut(url) {
                     e.last_validated = chrono::Utc::now().to_rfc3339();
                 }
@@ -418,12 +435,15 @@ impl DiskCache {
                 tracing::debug!("Cache revalidated (304 Not Modified): {}", url);
                 false
             }
-            Ok(resp) if resp.status().is_success() => {
+            Ok(Ok(resp)) if resp.status().is_success() => {
+                self.failed_revalidations.remove(url);
                 self.download_and_cache(url).await?;
                 tracing::info!("Cache refreshed (content changed): {}", url);
                 true
             }
-            Ok(resp) => {
+            Ok(Ok(resp)) => {
+                self.failed_revalidations
+                    .insert(url.to_string(), std::time::Instant::now());
                 tracing::warn!(
                     "Revalidation got HTTP {} for {}; keeping cached copy",
                     resp.status(),
@@ -431,12 +451,20 @@ impl DiskCache {
                 );
                 false
             }
-            Err(e) => {
+            Ok(Err(e)) => {
+                self.failed_revalidations
+                    .insert(url.to_string(), std::time::Instant::now());
                 tracing::warn!(
                     "Revalidation failed for {}: {}; keeping cached copy",
                     url,
                     e
                 );
+                false
+            }
+            Err(_) => {
+                self.failed_revalidations
+                    .insert(url.to_string(), std::time::Instant::now());
+                tracing::warn!("Revalidation of {} timed out; keeping cached copy", url);
                 false
             }
         };
@@ -476,18 +504,17 @@ impl DiskCache {
 
         // A freshness check runs in the play path, so it gets a short bound:
         // a slow server costs at most this once per revalidation interval
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(5), request.send()).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    tracing::debug!("Revalidation request for {} failed: {}", url, e);
-                    return Freshness::Unknown;
-                }
-                Err(_) => {
-                    tracing::debug!("Revalidation request for {} timed out", url);
-                    return Freshness::Unknown;
-                }
-            };
+        let response = match tokio::time::timeout(REVALIDATION_TIMEOUT, request.send()).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::debug!("Revalidation request for {} failed: {}", url, e);
+                return Freshness::Unknown;
+            }
+            Err(_) => {
+                tracing::debug!("Revalidation request for {} timed out", url);
+                return Freshness::Unknown;
+            }
+        };
 
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             if let Some(entry) = self.metadata.entries.get_mut(url) {

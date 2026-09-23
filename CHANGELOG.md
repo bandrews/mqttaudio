@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later play into that voice starts at voice volume 1.0, and `voice_stop`, `voice_fade_out` and
   `voice_volume` report it as not found. With ducking rules configured, the ducking engine likewise
   stops tracking voices that have gone idle.
+- **An unreachable server no longer stalls cache revalidation.** Checking whether a cached URL had
+  changed waited on the server with no time limit and retried on every play and every freshness tick,
+  while holding the cache, so one dead server could hold up plays, cache commands, `/metrics` and
+  `/status/cache`. A check now gives up after 5 seconds, keeps serving the cached copy, and is not
+  retried until `cache.revalidate_after_seconds` has passed.
 - **The config editor keeps a config file's permissions.** Saving replaced the file with a new one
   created with default permissions, so a config readable only by its owner (for example one holding
   `mqtt.password` or `http.auth_token`) became readable by other users. The saved file now keeps the

@@ -1,7 +1,7 @@
 // ABOUTME: Lane A test that disk-cache revalidation issues a conditional GET.
 // ABOUTME: When due, an unchanged file yields 304 and refreshes last_validated.
 
-use mqttaudio::cache::disk::DiskCache;
+use mqttaudio::cache::disk::{CacheEntry, DiskCache};
 use mqttaudio::cache::CacheManager;
 use mqttaudio::config::ResamplerQuality;
 use std::path::{Path, PathBuf};
@@ -70,6 +70,57 @@ async fn revalidation_refreshes_only_when_due() {
     assert!(cache.is_cached(&url));
 
     let _ = shutdown.send(());
+}
+
+#[tokio::test(start_paused = true)]
+async fn revalidating_against_an_unresponsive_server_is_bounded_and_throttled() {
+    // A server that accepts the connection but never answers must not stall the
+    // caller (plays and the freshness tick hold the cache lock meanwhile), and a
+    // failed check is not retried until the revalidation window passes again.
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/x.wav",
+        silent.local_addr().unwrap().port()
+    );
+    let cache_dir = TempDir::new().unwrap();
+    let mut cache = DiskCache::new(cache_dir.path().to_path_buf()).unwrap();
+    let local_file = DiskCache::cache_filename_for_url(&url);
+    std::fs::write(cache.files_dir().join(&local_file), b"cached").unwrap();
+    cache.put_entry(
+        url.clone(),
+        CacheEntry {
+            local_file,
+            etag: None,
+            last_modified: None,
+            last_validated: "2020-01-01T00:00:00+00:00".to_string(),
+            file_size: 6,
+            content_type: None,
+        },
+    );
+
+    let started = tokio::time::Instant::now();
+    let first = tokio::time::timeout(
+        Duration::from_secs(60),
+        cache.revalidate_if_due(&url, Duration::ZERO),
+    )
+    .await;
+    assert!(
+        first.is_ok(),
+        "an unresponsive server must not stall revalidation"
+    );
+    assert!(started.elapsed() <= Duration::from_secs(10));
+
+    let retry_started = tokio::time::Instant::now();
+    cache
+        .revalidate_if_due(&url, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_eq!(
+        retry_started.elapsed(),
+        Duration::ZERO,
+        "a failed check waits for the revalidation window before retrying"
+    );
+    assert!(cache.is_cached(&url), "the cached copy stays in service");
 }
 
 #[tokio::test]
