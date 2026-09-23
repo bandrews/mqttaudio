@@ -99,6 +99,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fades never ended, `stop`, `stopall` and `voice_stop` could not remove it, and it held its voice's
   ducking. It now keeps playing, without pitch correction, until the decoded file is in place; the
   warning at the `speed` command says so.
+- **A play uses a finished runtime `precache`.** The decode that `precache` or `cache_reload` started
+  joined the memory cache, and a URL's download the disk cache, only when some later load folded it in.
+  Until then a play of the URL downloaded it again, and a play of a local file over the auto limits was
+  windowed, losing seek, speed and loop crossfades. A play now folds finished loads into the caches
+  before deciding how to load.
 - **`/status/samples` reports a cold play's real length once it has decoded.** The status kept the
   header's estimate of `total_frames` and `total_ms` until some other play or stop refreshed it.
 - **The startup log names the configuration file.** The message was written before logging started, so
