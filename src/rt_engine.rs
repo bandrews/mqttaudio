@@ -292,6 +292,11 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
                     sample.set_target_volume(*volume);
                 }
             }
+            for source in state.streamed_sources.iter_mut() {
+                if streamed_matches(selector, source) {
+                    source.set_target_volume(*volume);
+                }
+            }
         }
     }
 }
@@ -931,6 +936,34 @@ mod tests {
         assert_eq!(
             state.live_inputs[0].volume, 0.4,
             "unmute after an explicit volume must not revert to the old pre-mute value"
+        );
+    }
+
+    #[test]
+    fn set_volume_matching_reaches_streamed_sources() {
+        // A windowed (streamed) play honours the per-sample volume command like a
+        // fully loaded one, ramping to the new level.
+        let data = vec![0.5f32; 2 * 2048];
+        let mut state = state_with(vec![]);
+        state
+            .streamed_sources
+            .push(streamed_with(1, "music", &data, false));
+
+        apply_command(
+            &mut state,
+            AudioCommand::SetVolumeMatching {
+                selector: selector_voice("music"),
+                volume: 0.5,
+            },
+            48000,
+        );
+        let mut output = vec![0.0f32; 2 * 1024];
+        crate::audio::mixer::mix_audio(&mut output, &mut state);
+
+        let last = output[output.len() - 1];
+        assert!(
+            (last - 0.25).abs() < 1e-3,
+            "the streamed source should ramp to half level, got {last}"
         );
     }
 

@@ -1141,8 +1141,11 @@ pub struct StreamedSource {
     /// Number of channels the producer writes (interleaved).
     pub input_channels: usize,
 
-    /// Per-source volume (0.0 - 1.0).
+    /// Per-source volume (0.0 - MAX_GAIN) - current smoothed value.
     pub volume: f32,
+
+    /// Target per-source volume for smooth ramping (0.0 - MAX_GAIN).
+    pub target_volume: f32,
 
     /// Voice-level volume (0.0 - 1.0) - current smoothed value.
     pub voice_volume: f32,
@@ -1209,6 +1212,7 @@ impl StreamedSource {
             consumer,
             input_channels,
             volume: volume.clamp(0.0, crate::config::MAX_GAIN),
+            target_volume: volume.clamp(0.0, crate::config::MAX_GAIN),
             voice_volume: 1.0,
             target_voice_volume: 1.0,
             channel_map,
@@ -1293,6 +1297,17 @@ impl StreamedSource {
         } else {
             self.voice_volume -= RAMP_RATE;
         }
+    }
+
+    /// Set target source volume for smooth ramping
+    pub fn set_target_volume(&mut self, target: f32) {
+        self.target_volume = target.clamp(0.0, crate::config::MAX_GAIN);
+    }
+
+    /// Advance the source and voice volumes toward their targets by one frame
+    pub fn advance_volumes(&mut self) {
+        ramp_toward(&mut self.volume, self.target_volume);
+        self.advance_voice_volume();
     }
 
     /// Whether this source has finished and can be reaped off the audio thread. A
@@ -2246,9 +2261,9 @@ fn mix_streamed_source_into_output(
     let mut underrun_frames = 0usize;
 
     for frame_idx in 0..frames {
-        // Advance voice volume toward target every frame so the ramp stays
-        // time-accurate across underruns.
-        source.advance_voice_volume();
+        // Advance the source and voice volumes toward their targets every frame so
+        // the ramps stay time-accurate across underruns.
+        source.advance_volumes();
 
         // source volume * voice volume * per-frame duck gain (D2) * fade-in/out
         // multiplier; the underrun fade gain is applied inside mix_ring_voice_frame.

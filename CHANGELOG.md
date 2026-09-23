@@ -31,6 +31,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later play into that voice starts at voice volume 1.0, and `voice_stop`, `voice_fade_out` and
   `voice_volume` report it as not found. With ducking rules configured, the ducking engine likewise
   stops tracking voices that have gone idle.
+- **The `volume` command reaches windowed (streamed) plays.** It changed only fully loaded samples, so a
+  long or large file played through a window ignored it while `/status/samples` reported the new volume
+  and the command reported success. Streamed sources now ramp to the new volume like loaded samples.
 - **Numeric input selectors address the configured input.** `input_volume` and `input_mute` with
   `"input": "1"` meant the second *configured* input to the control side but the second input that
   *opened* to the audio thread. When an earlier input failed to open, the command changed the wrong
