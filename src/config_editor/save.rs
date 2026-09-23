@@ -3,6 +3,7 @@
 
 use super::fields::ConfigDocument;
 use crate::config::Config;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// What happened when a document was loaded.
@@ -115,8 +116,17 @@ pub fn save_document(doc: &ConfigDocument, path: &Path) -> Result<SaveOutcome, V
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "mqttaudio.json".to_string())
     ));
-    std::fs::write(&tmp, doc.to_pretty_string())
-        .map_err(|e| vec![format!("could not write {}: {}", tmp.display(), e)])?;
+    let write_error = |e: std::io::Error| vec![format!("could not write {}: {}", tmp.display(), e)];
+    let mut file = std::fs::File::create(&tmp).map_err(write_error)?;
+    // Keep the replaced file's permissions (a config holding credentials is often
+    // readable only by its owner), applied before any content is written.
+    if let Ok(existing) = std::fs::metadata(path) {
+        file.set_permissions(existing.permissions())
+            .map_err(write_error)?;
+    }
+    file.write_all(doc.to_pretty_string().as_bytes())
+        .map_err(write_error)?;
+    drop(file);
     std::fs::rename(&tmp, path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         vec![format!(

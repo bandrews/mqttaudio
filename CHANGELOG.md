@@ -31,6 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later play into that voice starts at voice volume 1.0, and `voice_stop`, `voice_fade_out` and
   `voice_volume` report it as not found. With ducking rules configured, the ducking engine likewise
   stops tracking voices that have gone idle.
+- **The config editor keeps a config file's permissions.** Saving replaced the file with a new one
+  created with default permissions, so a config readable only by its owner (for example one holding
+  `mqtt.password` or `http.auth_token`) became readable by other users. The saved file now keeps the
+  permissions of the file it replaces.
+- **Clearing `mqtt.tls.ca_path` in the config editor keeps TLS on.** Removing the CA path also removed
+  the then-empty `tls` section, silently switching the broker connection to plain TCP. The section
+  stays, so TLS continues with the system root store; the `tls` switch turns TLS off.
 - **The `volume` command reaches windowed (streamed) plays.** It changed only fully loaded samples, so a
   long or large file played through a window ignored it while `/status/samples` reported the new volume
   and the command reported success. Streamed sources now ramp to the new volume like loaded samples.

@@ -30,10 +30,21 @@ fn set_creates_intermediate_objects_and_get_reads_back() {
 #[test]
 fn unset_removes_key_and_prunes_empty_parents() {
     let mut doc = ConfigDocument::new();
+    doc.set(&path_of(&["audio", "channel_aliases", "front"]), json!(0));
+    doc.unset(&path_of(&["audio", "channel_aliases", "front"]));
+    // Both the emptied channel_aliases object and the emptied audio object are pruned.
+    assert!(doc.root().as_object().unwrap().is_empty());
+}
+
+#[test]
+fn clearing_the_ca_path_keeps_tls_enabled() {
+    // An empty `tls` object means TLS with the system root store, so clearing the
+    // CA path must not quietly turn TLS off.
+    let mut doc = ConfigDocument::new();
     doc.set(&path_of(&["mqtt", "tls", "ca_path"]), json!("/ca.pem"));
     doc.unset(&path_of(&["mqtt", "tls", "ca_path"]));
-    // Both the emptied tls object and the emptied mqtt object are pruned.
-    assert!(doc.root().as_object().unwrap().is_empty());
+    assert_eq!(doc.root(), &json!({"mqtt": {"tls": {}}}));
+    assert!(doc.to_config().unwrap().mqtt.tls.is_some());
 }
 
 #[test]
@@ -189,6 +200,26 @@ fn save_writes_backs_up_and_validates() {
     // The saved file loads as a valid daemon config.
     let config = Config::from_file(&path).unwrap();
     assert_eq!(config.mqtt.server, "broker");
+}
+
+#[cfg(unix)]
+#[test]
+fn save_keeps_the_file_permissions() {
+    // A config holding credentials is often readable only by its owner; saving
+    // over it must not widen that.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mqttaudio.json");
+    let mut doc = ConfigDocument::new();
+    doc.set(&path_of(&["mqtt", "topic"]), json!("audio/#"));
+    save_document(&doc, &path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    doc.set(&path_of(&["mqtt", "password"]), json!("secret"));
+    save_document(&doc, &path).unwrap();
+
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
 }
 
 #[test]

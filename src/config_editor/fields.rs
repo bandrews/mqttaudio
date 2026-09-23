@@ -11,6 +11,21 @@ pub enum Seg {
     Idx(usize),
 }
 
+/// Section objects whose presence means something even when empty: an empty
+/// `mqtt.tls` turns TLS on with the system root store, so removing it would
+/// quietly switch the broker connection to plain TCP.
+const KEPT_WHEN_EMPTY: &[&[&str]] = &[&["mqtt", "tls"]];
+
+fn is_kept_when_empty(path: &[Seg]) -> bool {
+    KEPT_WHEN_EMPTY.iter().any(|kept| {
+        kept.len() == path.len()
+            && kept
+                .iter()
+                .zip(path)
+                .all(|(key, seg)| matches!(seg, Seg::Key(k) if k == key))
+    })
+}
+
 /// Build a path from static key segments.
 pub fn path_of(keys: &[&str]) -> Vec<Seg> {
     keys.iter().map(|k| Seg::Key(k.to_string())).collect()
@@ -139,8 +154,9 @@ impl ConfigDocument {
     }
 
     /// Remove the key (or array element) at `path`, pruning any parent objects
-    /// left empty (an empty section object deserializes the same as an absent
-    /// one, so pruning keeps saved files sparse without changing meaning).
+    /// left empty so saved files stay sparse. An empty section object
+    /// deserializes the same as an absent one, except the sections listed in
+    /// `KEPT_WHEN_EMPTY`, which are left in place.
     pub fn unset(&mut self, path: &[Seg]) {
         let Some((last, parents)) = path.split_last() else {
             return;
@@ -167,7 +183,7 @@ impl ConfigDocument {
             let parent_path = &path[..depth];
             let is_empty_obj =
                 matches!(self.get(parent_path), Some(Value::Object(o)) if o.is_empty());
-            if is_empty_obj {
+            if is_empty_obj && !is_kept_when_empty(parent_path) {
                 let Some((last, parents)) = parent_path.split_last() else {
                     break;
                 };
