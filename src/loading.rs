@@ -154,7 +154,11 @@ pub async fn prepare(
         }
     }
     let window_ms = window_ms.unwrap_or(config.cache.stream_window_ms);
-    let prebuffer_ms = prebuffer_ms.unwrap_or(config.cache.stream_prebuffer_ms);
+    // The window holds all the audio buffered ahead, so a longer prebuffer could
+    // never fill.
+    let prebuffer_ms = prebuffer_ms
+        .unwrap_or(config.cache.stream_prebuffer_ms)
+        .min(window_ms);
     let window_frames = (window_ms as usize * rate as usize / 1000).max(1);
     let quality = config.advanced.resampler_quality;
     let http = file.starts_with("http://") || file.starts_with("https://");
@@ -566,6 +570,56 @@ mod tests {
             "the play did not use the precached decode"
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// Prepare a windowed play of the test file with `window_ms` and `prebuffer_ms`
+    /// overrides and a long prebuffer deadline, returning how long it took to start.
+    async fn windowed_start_time(
+        window_ms: Option<u32>,
+        prebuffer_ms: Option<u32>,
+    ) -> std::time::Duration {
+        let dir = tempfile::tempdir().unwrap();
+        let cache: Cache = Arc::new(Mutex::new(
+            cache::CacheManager::new(dir.path().to_path_buf()).unwrap(),
+        ));
+        let mut config = config::Config::default();
+        config.cache.stream_prebuffer_deadline_ms = 5000;
+        let mut command = play(TEST_WAV);
+        if let AudioCommand::Play {
+            mode,
+            window_ms: window,
+            prebuffer_ms: prebuffer,
+            ..
+        } = &mut command
+        {
+            *mode = config::LoadMode::Stream;
+            *window = window_ms;
+            *prebuffer = prebuffer_ms;
+        }
+        let started = std::time::Instant::now();
+        let prepared = prepare(&command, &config, &cache, 48000).await.unwrap();
+        assert!(matches!(prepared, PreparedPlayback::Stream(_)));
+        started.elapsed()
+    }
+
+    #[tokio::test]
+    async fn a_default_prebuffer_longer_than_the_play_window_does_not_hold_the_start() {
+        // The window is all a windowed play buffers ahead, so a prebuffer longer
+        // than it could never fill and would hold the play until its deadline.
+        let elapsed = windowed_start_time(Some(100), None).await;
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "started after {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_prebuffer_longer_than_the_configured_window_does_not_hold_the_start() {
+        let elapsed = windowed_start_time(None, Some(2000)).await;
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "started after {elapsed:?}"
+        );
     }
 
     #[tokio::test]

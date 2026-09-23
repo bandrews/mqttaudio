@@ -80,8 +80,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored with a log line while HTTP callers were told it succeeded.
 - **A play's `window_ms` and `prebuffer_ms` overrides are validated** against the same limits as
   `cache.stream_window_ms` and `cache.stream_prebuffer_ms`: `window_ms` 100-60000, and `prebuffer_ms`
-  no larger than the window. A zero window underran constantly and a huge one allocated outside the
-  memory budget.
+  no larger than the play's `window_ms` (60000 without one). A zero window underran constantly and a
+  huge one allocated outside the memory budget.
+- **A windowed play whose prebuffer is longer than its window starts once the window is full.** Such a
+  prebuffer, for example the default 150 ms with `"window_ms": 100`, or a play's `prebuffer_ms` longer
+  than `cache.stream_window_ms`, could never fill, so the play waited for
+  `cache.stream_prebuffer_deadline_ms` or `prebuffer_ms`, whichever was longer. The prebuffer is now
+  capped at the window.
 - **Edits to files loaded by the startup precache are picked up.** The default blocking precache did not
   record the file's size and modification time, so after an edit the cached copy kept playing until a
   `cache_reload` or restart. It now records them like any other load.
