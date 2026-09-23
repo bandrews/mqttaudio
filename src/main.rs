@@ -1168,6 +1168,9 @@ async fn main() {
                     &cache_manager,
                     &mut cmd_tx,
                     &mut playing,
+                    &status_snapshot,
+                    &input_statuses,
+                    output_channels,
                 )
                 .await;
                 // Turn capture-path counter growth into off-RT log lines (D57).
@@ -1586,12 +1589,17 @@ struct StreamingUpgrade {
 /// needs slice access) that a full decode used to provide. Runs on the reaper
 /// tick, entirely off-RT; the displaced streaming buffer returns via the spent
 /// husk for off-RT drop. A play whose promotion was skipped (stale generation or
-/// an over-budget cache) simply keeps its streaming buffer.
+/// an over-budget cache) simply keeps its streaming buffer. The status snapshot is
+/// rebuilt when a play is upgraded, so it reports the decoded length rather than
+/// the header estimate.
 async fn upgrade_completed_streaming_plays(
     upgrades: &mut Vec<StreamingUpgrade>,
     cache_manager: &std::sync::Arc<tokio::sync::Mutex<cache::CacheManager>>,
     cmd_tx: &mut rt_engine::CommandProducer,
     playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
+    snapshot: &std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
+    inputs: &[http::InputStatus],
+    output_channels: usize,
 ) {
     if upgrades.is_empty() {
         return;
@@ -1608,6 +1616,7 @@ async fn upgrade_completed_streaming_plays(
     cache.cleanup_completed_loads();
 
     let mut remaining = Vec::with_capacity(upgrades.len());
+    let mut upgraded = false;
     for upgrade in upgrades.drain(..) {
         if !upgrade.buffer.is_complete() {
             remaining.push(upgrade);
@@ -1628,6 +1637,7 @@ async fn upgrade_completed_streaming_plays(
                 if let Some(status) = playing.get_mut(&upgrade.internal_id) {
                     status.total_frames = frames;
                 }
+                upgraded = true;
                 tracing::debug!(
                     "Upgraded cold play of {} to its complete buffer",
                     upgrade.file
@@ -1636,6 +1646,9 @@ async fn upgrade_completed_streaming_plays(
         }
     }
     *upgrades = remaining;
+    if upgraded {
+        refresh_snapshot(snapshot, playing, inputs, output_channels);
+    }
 }
 
 /// Control-side stage clock for one play command (Sprint 11, D50). Captures the
@@ -2979,6 +2992,9 @@ mod tests {
                 &self.cache_manager,
                 &mut self.cmd_tx,
                 &mut self.playing,
+                &self.snapshot,
+                &self.inputs,
+                2,
             )
             .await;
         }
@@ -3641,6 +3657,43 @@ mod tests {
             .buffer
             .as_complete()
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn upgrade_publishes_the_decoded_length_to_status() {
+        // A cold play reports its header estimate until the decode completes; the
+        // upgrade must publish the real length to the HTTP status snapshot.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let command = play(Some("estimate"), 1.0);
+        let file = match &command {
+            AudioCommand::Play { file, .. } => file.clone(),
+            _ => unreachable!(),
+        };
+        let decoded = fixture
+            .cache_manager
+            .lock()
+            .await
+            .get_or_load(&file, SR)
+            .await
+            .unwrap();
+        let mut buffer = audio::streaming::StreamingBuffer::new(
+            decoded.channels,
+            decoded.sample_rate,
+            Some(decoded.frames / 2),
+        );
+        buffer.append(&decoded.data);
+        buffer.mark_complete();
+        let prepared = audio::streaming::SampleBuffer::Streaming(Arc::new(RwLock::new(buffer)));
+        fixture
+            .run_prepared(command, Some(PreparedPlayback::Full(prepared)))
+            .await;
+        fixture.drain();
+        fixture.run_upgrades().await;
+
+        let snapshot = fixture.snapshot.read().unwrap();
+        assert_eq!(snapshot.samples.len(), 1);
+        assert_eq!(snapshot.samples[0].total_frames, decoded.frames);
     }
 
     #[tokio::test]

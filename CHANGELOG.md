@@ -88,6 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A windowed play warns about options it cannot honor.** A windowed (streamed) play always starts at
   the beginning, loops without a crossfade, and plays a URL only once; `start_position_ms`,
   `crossfade_ms`, and `loop` on a URL were dropped silently and now log a warning.
+- **`/status/samples` reports a cold play's real length once it has decoded.** The status kept the
+  header's estimate of `total_frames` and `total_ms` until some other play or stop refreshed it.
 - **The startup log names the configuration file.** The message was written before logging started, so
   it never appeared; the daemon now logs which file it loaded, or that it found none.
 - **Talkback reports an out-of-range `gain` as a gain error** instead of the lease-duration message.
