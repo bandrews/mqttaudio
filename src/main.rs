@@ -57,14 +57,6 @@ struct Args {
     #[arg(long)]
     list_inputs: bool,
 
-    /// LFE (subwoofer) channel number for bass management
-    #[arg(long)]
-    lfe_channel: Option<usize>,
-
-    /// Crossover frequency (Hz) for bass management
-    #[arg(long)]
-    crossover_frequency: Option<f32>,
-
     /// MQTT topic to publish log messages to
     #[arg(long)]
     log_topic: Option<String>,
@@ -1149,6 +1141,7 @@ async fn main() {
                     &mut active_counts,
                     &mut streamed_voices,
                     &mut playing,
+                    &voice_manager,
                     &status_snapshot,
                     &ducking_snapshot,
                     &input_statuses,
@@ -1389,11 +1382,13 @@ fn detect_available_memory() -> Option<u64> {
 }
 
 /// Reconcile control-side bookkeeping for one finished voice-bearing entry (a sample
-/// or a streamed source): drop it from the live `playing` map and decrement its
-/// voice's active count; when that count reaches zero, restore the voice through the
-/// shared notify path (which, for a ducking primary, recomputes restore targets sent
-/// back to the audio thread). Returns whether the voice's count reached zero (it is
-/// now fully idle), so the caller can drop it from the streamed-voice set.
+/// or a streamed source): drop it from the live `playing` map and the voice registry
+/// (which drops a voice once its last entry is gone) and decrement its voice's active
+/// count; when that count reaches zero, restore the voice through the shared notify
+/// path (which, for a ducking primary, recomputes restore targets sent back to the
+/// audio thread). Returns whether the voice's count reached zero (it is now fully
+/// idle), so the caller can drop it from the streamed-voice set.
+#[allow(clippy::too_many_arguments)]
 fn reconcile_finished_voice(
     voice: &str,
     id: u64,
@@ -1401,9 +1396,11 @@ fn reconcile_finished_voice(
     ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
     active_counts: &mut std::collections::HashMap<String, usize>,
     playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
+    voice_manager: &parking_lot::Mutex<voice::VoiceManager>,
     ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
 ) -> bool {
     playing.remove(&id);
+    voice_manager.lock().remove_sample(id);
     if let Some(count) = active_counts.get_mut(voice) {
         *count -= 1;
         if *count == 0 {
@@ -1430,6 +1427,7 @@ fn reap_finished_samples(
     active_counts: &mut std::collections::HashMap<String, usize>,
     streamed_voices: &mut std::collections::HashSet<String>,
     playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
+    voice_manager: &parking_lot::Mutex<voice::VoiceManager>,
     snapshot: &std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
     ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
     inputs: &[http::InputStatus],
@@ -1454,6 +1452,7 @@ fn reap_finished_samples(
             ducking_engine.as_deref_mut(),
             active_counts,
             playing,
+            voice_manager,
             ducking_snapshot,
         ) {
             streamed_voices.remove(&voice);
@@ -1476,6 +1475,7 @@ fn reap_finished_samples(
             ducking_engine.as_deref_mut(),
             active_counts,
             playing,
+            voice_manager,
             ducking_snapshot,
         ) {
             streamed_voices.remove(&voice);
@@ -2973,6 +2973,7 @@ mod tests {
                 &mut self.active_counts,
                 &mut self.streamed_voices,
                 &mut self.playing,
+                &self.voice_manager,
                 &self.snapshot,
                 &self.ducking_snapshot,
                 &self.inputs,
@@ -4325,6 +4326,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reaper_removes_finished_samples_from_the_voice_registry() {
+        // /status/voices lists only voices with something still playing, and the
+        // per-play auto voices do not accumulate over a long uptime.
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("effects"), 1.0)).await;
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+        assert_eq!(fixture.voice_manager.lock().voice_count(), 2);
+
+        finish_voice_sample(&mut fixture, "effects");
+        fixture.reap();
+
+        let voices = fixture.voice_manager.lock().list_voices();
+        assert_eq!(
+            voices.len(),
+            1,
+            "only the playing voice remains: {voices:?}"
+        );
+        assert_eq!(voices[0]["id"], "music");
+    }
+
+    #[tokio::test]
+    async fn reaper_removes_finished_streamed_sources_from_the_voice_registry() {
+        let mut fixture = Fixture::new(vec![]);
+        let id = fixture.voice_manager.lock().add_sample_to_voice("bed");
+        fixture.active_counts.insert("bed".to_string(), 1);
+
+        finish_streamed_source(&mut fixture, "bed", id);
+        fixture.reap();
+
+        assert_eq!(fixture.voice_manager.lock().voice_count(), 0);
+    }
+
+    #[tokio::test]
     async fn reaper_reconciles_a_finished_streamed_source() {
         let mut fixture = Fixture::new(vec![]);
 
@@ -4672,5 +4707,18 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(output.trim()).is_err(),
             "text format must not be JSON, got: {output:?}"
         );
+    }
+
+    #[test]
+    fn bass_management_has_no_command_line_flags() {
+        // Bass management needs source_channels, which only the bass_management
+        // config section can express, so the command line offers no partial
+        // override that would be silently ignored.
+        for flag in ["--lfe-channel", "--crossover-frequency"] {
+            assert!(
+                Args::try_parse_from(["mqttaudio", flag, "3"]).is_err(),
+                "{flag} must be rejected rather than silently ignored"
+            );
+        }
     }
 }

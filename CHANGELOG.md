@@ -24,6 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`latency_ms` too small for the resampler is raised instead of dropping audio.** A ring that cannot hold
   the steering target plus one 1024-frame burst dropped at the producer on every chunk. The minimum (11 ms
   at a 48 kHz output) is now applied when the input opens, with a warning naming the value used.
+- **Finished sounds leave the voice list.** A voice whose samples had all finished stayed in
+  `/status/voices` (and in `active_voices` on `/status` and `/metrics`) with a stale sample count, and
+  every play without a `voice` added an entry that was never removed, so the list grew for the life of
+  the process. Finished samples and streamed sources are now removed and an empty voice is dropped: a
+  later play into that voice starts at voice volume 1.0, and `voice_stop`, `voice_fade_out` and
+  `voice_volume` report it as not found. With ducking rules configured, the ducking engine likewise
+  stops tracking voices that have gone idle.
+- **Configuration errors are reported accurately.** An out-of-range `audio.channel_volumes` entry
+  names the real limit (`4`) instead of the text `MAX_GAIN`, and an out-of-range
+  `ducking_rules[].target_volume` is reported once instead of twice.
+
+### Removed
+
+- **`--lfe-channel` and `--crossover-frequency` are rejected.** The 2.1.0-rc.1 notes list them as
+  removed, but the release candidate still accepted both flags and ignored their values. Bass
+  management is configured in the `bass_management` config section.
 
 ## [2.1.0-rc.1] - 2026-09-04
 

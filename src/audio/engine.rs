@@ -1,5 +1,5 @@
-// ABOUTME: Audio engine coordinator managing playback, caching, and state.
-// ABOUTME: Handles sample loading, voice management, and mixer state updates.
+// ABOUTME: Output device discovery and stream configuration, and the callback that runs the mixer.
+// ABOUTME: Supervises the output stream, rebuilding it with backoff after a fatal device error.
 
 use crate::audio::device::output_device_identifier;
 use crate::audio::types::DeviceConfig;

@@ -1111,12 +1111,12 @@ impl Config {
             );
         }
 
-        // Channel volumes must be 0.0 to 1.0
+        // Channel volumes must be 0.0 to MAX_GAIN
         for (ch, vol) in &self.audio.channel_volumes {
             if !vol.is_finite() || *vol < 0.0 || *vol > MAX_GAIN {
                 errors.push(format!(
-                    "audio.channel_volumes.{} must be between 0.0 and MAX_GAIN",
-                    ch
+                    "audio.channel_volumes.{} must be between 0.0 and {}",
+                    ch, MAX_GAIN
                 ));
             }
         }
@@ -1278,14 +1278,8 @@ impl Config {
             }
         }
 
-        // Ducking rule validation
+        // Ducking rule validation (target_volume is checked above)
         for (i, rule) in self.ducking_rules.iter().enumerate() {
-            if rule.target_volume < 0.0 || rule.target_volume > 1.0 {
-                errors.push(format!(
-                    "ducking_rules[{}].target_volume must be between 0.0 and 1.0",
-                    i
-                ));
-            }
             if rule.fade_duration_ms > 60000 {
                 errors.push(format!(
                     "ducking_rules[{}].fade_duration_ms must be at most 60000",
@@ -1695,6 +1689,43 @@ mod tests {
             .unwrap_err()
             .iter()
             .any(|e| e.contains("target_volume")));
+    }
+
+    #[test]
+    fn out_of_range_ducking_target_is_reported_once() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.ducking_rules.push(DuckingRule {
+            primary_voice: "a".to_string(),
+            ducked_voices: vec!["b".to_string()],
+            target_volume: 1.5,
+            fade_duration_ms: 100,
+        });
+        let errors = config.validate().unwrap_err();
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|e| e.contains("target_volume"))
+                .count(),
+            1,
+            "one bad value should produce one error, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn channel_volume_error_states_the_gain_limit() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.audio.channel_volumes.insert("0".to_string(), 5.0);
+        let errors = config.validate().unwrap_err();
+        let expected = format!(
+            "audio.channel_volumes.0 must be between 0.0 and {}",
+            MAX_GAIN
+        );
+        assert!(
+            errors.contains(&expected),
+            "expected {expected:?}, got {errors:?}"
+        );
     }
 
     #[test]

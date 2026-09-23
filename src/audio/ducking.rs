@@ -268,12 +268,24 @@ impl DuckingEngine {
             .unwrap_or(1.0)
     }
 
+    /// Number of voices the engine currently records as active (for testing)
+    #[cfg(test)]
+    fn tracked_voice_count(&self) -> usize {
+        self.active_voices.len()
+    }
+
     /// Record a voice activity change and compute the resulting target changes,
     /// without owning any duck state. The control thread calls this and forwards
     /// each [`DuckTargetChange`] to the audio thread; only voices whose resolved
     /// target actually moved are emitted.
     pub fn compute_changes(&mut self, voice_id: &str, is_active: bool) -> Vec<DuckTargetChange> {
-        self.active_voices.insert(voice_id.to_string(), is_active);
+        // Inactive voices are removed rather than stored as false, so one-shot
+        // auto voices do not accumulate forever.
+        if is_active {
+            self.active_voices.insert(voice_id.to_string(), true);
+        } else {
+            self.active_voices.remove(voice_id);
+        }
 
         // The default restore fade for a voice that was never ducked (D25 only
         // changes restore once a voice has actually been ducked).
@@ -1107,6 +1119,20 @@ mod tests {
             "expected restored to ~1.0, got {}",
             applier.peek_multiplier("music")
         );
+    }
+
+    #[test]
+    fn compute_changes_forgets_voices_once_idle() {
+        // Inactive voices are dropped rather than stored as false, so the per-play
+        // auto voices do not accumulate over a long uptime.
+        let rules = vec![create_test_rule("narration", vec!["music"], 0.1, 1000)];
+        let mut engine = DuckingEngine::new(rules, 48000);
+        for n in 0..3 {
+            let voice = format!("_auto_1_{}", n);
+            engine.compute_changes(&voice, true);
+            engine.compute_changes(&voice, false);
+        }
+        assert_eq!(engine.tracked_voice_count(), 0);
     }
 
     #[test]
