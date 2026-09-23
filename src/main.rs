@@ -2004,6 +2004,15 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             crossfade_ms
                         );
                     }
+                    // A URL is read once as it downloads, so only a local file can loop.
+                    let loops = loop_mode && !file.starts_with("http");
+                    if loop_mode && !loops {
+                        tracing::warn!(
+                            "Play of {} is windowed (streamed) from a URL, which plays once; \
+                             loop is ignored",
+                            file
+                        );
+                    }
                     finish_streamed_play(
                         handles,
                         file.clone(),
@@ -2012,7 +2021,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                         voice,
                         channel_map,
                         fade_in,
-                        loop_mode && !file.starts_with("http"),
+                        loops,
                         0,
                         0,
                         stages,
@@ -3884,6 +3893,48 @@ mod tests {
         );
         assert!(
             warnings.iter().any(|w| w.contains("crossfade_ms")),
+            "got {warnings:?}"
+        );
+    }
+
+    /// Serve `body` as a WAV file for a single request on a local port and return
+    /// its URL.
+    async fn serve_wav_once(body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/bed.wav", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(&body).await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn windowed_url_play_warns_that_it_does_not_loop() {
+        // A windowed play of a URL reads the download once, so it cannot loop;
+        // asking for a loop must be visible rather than silently dropped.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let url = serve_wav_once(std::fs::read(TEST_WAV).unwrap()).await;
+        let mut fixture = Fixture::new(vec![]);
+        let mut play = play_stream(Some("bed"));
+        if let AudioCommand::Play {
+            file, loop_mode, ..
+        } = &mut play
+        {
+            *file = url;
+            *loop_mode = true;
+        }
+        let warnings = run_capturing_warnings(&mut fixture, play).await;
+        assert!(
+            warnings.iter().any(|w| w.contains("loop")),
             "got {warnings:?}"
         );
     }
