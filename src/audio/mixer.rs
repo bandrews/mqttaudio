@@ -146,16 +146,16 @@ pub struct ActiveSample {
     /// Fractional part of playback position for sub-sample interpolation
     fractional_position: f64,
 
-    /// Per-sample volume (0.0 - 1.0) - current smoothed value
+    /// Per-sample volume (0.0 - MAX_GAIN) - current smoothed value
     pub volume: f32,
 
     /// Target per-sample volume for smooth ramping
     pub target_volume: f32,
 
-    /// Voice-level volume (0.0 - 1.0) - current smoothed value
+    /// Voice-level volume (0.0 - MAX_GAIN) - current smoothed value
     pub voice_volume: f32,
 
-    /// Target voice volume for smooth ramping (0.0 - 1.0)
+    /// Target voice volume for smooth ramping (0.0 - MAX_GAIN)
     pub target_voice_volume: f32,
 
     /// Channel routing: vec![(src_channel, dest_channel), ...]
@@ -906,7 +906,7 @@ pub struct LiveInput {
     /// Number of input channels
     pub input_channels: usize,
 
-    /// Per-input volume (0.0 - 1.0) - current smoothed value
+    /// Per-input volume (0.0 - MAX_GAIN) - current smoothed value
     pub volume: f32,
     pub target_volume: f32,
     pub max_backlog_frames: usize,
@@ -923,10 +923,10 @@ pub struct LiveInput {
     /// so unmute returns to the calibrated value rather than a hardcoded 1.0 (D34).
     pre_mute_volume: f32,
 
-    /// Voice-level volume (0.0 - 1.0) - current smoothed value
+    /// Voice-level volume (0.0 - MAX_GAIN) - current smoothed value
     pub voice_volume: f32,
 
-    /// Target voice volume for smooth ramping (0.0 - 1.0)
+    /// Target voice volume for smooth ramping (0.0 - MAX_GAIN)
     pub target_voice_volume: f32,
 
     /// Channel routing: vec![(src_channel, dest_channel), ...]
@@ -1090,9 +1090,7 @@ impl LiveInput {
         }
     }
 
-    /// Mute or unmute this input, ramping to avoid a pop. Unmute restores
-    /// the configured (or last set) volume rather than snapping to 1.0.
-    /// Whether this input is muted (or on its way there)
+    /// Whether this input is muted
     pub fn is_muted(&self) -> bool {
         self.muted
     }
@@ -1147,10 +1145,10 @@ pub struct StreamedSource {
     /// Target per-source volume for smooth ramping (0.0 - MAX_GAIN).
     pub target_volume: f32,
 
-    /// Voice-level volume (0.0 - 1.0) - current smoothed value.
+    /// Voice-level volume (0.0 - MAX_GAIN) - current smoothed value.
     pub voice_volume: f32,
 
-    /// Target voice volume for smooth ramping (0.0 - 1.0).
+    /// Target voice volume for smooth ramping (0.0 - MAX_GAIN).
     pub target_voice_volume: f32,
 
     /// Channel routing: vec![(src_channel, dest_channel), ...].
@@ -2148,7 +2146,7 @@ fn channel_route_gain(gains: &[f32], route_idx: usize) -> f32 {
 /// count across the block), so the transition to silence has no hard step (F3).
 ///
 /// Shared by the live-input and streamed-source mix paths; allocates nothing, never
-/// blocks, and supports up to 16 input channels.
+/// blocks, and supports up to 64 input channels.
 #[allow(clippy::too_many_arguments)]
 fn mix_ring_voice_frame(
     consumer: &mut HeapConsumer<f32>,

@@ -381,7 +381,7 @@ pub struct VolumeMessage {
     /// Target all samples in this voice
     #[serde(skip_serializing_if = "Option::is_none")]
     pub voice: Option<String>,
-    /// New volume level (0.0 - 1.0)
+    /// New volume level (0.0 - MAX_GAIN)
     pub volume: f32,
 }
 

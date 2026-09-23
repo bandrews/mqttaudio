@@ -264,8 +264,7 @@ pub struct CacheConfig {
     pub full_load_max_bytes: u64,
     /// Auto threshold: a local asset longer than this many seconds is windowed.
     pub full_load_max_seconds: u32,
-    /// Default freshness policy: `trusting` (serve cache, refresh in the background),
-    /// `dev` (re-check every load), or `pinned` (never auto-check).
+    /// Default freshness policy: `trusting`, `dev`, or `pinned` (see [`FreshnessMode`]).
     pub freshness: FreshnessMode,
 }
 
@@ -396,7 +395,7 @@ pub struct InputRouteConfig {
 pub struct InputConfig {
     /// Device name (None = default input device)
     pub device: Option<String>,
-    /// Volume (0.0 - 1.0)
+    /// Volume (0.0 - MAX_GAIN)
     pub volume: f32,
     /// Voice ID for ducking integration
     pub voice_id: String,
@@ -586,16 +585,17 @@ pub enum MemoryCap {
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum FreshnessMode {
-    /// Serve the cached copy immediately; pick up local changes via a cheap `stat`
-    /// each load, and refresh remote entries in the background once past the
-    /// revalidation window. Never blocks a play on the network. (Default.)
+    /// Re-`stat` a memory-resident local file on each play and re-decode it if it
+    /// changed. Downloaded HTTP files past the revalidation window get a conditional
+    /// GET: from the 30 s background pass while decoded in memory, or on the play
+    /// itself when only on disk. (Default.)
     #[default]
     Trusting,
-    /// Check on every load: re-`stat` local files each play and revalidate remote
-    /// entries with no freshness window, so an edited asset is picked up immediately.
-    /// For active development.
+    /// As `Trusting`, but the background pass re-checks every in-memory HTTP entry
+    /// on each tick, ignoring the revalidation window. For active development.
     Dev,
-    /// Never auto-check; changes are picked up only via an explicit reload or restart.
+    /// No local re-`stat` and no background pass. An HTTP file that is only on disk
+    /// is still re-checked on play once past the revalidation window.
     Pinned,
 }
 
@@ -648,15 +648,16 @@ pub struct HttpConfig {
     pub port: u16,
     /// Bind address (default: 127.0.0.1 for security)
     pub bind_address: String,
-    /// Optional Bearer token for authentication (if set, all requests require it)
+    /// Optional Bearer token. When set, command and WebSocket routes require it;
+    /// `require_auth` extends that to the status routes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_token: Option<String>,
     /// Enable WebSocket endpoint for log streaming
     pub websocket_enabled: bool,
     /// Allow CORS from any origin (useful for web admin panels)
     pub cors_permissive: bool,
-    /// Opt-in: require a valid token on ALL routes (including status and ws).
-    /// Default false preserves the open status/health/ws endpoints.
+    /// Opt-in: also require the token on status routes; /health and /ready stay
+    /// open. Off by default, leaving the status routes open.
     #[serde(default)]
     pub require_auth: bool,
 }
@@ -943,11 +944,6 @@ impl Config {
         })
     }
 
-    /// Resolve `audio.channel_volumes` into a per-output-channel gain vector of
-    /// length `output_channels`, defaulting to unity. Keys may be numeric channel
-    /// indices or aliases; entries that resolve outside the channel range (or to an
-    /// unknown alias) are skipped with a warning so a misconfiguration never aborts
-    /// startup or panics the audio thread.
     /// Resolve bass management channel references to numeric indices
     pub fn resolve_bass_management(&self) -> Result<ResolvedBassManagement, String> {
         let lfe = self.resolve_channel(&self.bass_management.lfe_channel)?;
@@ -1499,7 +1495,7 @@ mod tests {
                 "sample_rate": 96000,
                 "buffer_size": 1024,
                 "channel_names": {
-                    "_comment": "removed field (D60): old configs carrying it must still parse",
+                    "_comment": "display labels keyed by channel number",
                     "0": "front_left"
                 },
                 "channel_volumes": {
@@ -3638,10 +3634,9 @@ mod tests {
     }
 
     #[test]
-    fn removed_channel_names_key_still_parses() {
-        // D60: `audio.channel_names` was removed (it was never read); configs
-        // that still carry the key must keep parsing — serde tolerates unknown
-        // keys because no config struct opts into deny_unknown_fields.
+    fn channel_names_labels_parse_alongside_aliases() {
+        // `audio.channel_names` holds display labels (number -> name) next to the
+        // `channel_aliases` routing uses (name -> number); both parse together.
         let json = r#"{
             "audio": {
                 "channel_names": { "0": "front_left" },

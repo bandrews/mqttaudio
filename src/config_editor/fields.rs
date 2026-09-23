@@ -798,7 +798,7 @@ pub static REGISTRY: [FieldSpec; 55] = [
         label: "client_id",
         path: &["mqtt", "client_id"],
         kind: FieldKind::OptionalText,
-        help: "MQTT client id. Unset auto-generates mqttaudio_<pid>.",
+        help: "MQTT client id. Unset generates a random mqttaudio_<8 hex digits> at startup.",
     },
     FieldSpec {
         section: Section::Mqtt,
@@ -914,7 +914,7 @@ pub static REGISTRY: [FieldSpec; 55] = [
         label: "enabled",
         path: &["cache", "enabled"],
         kind: FieldKind::Bool,
-        help: "Cache decoded audio on disk for fast replays. Default on.",
+        help: "Keep downloaded HTTP files in the cache directory so replays and restarts skip the download. Default on.",
     },
     FieldSpec {
         section: Section::Cache,
@@ -931,7 +931,7 @@ pub static REGISTRY: [FieldSpec; 55] = [
             min: 0,
             max: u32::MAX as u64,
         },
-        help: "Revalidation window for remote (HTTP) cache entries in seconds. 0 = always re-check. Default 300.",
+        help: "Seconds a downloaded HTTP file is trusted before a conditional re-check. 0 = re-check at every opportunity. Default 300.",
     },
     FieldSpec {
         section: Section::Cache,
@@ -1023,7 +1023,7 @@ pub static REGISTRY: [FieldSpec; 55] = [
         label: "freshness",
         path: &["cache", "freshness"],
         kind: FieldKind::Enum(&["trusting", "dev", "pinned"]),
-        help: "Cache freshness: trusting (serve cache, refresh in background), dev (re-check every load), pinned (never auto-check).",
+        help: "Cache freshness: trusting (re-stat local files on play; re-check HTTP files past revalidate_after_seconds), dev (also re-check in-memory HTTP files every 30 s), pinned (no local re-stat, no background re-check).",
     },
     // --- Security ---
     FieldSpec {
@@ -1046,7 +1046,7 @@ pub static REGISTRY: [FieldSpec; 55] = [
         label: "verbose",
         path: &["logging", "verbose"],
         kind: FieldKind::Bool,
-        help: "Verbose mode; equivalent to level = debug.",
+        help: "Raise the log level to at least debug and log cache statistics. Same as --verbose.",
     },
     FieldSpec {
         section: Section::Logging,
@@ -1089,7 +1089,7 @@ pub static REGISTRY: [FieldSpec; 55] = [
         label: "auth_token",
         path: &["http", "auth_token"],
         kind: FieldKind::Secret,
-        help: "Bearer token protecting command routes (min 8 characters). Unset = open.",
+        help: "Bearer token for command and WebSocket routes (min 8 characters). Unset = open.",
     },
     FieldSpec {
         section: Section::Http,
@@ -1110,7 +1110,7 @@ pub static REGISTRY: [FieldSpec; 55] = [
         label: "require_auth",
         path: &["http", "require_auth"],
         kind: FieldKind::Bool,
-        help: "Require the token on ALL routes including status/health/ws. Default off.",
+        help: "Also require the token on status routes; /health and /ready stay open. Needs a token. Default off.",
     },
     // --- Ducking ---
     FieldSpec {

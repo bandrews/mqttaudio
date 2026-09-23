@@ -4,13 +4,15 @@
 #   sudo install -Dm644 packaging/mqttaudio.service /etc/systemd/system/mqttaudio.service
 #   sudo install -Dm755 target/release/mqttaudio /usr/local/bin/mqttaudio
 #   sudo useradd --system --no-create-home --shell /usr/sbin/nologin mqttaudio
-#   sudo install -Dm644 your-config.json /etc/mqttaudio/config.json
+#   sudo install -Dm640 -o root -g mqttaudio your-config.json /etc/mqttaudio/config.json
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now mqttaudio
 #
 # Set cache.directory in /etc/mqttaudio/config.json to /var/lib/mqttaudio/cache so
-# it lands in the writable StateDirectory granted below (the default is the
-# service user's home, which the hardening stanza makes read-only).
+# it lands in the writable StateDirectory granted below. The default is under the
+# service user's home, which ProtectHome= hides, so with the disk cache enabled the
+# daemon cannot create its cache and exits at startup. For the same reason, sound
+# files must live outside /home, /root and /run/user.
 #
 # The daemon exits non-zero when the audio device cannot be recovered (D4); with
 # Restart=on-failure systemd then restarts it.

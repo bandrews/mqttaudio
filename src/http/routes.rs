@@ -29,10 +29,6 @@ fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// Authentication middleware. With no token configured the request passes (open
-/// mode) unless `require_auth` is set, in which case it fails closed. A token is
-/// accepted via `Authorization: Bearer <token>` or the `?token=` query param,
-/// compared in constant time.
 /// Percent-decode a query parameter value ('+' as space), so tokens with
 /// URL-encoded characters authenticate through the query form.
 fn percent_decode(value: &str) -> String {
@@ -69,7 +65,10 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Authentication middleware that checks for Bearer token if configured.
+/// Authentication middleware. With no token configured the request passes (open
+/// mode) unless `require_auth` is set, in which case it fails closed. A token is
+/// accepted via `Authorization: Bearer <token>` or the `?token=` query param,
+/// compared in constant time.
 async fn auth_middleware(
     State(state): State<AppState>,
     request: Request<Body>,
@@ -173,8 +172,9 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         auth_middleware,
     ));
 
-    // /health is always open (liveness probe). Status and ws are open by default
-    // but gated when require_auth is set.
+    // /health and /ready are always open (liveness and readiness probes). Status
+    // routes are open unless require_auth is set; the WebSockets carry the auth
+    // middleware either way, so they need the token whenever one is set.
     let mut app = Router::new().merge(health_route);
 
     if state.require_auth {

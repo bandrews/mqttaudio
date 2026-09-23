@@ -343,8 +343,8 @@ pub fn required_channels(channel_map: &[(usize, usize)]) -> usize {
 
 /// Choose the channel count to open a capture stream with.
 ///
-/// `exact` forces a specific count, for hardware whose capabilities cpal
-/// reports incorrectly. Otherwise the smallest supported count that covers
+/// `exact` selects that count when the device reports it, for example to open a
+/// wider layout than the routes need. Otherwise the smallest supported count that covers
 /// every routed source channel is used, so a device offering a range is not
 /// opened wider than the routing needs while a device with a fixed layout
 /// (ALSA `hw:` on a multichannel interface) still matches. Returns None when
@@ -367,9 +367,6 @@ pub fn select_channel_count(
     }
 }
 
-/// Find a capture configuration for the device.
-///
-/// Supported native formats are converted to f32 by the typed capture callback.
 /// Choose the capture rate from a reported range. ALSA plug devices report a
 /// continuous range with an implausible maximum; that is capability-report
 /// noise, not a reason to disqualify the configuration, so the ceiling is
@@ -379,6 +376,9 @@ fn choose_capture_rate(min_rate: u32, max_rate: u32, preferred: u32) -> u32 {
     preferred.max(min_rate).min(max_rate)
 }
 
+/// Find a capture configuration for the device.
+///
+/// Supported native formats are converted to f32 by the typed capture callback.
 pub fn find_input_config(
     device: &Device,
     requested_channels: Option<usize>,
@@ -439,7 +439,8 @@ pub fn find_input_config(
         .filter(|c| c.channels() == channels)
         .collect();
 
-    // Matching the output rate keeps the resampler out of the signal path
+    // Matching the output rate avoids a nominal rate conversion; the drift
+    // correction still resamples slightly
     let exact_rate = matching.iter().find(|c| {
         choose_capture_rate(
             c.min_sample_rate(),

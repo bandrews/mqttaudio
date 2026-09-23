@@ -21,7 +21,8 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 
 /// Per-sample status the control thread knows when a sample is started. Live
-/// playback position is owned by the audio thread and is not reflected here.
+/// playback position is owned by the audio thread, which publishes it through
+/// `position` while telemetry is enabled.
 #[derive(Clone, Default)]
 pub struct SampleStatus {
     pub internal_id: u64,
@@ -74,7 +75,8 @@ pub struct InputStatus {
 
 /// Control-side view of what is playing, exposed to the HTTP status handlers.
 /// The control thread rebuilds it as it sends commands; the audio thread never
-/// touches it (D20). Live per-sample position is not available control-side.
+/// touches it (D20). Live per-sample position arrives only through each sample's
+/// `position` publisher, while telemetry is enabled.
 #[derive(Clone, Default)]
 pub struct StatusSnapshot {
     pub active_samples: usize,
@@ -160,8 +162,8 @@ pub struct AppState {
     /// Count of output samples the limiter held at the ceiling, for `/status`
     /// and `/metrics`. Produced by the Sprint-6 limiter on the audio thread.
     pub clip_count: Arc<AtomicU64>,
-    /// Count of cpal stream-error callbacks (dropouts/underruns that triggered a
-    /// stream rebuild), produced by the Sprint-5 audio engine. Surfaced in
+    /// Count of cpal stream-error callbacks, including xruns the backend recovered
+    /// from; only unrecoverable errors trigger a stream rebuild. Surfaced in
     /// `/metrics` and `/status`.
     pub xruns: Arc<AtomicU64>,
     /// When the daemon started, for the `/metrics` uptime field.
@@ -173,7 +175,7 @@ pub struct AppState {
     pub ducking: Arc<RwLock<HashMap<String, f32>>>,
     /// Optional auth token for Bearer authentication
     pub auth_token: Option<String>,
-    /// Opt-in: require a valid token on ALL routes (status + ws included).
+    /// Opt-in: also require the token on status routes; /health and /ready stay open.
     pub require_auth: bool,
     /// Log broadcaster for WebSocket clients
     pub log_broadcaster: Arc<LogBroadcaster>,

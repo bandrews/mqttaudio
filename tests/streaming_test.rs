@@ -1,3 +1,6 @@
+// ABOUTME: Integration tests for HTTP streaming loads, the disk cache, and revalidation.
+// ABOUTME: Serves generated WAV files from a local test server; needs no external network.
+
 #[derive(Clone)]
 struct TestCacheOptions {
     max_memory_mb: u32,

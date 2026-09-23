@@ -98,12 +98,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Configuration errors are reported accurately.** An out-of-range `audio.channel_volumes` entry
   names the real limit (`4`) instead of the text `MAX_GAIN`, and an out-of-range
   `ducking_rules[].target_volume` is reported once instead of twice.
+- **The config editor's help describes what the daemon does.** The help for `mqtt.client_id`,
+  `cache.enabled`, `cache.revalidate_after_seconds`, `cache.freshness`, `logging.verbose`,
+  `http.auth_token`, `http.require_auth` and `audio.channel_volumes` entries described a different
+  client id format, a cache of decoded audio, per-play rechecks, a fixed log level, which routes a token
+  protects, and a 0.0-1.0 range.
+- **`tests/scripts/demo_ducking.sh` stops only mqttaudio itself.** Its cleanup killed every process whose
+  command line mentioned `mqttaudio`, such as an editor open on the repository.
 
 ### Security
 
 - **`POST /telemetry` requires the auth token when one is set.** Turning telemetry on changes daemon
   state and adds real-time work, so it is protected like the command endpoints. `GET /telemetry` stays
   open unless `http.require_auth` is set.
+- **The systemd install steps keep the config file private.** `packaging/mqttaudio.service` installed
+  the config world-readable although it can hold `mqtt.password` and `http.auth_token`; it is now
+  installed readable only by root and the `mqttaudio` group.
 
 ### Removed
 

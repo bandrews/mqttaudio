@@ -156,9 +156,9 @@ async fn main() {
 
     // Container/deployment environments must be able to enable the internal
     // HTTP gateway without baking a bearer token into the checked-in venue
-    // config. A requested non-loopback bind always requires auth; an absent
-    // token leaves startup validation failed closed rather than exposing an
-    // unauthenticated daemon on the Compose network.
+    // config. MQTTAUDIO_HTTP_REQUIRE_AUTH without a token fails startup
+    // validation closed rather than exposing an unauthenticated daemon; a
+    // non-loopback bind without auth only logs a warning.
     if let Ok(bind_address) = std::env::var("MQTTAUDIO_HTTP_BIND_ADDRESS") {
         if !bind_address.trim().is_empty() {
             config.http.bind_address = bind_address;
@@ -722,10 +722,10 @@ async fn main() {
                         tracing::error!("Command ring full while adding live input {}", idx);
                     }
 
-                    // Mark the configured input voice active so it can trigger ducking
-                    // as a primary (D4), through the same off-RT notify path as sample
-                    // voices. The stream is open for the process lifetime, so the voice
-                    // is active for it; signal-gated activation is Sprint 8 (D36).
+                    // Let the input's voice trigger ducking as a primary (D4), through
+                    // the same off-RT notify path as sample voices. With an
+                    // activity_threshold the reaper tick follows the capture level
+                    // (D36); without one the voice is active while the stream is open.
                     if let Some(threshold) = input_config.activity_threshold {
                         let sources = input_config
                             .routes
@@ -1017,8 +1017,8 @@ async fn main() {
     // decrements voice activity, and lets the ducking engine restore voices.
     let mut reaper_tick = tokio::time::interval(std::time::Duration::from_millis(20));
     // Periodic HTTP freshness tick (stale-while-revalidate): refreshes stale remote
-    // cache entries out-of-band so a play never blocks on the network. Idle when
-    // freshness is pinned.
+    // cache entries that are decoded in memory out-of-band, so a play of one never
+    // blocks on the network. Idle when freshness is pinned.
     let mut freshness_tick = tokio::time::interval(std::time::Duration::from_secs(30));
     let mut loads = tokio::task::JoinSet::new();
     let load_permit = Arc::new(tokio::sync::Semaphore::new(4));

@@ -1865,7 +1865,7 @@ fn scalar_item_help(elem: &FieldKind) -> &'static str {
 fn map_item_help(value_kind: &FieldKind) -> &'static str {
     match value_kind {
         FieldKind::UInt { .. } => "The channel number (0-indexed) this alias refers to.",
-        FieldKind::Float { .. } => "Calibration gain for this channel (0.0 - 1.0).",
+        FieldKind::Float { .. } => "Calibration gain for this channel (0.0 - 4.0, 1.0 = unity).",
         FieldKind::MapToJson => {
             "A macro: command parameters merged into commands that reference it by name."
         }

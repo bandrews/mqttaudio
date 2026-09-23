@@ -1,4 +1,6 @@
 #!/bin/bash
+# ABOUTME: Interactive demo of ducking rules using tone files from tests/audio.
+# ABOUTME: Run from tests/scripts with a broker on localhost; needs mosquitto_pub.
 
 # Audio Ducking Demo Script
 # This script demonstrates the audio ducking feature with different scenarios
@@ -29,7 +31,7 @@ read -p "Press Enter to start the demo..."
 echo ""
 
 # Kill any existing instances
-pkill -9 -f "mqttaudio" 2>/dev/null || true
+pkill -9 -x mqttaudio 2>/dev/null || true
 sleep 1
 
 # Start mqttaudio with ducking config

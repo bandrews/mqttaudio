@@ -11,7 +11,7 @@ pub struct Voice {
     pub id: String,
     /// IDs of active samples in this voice
     pub sample_ids: Vec<u64>,
-    /// Voice-level volume (0.0 - 1.0)
+    /// Voice-level volume (0.0 - MAX_GAIN)
     pub volume: f32,
 }
 

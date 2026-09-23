@@ -13,7 +13,8 @@ use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
-/// Maximum number of log messages to buffer for new subscribers.
+/// Log lines the broadcast channel holds for clients that fall behind; a client
+/// that lags further than this misses lines. New clients receive no history.
 const LOG_BUFFER_SIZE: usize = 1000;
 
 /// Broadcasts log messages to connected WebSocket clients.
@@ -133,9 +134,8 @@ async fn handle_socket(socket: WebSocket, broadcaster: Arc<LogBroadcaster>) {
 }
 
 /// Handle the state-event WebSocket upgrade (`/ws/state`, Sprint W7). Unlike the
-/// log stream, frames here are already typed JSON (tick frames with positions +
-/// meters, and discrete state events) produced by the control thread, so they are
-/// forwarded verbatim.
+/// log stream, frames here are already typed JSON (tick frames with positions and
+/// meters) produced by the HTTP server's tick task, so they are forwarded verbatim.
 pub async fn handle_state_websocket(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
