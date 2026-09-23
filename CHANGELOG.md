@@ -72,6 +72,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Out-of-range bass-management source channels are reported.** A `source_channels` entry beyond the
   device's channel count contributes no bass; startup now logs a warning naming it, as it already did for
   an out-of-range `lfe_channel`.
+- **`speed` with `pitch_correction` and a negative speed is reported as an invalid request.** It was
+  ignored with a log line while HTTP callers were told it succeeded.
+- **A play's `window_ms` and `prebuffer_ms` overrides are validated** against the same limits as
+  `cache.stream_window_ms` and `cache.stream_prebuffer_ms`: `window_ms` 100-60000, and `prebuffer_ms`
+  no larger than the window. A zero window underran constantly and a huge one allocated outside the
+  memory budget.
+- **The startup log names the configuration file.** The message was written before logging started, so
+  it never appeared; the daemon now logs which file it loaded, or that it found none.
 - **Talkback reports an out-of-range `gain` as a gain error** instead of the lease-duration message.
 - **More configuration mistakes are caught at startup.** `http.bind_address` must be an IP address: a
   host name such as `localhost` used to pass validation and then fail when the HTTP server started,

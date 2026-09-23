@@ -15,6 +15,12 @@ use std::path::{Path, PathBuf};
 /// than wrapping.
 pub const MAX_GAIN: f32 = 4.0;
 
+/// Smallest and largest window a windowed (streamed) play may use, in ms. Shorter
+/// windows underrun constantly; longer ones hold large rings outside the memory
+/// budget.
+pub const MIN_STREAM_WINDOW_MS: u32 = 100;
+pub const MAX_STREAM_WINDOW_MS: u32 = 60_000;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct MqttConfig {
@@ -1099,8 +1105,11 @@ impl Config {
         }
 
         // Streamed-source window and prebuffer must be sane and consistent.
-        if self.cache.stream_window_ms < 100 || self.cache.stream_window_ms > 60000 {
-            errors.push("cache.stream_window_ms must be between 100 and 60000".to_string());
+        if !(MIN_STREAM_WINDOW_MS..=MAX_STREAM_WINDOW_MS).contains(&self.cache.stream_window_ms) {
+            errors.push(format!(
+                "cache.stream_window_ms must be between {} and {}",
+                MIN_STREAM_WINDOW_MS, MAX_STREAM_WINDOW_MS
+            ));
         }
         if self.cache.stream_prebuffer_ms > self.cache.stream_window_ms {
             errors.push(

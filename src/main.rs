@@ -125,8 +125,12 @@ async fn main() {
         return;
     }
 
-    // Load configuration
-    let mut config = match config::Config::load_from_path_or_default(args.config.as_deref()) {
+    // Load configuration. The path is kept so it can be logged once logging is up.
+    let config_path = match args.config.as_deref() {
+        Some(path) => Some(std::path::PathBuf::from(path)),
+        None => config::Config::find_config_file(),
+    };
+    let mut config = match config::Config::load_from_path_or_default(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to load configuration: {}", e);
@@ -230,6 +234,7 @@ async fn main() {
     };
 
     tracing::info!("mqttaudio {} starting", env!("CARGO_PKG_VERSION"));
+    tracing::info!("{}", config_source_message(config_path.as_deref()));
     tracing::info!("Copyright © 2016-2025 Mo Fang Heavy Industries LLC");
 
     // Handle --list-devices
@@ -1194,6 +1199,15 @@ async fn main() {
                 break;
             }
         }
+    }
+}
+
+/// Where the running configuration came from, for the startup log.
+fn config_source_message(path: Option<&std::path::Path>) -> String {
+    match path {
+        Some(path) => format!("Configuration loaded from {}", path.display()),
+        None => "No configuration file found; using built-in defaults and command-line options"
+            .to_string(),
     }
 }
 
@@ -2647,6 +2661,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     "Negative speed ({}) is not supported with pitch correction; ignoring",
                     speed
                 );
+                ctx.fail(
+                    CommandErrorKind::InvalidRequest,
+                    "Negative speed is not supported with pitch correction",
+                );
             } else if selector_targets_streamed_voice(&selector, ctx.streamed_voices) {
                 tracing::warn!(
                     "Speed/pitch is not supported for windowed/streamed voices; ignoring (a \
@@ -2940,11 +2958,16 @@ mod tests {
 
         /// Run a parsed command through `handle_command`, pushing the resulting
         /// audio commands onto the ring (but not yet applying them to the mixer).
-        async fn run(&mut self, cmd: AudioCommand) {
-            self.run_prepared(cmd, None).await;
+        /// Returns the failure an HTTP caller would receive, if any.
+        async fn run(&mut self, cmd: AudioCommand) -> Option<mqtt::commands::CommandError> {
+            self.run_prepared(cmd, None).await
         }
 
-        async fn run_prepared(&mut self, cmd: AudioCommand, prepared: Option<PreparedPlayback>) {
+        async fn run_prepared(
+            &mut self,
+            cmd: AudioCommand,
+            prepared: Option<PreparedPlayback>,
+        ) -> Option<mqtt::commands::CommandError> {
             let mut ctx = CommandCtx {
                 cache_manager: &self.cache_manager,
                 voice_manager: &self.voice_manager,
@@ -2969,6 +2992,7 @@ mod tests {
                 prepared,
             };
             handle_command(cmd, &mut ctx).await;
+            ctx.error
         }
 
         /// Apply every queued audio command to the mixer, as the audio callback
@@ -3789,6 +3813,31 @@ mod tests {
         assert_eq!(
             fixture.mixer.active_samples[0].speed, 1.0,
             "the sample's speed must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_speed_with_pitch_is_reported_as_an_invalid_request() {
+        // The command does nothing, so an HTTP caller must not be told it worked.
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain();
+
+        let error = fixture
+            .run(AudioCommand::Speed {
+                selector: SampleSelector {
+                    internal_id: None,
+                    id: None,
+                    file: None,
+                    voice: Some("v".to_string()),
+                },
+                speed: -1.5,
+                pitch_correction: true,
+            })
+            .await;
+        assert_eq!(
+            error.map(|e| e.kind),
+            Some(mqtt::commands::CommandErrorKind::InvalidRequest)
         );
     }
 
@@ -4806,6 +4855,13 @@ mod tests {
             output.contains("No sample matches the selector"),
             "the failure must be logged, got {output:?}"
         );
+    }
+
+    #[test]
+    fn startup_log_names_the_configuration_source() {
+        let path = std::path::Path::new("/etc/mqttaudio/config.json");
+        assert!(config_source_message(Some(path)).contains("/etc/mqttaudio/config.json"));
+        assert!(config_source_message(None).contains("No configuration file"));
     }
 
     #[test]

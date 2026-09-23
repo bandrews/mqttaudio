@@ -573,11 +573,6 @@ pub fn expand_macros(
     }
 }
 
-/// Parse MQTT JSON payload into an audio command.
-/// Supports both flattened and nested (legacy) formats:
-/// - Flattened: {"command": "play", "file": "test.wav", "volume": 0.8}
-/// - Nested: {"command": "play", "message": {"file": "test.wav", "volume": 0.8}}
-///
 /// Reject a non-numeric internal_id at parse time: the system-assigned ids
 /// are numeric, so a non-numeric value could only ever silently match nothing.
 fn validate_internal_id(internal_id: &Option<String>) -> Result<(), ParseError> {
@@ -592,6 +587,37 @@ fn validate_internal_id(internal_id: &Option<String>) -> Result<(), ParseError> 
     Ok(())
 }
 
+/// Hold a play's window overrides to the limits configuration validation applies
+/// to `cache.stream_window_ms` and `cache.stream_prebuffer_ms`.
+fn validate_window_overrides(
+    window_ms: Option<u32>,
+    prebuffer_ms: Option<u32>,
+) -> Result<(), ParseError> {
+    use crate::config::{MAX_STREAM_WINDOW_MS, MIN_STREAM_WINDOW_MS};
+    if let Some(window) = window_ms {
+        if !(MIN_STREAM_WINDOW_MS..=MAX_STREAM_WINDOW_MS).contains(&window) {
+            return Err(ParseError::InvalidParameter(format!(
+                "window_ms must be between {} and {} (got {})",
+                MIN_STREAM_WINDOW_MS, MAX_STREAM_WINDOW_MS, window
+            )));
+        }
+    }
+    if let Some(prebuffer) = prebuffer_ms {
+        let limit = window_ms.unwrap_or(MAX_STREAM_WINDOW_MS);
+        if prebuffer > limit {
+            return Err(ParseError::InvalidParameter(format!(
+                "prebuffer_ms must not exceed the window ({} > {})",
+                prebuffer, limit
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Parse MQTT JSON payload into an audio command.
+/// Supports both flattened and nested (legacy) formats:
+/// - Flattened: {"command": "play", "file": "test.wav", "volume": 0.8}
+/// - Nested: {"command": "play", "message": {"file": "test.wav", "volume": 0.8}}
 pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
     let mqtt_cmd: MqttCommand = serde_json::from_str(json)?;
 
@@ -602,6 +628,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 return Err(ParseError::MissingMessage);
             }
             let play_msg: PlayMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            validate_window_overrides(play_msg.window_ms, play_msg.prebuffer_ms)?;
 
             Ok(AudioCommand::Play {
                 file: play_msg.file,
@@ -1921,6 +1948,27 @@ mod tests {
             }
             _ => panic!("Expected Play command"),
         }
+    }
+
+    #[test]
+    fn window_overrides_are_held_to_the_config_limits() {
+        // The same limits as cache.stream_window_ms / stream_prebuffer_ms: a tiny
+        // window underruns constantly and a huge one allocates outside the budget.
+        for json in [
+            r#"{"command": "play", "file": "a.wav", "window_ms": 0}"#,
+            r#"{"command": "play", "file": "a.wav", "window_ms": 600000}"#,
+            r#"{"command": "play", "file": "a.wav", "prebuffer_ms": 600000}"#,
+            r#"{"command": "play", "file": "a.wav", "window_ms": 500, "prebuffer_ms": 1000}"#,
+        ] {
+            assert!(
+                matches!(parse_command(json), Err(ParseError::InvalidParameter(_))),
+                "{json} must be rejected"
+            );
+        }
+        assert!(parse_command(
+            r#"{"command": "play", "file": "a.wav", "window_ms": 100, "prebuffer_ms": 100}"#
+        )
+        .is_ok());
     }
 
     #[test]
