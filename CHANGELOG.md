@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later play into that voice starts at voice volume 1.0, and `voice_stop`, `voice_fade_out` and
   `voice_volume` report it as not found. With ducking rules configured, the ducking engine likewise
   stops tracking voices that have gone idle.
+- **Remote plays fail instead of waiting forever on a silent server.** Opening an uncached URL had no
+  time limit, and a download feeding a windowed play (or a small file loaded over the same connection)
+  had no limit on how long the body could stall. A play waited silently, later plays of the same URL
+  joined it, and its decode thread was never released. Opening now gives up after 10 seconds to
+  connect or 30 seconds for the response, and a body that sends nothing for 60 seconds fails the play.
 - **An unreachable server no longer stalls cache revalidation.** Checking whether a cached URL had
   changed waited on the server with no time limit and retried on every play and every freshness tick,
   while holding the cache, so one dead server could hold up plays, cache commands, `/metrics` and

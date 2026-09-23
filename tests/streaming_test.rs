@@ -163,6 +163,24 @@ async fn start_counting_server(
     (port, count, shutdown_tx)
 }
 
+#[tokio::test(start_paused = true)]
+async fn opening_an_unresponsive_url_fails_instead_of_waiting() {
+    // A server that accepts the connection but never sends headers must fail the
+    // play rather than leave it, and every later play of the URL, waiting.
+    use mqttaudio::cache::http_stream::open_http_stream;
+    let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/cue.wav",
+        silent.local_addr().unwrap().port()
+    );
+    let opened =
+        tokio::time::timeout(std::time::Duration::from_secs(600), open_http_stream(&url)).await;
+    assert!(
+        matches!(opened, Ok(Err(_))),
+        "opening must fail with an error, not hang"
+    );
+}
+
 #[tokio::test]
 async fn test_http_stream_with_streaming_decoder() {
     // Setup: create temp dir and test WAV file

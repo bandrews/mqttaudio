@@ -546,11 +546,12 @@ fn header_string(response: &reqwest::Response, name: &str) -> Option<String> {
 }
 
 /// Open an HTTP URL and read its response headers, without downloading the body. Fails
-/// on a connection error or a non-success status.
+/// on a connection error, a server that does not answer in time, or a non-success
+/// status.
 pub async fn open_http_stream(url: &str) -> Result<OpenHttpStream, HttpStreamError> {
-    let response = reqwest::get(url)
+    let response = get_with_timeout(url)
         .await
-        .map_err(|e| HttpStreamError::Request(format!("Failed to connect: {}", e)))?;
+        .map_err(HttpStreamError::Request)?;
     if !response.status().is_success() {
         return Err(HttpStreamError::Request(format!(
             "HTTP {} from {}",
@@ -598,6 +599,18 @@ impl OpenHttpStream {
     /// the same bytes are teed to disk (temp file + atomic rename on success), so a
     /// cacheable windowed play also lands in the disk cache for the next replay.
     pub fn into_bounded_reader(self, persist: Option<PersistTarget>) -> BoundedHttpReader {
+        self.into_bounded_reader_with_stall_limit(
+            persist,
+            std::time::Duration::from_secs(BODY_STALL_TIMEOUT_SECS),
+        )
+    }
+
+    /// `into_bounded_reader` with the longest silence tolerated between body chunks.
+    fn into_bounded_reader_with_stall_limit(
+        self,
+        persist: Option<PersistTarget>,
+        stall_limit: std::time::Duration,
+    ) -> BoundedHttpReader {
         use futures_util::StreamExt;
         let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(WINDOWED_CHUNK_CHANNEL_CAPACITY);
         let content_length = self.content_length;
@@ -622,7 +635,25 @@ impl OpenHttpStream {
                 None => None,
             };
 
-            while let Some(chunk_result) = stream.next().await {
+            loop {
+                // Only the wait on the server is bounded; time spent waiting for the
+                // decoder to drain the channel is back-pressure, not a stall.
+                let chunk_result = match tokio::time::timeout(stall_limit, stream.next()).await {
+                    Ok(Some(chunk_result)) => chunk_result,
+                    Ok(None) => break,
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(format!(
+                                "Download stalled: no data for {} seconds",
+                                stall_limit.as_secs_f32()
+                            )))
+                            .await;
+                        if let Some(s) = sink.take() {
+                            s.abandon().await;
+                        }
+                        return;
+                    }
+                };
                 match chunk_result {
                     Ok(chunk) => {
                         if let Some(s) = sink.as_mut() {
@@ -838,6 +869,52 @@ mod tests {
             content_length: len,
             finished: false,
         }
+    }
+
+    /// A server that sends the response headers and the first bytes of a body,
+    /// then holds the connection open without sending anything more.
+    async fn stalling_server() -> String {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/cue.wav",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nRIFF")
+                .await
+                .unwrap();
+            let _held_open = socket;
+            std::future::pending::<()>().await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_fails_when_the_body_stops_arriving() {
+        // A stalled download must surface as a read error, so the play fails
+        // instead of waiting on the server forever.
+        let url = stalling_server().await;
+        let open = open_http_stream(&url).await.unwrap();
+        let mut reader =
+            open.into_bounded_reader_with_stall_limit(None, std::time::Duration::from_millis(200));
+        let read_all = tokio::task::spawn_blocking(move || {
+            let mut buf = [0u8; 2000];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        });
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), read_all).await;
+        assert!(
+            matches!(outcome, Ok(Ok(Err(_)))),
+            "a stalled body must fail the read"
+        );
     }
 
     #[test]
