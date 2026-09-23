@@ -1,106 +1,95 @@
 # Contributing to mqttaudio
 
-Contributions are welcome!  All contributors are expected to abide by the [Contributor Covenant](#contributor-covenant-30-code-of-conduct).
+Contributions are welcome! All contributors are expected to abide by the [Contributor Covenant](#contributor-covenant-30-code-of-conduct).
 
-This document explains how to set up your development environment and run tests.
+This document covers building, testing and the conventions changes are expected to follow. For how
+the code fits together, read [docs/architecture.md](docs/architecture.md) first.
 
-## Development Setup
+## Setup
 
-### Prerequisites
+- **Rust 1.88 or newer.** The Linux validation image uses Rust 1.95.
+- **Platform packages** for building: see [Getting Started](docs/getting-started.md#build-it). The
+  time-stretching dependency needs a C++ compiler and libclang on every platform.
+- **`mosquitto`** on your `PATH`: `cargo test` includes a test that starts its own broker
+  (`tests/mqtt_reconnect_test.rs`).
+- **Docker**, for the Linux validation gate.
+- **Node.js 20 and pnpm** (through `corepack`), only for the web UI and `tests/scripts/interactive_test.js`.
+- `ffmpeg` is not needed: the test audio in `tests/audio/` is committed.
 
-- Rust 1.95 (matches the Linux validation image)
-- Node.js (for interactive integration tests)
-- ffmpeg (for generating test audio files)
-
-**Linux only:**
 ```bash
-# Debian/Ubuntu
-sudo apt-get install libasound2-dev libssl-dev pkg-config build-essential clang libclang-dev
-
-# Fedora/RHEL
-sudo dnf install alsa-lib-devel openssl-devel pkgconf-pkg-config gcc-c++ clang clang-devel
+cargo build            # debug build
+cargo build --release  # release build: target/release/mqttaudio
 ```
 
-### Building
+## Tests
+
+GitHub Actions is intentionally disabled for this repository to avoid hosted CI costs and quota
+usage. Run validation locally, including the Docker-based Linux validation and the local browser
+suites. Do not add or enable Actions workflows, or re-enable repository Actions, without an explicit
+maintainer request.
+
+### The validation gate
 
 ```bash
-cargo build          # Debug build
-cargo build --release  # Release build
+./scripts/validate.sh            # Lane A: everything below in Docker, with a private mosquitto
+./scripts/validate.sh --native   # Lane B: the same checks on this host, plus the audio-device tests
 ```
 
-## Running Tests
+Both run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, a release build with
+`RUSTFLAGS="-D warnings"`, the property tests in `tests/fuzz_command_config.rs`, and the test suite.
+Lane A also runs the broker tests; Lane B skips them and runs the tests that open a real audio
+device. Neither runs the web UI suites (see [docs/webui/README.md](docs/webui/README.md)).
 
-Run validation locally, including the Docker-based Linux validation and local browser suites. GitHub Actions is intentionally disabled for this repository to avoid hosted CI costs and quota usage. Do not add or enable Actions workflows or re-enable repository Actions without an explicit maintainer request.
-
-
-### Unit Tests
-
-```bash
-cargo test           # All tests
-cargo test --lib     # Unit tests only
-cargo test config::  # Tests for a specific module
-```
-
-### HTTP API Integration Tests
-
-Automated tests for the HTTP REST API:
+### Running tests directly
 
 ```bash
+cargo test                     # everything that needs no broker or audio device
+cargo test --lib config::      # one module's unit tests
 cargo test --test http_api_test
 ```
 
-### Interactive Integration Test
+Some tests only run when asked:
 
-For comprehensive testing including audio playback verification:
+| Variable | Enables |
+|----------|---------|
+| `MQTTAUDIO_BROKER_TESTS=1` | Tests against a broker on `localhost:1883` |
+| `MQTTAUDIO_TLS_CA=<ca.pem>` | The TLS connection test against `localhost:8883` (certificate for `localhost`) |
+| `MQTTAUDIO_DEVICE_TESTS=1` with `cargo test -- --include-ignored` | Tests that open the default audio device |
 
-```bash
-node tests/scripts/interactive_test.js
-```
+`tests/daemon_control_test.rs` is also `#[ignore]`d: it drives a built daemon against a real device.
 
-This will:
-- Build the release binary
-- Start mqttaudio in HTTP-only mode (no MQTT broker required)
-- Run automated API endpoint tests
-- Walk you through audio playback tests with manual confirmation
-- Report a summary of passed/failed tests
+### Manual and interactive checks
 
-**Environment variables:**
-- `HTTP_PORT` - Port for test server (default: 8765)
-- `VERBOSE` - Set to see mqttaudio stdout/stderr
+- `node tests/scripts/interactive_test.js [-v] [-d <device>]` builds the release binary, starts it in
+  HTTP-only mode on `HTTP_HOST:HTTP_PORT` (default `127.0.0.1:8765`), runs API checks, and walks you
+  through listening tests.
+- `tests/scripts/stress_test.sh` sends bursts of MQTT commands (needs `mosquitto_pub` and a running
+  daemon on topic `audio/test`, started from the repository root).
+- `tests/scripts/demo_ducking.sh` demonstrates ducking with tones; run it from `tests/scripts/`.
+- [docs/sprints/MANUAL-VERIFICATION.md](docs/sprints/MANUAL-VERIFICATION.md) lists the checks that
+  need real hardware.
 
 ### Benchmarks
 
 ```bash
 cargo bench --bench mixer_benchmark
+cargo bench --bench loading_benchmark
 ```
 
-## Code Quality
+## Conventions
 
-Before submitting a PR:
-
-```bash
-cargo fmt            # Format code
-cargo clippy         # Run lints
-cargo build --release 2>&1 | grep warning  # Check for warnings
-```
-
-The release build must have zero warnings.
-
-## Pull Request Guidelines
-
-1. Keep changes focused - one feature or fix per PR
-2. Add tests for new functionality
-3. Update documentation if adding user-facing features
-4. Run the full test suite before submitting
-
-## Architecture Overview
-
-See [docs/architecture.md](docs/architecture.md) for details on the system design.
-
-Key points:
-- Audio callback runs in a real-time thread - never block it
-- Commands flow through an async channel from MQTT/HTTP to the main loop
-- All audio buffers are pre-decoded and shared via `Arc<DecodedBuffer>`
+- **Zero warnings.** The release build, `cargo clippy --all-targets -- -D warnings` and
+  `cargo fmt --check` must all be clean.
+- **Tests first.** Every fix or feature starts with a failing test that shows the problem. Test output
+  must be clean: a test that expects an error or warning captures and checks it.
+- **The audio thread never blocks.** Code that runs in the output or capture callbacks must not
+  allocate, free, lock, log or do I/O; `tests/alloc_harness.rs` checks the mix paths. See
+  [Real-time rules](docs/architecture.md#real-time-rules).
+- **File headers.** Every source file starts with two `ABOUTME:` comment lines saying what it does.
+- **Documentation.** Update the docs in `docs/` and the `[Unreleased]` section of `CHANGELOG.md` with
+  any user-visible change, and record problems you find but do not fix in
+  [docs/bugs.md](docs/bugs.md).
+- **Focused changes.** One fix or feature per pull request.
 
 
 # Contributor Covenant 3.0 Code of Conduct

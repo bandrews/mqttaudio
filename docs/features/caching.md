@@ -1,203 +1,173 @@
-# Caching
+# Caching and Large Files
 
-mqttaudio automatically caches audio files for fast playback. HTTP files are downloaded once and reused. Files are decoded and kept in memory for instant access, with streaming support for large files.
+mqttaudio decodes each file to raw audio before playing it. Decoded audio is large, about 23 MB per
+minute of stereo at 48 kHz, so the daemon keeps the files it can afford in a memory cache, streams
+the ones it cannot through a small window, and keeps downloaded files on disk.
 
-## Cache Layers
+## The two caches
 
-### Memory Cache
+**The memory cache** holds decoded audio. Every play of a file shares one copy, and a file already
+there starts at once.
 
-Decoded audio (PCM) is kept in RAM for instant playback:
-- First play: decode file → store in memory (streaming for large files)
-- Subsequent plays: instant playback from memory
-- Cleared when mqttaudio exits
-- LRU eviction when memory limit is reached
+- It has a size budget (see [Memory budget](#memory-budget)). When a new file needs room, the least
+  recently used files are dropped, but never one that is playing.
+- A file too large for the room left still plays; it just is not kept.
+- It is empty at every start. Use [precaching](#precaching) to fill it before the first cue.
 
-### Disk Cache
+**The disk cache** holds downloaded files, so a URL is fetched once and survives restarts. It is on
+while `cache.enabled` is `true` (the default) and lives in `cache.directory`:
 
-Downloaded files are stored on disk:
-- Every HTTP download - streamed plays, runtime precache, and startup
-  precache alike - is written through to the cache directory and persists
-  across restarts
-- Set `cache.enabled: false` to disable the disk cache entirely: downloads
-  then play from memory only and are re-fetched after a restart
-- Cached files are periodically revalidated against the server (see HTTP
-  Validation below)
+- `metadata.json` records each URL, its size and the server's `ETag` / `Last-Modified` headers.
+- `files/` holds the downloads, named from a hash of the URL (`3f9a1c2e7b40.wav`; extensions other
+  than `wav`, `mp3`, `ogg` and `flac` become `.dat`). In-progress downloads end in `.part` or
+  `.streaming.tmp`.
 
-## Streaming Playback
+The disk cache has no size limit; it grows until `cache_clear` or until you delete it. Local files
+are never copied into it.
 
-For large files or slow HTTP connections, playback begins before the entire file is loaded:
-- Playback starts as soon as enough audio is buffered (~50ms worth)
-- Background task continues loading the rest
-- Unloaded sections return silence (rare in practice)
-- Seeking to unloaded regions waits for data
+## Full and windowed plays
 
-## Latency
+A **full** play decodes the whole file into memory. It can seek, loop with a crossfade, play
+backwards and change speed with pitch correction. The first play of a file does not wait for the
+whole decode: it starts as soon as its start position is decoded and the rest decodes in the
+background. When the decode finishes, the file enters the memory cache.
 
-| Scenario | Typical Latency |
-|----------|-----------------|
-| Cached in memory (hot) | ~100 ns |
-| Cold start (local file) | 6-65 ms |
-| Cold start (HTTP) | ~10 ms |
-| First HTTP download (full) | 100-300 ms |
+While that first decode is still running, a `seek` past the decoded part plays silence until the
+decode catches up, looping waits until the end has been decoded, and pitch correction starts only
+when the decode is complete.
+
+A **windowed** play streams: a background thread decodes into a buffer `cache.stream_window_ms` long
+(1.5 s by default), and memory stays at that size however long the file is. A windowed play starts
+at the beginning, cannot seek or change speed, loops a local file without a crossfade, and plays a URL
+only once. If decoding falls behind, the sound fades out quickly and resumes where it left off once
+audio arrives. Windowed audio never enters the memory cache.
+
+### How a play is loaded
+
+With `"mode": "auto"` (the play's `mode`, else `cache.load_mode`):
+
+| File | Played in full when | Otherwise |
+|------|---------------------|-----------|
+| Already in the memory cache | Always | |
+| Local file | Its decoded size is at most `cache.full_load_max_bytes` (32 MiB), it is at most `cache.full_load_max_seconds` (60 s) long, and it fits in the budget's free room | Windowed |
+| URL already in the disk cache | Always | |
+| Other URL | Its estimated decoded size is at most `full_load_max_bytes` and fits in the free room | Windowed |
+| URL without a `Content-Length` | Never | Windowed |
+
+A local file's size and length come from its header. A URL's decoded size is estimated from its
+`Content-Length`: twice the download for WAV, FLAC, AIFF and ALAC files, 25 times for anything else.
+
+`"mode": "full"` plays in full whenever the estimate fits in the free room. `"mode": "stream"` is
+always windowed, for local files and uncached URLs.
+
+A URL that is already in the disk cache is always decoded in full, whatever its size and mode.
+Precache and `cache_reload` also always decode in full. Keep very long remote files out of the disk
+cache (with `"cacheable": false`) to avoid decoding them whole; see [Known Issues](../bugs.md).
+
+### How much memory audio needs
+
+Decoded audio takes `seconds × output rate × channels × 4` bytes:
+
+| Length | Mono | Stereo | 5.1 |
+|--------|------|--------|-----|
+| 1 minute | 11 MB | 23 MB | 69 MB |
+| 10 minutes | 115 MB | 230 MB | 690 MB |
+| 1 hour | 690 MB | 1.4 GB | 4.1 GB |
+
+(at a 48 kHz output rate)
+
+## Memory budget
+
+The memory cache and full plays share one budget. By default it is 40% of the memory available at
+startup, at least 128 MiB and at most 1 GiB. Set a fixed size with `cache.max_memory_mb` (or
+`--max-cache-mb`), or use `cache.memory_budget` for other fractions or to remove the limit; see
+[Configuration](../configuration.md#cache).
+
+The room a new full play may use is the budget minus the files that are playing and the loads still
+in progress. `GET /metrics` shows the budget (`cache.memory_cap_bytes`), the room left
+(`cache.memory_headroom_bytes`) and what the cache holds (`cache.memory_bytes`).
+
+The budget covers the memory cache, not the whole process. For a hard limit on everything, run the
+daemon under a memory limit such as systemd's `MemoryMax=` (see [Deployment](../deployment.md)).
+
+## Downloads
+
+The first play of a URL opens one request. Its `Content-Length` decides between a full and a
+windowed play (above), and the same response is then decoded. The download is written to the disk
+cache as it plays, unless the cache is off, the response has no `Content-Length`, or the play has
+`"cacheable": false`. It is kept only if it completes with the advertised length, so a windowed play
+stopped halfway does not save a partial file.
+
+A download gives up after 10 seconds without a connection, 30 seconds without a response, or 60
+seconds without data. Later plays of a URL that is cached on disk read the file from disk without
+touching the network, except for [freshness checks](#freshness).
+
+## Freshness
+
+The caches notice changed files like this:
+
+**Local files in the memory cache** are checked on every play: if their size or modification time
+changed, they are decoded again. A `pinned` play (the play's `freshness`, else `cache.freshness`)
+skips the check. Files not in the memory cache are always read fresh.
+
+**Downloaded files** are checked with a conditional request (`If-None-Match` / `If-Modified-Since`)
+once they are older than `cache.revalidate_after_seconds` (300 s):
+
+- A file that is also in the memory cache is checked by a background pass every 30 seconds. In `dev`
+  mode that pass checks every such file each time, ignoring the age; in `pinned` mode it does not
+  run.
+- A file only on disk is checked when it is played, in every mode. The check waits at most 5 seconds.
+
+A `304 Not Modified` restarts the file's age. A `200` downloads the new version, and plays from then
+on use it. If the server cannot be reached, the cached copy plays and the file is not checked again for
+another `revalidate_after_seconds`. A server that sends neither `ETag` nor `Last-Modified` cannot
+answer `304`, so every check downloads the file again.
+
+With `cache.enabled` off nothing is kept on disk, so a URL in the memory cache is never checked;
+after it leaves the memory cache, its next play downloads it again.
+
+To pick up a change immediately, send `cache_reload`.
 
 ## Precaching
 
-### On Startup
-
-Configure files to cache when mqttaudio starts:
+List files that must start instantly in `cache.precache`:
 
 ```json
-{
-  "cache": {
-    "precache": [
-      "/sounds/startup.wav",
-      "https://example.com/common-effect.mp3"
-    ]
-  }
+"cache": {
+  "precache": ["/opt/sounds/cues", "/opt/sounds/theme.mp3", "https://example.com/intro.wav"]
 }
 ```
 
-### Via MQTT
+A directory contributes its `.wav`, `.mp3`, `.ogg` and `.flac` files (not subdirectories). With
+`cache.precache_blocking` on (the default) each entry is fully decoded before the daemon takes
+commands; off, the daemon starts each load and then takes commands while they finish.
 
-Precache files before you need them:
+At runtime, the `precache` command does the same for one file or URL. Precaching always decodes the
+whole file, whatever its size, and a file larger than the budget's free room is not kept in memory
+afterwards (a URL stays on disk). Precache the files that fit.
 
-```json
-{
-  "command": "precache",
-  "file": "https://example.com/large-file.wav"
-}
-```
+## Cache commands
 
-This downloads and decodes the file without playing it.
+| Command | Does |
+|---------|------|
+| `precache` | Load a file or URL into the caches |
+| `cache_invalidate` | Drop one file or URL from both caches, and abandon a load of it in progress |
+| `cache_reload` | `cache_invalidate`, then `precache` |
+| `cache_clear` | Empty the memory cache and delete every file in the disk cache. Loads already in progress still finish and fill the cache again |
 
-## Cache Commands
+Sounds that are playing keep playing after their file leaves a cache. See
+[Commands](../commands.md#cache).
 
-### Clear All Cache
+## First-play latency
 
-Remove all cached files (memory and disk):
+- **Cached in memory:** the play starts in the next audio block.
+- **Cold full play of a local file:** a few milliseconds of decoding before the first block.
+- **Windowed play:** waits for `cache.stream_prebuffer_ms` (150 ms) of audio, at most
+  `cache.stream_prebuffer_deadline_ms` (300 ms). On a fast network or disk, `50` and `150` start
+  sooner; keep the defaults for internet sources.
+- **Uncached URL:** one round trip to the server, then as above.
+- **Every play** waits for the next audio block: up to 10.7 ms at the default 512-frame buffer and
+  48 kHz.
 
-```json
-{"command": "cache_clear"}
-```
-
-### Invalidate Specific File
-
-Force re-download of a specific file:
-
-```json
-{
-  "command": "cache_invalidate",
-  "file": "https://example.com/updated-file.wav"
-}
-```
-
-## Configuration
-
-```json
-{
-  "cache": {
-    "directory": "~/.mqttaudio/cache",
-    "precache": [],
-    "max_memory_mb": 512
-  }
-}
-```
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `enabled` | `true` | Disk-cache downloaded files (`false` = memory only) |
-| `directory` | `~/.mqttaudio/cache` | Disk cache location |
-| `revalidate_after_seconds` | `300` | Seconds before a cached URL is checked against the server (0 = every access) |
-| `precache` | `[]` | Files to cache on startup |
-| `max_memory_mb` | `512` | Memory cache limit in MB (0 = unlimited) |
-
-### CLI Option
-
-You can also set the memory limit via command line:
-```bash
-./mqttaudio --server localhost --topic audio/commands --max-cache-mb 1024
-```
-
-### LRU Eviction
-
-When the memory cache reaches its limit, least-recently-used entries are evicted:
-- Recently accessed files stay in cache
-- New files trigger eviction of old entries
-- An evicted file that is still playing keeps playing (playback holds its
-  own reference); the next play of it pays a fresh decode
-
-## Disk Cache Location
-
-Default location: `~/.mqttaudio/cache/`
-
-Override in your config file:
-```json
-{
-  "cache": {
-    "directory": "/custom/path"
-  }
-}
-```
-
-## HTTP Validation
-
-Cached URLs are checked for freshness on a schedule set by
-`cache.revalidate_after_seconds` (default 300; 0 = check on every access):
-
-1. On download, the ETag and Last-Modified headers are stored
-2. When a cached URL is played after the interval has elapsed, a
-   conditional request asks the server whether it changed
-3. Not modified (304) - the cached copy is served and the clock resets
-4. Changed (200) - the new content replaces the cache and plays instead
-
-If the server cannot be reached, the cached copy keeps playing and the
-check retries after the next interval - a dead server never blocks
-playback for more than a few seconds, once per interval. `cache_invalidate`
-still forces an immediate re-download when you don't want to wait.
-
-## Local Files
-
-Local files are cached in memory but not on disk (they're already local):
-
-- First play: decode → store in memory
-- Subsequent plays: instant from memory
-- No staleness checking (file system is source of truth)
-
-## Memory Usage
-
-Decoded audio uses more memory than compressed files:
-
-| Duration | Stereo 48kHz | Mono 48kHz |
-|----------|--------------|------------|
-| 30 seconds | ~11 MB | ~6 MB |
-| 1 minute | ~23 MB | ~11 MB |
-| 5 minutes | ~115 MB | ~57 MB |
-| 10 minutes | ~230 MB | ~115 MB |
-
-The default 512 MB limit allows for approximately:
-- ~22 minutes of stereo 48kHz audio
-- ~44 minutes of mono 48kHz audio
-
-With LRU eviction, least-recently-used files are automatically removed when the limit is reached.
-
-## Tips
-
-1. **Precache critical files** — Add startup sounds and frequently-used effects to the precache list
-2. **Use HTTP for large libraries** — Disk cache handles large file collections efficiently
-3. **Monitor memory** — Watch mqttaudio memory usage if caching many files
-4. **Clear cache after updates** — If you update files on your server, invalidate or clear the cache
-
-## Troubleshooting
-
-**File changes not detected:**
-- Make sure your HTTP server sends proper cache headers (ETag or Last-Modified)
-- Use `cache_invalidate` to force re-download
-- Or `cache_clear` to start fresh
-
-**Cache directory permission errors:**
-- Check write permissions on the cache directory
-- Specify a different directory in your config file
-
-**Memory usage too high:**
-- Clear cache with `cache_clear` command
-- Restart mqttaudio to clear memory cache
+`GET /metrics` reports `latency.play_to_first_mix_ns`, the time from a play being queued to its first
+audio being mixed, so you can measure your own hardware.

@@ -58,10 +58,11 @@
       "enabled: Enable the disk cache for downloaded files. false = downloads",
       "  play from memory only and are re-fetched after a restart",
       "directory: Directory for cache storage. ~ expands to user home",
-      "revalidate_after_seconds: How long a cached URL is served before asking the",
+      "revalidate_after_seconds: How long a downloaded file is used before asking the",
       "  server whether it changed (conditional request via ETag/Last-Modified).",
-      "  0 = check on every access; higher = fewer checks. A changed file is",
-      "  re-downloaded automatically; an unreachable server falls back to the cache"
+      "  Checks run on a 30 s background pass, or when a URL only on disk is played;",
+      "  0 = check at every such opportunity. A changed file is re-downloaded",
+      "  automatically; an unreachable server falls back to the cached copy"
     ]
   },
 
@@ -112,7 +113,7 @@
         "volume: Input volume gain (0.0-4.0, 1.0 = unity)",
         "voice_id: Voice name, used by input_volume/input_mute commands and ducking rules",
         "activity_threshold: Peak level (above 0, up to 1.0) above which this input counts as speaking,",
-        "  letting its voice_id trigger ducking rules as primary_voice. null = detection off",
+        "  letting its voice_id trigger ducking rules as primary_voice. null = active whenever open",
         "activity_hold_ms: How long activity persists after the level drops (rides out pauses)",
         "latency_ms: Buffer latency (5-500). 20-30 is a good starting point for live mics",
         "channels: Capture channels to open. null = smallest count covering every source_channel",

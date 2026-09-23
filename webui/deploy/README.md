@@ -52,7 +52,8 @@ Point it at a daemon with `VITE_DAEMON_TARGET`:
 VITE_DAEMON_TARGET=http://127.0.0.1:8080 pnpm dev
 ```
 
-The dev token (if the daemon requires auth) is handled by the daemon/proxy target; the SPA still uses `/api`.
+The dev proxy does not add a token: if the daemon has an `auth_token`, enter it on the connect screen. The SPA
+still uses `/api`.
 
 ## Token handling (DW9)
 

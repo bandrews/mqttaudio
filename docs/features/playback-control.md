@@ -1,268 +1,112 @@
 # Playback Control
 
-mqttaudio provides real-time control over playing audio, including seeking, speed changes, and reverse playback.
+Once a sound is playing you can move around in it, change its speed and pitch, run it backwards,
+change its volume, and stop it. These commands pick their sounds with a selector; see
+[Commands](../commands.md#sounds-and-voices) for the full parameter tables.
 
-## Sample Targeting
+## Picking sounds
 
-To control a playing sample, you need to identify it. Use any combination of:
-
-| Selector | Description |
-|----------|-------------|
-| `id` | Unique ID you assigned when playing |
-| `file` | Filename or URL of the playing audio |
-| `voice` | Voice group name |
-
-Multiple selectors use OR logic — the command affects any sample matching any selector.
-
-### Using IDs
-
-Assign an ID when playing:
+Give a sound an `id` when you play it, then use the `id` to address it:
 
 ```json
-{
-  "command": "play",
-  "file": "/sounds/music.mp3",
-  "id": "background-track",
-  "loop": true
-}
+{"command": "play", "file": "/opt/sounds/radio.mp3", "id": "radio", "loop": true}
+{"command": "speed", "id": "radio", "speed": 0.9}
 ```
 
-Then control by ID:
-
-```json
-{
-  "command": "speed",
-  "id": "background-track",
-  "speed": 0.5
-}
-```
+`id` is your label, and several sounds may share it. You can also select by `voice`, by the exact
+`file` string the sound was played with, or by `internal_id`, the unique id shown in
+`GET /status/samples`. A sound matches if any of the given selectors match.
 
 ## Seek
 
-Jump to a specific position:
-
 ```json
-{
-  "command": "seek",
-  "id": "background-track",
-  "position_ms": 60000
-}
+{"command": "seek", "id": "radio", "position_ms": 90000}
 ```
 
-Position is in milliseconds from the start.
+Jumps to a position in milliseconds from the start of the file, clamped to its end. `start_position_ms`
+on a `play` does the same from the outset.
 
-**Examples:**
-- `0` — Jump to beginning
-- `60000` — Jump to 1 minute
-- `300000` — Jump to 5 minutes
-
-## Speed Control
-
-Change playback speed in real-time:
+## Speed and reverse
 
 ```json
-{
-  "command": "speed",
-  "id": "background-track",
-  "speed": 1.5
-}
+{"command": "speed", "id": "radio", "speed": 1.5}
 ```
-
-### Speed Values
 
 | Speed | Effect |
 |-------|--------|
-| 0.5 | Half speed (slower) |
-| 1.0 | Normal speed |
-| 1.5 | 1.5x speed |
-| 2.0 | Double speed |
-| -1.0 | Reverse at normal speed |
-| -0.5 | Reverse at half speed |
+| `1.0` | Normal |
+| `0.5` | Half speed, an octave lower |
+| `2.0` | Double speed, an octave higher |
+| `-1.0` | Backwards at normal speed |
 
-### Speed Ranges
+Without pitch correction, speed changes pitch like a tape machine, and any value from `-100` to `100`
+works (values nearer zero than `0.01` become `±0.01`; `0` is rejected, use `stop`). Samples between
+the original ones are found by cubic interpolation. Well above `1.0` the sound can pick up aliasing
+artifacts; pitch correction avoids them.
 
-**Without pitch correction:**
-- Range: -100.0 to 100.0
-- Negative values play in reverse
-- Pitch changes with speed (faster = higher pitch)
-
-**With pitch correction:**
-- Range: 0.05 to 8.0
-- Reverse playback not supported
-- Original pitch is maintained
-
-## Pitch Correction
-
-Enable pitch correction to maintain the original pitch when changing speed:
+Reverse playback starts where the sound is now. A sound that has only just started therefore ends at
+once when reversed; `seek` into it first:
 
 ```json
-{
-  "command": "speed",
-  "id": "background-track",
-  "speed": 0.5,
-  "pitch_correction": true
-}
+{"command": "seek", "id": "tape", "position_ms": 8000}
+{"command": "speed", "id": "tape", "speed": -1.0}
 ```
 
-**Without pitch correction (default):**
-- Faster = higher pitch ("chipmunk effect")
-- Slower = lower pitch
-- Reverse playback works
-- Lower CPU usage
+A looping sound played backwards wraps from its start to its end.
 
-**With pitch correction:**
-- Pitch stays constant at any speed
-- Uses time-stretching algorithm
-- Higher CPU usage
-- No reverse playback
-
-## Reverse Playback
-
-Play audio backwards (without pitch correction only):
+## Pitch correction
 
 ```json
-{
-  "command": "speed",
-  "id": "effect-1",
-  "speed": -1.0
-}
+{"command": "speed", "id": "radio", "speed": 0.8, "pitch_correction": true}
 ```
 
-Negative speeds play the audio in reverse:
-- `-1.0` — Reverse at normal speed
-- `-0.5` — Reverse at half speed
-- `-2.0` — Reverse at double speed
+With `pitch_correction`, the tempo changes and the pitch stays. Speed is limited to `0.05`–`8.0` and
+cannot be negative. It costs noticeably more CPU than a plain speed change.
 
-## Volume Control
+Every `speed` command sets pitch correction on or off, so send `"pitch_correction": true` each time
+you want to keep it. A sound still being decoded for its first play gets pitch correction when the
+decode finishes; a warning says so.
 
-Adjust volume of specific samples:
+## Volume
 
 ```json
-{
-  "command": "volume",
-  "id": "background-track",
-  "volume": 0.3
-}
+{"command": "volume", "id": "radio", "volume": 0.4}
 ```
 
-This differs from `voice_volume` in that it targets specific samples, not entire voice groups.
+Sets the sound's own volume (`0.0`–`4.0`). It ramps over about 20 ms per unit, so it does not click.
+The sound's voice has a separate level, set with `voice_volume`, and ducking rules can lower it
+further; the three multiply. See [Voice Management](voice-management.md).
 
-## Stop Specific Samples
-
-Stop samples with optional fade-out:
+## Fades and stops
 
 ```json
-{
-  "command": "stop",
-  "id": "background-track",
-  "fade_out_ms": 1000
-}
+{"command": "play", "file": "/opt/sounds/theme.mp3", "id": "theme", "fade_in": 3000}
+{"command": "stop", "id": "theme", "fade_out_ms": 2000}
 ```
 
-Or stop by file:
+`stop` fades out over `fade_out_ms` (10 ms by default, just enough to avoid a click). `fadeall`
+fades out everything; `voice_fade_out` fades one voice. A fade-out that starts while a sound is
+fading in, or during another fade-out, continues from the sound's current level.
+
+## Looping
 
 ```json
-{
-  "command": "stop",
-  "file": "/sounds/music.mp3"
-}
+{"command": "play", "file": "/opt/sounds/rain.wav", "loop": true, "crossfade_ms": 250}
 ```
 
-Or by voice:
+`loop` repeats the file until it is stopped. `crossfade_ms` blends the end into the start at each
+repeat with an equal-power crossfade, for files that do not loop cleanly on their own. The file must
+be longer than twice the crossfade; otherwise the crossfade is skipped with a warning.
 
-```json
-{
-  "command": "stop",
-  "voice": "effects",
-  "fade_out_ms": 500
-}
-```
+## Windowed sounds
 
-## Play Options
+Long or large files may play [windowed](caching.md#full-and-windowed-plays), streaming through a
+small buffer. A windowed sound can be stopped, faded and turned up or down, but it ignores `seek`
+and `speed`, starts from the beginning, and loops without a crossfade (a windowed URL does not loop
+at all); the `play` options it cannot honor are logged as warnings. `"mode": "full"` on the `play`
+asks for a full load when the file fits in memory. `GET /status/samples` shows `"windowed": true` for
+windowed sounds.
 
-### Start Position
-
-Start playback from a specific position:
-
-```json
-{
-  "command": "play",
-  "file": "/sounds/long-track.mp3",
-  "start_position_ms": 120000
-}
-```
-
-## Examples
-
-### DJ-Style Speed Control
-
-```bash
-# Start a track
-mosquitto_pub -t audio/commands -m '{
-  "command": "play",
-  "file": "/music/track.mp3",
-  "id": "deck-a",
-  "loop": true
-}'
-
-# Slow down for transition
-mosquitto_pub -t audio/commands -m '{
-  "command": "speed",
-  "id": "deck-a",
-  "speed": 0.95
-}'
-
-# Speed up
-mosquitto_pub -t audio/commands -m '{
-  "command": "speed",
-  "id": "deck-a",
-  "speed": 1.05
-}'
-
-# Back to normal
-mosquitto_pub -t audio/commands -m '{
-  "command": "speed",
-  "id": "deck-a",
-  "speed": 1.0
-}'
-```
-
-### Slow-Motion Effect
-
-```bash
-# Play sound and slow it down dramatically
-mosquitto_pub -t audio/commands -m '{
-  "command": "play",
-  "file": "/sounds/explosion.wav",
-  "id": "slowmo"
-}'
-
-mosquitto_pub -t audio/commands -m '{
-  "command": "speed",
-  "id": "slowmo",
-  "speed": 0.25,
-  "pitch_correction": true
-}'
-```
-
-### Rewind Effect
-
-```bash
-# Play in reverse for a "rewind" effect
-mosquitto_pub -t audio/commands -m '{
-  "command": "speed",
-  "id": "music",
-  "speed": -3.0
-}'
-```
-
-### Jump to Chorus
-
-```bash
-# Skip to a specific section
-mosquitto_pub -t audio/commands -m '{
-  "command": "seek",
-  "id": "background-music",
-  "position_ms": 90000
-}'
-```
+When a `seek` or `speed` selects by `voice`, and a windowed sound has played in that voice since the
+voice was last silent, the whole command is ignored, including for the voice's fully loaded sounds.
+Select those by `id` instead.

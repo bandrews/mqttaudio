@@ -92,7 +92,7 @@ mqttaudio runs open by default so it is easy to try on a trusted network. Each o
 | Anyone who can reach the HTTP port can send commands | `http.auth_token` protects the command endpoints; `http.require_auth` extends it to status, metrics and WebSockets. Keep `http.bind_address` on loopback unless it must be remote; a warning is logged for a non-loopback bind without authentication |
 
 The HTTP server speaks plain HTTP. Put a reverse proxy in front of it for TLS
-([HTTP API: HTTPS](http-api.md#httpstls)).
+([HTTP API: HTTPS](http-api.md#https)).
 
 To keep a token out of a checked-in config, use environment variables:
 
@@ -122,7 +122,7 @@ With the HTTP server enabled:
 | Endpoint | Use |
 |----------|-----|
 | `GET /health` | Liveness: the process is up and serving |
-| `GET /ready` | Readiness: `200` only when the output and every configured input are running |
+| `GET /ready` | Readiness: `200` when the output and every configured input opened at startup; not updated if an input fails later |
 | `GET /metrics` | Uptime, limiter clip count, audio stream errors (`xruns`), active counts, cache memory use and headroom, per-voice ducking, play-start latency |
 | `GET /status/inputs` | Per-input capture health (overruns, starvation, trims) |
 

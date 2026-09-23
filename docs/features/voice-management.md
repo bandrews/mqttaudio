@@ -1,192 +1,98 @@
 # Voice Management
 
-Voices are named groups of sounds that you can control together. They're essential for organizing audio in complex installations.
+A voice is a named group of sounds. Put related sounds in one voice (all the ambience, all the
+music, all the narration) and you can fade, stop or level them together, and let
+[ducking rules](ducking.md) react to them.
 
-## Creating Voices
+## Putting sounds in a voice
 
-A voice is created automatically when you play audio with a voice name:
-
-```json
-{
-  "command": "play",
-  "file": "/sounds/rain.wav",
-  "voice": "ambience"
-}
-```
-
-Multiple sounds can belong to the same voice:
+Name the voice when you play:
 
 ```json
-{"command": "play", "file": "/sounds/rain.wav", "voice": "ambience", "loop": true}
-{"command": "play", "file": "/sounds/wind.wav", "voice": "ambience", "loop": true}
-{"command": "play", "file": "/sounds/thunder.wav", "voice": "ambience"}
+{"command": "play", "file": "/opt/sounds/rain.wav", "voice": "ambience", "loop": true}
+{"command": "play", "file": "/opt/sounds/wind.wav", "voice": "ambience", "loop": true}
+{"command": "play", "file": "/opt/sounds/thunder.wav", "voice": "ambience"}
 ```
 
-All three sounds are now in the "ambience" voice.
+A voice exists while it has sounds playing. When its last sound ends it disappears, along with its
+volume setting, and the next play into the same name starts fresh at volume `1.0`.
 
-## Voice Commands
+A play without a `voice` gets a voice of its own with a generated name (shown in
+`GET /status/samples`), so nothing else is grouped with it. Name the voice for anything you may want
+to control as a group later.
 
-### Stop a Voice
+## Voice commands
 
-Stop all sounds in a voice immediately:
+**Fade out** every sound in the voice, then stop them:
 
 ```json
-{
-  "command": "voice_stop",
-  "voice": "ambience"
-}
+{"command": "voice_fade_out", "voice": "ambience", "time": 3000}
 ```
 
-### Fade Out a Voice
-
-Fade out all sounds in a voice smoothly:
+**Stop** them (with a 10 ms fade to avoid a click):
 
 ```json
-{
-  "command": "voice_fade_out",
-  "voice": "ambience",
-  "time": 3000
-}
+{"command": "voice_stop", "voice": "ambience"}
 ```
 
-After the fade completes, all sounds are removed.
-
-### Adjust Voice Volume
-
-Change the volume of all sounds in a voice:
+**Set the voice's level:**
 
 ```json
-{
-  "command": "voice_volume",
-  "voice": "music",
-  "volume": 0.5
-}
+{"command": "voice_volume", "voice": "music", "volume": 0.3}
 ```
 
-This affects currently playing sounds and any new sounds added to this voice.
+The level ramps smoothly, applies to every sound playing in the voice, and is inherited by sounds
+started in the voice while it still has sounds playing. A live input whose `voice_id` matches is set
+too. Each command fails (HTTP `404`, logged over MQTT) when the voice has nothing playing.
 
-## Common Patterns
+## Levels multiply
 
-### Background Music with Effects
+A sound's loudness is its own `volume` × its voice's level × any ducking applied to the voice:
+
+| Set with | Scope |
+|----------|-------|
+| `play` `volume`, `volume` command | One sound |
+| `voice_volume` | Every sound in the voice |
+| Ducking rules | The voice, automatically while a primary voice plays |
+
+Each ranges up to `4.0` (+12 dB) except ducking, which only lowers. `GET /status/voices` shows each
+voice's level and current ducking multiplier:
+
+```json
+{"voices": [{"id": "music", "sample_count": 1, "volume": 0.3, "ducking_multiplier": 0.2}]}
+```
+
+## Patterns
+
+**Scene change.** Fade one scene out while the next fades in:
 
 ```bash
-TOPIC="audio/commands"
-
-# Start background music
-mosquitto_pub -t $TOPIC -m '{
-  "command": "play",
-  "file": "/sounds/music.mp3",
-  "voice": "music",
-  "loop": true,
-  "volume": 0.4
-}'
-
-# Play sound effects as needed
-mosquitto_pub -t $TOPIC -m '{
-  "command": "play",
-  "file": "/sounds/doorbell.wav",
-  "voice": "effects"
-}'
-
-# Lower music for an announcement
-mosquitto_pub -t $TOPIC -m '{
-  "command": "voice_volume",
-  "voice": "music",
-  "volume": 0.1
-}'
-
-# Restore music volume after announcement
-mosquitto_pub -t $TOPIC -m '{
-  "command": "voice_volume",
-  "voice": "music",
-  "volume": 0.4
-}'
+mosquitto_pub -t audio/commands -m '{"command": "voice_fade_out", "voice": "scene1", "time": 2000}'
+mosquitto_pub -t audio/commands -m '{"command": "play", "file": "/opt/sounds/scene2.mp3",
+  "voice": "scene2", "loop": true, "fade_in": 2000}'
 ```
 
-### Layered Ambience
-
-Build up complex soundscapes by layering:
+**Layered ambience.** Build a soundscape from several loops in one voice, each with its own volume,
+and end it with one command:
 
 ```bash
-# Base layer
-mosquitto_pub -t $TOPIC -m '{
-  "command": "play",
-  "file": "/sounds/forest-base.wav",
-  "voice": "ambience",
-  "loop": true,
-  "volume": 0.3
-}'
-
-# Add birds
-mosquitto_pub -t $TOPIC -m '{
-  "command": "play",
-  "file": "/sounds/birds.wav",
-  "voice": "ambience",
-  "loop": true,
-  "volume": 0.5
-}'
-
-# Add stream
-mosquitto_pub -t $TOPIC -m '{
-  "command": "play",
-  "file": "/sounds/stream.wav",
-  "voice": "ambience",
-  "loop": true,
-  "volume": 0.4
-}'
-
-# Stop everything at once
-mosquitto_pub -t $TOPIC -m '{
-  "command": "voice_fade_out",
-  "voice": "ambience",
-  "time": 5000
-}'
+mosquitto_pub -t audio/commands -m '{"command": "play", "file": "/opt/sounds/forest.wav", "voice": "ambience", "loop": true, "volume": 0.3}'
+mosquitto_pub -t audio/commands -m '{"command": "play", "file": "/opt/sounds/birds.wav", "voice": "ambience", "loop": true, "volume": 0.5}'
+mosquitto_pub -t audio/commands -m '{"command": "voice_fade_out", "voice": "ambience", "time": 5000}'
 ```
 
-### Transition Between Scenes
+**Announcements over music.** Rather than lowering and restoring the music by hand, add a
+[ducking rule](ducking.md) with `"primary_voice": "announcements"` and `"ducked_voices": ["music"]`.
 
-```bash
-# Fade out current scene
-mosquitto_pub -t $TOPIC -m '{
-  "command": "voice_fade_out",
-  "voice": "scene1",
-  "time": 2000
-}'
+## Naming
 
-# Start next scene (fading in)
-mosquitto_pub -t $TOPIC -m '{
-  "command": "play",
-  "file": "/sounds/scene2-music.mp3",
-  "voice": "scene2",
-  "loop": true,
-  "fade_in": 2000
-}'
-```
+Voice names are case-sensitive. Name voices by what they do (`ambience`, `music`, `narration`,
+`hints`, `effects`), not by file, and use the same names in your ducking rules. A typical escape room:
 
-## Voice Naming Tips
-
-1. **Use descriptive names** — "narration", "music", "effects" are better than "v1", "v2"
-2. **Be consistent** — Stick to a naming convention across your installation
-3. **Group by function** — Not by file or location
-4. **Consider ducking** — Names that work well with ducking rules (see [Audio Ducking](ducking.md))
-
-Example naming scheme for an escape room:
-- `ambient` — Background atmosphere
-- `music` — Background music
-- `hints` — Gamemaster hints
-- `effects` — One-shot sound effects
-- `victory` — Win sounds
-- `timer` — Timer warnings
-
-## Anonymous Voices
-
-If you don't specify a voice, an anonymous voice is created:
-
-```json
-{
-  "command": "play",
-  "file": "/sounds/effect.wav"
-}
-```
-
-Anonymous voices can't be controlled with voice commands. Use named voices for any sounds you might need to control later.
+| Voice | Holds |
+|-------|-------|
+| `ambience` | Background atmosphere |
+| `music` | Soundtrack |
+| `hints` | Game master hints |
+| `effects` | One-shot props and puzzle sounds |
+| `timer` | Countdown warnings |

@@ -1,201 +1,103 @@
-# Audio Ducking
+# Ducking
 
-Audio ducking automatically reduces the volume of background sounds when foreground sounds play. This ensures speech, narration, and announcements are clearly audible over music and effects.
+Ducking turns background voices down while a foreground voice plays, and brings them back
+afterwards, so narration, hints and announcements stay clear without anyone riding the faders.
 
-## How It Works
-
-1. You define rules in your config file
-2. When a "primary" voice starts playing, "ducked" voices fade down
-3. When the primary voice stops, ducked voices fade back up
-4. All transitions are smooth and glitch-free
-
-## Configuration
-
-Add ducking rules to your config file:
+## A rule
 
 ```json
-{
-  "ducking_rules": [
-    {
-      "primary_voice": "narration",
-      "ducked_voices": ["music", "effects"],
-      "target_volume": 0.15,
-      "fade_duration_ms": 2000
-    }
-  ]
-}
+"ducking_rules": [
+  {
+    "primary_voice": "narration",
+    "ducked_voices": ["music", "ambience"],
+    "target_volume": 0.15,
+    "fade_duration_ms": 1000
+  }
+]
 ```
 
-| Field | Description |
-|-------|-------------|
-| `primary_voice` | Voice that triggers ducking when it plays |
-| `ducked_voices` | Voices that will be reduced in volume |
-| `target_volume` | Volume level to duck to (0.0 to 1.0) |
-| `fade_duration_ms` | Fade time in milliseconds |
+While any sound plays in the `narration` voice, the `music` and `ambience` voices fade to 15% of
+their level over one second. When the last narration sound ends, they fade back.
 
-## Examples
+| Setting | Meaning |
+|---------|---------|
+| `primary_voice` | The voice whose activity triggers the rule. A live input's `voice_id` works too |
+| `ducked_voices` | Voices to turn down. May include live inputs' voices |
+| `target_volume` | Multiplier while ducked, `0.0`–`1.0` |
+| `fade_duration_ms` | Fade length, up to `60000` |
 
-### Simple Narration Ducking
+Ducking multiplies with each sound's `volume` and its voice's `voice_volume`, so levels you set
+while a voice is ducked are kept and heard in full once it recovers. A sound that starts in a
+ducked voice starts ducked.
 
-Duck music and effects when narration plays:
-
-```json
-{
-  "ducking_rules": [
-    {
-      "primary_voice": "narration",
-      "ducked_voices": ["music", "effects"],
-      "target_volume": 0.15,
-      "fade_duration_ms": 2000
-    }
-  ]
-}
-```
-
-**Usage:**
 ```bash
-# Start background music
-mosquitto_pub -t audio/commands -m '{
-  "command": "play",
-  "file": "/sounds/music.mp3",
-  "voice": "music",
-  "loop": true,
-  "volume": 0.7
-}'
-
-# Play narration - music automatically ducks to 15%
-mosquitto_pub -t audio/commands -m '{
-  "command": "play",
-  "file": "/sounds/narration.wav",
-  "voice": "narration"
-}'
-
-# When narration finishes, music automatically restores to 70%
+mosquitto_pub -t audio/commands -m '{"command": "play", "file": "/opt/sounds/theme.mp3", "voice": "music", "loop": true, "volume": 0.7}'
+# The music drops to 15% of 0.7 over one second...
+mosquitto_pub -t audio/commands -m '{"command": "play", "file": "/opt/sounds/welcome.wav", "voice": "narration"}'
+# ...and returns to 0.7 when welcome.wav ends.
 ```
 
-### Priority Hierarchy
+## Several rules
 
-Create multiple rules for different priority levels:
+Rules can overlap. While several rules duck the same voice at once:
+
+- it goes to the **lowest** of their `target_volume`s,
+- using the **shortest** of their fades;
+- when they have all ended, it recovers over the **longest** fade that ducked it.
 
 ```json
-{
-  "ducking_rules": [
-    {
-      "primary_voice": "announcement",
-      "ducked_voices": ["music", "effects", "narration"],
-      "target_volume": 0.02,
-      "fade_duration_ms": 500
-    },
-    {
-      "primary_voice": "narration",
-      "ducked_voices": ["music", "effects"],
-      "target_volume": 0.15,
-      "fade_duration_ms": 2000
-    },
-    {
-      "primary_voice": "dialog",
-      "ducked_voices": ["music", "effects"],
-      "target_volume": 0.10,
-      "fade_duration_ms": 1500
-    }
-  ]
-}
+"ducking_rules": [
+  {"primary_voice": "announcement", "ducked_voices": ["music", "ambience", "narration"], "target_volume": 0.05, "fade_duration_ms": 300},
+  {"primary_voice": "narration", "ducked_voices": ["music", "ambience"], "target_volume": 0.2, "fade_duration_ms": 1000}
+]
 ```
 
-This creates a 3-tier priority:
-1. **Announcements** (highest) — Ducks everything to 2%
-2. **Dialog** — Ducks music and effects to 10%
-3. **Narration** — Ducks music and effects to 15%
-4. **Music/Effects** (lowest) — Never triggers ducking
+Here an announcement ducks everything, narration included, almost to silence; narration alone
+ducks only the background.
 
-### Escape Room Setup
+## Live microphones
 
-```json
-{
-  "ducking_rules": [
-    {
-      "primary_voice": "gm_mic",
-      "ducked_voices": ["ambient", "effects", "music"],
-      "target_volume": 0.1,
-      "fade_duration_ms": 500
-    },
-    {
-      "primary_voice": "hints",
-      "ducked_voices": ["ambient", "music"],
-      "target_volume": 0.2,
-      "fade_duration_ms": 1000
-    }
-  ]
-}
-```
-
-When the gamemaster speaks (through the microphone), everything else ducks quickly. Pre-recorded hints also duck background audio but less aggressively.
-
-## Multiple Rules
-
-When multiple rules apply simultaneously:
-- The **lowest target volume** is used
-- The **fastest fade** is used
-
-For example, if both narration (15%, 2000ms) and dialog (10%, 1500ms) are playing, music ducks to 10% with a 1500ms fade.
-
-## Restore Timing
-
-When the primary voice stops, ducked voices fade back to full volume over the same `fade_duration_ms` that ducked them — the **longest** fade, if several rules ducked the voice. (In the example above, where music was ducked with a 2000ms narration rule and a 1500ms dialog rule, it restores over 2000ms.) Ducking and restoring a voice are therefore symmetric by default.
-
-## Microphone Input Ducking
-
-A microphone input's `voice_id` can appear in `ducked_voices`: playing a
-sample on the rule's `primary_voice` lowers the microphone along with any
-other ducked voices.
-
-A microphone can also trigger ducking. Give the input an
-`activity_threshold` - the peak capture level (0.0-1.0) above which the
-input counts as speaking - and its `voice_id` works as a `primary_voice`:
+**As a trigger.** Give the input an `activity_threshold` and use its `voice_id` as a
+`primary_voice`. The input counts as active from the moment its level reaches the threshold until it
+has stayed below it for `activity_hold_ms` (750 ms by default), which keeps the duck from pumping
+between words:
 
 ```json
 {
   "inputs": [
     {
-      "device": "USB Microphone",
-      "voice_id": "presenter_mic",
+      "device": "plughw:CARD=Headset,DEV=0",
+      "voice_id": "gm_mic",
       "activity_threshold": 0.05,
-      "activity_hold_ms": 750,
-      "routes": [{"source_channel": 0, "dest_channel": 0}]
+      "routes": [{"source_channel": 0, "dest_channel": 0}, {"source_channel": 0, "dest_channel": 1}]
     }
   ],
   "ducking_rules": [
-    {
-      "primary_voice": "presenter_mic",
-      "ducked_voices": ["music"],
-      "target_volume": 0.1,
-      "fade_duration_ms": 500
-    }
+    {"primary_voice": "gm_mic", "ducked_voices": ["ambience", "music"], "target_volume": 0.1, "fade_duration_ms": 300}
   ]
 }
 ```
 
-Music ducks while the microphone's input stream is open. Activation is not yet gated on the microphone's signal level, so the duck holds for as long as the input is configured and running; signal-level gating (ducking only while the mic is actually loud) is planned. To toggle this ducking on and off today, start and stop the input.
+The level is the peak of the input's routed channels as captured, checked every 20 ms, before the
+input's volume and mute. Set the threshold above the room's background noise: watch the levels in
+the config editor's input picker to find it. Because mute does not change the captured level, a
+muted microphone that picks up sound still triggers its rules.
 
-## Tips
+Without `activity_threshold`, an input is active the whole time it is open, so its rules duck
+permanently.
 
-1. **Start with conservative settings** — It's easier to adjust from "too quiet" than to fix overloaded audio
-2. **Match fade times to content** — Fast fades for live mic, slower for pre-recorded narration
-3. **Test with real content** — Ducking behavior can be surprising with certain audio combinations
-4. **Consider silence detection** — Very quiet primary voices may not trigger ducking noticeably
+**As a ducked voice.** List an input's `voice_id` in `ducked_voices` to turn the microphone down
+while the primary plays.
 
-## Troubleshooting
+## Checking it
 
-**Ducking not working:**
-- Verify voice names match exactly (case-sensitive)
-- Check that the primary voice is actually playing audio
-- Confirm ducking rules are in your config file
+`GET /status/voices` shows each voice's `ducking_multiplier` (below `1.0` while ducked), and
+`GET /metrics` lists the currently ducked voices. If nothing ducks, check that the voice names match
+exactly (they are case-sensitive) and that the primary voice really has a sound playing.
 
-**Fades are abrupt:**
-- Increase `fade_duration_ms`
+## Choosing values
 
-**Ducking is too aggressive:**
-- Increase `target_volume` (e.g., 0.15 → 0.25)
-
-**Audio pops during transitions:**
-- This shouldn't happen — please report as a bug
+- Speech over music usually sits well at `0.1`–`0.3`.
+- Short fades (200–500 ms) suit live voices and hints; longer ones (1–2 s) suit narration over music.
+- Since recovery uses the longest fade, a slow rule makes the background come back slowly even after
+  a fast one.

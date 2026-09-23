@@ -1,554 +1,415 @@
-# Command Reference
+# Commands
 
-All commands are JSON messages published to the configured MQTT topic or sent via HTTP.
-
-## Command Format
+Every command is a JSON object with a `command` field and its parameters. Publish it to the
+configured MQTT topic, or POST it to the [HTTP API](http-api.md).
 
 ```json
-{
-  "command": "command_name",
-  "param1": "value1",
-  "param2": "value2"
-}
+{"command": "play", "file": "/opt/sounds/doorbell.wav", "voice": "effects", "volume": 0.8}
 ```
 
----
+- **MQTT** is fire-and-forget: nothing is sent back. A command that fails is logged at `warn` or
+  `error` level.
+- **HTTP** waits for the outcome and answers with a status code (`POST /command` takes the same JSON;
+  see [HTTP API](http-api.md#command-results)).
+- Command names are case-sensitive. Parameters the command does not know are ignored, so a misspelled
+  parameter name has no effect rather than causing an error.
+- Commands run in the order they arrive, except those that read files (`play`, `precache`,
+  `cache_clear`, `cache_invalidate`, `cache_reload`): these load in the background, at most 4 at a
+  time and 32 in flight, and take effect when their load finishes. A slow download therefore never
+  holds up a `stop` or a volume change. `stopall` and `fadeall` also cancel every load still in flight;
+  other commands do not, so a `stop` sent while its sound is still loading finds nothing to stop.
 
-## Playback Commands
+| Command | Does | HTTP endpoint |
+|---------|------|---------------|
+| [`play`](#play) | Play a file or URL | `POST /play` |
+| [`stop`](#stop) | Stop matching sounds | `POST /stop` |
+| [`stopall`](#stopall) | Stop every sound | `POST /stopall` |
+| [`fadeall`](#fadeall) | Fade out every sound | `POST /fadeall` |
+| [`volume`](#volume) | Change matching sounds' volume | `POST /volume` |
+| [`seek`](#seek) | Jump within matching sounds | `POST /seek` |
+| [`speed`](#speed) | Change matching sounds' speed | `POST /speed` |
+| [`voice_stop`](#voice_stop) | Stop a voice | `POST /voice/stop` |
+| [`voice_fade_out`](#voice_fade_out) | Fade out a voice | `POST /voice/fade_out` |
+| [`voice_volume`](#voice_volume) | Change a voice's volume | `POST /voice/volume` |
+| [`input_volume`](#input_volume) | Change a live input's volume | `POST /input/volume` |
+| [`input_mute`](#input_mute) | Mute or unmute a live input | `POST /input/mute` |
+| [`precache`](#precache) | Load a file into the cache | `POST /precache` |
+| [`cache_clear`](#cache_clear) | Empty the caches | `POST /cache/clear` |
+| [`cache_invalidate`](#cache_invalidate) | Drop one file from the caches | `POST /cache/invalidate` |
+| [`cache_reload`](#cache_reload) | Drop one file and load it again | `POST /cache/reload` |
+| [`talkback_acquire`](#talkback) | Open the talkback microphone for a while | `POST /talkback/acquire` |
+| [`talkback_release`](#talkback) | Close it | `POST /talkback/release` |
+| [`talkback_hard_mute`](#talkback) | Close it whoever holds it | `POST /talkback/hard-mute` |
+
+Volumes throughout are linear gains: `1.0` is unity, `0.5` is about -6 dB, and the maximum is `4.0`
+(+12 dB). Values outside `0.0`–`4.0` are clamped.
+
+## Sounds and voices
+
+Each `play` starts one **sound**. A sound belongs to a **voice**, a named group used by the `voice_*`
+commands and by [ducking rules](features/ducking.md). A play without a `voice` gets a voice of its
+own. A voice exists while it has sounds playing: when the last one ends the voice is removed, and a
+later play into the same name starts again at voice volume `1.0`.
+
+`stop`, `volume`, `seek` and `speed` pick sounds with a **selector**:
+
+| Selector | Matches |
+|----------|---------|
+| `internal_id` | The one sound with this id. Ids are assigned by the daemon and listed by `GET /status/samples`; pass it as a string of digits, such as `"42"` |
+| `id` | Sounds started with this `id` |
+| `file` | Sounds started with exactly this `file` string |
+| `voice` | Sounds in this voice |
+
+Give at least one. A sound matches if any given selector matches it. A command with no selector is
+rejected (HTTP `400`), and one that matches no playing sound fails with HTTP `404`.
+
+## Playback
 
 ### play
-
-Play an audio file.
 
 ```json
 {
   "command": "play",
-  "file": "/path/to/sound.wav",
-  "id": "my-sound-id",
-  "voice": "effects",
-  "volume": 0.8,
-  "loop": false,
-  "fade_in": 1000,
-  "start_position_ms": 0,
-  "channel_map": [
-    {"src": 0, "dest": 2},
-    {"src": 1, "dest": 3}
-  ]
+  "file": "/opt/sounds/rain.wav",
+  "id": "rain",
+  "voice": "ambience",
+  "volume": 0.6,
+  "loop": true,
+  "crossfade_ms": 200,
+  "fade_in": 2000
 }
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `file` | string | *required* | File path or HTTP/HTTPS URL |
-| `id` | string | auto | Unique ID for targeting this sound later |
-| `voice` | string | auto | Voice group name |
-| `volume` | float | 1.0 | Volume (0.0 to 4.0, unity is 1.0) |
-| `loop` | boolean | false | Loop playback continuously |
-| `crossfade_ms` | integer | 0 | Crossfade duration at loop boundaries (0 = disabled) |
-| `fade_in` | integer | 0 | Fade-in duration (milliseconds) |
-| `start_position_ms` | integer | 0 | Start position (milliseconds) |
-| `channel_map` | array | auto | Channel routing (see below) |
-| `mode` | string | `auto` | Load strategy: `auto` (decide by size/duration + memory budget), `full` (always in-memory), or `stream` (window a big/long file). Applies to local files and `http(s)://` URLs. A windowed voice plays forward only |
-| `window_ms` | integer | config | Windowed-source ring depth override (streamed plays) |
-| `prebuffer_ms` | integer | config | Windowed-source prebuffer override (streamed plays) |
-| `freshness` | string | config | Cache freshness override: `trusting`, `dev`, or `pinned` |
-| `cacheable` | boolean | `true` | HTTP windowed plays only: `true` (default) tees the download to the disk cache so a replay hits disk; `false` treats the source as live (window, never persist). A URL with no `Content-Length` is always live |
+| `file` | string | *required* | Local path, or an `http://` / `https://` URL. With `security.allowed_directories` set, a local path must be inside one of them |
+| `id` | string | none | Your label for the sound, for later selectors. Several sounds may share one |
+| `voice` | string | a voice of its own | Voice to play in |
+| `volume` | number | `1.0` | Sound volume, `0.0`–`4.0` |
+| `loop` | boolean | `false` | Repeat until stopped |
+| `crossfade_ms` | integer | `0` | Blend the end of the file into its start at each loop. Needs `loop: true` and a file longer than twice the crossfade; a warning is logged otherwise |
+| `fade_in` | integer | none | Fade in over this many milliseconds |
+| `start_position_ms` | integer | `0` | Start this far into the file (clamped to its end) |
+| `channel_map` | array | channel *n* → output *n* | Where each source channel plays; see [Channel map](#channel-map) |
+| `mode` | string | `cache.load_mode` | `auto`, `full` or `stream`; see [Full and windowed plays](#full-and-windowed-plays) |
+| `window_ms` | integer | `cache.stream_window_ms` | Window length for a windowed play, `100`–`60000` |
+| `prebuffer_ms` | integer | `cache.stream_prebuffer_ms` | Audio buffered before a windowed play starts; at most `window_ms` |
+| `freshness` | string | `cache.freshness` | `trusting`, `dev` or `pinned`. On a play, only decides whether an edited local file already in memory is re-read (not with `pinned`); see [Caching](features/caching.md#freshness) |
+| `cacheable` | boolean | `true` | For a URL that is not cached yet: `false` keeps the download out of the disk cache (for a live stream or a one-off file). A response without `Content-Length` is never saved |
 
-Volumes are gains: 1.0 is unity, below that attenuates and above that boosts, up
-to 4.0 (+12 dB). The mixer saturates its output, so a boost loud enough to
-exceed full scale clips rather than wrapping around.
+Without a `channel_map`, source channel 0 plays on output 0, channel 1 on output 1, and so on: a mono
+file plays on output 0 only. Source channels beyond the device's channel count are not heard.
 
-**Channel Mapping:**
+When 256 sounds are already playing, a new play replaces the oldest sound that is not looping,
+without a fade. If all 256 loop, the new play is dropped.
 
-Without `channel_map`, audio plays on sequential channels starting from 0. With `channel_map`, you specify exactly where each source channel goes:
+#### Full and windowed plays
+
+A **full** play decodes the whole file into memory. It supports everything above plus `seek`,
+`speed`, reverse playback and pitch correction, and a finished decode stays in the memory cache for
+instant replays. A **windowed** play streams through a short buffer (`window_ms`), so memory stays
+small however long the file is, but it:
+
+- always starts at the beginning (`start_position_ms` is ignored, with a warning);
+- loops a local file without a crossfade (`crossfade_ms` is ignored, with a warning), and plays a URL
+  only once (`loop` is ignored, with a warning);
+- ignores `seek` and `speed`.
+
+`mode: "auto"` plays a file in full unless it is larger than `cache.full_load_max_bytes` decoded,
+longer than `cache.full_load_max_seconds`, or too big for the memory still free in the cache budget.
+A URL of unknown length is always windowed. `"full"` asks for a full play but still falls back to
+windowed when the file would not fit in memory; `"stream"` always plays windowed. A URL that is
+already in the disk cache is always played in full. [Caching](features/caching.md) has the details.
+
+#### Channel map
+
+Each entry routes one source channel to one output channel:
 
 ```json
 {
   "command": "play",
-  "file": "/sound.wav",
+  "file": "/opt/sounds/quad-ambience.wav",
   "channel_map": [
     {"src": 0, "dest": 4},
-    {"src": 1, "dest": 5}
+    {"src": 1, "dest": 5},
+    {"src": 2, "dest": "rear_left"},
+    {"src": 3, "dest": "rear_right", "gain": 0.8}
   ]
 }
 ```
 
-You can use channel aliases (defined in config) instead of numbers:
+- `src` is a channel of the file, `dest` an output channel. Either may be a number or a name from
+  `audio.channel_aliases`; an unknown name fails the play (HTTP `400`).
+- A source channel may appear in several entries to play on several outputs.
+- `gain` (default `1.0`, range `0.0`–`8.0`) scales one route. Routes that land on the same output
+  add together, so lower their gains to avoid clipping when folding channels down.
+
+### stop
 
 ```json
-{
-  "command": "play",
-  "file": "/sound.wav",
-  "channel_map": [
-    {"src": 0, "dest": "front_left"},
-    {"src": 1, "dest": "front_right"}
-  ]
-}
+{"command": "stop", "id": "rain", "fade_out_ms": 500}
 ```
 
-You can route one source to multiple destinations:
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `internal_id`, `id`, `file`, `voice` | string | | [Selector](#sounds-and-voices) |
+| `fade_out_ms` | integer | `10` | Fade-out length. The short default avoids a click |
 
-```json
-{
-  "command": "play",
-  "file": "/mono.wav",
-  "channel_map": [
-    {"src": 0, "dest": 0},
-    {"src": 0, "dest": 1},
-    {"src": 0, "dest": 2}
-  ]
-}
-```
-
-Each route accepts an optional `gain` (default `1.0`). When several source channels are routed to the same
-destination they sum, which can clip; a per-route `gain` lets you attenuate (or boost) each route. A route
-without `gain` is unity, so existing maps are unaffected:
-
-```json
-{
-  "command": "play",
-  "file": "/quad.wav",
-  "channel_map": [
-    {"src": 0, "dest": 0, "gain": 0.5},
-    {"src": 2, "dest": 0, "gain": 0.5},
-    {"src": 1, "dest": 1, "gain": 0.5},
-    {"src": 3, "dest": 1, "gain": 0.5}
-  ]
-}
-```
+A sound that is already fading continues from its current level.
 
 ### stopall
-
-Stop all playing audio immediately.
 
 ```json
 {"command": "stopall"}
 ```
 
+Fades every sound out over 10 ms and cancels loads still in flight (their HTTP callers get `409`).
+Live inputs keep running.
+
 ### fadeall
 
-Fade all playing audio out, then stop it. Samples are removed once their fade
-completes.
-
 ```json
-{"command": "fadeall", "time": 2000}
+{"command": "fadeall", "time": 3000}
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `time` | integer | `1000` | Fade duration in milliseconds. Also accepted as `fade_out_ms` |
+| `time` | integer | `1000` | Fade-out length in milliseconds. Also accepted as `fade_out_ms` |
 
-`soundFadeAll`, `fadeout`, and `soundFadeOut` are accepted as aliases for
-compatibility with the original app.
-
-Sent without a `time`, it fades everything over one second:
-
-```json
-{"command": "fadeall"}
-```
-
-Live inputs are not affected, the same as with `stopall`. Use `input_mute` for
-a microphone.
-
----
-
-## Sample Targeting Commands
-
-These commands control specific playing samples by ID, filename, or voice.
-
-### stop
-
-Stop specific samples.
-
-```json
-{
-  "command": "stop",
-  "id": "my-sound-id",
-  "fade_out_ms": 500
-}
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
-| `id` | string | — | Stop sample with this ID |
-| `file` | string | — | Stop all samples playing this file |
-| `voice` | string | — | Stop all samples in this voice |
-| `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
-| `fade_out_ms` | integer | 10 | Fade-out duration (milliseconds). The 10 ms default avoids clicks on abrupt stops |
-
-At least one of `internal_id`, `id`, `file`, or `voice` is required. Multiple selectors use OR logic (a sample matches if any one criterion matches). An empty selector matches nothing and is silently a no-op.
-
-### seek
-
-Jump to a position in a playing sample.
-
-```json
-{
-  "command": "seek",
-  "id": "my-sound-id",
-  "position_ms": 60000
-}
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
-| `id` | string | — | Target sample ID |
-| `file` | string | — | Target all samples playing this file |
-| `voice` | string | — | Target all samples in this voice |
-| `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
-| `position_ms` | integer | *required* | Position to seek to (milliseconds) |
-
-### speed
-
-Change playback speed.
-
-```json
-{
-  "command": "speed",
-  "id": "my-sound-id",
-  "speed": 1.5,
-  "pitch_correction": false
-}
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
-| `id` | string | — | Target sample ID |
-| `file` | string | — | Target samples playing this file |
-| `voice` | string | — | Target samples in this voice |
-| `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
-| `speed` | float | *required* | Playback speed multiplier |
-| `pitch_correction` | boolean | false | Maintain original pitch |
-
-**Speed ranges:**
-- Without pitch correction: -100.0 to 100.0 (negative = reverse)
-- With pitch correction: 0.05 to 8.0 (reverse not supported)
-- `speed: 0` is rejected with an error - use `stop` to end playback.
-  Reverse playback starts from the sample's current position, so a sample
-  still at its beginning finishes immediately; `seek` first to play backwards
-  from a point
+Like `stopall` with a longer fade: every sound fades out and ends, loads in flight are cancelled, and
+live inputs keep running.
 
 ### volume
 
-Adjust volume of specific samples.
-
 ```json
-{
-  "command": "volume",
-  "id": "my-sound-id",
-  "volume": 0.5
-}
+{"command": "volume", "voice": "ambience", "volume": 0.3}
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
-| `id` | string | — | Target sample ID |
-| `file` | string | — | Target samples playing this file |
-| `voice` | string | — | Target samples in this voice |
-| `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
-| `volume` | float | *required* | New volume (0.0 to 4.0, unity is 1.0) |
+| `internal_id`, `id`, `file`, `voice` | string | | [Selector](#sounds-and-voices) |
+| `volume` | number | *required* | New sound volume, `0.0`–`4.0` |
 
----
+The change ramps over about 20 ms per unit of volume, so it does not click. This sets each sound's
+own volume; `voice_volume` sets a separate voice level, and the two multiply.
 
-## Voice Commands
+### seek
+
+```json
+{"command": "seek", "id": "narration", "position_ms": 60000}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `internal_id`, `id`, `file`, `voice` | string | | [Selector](#sounds-and-voices) |
+| `position_ms` | integer | *required* | New position, clamped to the end of the file |
+
+Applies to full plays only. Windowed sounds ignore it. When the selector names a `voice` in which a
+windowed sound has played since the voice was last silent, the whole command is ignored with a
+warning.
+
+### speed
+
+```json
+{"command": "speed", "id": "narration", "speed": 0.8, "pitch_correction": true}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `internal_id`, `id`, `file`, `voice` | string | | [Selector](#sounds-and-voices) |
+| `speed` | number | *required* | Playback rate: `1.0` normal, `2.0` double, negative plays backwards |
+| `pitch_correction` | boolean | `false` | Keep the original pitch while changing speed |
+
+- Without pitch correction, speed ranges from `-100` to `100`; values closer to zero than `0.01` become
+  `±0.01`. With it, speed is clamped to `0.05`–`8.0` and cannot be negative (HTTP `400`).
+- `speed: 0` is rejected (HTTP `400`); use `stop`.
+- Each `speed` command sets pitch correction on or off, so one without `pitch_correction` turns it off.
+- Reverse playback starts from the current position, so a sound still at its start ends at once.
+  `seek` first to play backwards from a point.
+- A sound that is still loading for its first play gets pitch correction once the load completes; a
+  warning says so.
+- Applies to full plays only, with the same windowed-voice rule as `seek`.
+
+## Voices
 
 ### voice_stop
 
-Stop all samples in a voice immediately.
-
 ```json
-{
-  "command": "voice_stop",
-  "voice": "background"
-}
+{"command": "voice_stop", "voice": "ambience"}
 ```
+
+Fades every sound in the voice out over 10 ms. Fails with HTTP `404` when the voice has no sounds.
 
 ### voice_fade_out
 
-Fade out all samples in a voice.
-
 ```json
-{
-  "command": "voice_fade_out",
-  "voice": "background",
-  "time": 2000
-}
+{"command": "voice_fade_out", "voice": "ambience", "time": 5000}
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `voice` | string | *required* | Voice name |
-| `time` | integer | *required* | Fade duration (milliseconds) |
+| `voice` | string | *required* | Voice to fade |
+| `time` | integer | *required* | Fade length in milliseconds (the HTTP endpoint calls it `time_ms`) |
+
+Fails with HTTP `404` when the voice has no sounds.
 
 ### voice_volume
 
-Adjust volume for all samples in a voice.
-
 ```json
-{
-  "command": "voice_volume",
-  "voice": "music",
-  "volume": 0.5
-}
+{"command": "voice_volume", "voice": "music", "volume": 0.4}
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `voice` | string | *required* | Voice name |
-| `volume` | float | *required* | New volume (0.0 to 4.0, unity is 1.0) |
+| `voice` | string | *required* | Voice, or a live input's `voice_id` |
+| `volume` | number | *required* | Voice level, `0.0`–`4.0` |
 
----
+Ramps every sound in the voice (and any live input with that `voice_id`) to the new level. Sounds
+started in the voice while it keeps playing inherit the level; once the voice's last sound ends the
+level is forgotten. Fails with HTTP `404` when no sound or ready input has the voice.
 
-## Cache Commands
+## Live inputs
+
+These address a live input from the config's `inputs` list, by its `voice_id` or by its position in
+the list as a string (`"0"` is the first). The value must be a JSON string. An input that failed to
+open answers HTTP `404`.
+
+### input_volume
+
+```json
+{"command": "input_volume", "input": "gm_mic", "volume": 0.8}
+```
+
+Sets the input's volume (`0.0`–`4.0`) at once, and unmutes it.
+
+### input_mute
+
+```json
+{"command": "input_mute", "input": "gm_mic", "mute": true}
+```
+
+Muting silences the input at once and remembers its volume; unmuting restores that volume. While a
+[talkback](#talkback) lease holds the input, unmuting it with this command is refused (HTTP `403`).
+
+## Cache
 
 ### precache
 
-Download and decode a file without playing it.
-
 ```json
-{
-  "command": "precache",
-  "file": "https://example.com/large-file.wav"
-}
+{"command": "precache", "file": "https://example.com/sounds/intro.mp3"}
 ```
 
-Use this to eliminate first-play latency for files you'll need later.
+Loads a file into the memory cache, and a URL into the disk cache too (when it is enabled), so a
+later play starts instantly. The command completes once loading has started; the decode continues in the background.
+The file is always decoded in full, and a file too large for the memory budget is not kept in memory
+(a URL stays in the disk cache). Directories are accepted only in the config's `cache.precache`.
 
 ### cache_clear
-
-Clear the entire cache (memory and disk).
 
 ```json
 {"command": "cache_clear"}
 ```
 
+Empties the memory cache and deletes every file in the disk cache.
+
 ### cache_invalidate
 
-Remove a specific file from cache.
-
 ```json
-{
-  "command": "cache_invalidate",
-  "file": "https://example.com/updated-file.wav"
-}
+{"command": "cache_invalidate", "file": "https://example.com/sounds/intro.mp3"}
 ```
+
+Drops one file (or URL) from both caches, so its next play reads it again.
 
 ### cache_reload
 
-Invalidate a cached entry and immediately re-precache it, so the next play is both fresh and instant. Useful
-after a content pipeline republishes an asset.
-
 ```json
-{
-  "command": "cache_reload",
-  "file": "/sounds/updated-cue.wav"
-}
+{"command": "cache_reload", "file": "/opt/sounds/cue-12.wav"}
 ```
 
----
+`cache_invalidate` followed by `precache`: the next play gets the current file without waiting for
+it to load. Use it after replacing a file in place.
 
-## Input Commands
+## Talkback
 
-### input_volume
-
-Adjust volume for a microphone/input device.
+Talkback lets one client at a time open a microphone for a short, renewable lease, for example a
+push-to-talk button in a control panel. When the lease runs out, is released or is hard-muted, the
+microphone is muted again. See [Microphone Input](features/microphone-input.md#talkback) for setup
+and current limitations.
 
 ```json
-{
-  "command": "input_volume",
-  "input": "gamemaster_mic",
-  "volume": 0.5
-}
+{"command": "talkback_acquire", "client_id": "panel-1", "destination": "GUEST_ALL", "gain": 0.0, "lease_ms": 1000}
+{"command": "talkback_release", "client_id": "panel-1", "lease_id": "lease-0001"}
+{"command": "talkback_hard_mute"}
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `input` | string | *required* | Input name (voice_id) or index |
-| `volume` | float | *required* | Volume (0.0 to 4.0, unity is 1.0) |
+| `client_id` | string | *required* | Who holds the lease |
+| `source_id` | string | `"GM_MIC"` | Must be `GM_MIC`. It opens the input whose `voice_id` is `GM_MIC`, or else `mic` |
+| `destination` | string | *required* | One of `GUEST_ALL`, `ROOM_1`, `ROOM_2A`, `ROOM_2B`, `ROOM_3`, `ROOM_4` |
+| `gain` | number | *required* | `-60` to `12` (dB) |
+| `lease_ms` | integer | *required* | Lease length, `250`–`2000` ms |
+| `lease_id` | string | *required* (release) | The lease's id, from `GET /status/talkback` |
 
-### input_mute
-
-Mute or unmute an input.
-
-```json
-{
-  "command": "input_mute",
-  "input": "0",
-  "mute": true
-}
-```
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `input` | string | *required* | Input name or index |
-| `mute` | boolean | *required* | true = mute, false = unmute |
-
-Muting ramps the level down over ~20ms (no pop), and unmuting restores the
-input's configured or last-set volume - a mic set to 0.7 comes back at 0.7,
-a boosted one comes back boosted.
-
----
-
-## Examples
-
-### Complete Session
-
-```bash
-TOPIC="audio/commands"
-
-# Precache files for instant playback
-mosquitto_pub -t $TOPIC -m '{"command": "precache", "file": "/sounds/music.mp3"}'
-mosquitto_pub -t $TOPIC -m '{"command": "precache", "file": "/sounds/narration.wav"}'
-
-# Start background music with crossfade for smooth looping
-mosquitto_pub -t $TOPIC -m '{
-  "command": "play",
-  "file": "/sounds/music.mp3",
-  "voice": "music",
-  "volume": 0.3,
-  "loop": true,
-  "crossfade_ms": 100,
-  "fade_in": 2000
-}'
-
-# Play a sound effect
-mosquitto_pub -t $TOPIC -m '{
-  "command": "play",
-  "file": "/sounds/doorbell.wav",
-  "voice": "effects"
-}'
-
-# Duck music and play narration
-mosquitto_pub -t $TOPIC -m '{
-  "command": "voice_volume",
-  "voice": "music",
-  "volume": 0.1
-}'
-
-mosquitto_pub -t $TOPIC -m '{
-  "command": "play",
-  "file": "/sounds/narration.wav",
-  "voice": "narration"
-}'
-
-# Restore music (after narration finishes)
-mosquitto_pub -t $TOPIC -m '{
-  "command": "voice_volume",
-  "voice": "music",
-  "volume": 0.3
-}'
-
-# Fade out music
-mosquitto_pub -t $TOPIC -m '{
-  "command": "voice_fade_out",
-  "voice": "music",
-  "time": 5000
-}'
-
-# Stop all audio
-mosquitto_pub -t $TOPIC -m '{"command": "stopall"}'
-```
-
-### Multichannel Surround
-
-```bash
-# Play 4-channel audio to rear speakers (channels 4-7)
-mosquitto_pub -t $TOPIC -m '{
-  "command": "play",
-  "file": "/sounds/quad-ambience.wav",
-  "channel_map": [
-    {"src": 0, "dest": 4},
-    {"src": 1, "dest": 5},
-    {"src": 2, "dest": 6},
-    {"src": 3, "dest": 7}
-  ]
-}'
-```
-
-### Variable Speed Playback
-
-```bash
-# Play at double speed (chipmunk effect)
-mosquitto_pub -t $TOPIC -m '{
-  "command": "play",
-  "file": "/sounds/speech.wav",
-  "id": "speech-1"
-}'
-
-mosquitto_pub -t $TOPIC -m '{
-  "command": "speed",
-  "id": "speech-1",
-  "speed": 2.0
-}'
-
-# Slow down to half speed with pitch correction
-mosquitto_pub -t $TOPIC -m '{
-  "command": "speed",
-  "id": "speech-1",
-  "speed": 0.5,
-  "pitch_correction": true
-}'
-```
-
----
+- Acquiring unmutes the input and starts a lease. The holder renews it by acquiring again before it
+  expires; another client is refused (HTTP `403`) until then.
+- Releasing needs the holder's `client_id` and the current `lease_id`.
+- `talkback_hard_mute` ends the current lease, whoever holds it, and mutes its input.
 
 ## Macros
 
-Commands can reference macros defined in the config file to apply preset parameters.
+A `macro` field merges presets from the config's [`macros`](configuration.md#macros) section into a
+command:
 
 ```json
-{
-  "command": "play",
-  "file": "/sounds/music.mp3",
-  "macro": "wholeroom"
-}
+{"command": "play", "file": "/opt/sounds/theme.mp3", "macro": ["quiet", "wholeroom"], "voice": "music"}
 ```
 
-Parameters specified in the command take precedence over macro values. Multiple macros can be specified as an array, with earlier macros taking precedence over later ones:
+The command's own parameters win, then earlier macros over later ones. Here `voice` comes from the
+command, `volume` from `quiet`, and `channel_map` from `wholeroom` (given the config example linked
+above). `macro` goes at the top level of the command. An unknown macro name is skipped with a warning.
+
+## Compatibility with the original mqttaudio
+
+Commands may put their parameters in a `message` object instead of at the top level:
 
 ```json
-{
-  "command": "play",
-  "file": "/sounds/music.mp3",
-  "macro": ["quiet", "wholeroom"],
-  "voice": "background"
-}
+{"command": "play", "message": {"file": "/opt/sounds/rain.wav", "volume": 0.8}}
 ```
 
-In this example: `voice` comes from the command, `volume` from the "quiet" macro, and `channel_map` from "wholeroom".
+When `message` is present, only its contents are read.
 
-See [Configuration](configuration.md#macros) for defining macros.
+These command names from the original app are also accepted:
 
----
+| Name | Same as |
+|------|---------|
+| `soundPlay` | `play` |
+| `soundStopAll` | `stopall` |
+| `soundPrecache` | `precache` |
+| `soundFadeAll`, `fadeout`, `soundFadeOut` | `fadeall` |
 
-## Legacy Format
+## Examples
 
-For backward compatibility, commands also accept parameters wrapped in a `message` object:
+```bash
+TOPIC=audio/commands
 
-```json
-{
-  "command": "play",
-  "message": {
-    "file": "/path/to/sound.wav",
-    "volume": 0.8
-  }
-}
+# Load the cues for tonight so they start instantly
+mosquitto_pub -t $TOPIC -m '{"command": "precache", "file": "/opt/sounds/theme.mp3"}'
+
+# Background music on a loop, fading in
+mosquitto_pub -t $TOPIC -m '{"command": "play", "file": "/opt/sounds/theme.mp3", "voice": "music",
+  "volume": 0.3, "loop": true, "crossfade_ms": 100, "fade_in": 2000}'
+
+# A narration; with a ducking rule for "narration" the music dips on its own
+mosquitto_pub -t $TOPIC -m '{"command": "play", "file": "/opt/sounds/intro.wav", "voice": "narration"}'
+
+# Four-channel ambience on outputs 4-7
+mosquitto_pub -t $TOPIC -m '{"command": "play", "file": "/opt/sounds/quad.wav",
+  "channel_map": [{"src": 0, "dest": 4}, {"src": 1, "dest": 5}, {"src": 2, "dest": 6}, {"src": 3, "dest": 7}]}'
+
+# Slow a sound down without lowering its pitch
+mosquitto_pub -t $TOPIC -m '{"command": "speed", "id": "intro", "speed": 0.8, "pitch_correction": true}'
+
+# End of the show
+mosquitto_pub -t $TOPIC -m '{"command": "fadeall", "time": 5000}'
 ```
-
-This format is equivalent to the flattened format shown throughout this document. When both formats are present in the same message, the `message` object takes precedence (its contents replace the flattened keys wholesale rather than merging).
-
-### Legacy command names
-
-Three commands also accept a legacy alias for their `command` value:
-
-| Canonical | Legacy alias |
-|-----------|--------------|
-| `play` | `soundPlay` |
-| `stopall` | `soundStopAll` |
-| `precache` | `soundPrecache` |
-
-These aliases are accepted only for those three commands; every other command uses its canonical name. Command names are matched case-sensitively.

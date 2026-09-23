@@ -1,174 +1,295 @@
-# HTTP REST API
+# HTTP API
 
-mqttaudio includes an optional HTTP server that provides REST endpoints mirroring all MQTT commands. This is useful for:
+mqttaudio can serve a small HTTP API alongside MQTT, or instead of it. It accepts every
+[command](commands.md), reports what is playing, and streams logs and live state over WebSockets.
+Use it for control panels, for scripting with `curl`, or to run without a broker.
 
-- Integration testing without an MQTT broker
-- Web-based admin interfaces
-- Simple HTTP-based automation
-
-## Enable HTTP Server
-
-```bash
-# Via command line
-./mqttaudio --server localhost --topic audio/commands --http-port 8080
-
-# Or via config file
-./mqttaudio --config config.json
-```
-
-Config file example:
+## Turn it on
 
 ```json
 {
-  "mqtt": { "topic": "audio/commands" },
   "http": {
     "enabled": true,
     "port": 8080,
-    "bind_address": "127.0.0.1",
-    "auth_token": "your-secret-token",
-    "websocket_enabled": true,
-    "cors_permissive": false
+    "auth_token": "a-long-random-token"
   }
 }
 ```
 
-## Configuration Options
+or `mqttaudio --http-port 8080`. The server listens on `127.0.0.1` unless `http.bind_address` says
+otherwise, and logs the address it bound (`HTTP server listening on http://127.0.0.1:8080`). Port `0`,
+the default, picks a free port. All `http` settings are listed in
+[Configuration](configuration.md#http).
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enabled` | bool | false | Enable HTTP server |
-| `port` | u16 | 0 | Port number (0 = auto-select an available port) |
-| `bind_address` | string | "127.0.0.1" | Network interface to bind |
-| `auth_token` | string | null | Optional Bearer token for authentication (min 8 characters) |
-| `websocket_enabled` | bool | true | Enable WebSocket endpoint |
-| `cors_permissive` | bool | false | Allow CORS from any origin |
-| `require_auth` | bool | false | Require the token on all routes, including status and `/ws` |
-
-## REST Endpoints
-
-### Status Endpoints (No Authentication Required)
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check (returns service status) |
-| `/version` | GET | Build identity (`name`, `version`, optional `git_sha`) |
-| `/metrics` | GET | Operational telemetry (uptime, clips, xruns, active counts, per-voice ducking, first-start play latency) |
-| `/status` | GET | Current playback status (samples, voices, cache) |
-| `/status/samples` | GET | List of active samples |
-| `/status/voices` | GET | List of active voices (with per-voice ducking multiplier) |
-| `/status/inputs` | GET | List of configured live inputs |
-| `/status/talkback` | GET | Applied fail-closed talkback lease state |
-| `/ready` | GET | Readiness of output and configured capture inputs |
-| `/status/cache` | GET | Cache statistics |
-| `/status/inputs` | GET | Live inputs and their capture health |
-
-### Command Endpoints (Authentication Required if configured)
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/command` | POST | Send any command (same JSON as MQTT) |
-| `/play` | POST | Play audio file (same parameters as the MQTT `play` command, including `channel_map`) |
-| `/stop` | POST | Stop samples by selector |
-| `/stopall` | POST | Stop all playback |
-| `/fadeall` | POST | Fade out all playback |
-| `/volume` | POST | Set sample volume |
-| `/seek` | POST | Seek to position |
-| `/speed` | POST | Change playback speed |
-| `/voice/volume` | POST | Set voice volume |
-| `/voice/fade_out` | POST | Fade out a voice |
-| `/voice/stop` | POST | Stop a voice |
-| `/input/volume` | POST | Set live-input volume |
-| `/input/mute` | POST | Mute/unmute a live input |
-| `/talkback/acquire` | POST | Acquire or renew a bounded talkback lease |
-| `/talkback/release` | POST | Release the caller's talkback lease |
-| `/talkback/hard-mute` | POST | Priority-mute every active talkback lease |
-| `/cache/clear` | POST | Clear all caches |
-| `/cache/invalidate` | POST | Invalidate specific cache entry |
-| `/cache/reload` | POST | Invalidate then re-precache an entry (fresh + instant) |
-| `/precache` | POST | Pre-cache an audio file |
-| `/input/volume` | POST | Set a live input's volume (`{"input": "mic", "volume": 0.8}`) |
-| `/input/mute` | POST | Mute/unmute a live input (`{"input": "mic", "mute": true}`) |
-
-Command endpoints wait for the command to be processed and report the
-real outcome: `{"success": true, "message": ...}` on success, or an error
-with a matching status code - 400 for malformed requests, 404 when a
-file fails to load or a selector matches nothing, 403 when a path is
-outside `security.allowed_directories`, 409 when a pending play was
-cancelled by a stop, 504 if the result takes longer than 30 seconds.
-Loads run in the background, so a slow download never delays other
-commands (an emergency `stopall` also cancels any loads still in flight).
-
-> **Typed endpoints vs `/command`.** The convenience endpoints above deserialize a fixed set of fields. In
-> particular, `POST /play` accepts only `file`, `id`, `volume`, `voice`, `fade_in`, `start_position_ms`,
-> `loop` (also `loop_mode`), and `crossfade_ms`. It does **not** accept `channel_map`, `mode`, `window_ms`,
-> `prebuffer_ms`, `freshness`, or `cacheable` — to use those, POST the full command JSON to `/command`
-> (which accepts the same payload as MQTT). Unknown fields sent to a typed endpoint are silently ignored.
-> Note also that `POST /voice/fade_out` takes `time_ms`, whereas the raw command / MQTT key is `time`.
+With only the HTTP server enabled (no `mqtt.topic`), no broker is needed. If the HTTP server cannot
+start and there is no MQTT connection either, the daemon exits with an error.
 
 ## Authentication
 
-If `auth_token` is set in config, all command endpoints require authentication:
+| Routes | Without `auth_token` | With `auth_token` | With `auth_token` and `require_auth` |
+|--------|----------------------|-------------------|--------------------------------------|
+| `/health`, `/ready` | open | open | open |
+| [Status routes](#status-routes) | open | open | token required |
+| [Command routes](#command-routes), `POST /telemetry` | open | token required | token required |
+| `/ws`, `/ws/state` | open | token required | token required |
+
+Send the token as `Authorization: Bearer <token>` or as a `token` query parameter
+(`?token=<token>`, percent-encoded if it contains special characters). A request without a valid
+token gets `401` with an empty body.
 
 ```bash
-# Bearer token in header
-curl -H "Authorization: Bearer your-secret-token" \
-     -X POST http://localhost:8080/stopall
-
-# Or token in query string
-curl -X POST "http://localhost:8080/stopall?token=your-secret-token"
+curl -H "Authorization: Bearer a-long-random-token" -X POST http://localhost:8080/stopall
+curl -X POST "http://localhost:8080/stopall?token=a-long-random-token"
 ```
 
-Status endpoints (`/health`, `/status/*`) do not require authentication.
+Browsers cannot set headers on a WebSocket, so use the query parameter there. Tokens shorter than 8
+characters are rejected at startup, and `require_auth` without a token is a startup error.
 
-## Status Response Formats
+## Command routes
 
-### `/status` Response
+All take `POST` with a JSON body (`Content-Type: application/json`).
 
-Returns a summary of playback and cache state:
+| Route | Command | Body |
+|-------|---------|------|
+| `/command` | any | The full command JSON, exactly as sent over MQTT |
+| `/play` | `play` | `file`, `id`, `volume`, `voice`, `fade_in`, `start_position_ms`, `loop`, `crossfade_ms`, `channel_map` |
+| `/stop` | `stop` | Selector fields and `fade_out_ms` |
+| `/stopall` | `stopall` | none |
+| `/fadeall` | `fadeall` | `time` (send `{}` for the default) |
+| `/volume` | `volume` | Selector fields and `volume` |
+| `/seek` | `seek` | Selector fields and `position_ms` |
+| `/speed` | `speed` | Selector fields, `speed` and `pitch_correction` |
+| `/voice/stop` | `voice_stop` | `voice` |
+| `/voice/fade_out` | `voice_fade_out` | `voice` and `time_ms` |
+| `/voice/volume` | `voice_volume` | `voice` and `volume` |
+| `/input/volume` | `input_volume` | `input` and `volume` |
+| `/input/mute` | `input_mute` | `input` and `mute` |
+| `/precache` | `precache` | `file` |
+| `/cache/clear` | `cache_clear` | none |
+| `/cache/invalidate` | `cache_invalidate` | `file` |
+| `/cache/reload` | `cache_reload` | `file` |
+| `/talkback/acquire` | `talkback_acquire` | `client_id`, `source_id`, `destination`, `gain`, `lease_ms` |
+| `/talkback/release` | `talkback_release` | `client_id` and `lease_id` |
+| `/talkback/hard-mute` | `talkback_hard_mute` | none |
+| `/telemetry` | | `{"enabled": true}` or `false`; see [Telemetry](#telemetry) |
+
+The parameters mean the same as in the [command reference](commands.md). The typed routes accept
+only the fields listed: for `mode`, `window_ms`, `prebuffer_ms`, `freshness` or `cacheable` on a play,
+use `/command`. Unlisted fields are ignored.
+
+```bash
+curl -X POST http://localhost:8080/play -H "Content-Type: application/json" \
+  -d '{"file": "/opt/sounds/rain.wav", "voice": "ambience", "loop": true, "fade_in": 2000}'
+
+curl -X POST http://localhost:8080/command -H "Content-Type: application/json" \
+  -d '{"command": "play", "file": "https://example.com/bed.mp3", "mode": "stream"}'
+
+curl -X POST http://localhost:8080/voice/fade_out -H "Content-Type: application/json" \
+  -d '{"voice": "ambience", "time_ms": 3000}'
+```
+
+### Command results
+
+A command route waits until the command has been carried out (for a play, until its sound is
+queued to start) and reports the outcome:
+
+```json
+{"success": true, "message": "Command completed"}
+{"success": false, "error": "No sample matches the selector"}
+```
+
+| Status | Meaning |
+|--------|---------|
+| `200` | Done |
+| `400` | The command is malformed: bad JSON, unknown command, a missing or invalid parameter, no selector, an unknown channel name, `speed: 0` |
+| `403` | Not allowed: a path outside `security.allowed_directories`, a refused talkback request, unmuting an input held by talkback |
+| `404` | Nothing to act on: a file that is missing or cannot be decoded, a URL that fails, a selector that matches no sound, an empty voice, an input that did not open |
+| `409` | A pending play or cache command was cancelled by `stopall` or `fadeall` |
+| `500` | The daemon is overloaded (32 loads already in flight, or its audio queue is full) or failed internally |
+| `504` | No result within 30 seconds |
+
+A typed route whose body cannot be read as its fields answers with a plain-text error from the web
+framework: `400` for broken JSON, `415` without a JSON `Content-Type`, `422` for a missing or
+mistyped field. `/command` answers those cases with a `400` in the JSON shape above.
+
+## Status routes
+
+All take `GET`.
+
+| Route | Returns |
+|-------|---------|
+| `/health` | `{"status": "ok", "service": "mqttaudio", "version": "..."}` while the process is serving |
+| `/ready` | Whether audio output and every configured input are running |
+| `/version` | Name, version and, in builds that set it, `git_sha` |
+| `/status` | Counts, limiter and xrun counters, cache totals |
+| `/status/samples` | Every playing sound |
+| `/status/voices` | Every voice, with its volume and ducking level |
+| `/status/inputs` | Every configured live input and its capture health |
+| `/status/cache` | Memory and disk cache totals |
+| `/status/talkback` | The talkback lease |
+| `/status/meters` | Output peak levels (with [telemetry](#telemetry) on) |
+| `/metrics` | Monitoring counters |
+| `/config` | The configuration the daemon started with |
+| `/telemetry` | `{"enabled": false}`: whether telemetry is on |
+
+### /ready
+
+`200` when ready, `503` otherwise:
+
+```json
+{
+  "status": "not_ready",
+  "ready": false,
+  "checks": {"output": true, "inputs": false},
+  "failed_inputs": [{"voice_id": "gm_mic", "error": "..."}]
+}
+```
+
+Readiness is decided when the daemon starts. An input that fails later does not change it.
+
+### /status
 
 ```json
 {
   "status": "running",
-  "version": "2.0.0",
+  "version": "2.1.0-rc.1",
   "active_samples": 2,
-  "active_inputs": 0,
-  "active_voices": 1,
-  "output_channels": 2,
+  "active_inputs": 1,
+  "active_voices": 2,
+  "output_channels": 8,
   "clip_count": 0,
   "xruns": 0,
   "cache": {
-    "memory": { "entries": 3, "size_bytes": 1048576 },
-    "disk": { "entries": 10, "size_bytes": 5242880 }
+    "memory": {"entries": 3, "size_bytes": 1048576},
+    "disk": {"entries": 10, "size_bytes": 5242880}
   }
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `status` | string | Service state (e.g. `"running"`) |
-| `version` | string | Package version string |
-| `active_samples` | integer | Number of samples currently playing |
-| `active_inputs` | integer | Number of active live inputs |
-| `active_voices` | integer | Number of active voice groups |
-| `output_channels` | integer | Output channel count |
-| `clip_count` | integer | Output samples the limiter held at the ceiling since startup |
-| `xruns` | integer | Audio stream-error callbacks (dropouts/underruns that triggered a stream rebuild) since startup |
+- `active_inputs` is the number of configured inputs, including any that failed to open.
+- `clip_count` counts output samples that reached the limiter's ceiling since startup.
+- `xruns` counts errors reported by the audio output stream since startup, including underruns the
+  audio system recovered from on its own.
 
-### `/version` Response
-
-Build identity. `git_sha` is present only when the build injected `MQTTAUDIO_GIT_SHA`.
+### /status/samples
 
 ```json
 {
-  "name": "mqttaudio",
-  "version": "2.0.0",
-  "git_sha": "a1b2c3d"
+  "samples": [
+    {
+      "internal_id": "7",
+      "id": "rain",
+      "voice": "ambience",
+      "file": "/opt/sounds/rain.wav",
+      "position": 48000,
+      "position_ms": 1000,
+      "total_frames": 480000,
+      "total_ms": 10000,
+      "sample_rate": 48000,
+      "volume": 0.6,
+      "voice_volume": 1.0,
+      "speed": 1.0,
+      "loop_mode": true,
+      "windowed": false,
+      "progress_percent": 10.0
+    }
+  ]
 }
 ```
 
-### `/metrics` Response
+- `internal_id` is the value to use in an `internal_id` selector.
+- `position`, `position_ms` and `progress_percent` are live only while [telemetry](#telemetry) is on,
+  and `0` otherwise. They are always `0` for a windowed sound.
+- `total_frames` and `total_ms` are `0` for a windowed sound, and an estimate while a sound's first
+  load is still decoding.
+- `speed` is the value last requested, before clamping.
 
-Operational telemetry for monitoring. Every field is real — no placeholders.
+### /status/voices
+
+```json
+{
+  "voices": [
+    {"id": "music", "sample_count": 1, "volume": 1.0, "ducking_multiplier": 0.2},
+    {"id": "narration", "sample_count": 1, "volume": 1.0, "ducking_multiplier": 1.0}
+  ]
+}
+```
+
+`ducking_multiplier` is the level a ducking rule is taking the voice to (`1.0` when not ducked).
+
+### /status/inputs
+
+```json
+{
+  "inputs": [
+    {
+      "index": 0,
+      "voice_id": "gm_mic",
+      "volume": 0.8,
+      "channels": 1,
+      "muted": false,
+      "unmuted_volume": 0.8,
+      "ready": true,
+      "last_error": null,
+      "backlog_frames": 512,
+      "max_backlog_frames": 2304,
+      "dropped_frames": 0,
+      "trimmed_frames": 0,
+      "underrun_frames": 0
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `index` | Position in the config's `inputs` list, usable as an `input` selector |
+| `volume`, `muted`, `unmuted_volume` | The state the audio thread has applied. `unmuted_volume` is what unmuting restores |
+| `ready`, `last_error` | Whether the capture stream opened at startup, and why not |
+| `backlog_frames` | Audio waiting between capture and output right now |
+| `max_backlog_frames` | Backlog above which old audio is discarded to keep latency bounded |
+| `dropped_frames` | Captured audio lost because the buffer was full |
+| `trimmed_frames` | Audio discarded to bring latency back down |
+| `underrun_frames` | Output frames that found no captured audio waiting |
+
+The three counters only grow. [Microphone Input](features/microphone-input.md#monitoring) explains
+what rising values mean.
+
+### /status/cache
+
+```json
+{
+  "memory": {"entries": 3, "size_bytes": 1572864, "size_mb": 1.5},
+  "disk": {"entries": 10, "size_bytes": 5242880, "size_mb": 5.0}
+}
+```
+
+### /status/talkback
+
+```json
+{
+  "now_ms": 51234,
+  "talkback": {
+    "state": "live",
+    "applied_live": true,
+    "lease_id": "lease-0003",
+    "owner_client_id": "panel-1",
+    "source_id": "GM_MIC",
+    "destination": "GUEST_ALL",
+    "gain": 0.0,
+    "lease_expires_at_ms": 52000,
+    "last_transition": "acquired",
+    "last_error": null
+  }
+}
+```
+
+`state` is `live` while a lease is held and `muted` otherwise. `now_ms` and `lease_expires_at_ms` are
+milliseconds since the daemon started, so their difference is the time left. `last_transition` is
+`acquired`, `renewed`, `released`, `expired` or `hard-muted`; `last_error` is the last refused
+request's reason. The lease holder needs `lease_id` to release it.
+
+### /metrics
 
 ```json
 {
@@ -177,250 +298,106 @@ Operational telemetry for monitoring. Every field is real — no placeholders.
   "xruns": 0,
   "active_voices": 1,
   "active_samples": 2,
-  "active_inputs": 0,
-  "output_channels": 2,
+  "active_inputs": 1,
+  "output_channels": 8,
   "cache": {
     "memory_bytes": 1572864,
     "memory_entries": 3,
     "memory_headroom_bytes": 858993459,
     "memory_cap_bytes": 1073741824,
-    "disk_bytes": 0
+    "disk_bytes": 5242880
   },
-  "ducking": { "music": 0.1 },
+  "ducking": {"music": 0.2},
   "latency": {
-    "play_to_first_mix_ns": { "last": 12400000, "max": 18100000 },
+    "play_to_first_mix_ns": {"last": 12400000, "max": 18100000},
     "plays_measured": 42
-  }
+  },
+  "input_capture": {
+    "gm_mic": {"resample_errors": 0, "overflow_dropped_samples": 0, "ratio_rejects": 0, "scratch_regrows": 0}
+  },
+  "pitch_scratch_regrows": 0
 }
 ```
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `uptime_seconds` | float | Seconds since the daemon started |
-| `clips` | integer | Output samples the limiter held at the ceiling since startup |
-| `xruns` | integer | Audio stream-error callbacks (dropouts/underruns) since startup |
-| `active_voices` | integer | Number of active voice groups |
-| `active_samples` | integer | Number of samples currently playing |
-| `active_inputs` | integer | Number of active live inputs |
-| `output_channels` | integer | Output channel count |
-| `cache.memory_bytes` | integer | Resident decoded-audio bytes in the memory cache |
-| `cache.memory_entries` | integer | Number of decoded buffers resident |
-| `cache.memory_headroom_bytes` | integer / null | Bytes the cache can still accept under the budget (`null` if the budget is unlimited) |
-| `cache.memory_cap_bytes` | integer / null | The resolved hard memory-budget cap in bytes (`null` if the budget is unlimited); `memory_headroom_bytes` is the portion still free |
-| `cache.disk_bytes` | integer | Bytes held in the on-disk cache |
-| `ducking` | object | Map of voice id to its resolved ducking multiplier (`< 1.0` = ducked); voices at full volume are omitted |
-| `latency.play_to_first_mix_ns.last` | integer | The most recent play's enqueue-to-first-mix latency in nanoseconds (0 until a play is measured) |
-| `latency.play_to_first_mix_ns.max` | integer | The largest first-mix latency measured since startup |
-| `latency.plays_measured` | integer | How many plays have been measured |
-| `input_capture.<voice>` | object | Per-input capture-path counters: `resample_errors`, `overflow_dropped_samples`, `ratio_rejects`, `scratch_regrows` (Sprint 13, D57/D58) |
-| `pitch_scratch_regrows` | integer | Audio-thread pitch-scratch regrows past the pre-size (0 in normal operation) |
+| Field | Meaning |
+|-------|---------|
+| `clips`, `xruns` | As on `/status` |
+| `cache.memory_cap_bytes` | The memory cache budget (`null` when unlimited) |
+| `cache.memory_headroom_bytes` | Budget still free for new full loads (`null` when unlimited) |
+| `ducking` | Voices currently ducked, with the level they are ducked to |
+| `latency.play_to_first_mix_ns` | Time from a play being queued to its first audio being mixed: the most recent and the largest since startup |
+| `input_capture.<voice_id>` | Capture-path error counters per input; all should stay `0` |
+| `pitch_scratch_regrows` | Should stay `0`; a rising value means the audio device delivers larger blocks than expected |
 
-### `/status/voices` Response
+### /config
 
-Each voice carries its resolved ducking multiplier (`1.0` when not ducked):
+The configuration as the daemon applied it at startup, after command-line and environment
+overrides, with `mqtt.password` and `http.auth_token` replaced by `null`. Changes to the file do not
+show here until a restart.
 
-```json
-{
-  "voices": [
-    { "id": "music", "sample_count": 1, "volume": 1.0, "ducking_multiplier": 0.1 },
-    { "id": "narration", "sample_count": 1, "volume": 1.0, "ducking_multiplier": 1.0 }
-  ]
-}
-```
+## Telemetry
 
-### `/status/samples` Response
+Live playback positions and output meters cost work on the audio thread, so they are off until a
+client asks for them. `POST /telemetry` with `{"enabled": true}` turns them on for everyone, and
+`{"enabled": false}` turns them off again; the answer echoes the new state. The setting is not saved
+across restarts.
 
-Returns active samples with playback position and timing information:
+While telemetry is on:
 
-```json
-{
-  "samples": [
-    {
-      "internal_id": "1",
-      "id": "user-provided-id",
-      "voice": "background",
-      "file": "/sounds/music.mp3",
-      "position": 48000,
-      "position_ms": 1000,
-      "total_frames": 480000,
-      "total_ms": 10000,
-      "sample_rate": 48000,
-      "volume": 0.8,
-      "voice_volume": 1.0,
-      "speed": 1.0,
-      "loop_mode": true,
-      "progress_percent": 10
-    }
-  ]
-}
-```
+- `/status/samples` reports live positions;
+- `/status/meters` returns each output channel's peak level since the previous audio block, as a
+  linear amplitude after the limiter: `{"output": [0.42, 0.40, 0.0, ...]}` (all zeros while
+  telemetry is off);
+- `/ws/state` sends updates.
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `internal_id` | string | System-assigned unique ID |
-| `id` | string/null | User-provided sample ID (if any) |
-| `voice` | string | Voice group this sample belongs to |
-| `file` | string | Source file path |
-| `position` | integer | Current position in frames |
-| `position_ms` | integer | Current position in milliseconds |
-| `total_frames` | integer | Total audio length in frames |
-| `total_ms` | integer | Total audio length in milliseconds (0 while a compressed HTTP stream's length is still unknown) |
-| `sample_rate` | integer | Sample rate in Hz |
-| `volume` | float | Sample volume (0.0-4.0, 1.0 = unity) |
-| `voice_volume` | float | Voice group volume (0.0-4.0, 1.0 = unity) |
-| `speed` | float | Playback speed multiplier |
-| `loop_mode` | boolean | Whether looping is enabled |
-| `progress_percent` | float | Playback progress (0-100) |
+## WebSockets
 
-> **Live position note.** `position`, `position_ms`, and `progress_percent` are currently reported as `0`.
-> Live playback position is advanced by the real-time audio thread and is not mirrored to the control thread
-> that serves this endpoint, so the example values above show the field shapes, not live progress. The other
-> fields (`file`, `voice`, `total_ms`, `volume`, `voice_volume`, `speed`, `loop_mode`) are live.
+### /ws: log stream
 
-### `/status/inputs` Response
-
-Returns the configured live inputs and their current volume/mute state:
-
-```json
-{
-  "inputs": [
-    { "index": 0, "voice_id": "gamemaster_mic", "volume": 0.8, "channels": 1, "muted": false, "unmuted_volume": 0.8, "ready": true, "last_error": null }
-  ]
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `index` | integer | Zero-based input index |
-| `voice_id` | string | Voice group the input feeds |
-| `volume` | float | Current input volume (0.0-1.0) |
-| `channels` | integer | Input channel count |
-| `muted` | boolean | Applied mute state; this is explicit rather than inferred from the current volume |
-| `unmuted_volume` | float | Calibrated level restored when an applied mute is released |
-| `ready` | boolean | Whether the capture stream opened and can accept commands |
-| `last_error` | string / null | Capture/open error when `ready` is false |
-
-### `/status/talkback` Response
-
-The daemon reports the applied lease, not a browser's requested state. A
-lease automatically returns to `muted` when its monotonic expiry is reached or
-the process restarts:
-
-```json
-{
-  "now_ms": 1234,
-  "talkback": {
-    "state": "muted",
-    "applied_live": false,
-    "lease_id": null,
-    "owner_client_id": null,
-    "source_id": null,
-    "destination": null,
-    "gain": 0.0,
-    "lease_expires_at_ms": null,
-    "last_transition": "expired",
-    "last_error": null
-  }
-}
-```
-
-`lease_expires_at_ms` and `now_ms` are monotonic daemon-clock values. A
-gateway may derive a display-only remaining duration from their difference;
-expiry enforcement never uses wall-clock conversion.
-
-### `/status/cache` Response
-
-Returns memory and disk cache totals (the `size_mb` fields are not present in the `/status` cache summary):
-
-```json
-{
-  "memory": { "entries": 3, "size_bytes": 1572864, "size_mb": 1.5 },
-  "disk": { "entries": 10, "size_bytes": 5242880, "size_mb": 5.0 }
-}
-```
-
-## WebSocket Log Streaming
-
-Connect to `/ws` for real-time log streaming. The first frame is
-`{"type":"connected", "message":…, "version":…}`; every subsequent daemon log
-line arrives as `{"type":"log", "message":…}`, where `message` is the formatted
-line (timestamp, level, target, text — the tracing subscriber feeds the socket;
-daemon Sprint 14, D62).
+Streams the daemon's log. The first message is
+`{"type": "connected", "message": "Connected to mqttaudio log stream", "version": "..."}`; after it,
+each log line arrives as `{"type": "log", "message": "<formatted line>"}`. New clients get no earlier
+lines, and a client that falls more than 1000 lines behind skips the lines it missed. Turn it off
+with `http.websocket_enabled: false`.
 
 ```javascript
-const ws = new WebSocket('ws://localhost:8080/ws?token=your-secret-token');
-ws.onmessage = (event) => {
-  const data = JSON.parse(event.data);
-  console.log(data.message); // {type: "connected"|"log", message: ...}
-};
+const ws = new WebSocket("ws://localhost:8080/ws?token=a-long-random-token");
+ws.onmessage = (event) => console.log(JSON.parse(event.data).message);
 ```
 
-When `auth_token` is set, `/ws` requires it like the command endpoints.
-Browsers cannot send an Authorization header on a WebSocket, so pass the
-token as the `token` query parameter; omit it entirely when no auth token
-is configured.
+### /ws/state: live positions and meters
 
-## Example Usage
-
-```bash
-# Play a sound
-curl -X POST http://localhost:8080/play \
-  -H "Content-Type: application/json" \
-  -d '{"file": "/sounds/effect.wav", "volume": 0.8}'
-
-# Play with looping
-curl -X POST http://localhost:8080/play \
-  -H "Content-Type: application/json" \
-  -d '{"file": "/sounds/music.mp3", "loop": true, "voice": "background"}'
-
-# Stop all playback
-curl -X POST http://localhost:8080/stopall
-
-# Fade all playback out over 2 seconds
-curl -X POST http://localhost:8080/fadeall \
-  -H "Content-Type: application/json" \
-  -d '{"time": 2000}'
-
-# Get status
-curl http://localhost:8080/status
-
-# Send raw command (same format as MQTT)
-curl -X POST http://localhost:8080/command \
-  -H "Content-Type: application/json" \
-  -d '{"command": "play", "file": "/sounds/music.mp3", "loop": true}'
-
-# Fade out a voice
-curl -X POST http://localhost:8080/voice/fade_out \
-  -H "Content-Type: application/json" \
-  -d '{"voice": "background", "time_ms": 3000}'
-```
-
-## Running Without MQTT
-
-The HTTP server can run independently without an MQTT broker:
+While telemetry is on, sends about 15 messages per second:
 
 ```json
 {
-  "http": {
-    "enabled": true,
-    "port": 8080
-  }
+  "type": "tick",
+  "samples": [{"internal_id": "7", "position_ms": 1000, "progress_percent": 10.0}],
+  "meters": {"output": [0.42, 0.40, 0.0, 0.0]}
 }
 ```
 
-When HTTP is enabled and MQTT connection fails, mqttaudio continues in HTTP-only mode.
+Nothing is sent while telemetry is off.
 
-## HTTPS/TLS
+## Cross-origin requests
 
-The HTTP server does not support HTTPS directly. For production use with TLS, use a reverse proxy like nginx or Caddy:
+`http.cors_permissive: true` lets web pages from any origin call the API. Browsers do not treat the
+`Authorization` header as covered by that permission, so a cross-origin page should pass the token as
+the `token` query parameter. A page served from the same origin (for example through the
+[web UI's proxy](webui/README.md)) needs neither.
+
+## HTTPS
+
+The server speaks plain HTTP. To reach it over a network, bind it to loopback and put a reverse
+proxy in front of it for TLS, forwarding WebSocket upgrades:
 
 ```nginx
 server {
     listen 443 ssl;
     server_name audio.example.com;
 
-    ssl_certificate /path/to/cert.pem;
-    ssl_certificate_key /path/to/key.pem;
+    ssl_certificate     /etc/ssl/audio.example.com.pem;
+    ssl_certificate_key /etc/ssl/audio.example.com.key;
 
     location / {
         proxy_pass http://127.0.0.1:8080;

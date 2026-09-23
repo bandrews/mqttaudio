@@ -18,8 +18,8 @@ A single page with tabs:
   pitch-correction toggle and reverse, windowed/streamed gating), plus voice and live-input control strips
   (volume / fade / mute — these apply **immediately**).
 - **Console** — a form per command with client-side validation and the OR-logic selector (with an
-  empty-selector warning), a cue launcher, and a raw `/command` editor for the full play surface
-  (`channel_map`/`mode`/`freshness`/…) that the typed `/play` endpoint drops.
+  empty-selector warning), a cue launcher, and a raw `/command` editor for the play options the typed
+  `/play` endpoint does not accept (`mode`, `window_ms`, `prebuffer_ms`, `freshness`, `cacheable`).
 - **Matrix** — a src×dest channel-routing grid with per-route gain, clip-risk badges, and fan-out.
 - **Config** — the running config (read-only, secrets redacted), a live ducking visualization, and editors that
   emit **restart-required** config snippets (the daemon reads config once at startup; only per-input
@@ -38,12 +38,19 @@ proxies `/api` + `/ws` to the daemon, so the browser is same-origin and the auth
 
 ```bash
 docker build -t mqttaudio-webui webui
+# Leave out DAEMON_TOKEN if the daemon has no auth_token.
 docker run -p 8088:8088 \
+  --add-host=host.docker.internal:host-gateway \
   -e DAEMON_HOST=host.docker.internal:8080 \
-  -e DAEMON_TOKEN=your-daemon-token \   # omit if the daemon is open
+  -e DAEMON_TOKEN=your-daemon-token \
   mqttaudio-webui
 # open http://localhost:8088 — on the connect screen leave the URL at /api
 ```
+
+The container reaches the daemon through the host, so the daemon must listen on an address the
+container can reach: on Linux, set `http.bind_address` to `0.0.0.0` (with an `auth_token`), or run the
+container with `--network host` and `DAEMON_HOST=127.0.0.1:8080`. Docker Desktop on macOS and
+Windows provides `host.docker.internal` itself.
 
 ### Local dev (no sidecar)
 
@@ -53,7 +60,8 @@ pnpm install
 VITE_DAEMON_TARGET=http://127.0.0.1:8080 pnpm dev   # Vite proxies /api + /ws to the daemon
 ```
 
-Start a daemon with its HTTP server enabled, e.g. `./mqttaudio --http-port 8080` (HTTP-only is fine).
+Start a daemon with its HTTP server enabled, e.g. `mqttaudio --http-port 8080` (HTTP-only is fine). The
+dev proxy does not add a token: if the daemon has an `auth_token`, enter it on the connect screen.
 
 ## Connecting
 
@@ -76,9 +84,10 @@ pnpm build              # type-check + production build to webui/dist
 
 `test:e2e:crossbrowser` needs the extra engines once: `pnpm exec playwright install webkit firefox`.
 
-CI (`.github/workflows/webui-ci.yml`) runs the Lane A gate (build, typecheck, lint, unit/component, Playwright
-headless incl. a11y) on Chromium. Lane B (real browser + live daemon) runs locally on a machine with an audio
-device. Cross-engine rendering/interaction/a11y parity (WebKit + Gecko) is covered by `test:e2e:crossbrowser`;
+The Lane A web gate is build, typecheck, lint, unit/component tests and headless Playwright with a11y checks on
+Chromium (the steps in `.github/workflows/webui-ci.yml`). GitHub Actions is disabled for this repository, so
+run them locally with the commands above. Lane B (real browser + live daemon) runs locally on a machine with an
+audio device. Cross-engine rendering/interaction/a11y parity (WebKit + Gecko) is covered by `test:e2e:crossbrowser`;
 the residual human pass — a real screen-reader walk-through and an ears-on "audio unaffected" listen — is
 tracked in [`MANUAL-VERIFICATION.md`](MANUAL-VERIFICATION.md).
 

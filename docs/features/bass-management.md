@@ -1,169 +1,115 @@
 # Bass Management
 
-Bass management extracts low frequencies from main channels and routes them to a dedicated subwoofer (LFE) channel. This is essential for professional installations with separate subwoofers.
+Bass management sends the low frequencies of chosen output channels to a subwoofer channel, so small
+main speakers do not have to reproduce deep bass. It works on the finished mix, after every sound and
+live input has been routed.
 
-## How It Works
-
-1. Audio plays through the mixer as normal
-2. A 4th-order Linkwitz-Riley low-pass extracts frequencies below the crossover point
-3. The extracted bass from every source channel is summed, normalized by the source count, and sent to the LFE channel
-4. By default, bass is removed from the source channels (a matching 4th-order Linkwitz-Riley high-pass); set `remove_bass_from_sources: false` to leave the mains full-range
-
-## Configuration
-
-Add bass management to your config file:
+## Turning it on
 
 ```json
-{
-  "bass_management": {
-    "enabled": true,
-    "lfe_channel": 3,
-    "crossover_frequency_hz": 80,
-    "source_channels": [0, 1, 2, 4, 5],
-    "remove_bass_from_sources": false
-  }
+"audio": {
+  "channel_aliases": {"front_left": 0, "front_right": 1, "center": 2, "lfe": 3, "rear_left": 4, "rear_right": 5}
+},
+"bass_management": {
+  "enabled": true,
+  "lfe_channel": "lfe",
+  "source_channels": ["front_left", "front_right", "center", "rear_left", "rear_right"],
+  "crossover_frequency_hz": 80
 }
 ```
 
-| Field | Description |
-|-------|-------------|
-| `enabled` | Enable/disable bass management |
-| `lfe_channel` | Output channel for the subwoofer (0-indexed) |
-| `crossover_frequency_hz` | Frequency cutoff (typically 80-120 Hz) |
-| `source_channels` | Channels to extract bass from |
-| `remove_bass_from_sources` | Remove bass from the source channels after extraction. **Default `true`** (standard bass management); set `false` for the additive "LFE+Main" mode |
-| `lfe_gain` | Linear trim applied to the summed LFE (default `1.0`). The LFE is normalized by the source count first, so this just matches sub level to the room |
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `enabled` | `false` | Turn bass management on |
+| `lfe_channel` | `3` | The subwoofer output (number or alias) |
+| `source_channels` | `[]` | Outputs to take bass from; required. No duplicates, and not the LFE channel |
+| `crossover_frequency_hz` | `80` | Where bass ends, `10`–`200` Hz |
+| `remove_bass_from_sources` | `true` | Also filter the bass out of the source channels |
+| `lfe_gain` | `1.0` | Level of the extracted bass on the subwoofer, `0.0`–`8.0` |
 
-> **Default change:** `remove_bass_from_sources` now defaults to `true`. The bass routed to the sub is
-> removed from the main channels, as in standard bass management. For the older additive behavior —
-> full-range mains *and* the same bass duplicated in the sub — set `remove_bass_from_sources: false`
-> ("LFE+Main", see the Bass Copy example).
+There are no command-line options for bass management.
 
-## CLI Options
+## What it does
 
-Override config from the command line:
+For every audio block:
 
-```bash
-./mqttaudio --lfe-channel 5 --crossover-frequency 100
-```
+1. Each source channel passes through a low-pass filter at the crossover frequency.
+2. The filtered bass of all source channels is added up, divided by the number of source channels,
+   multiplied by `lfe_gain`, and added to the LFE channel.
+3. With `remove_bass_from_sources` on, each source channel is replaced by its high-passed version, so
+   the bass plays only from the subwoofer. Off, the mains stay full-range and the subwoofer adds to
+   them.
+
+The filters are 4th-order Linkwitz-Riley (24 dB per octave), so the low and high halves add back up
+flat across the crossover.
+
+After bass management, `audio.channel_volumes` trims each output, including the LFE channel.
+
+### Level on the subwoofer
+
+Because the sum is divided by the number of source channels, bass that is on every source channel
+(a full-range mix) reaches the subwoofer at its original level, however many channels there are. Bass
+on only some of them arrives quieter: a sound playing on one channel of five reaches the subwoofer at
+a fifth of its level (-14 dB), and with `remove_bass_from_sources` on it is also removed from that
+channel. If your content often plays on a few channels, list only those channels, set
+`remove_bass_from_sources` to `false`, or raise `lfe_gain`.
+
+### Content routed straight to the LFE channel
+
+A sound or input routed directly to the LFE channel reaches the subwoofer full-range: it bypasses
+the crossover, and the extracted bass is added on top. Route there only content made for the
+subwoofer. A configured input route to the LFE channel logs a warning at startup.
+
+### Channels the device does not have
+
+If `lfe_channel` is not on the device, bass management does nothing and a warning is logged at
+startup. Source channels beyond the device's channel count are skipped, also with a warning.
 
 ## Examples
 
-### Standard 5.1 Setup
+**5.1** with the standard layout: the configuration above, which is also the
+[Configuration](../configuration.md#examples) example.
 
-Channel layout:
-- 0: Front Left
-- 1: Front Right
-- 2: Center
-- 3: LFE (Subwoofer)
-- 4: Surround Left
-- 5: Surround Right
+**Stereo with a subwoofer** on output 2, mains kept full-range:
 
 ```json
-{
-  "bass_management": {
-    "enabled": true,
-    "lfe_channel": 3,
-    "crossover_frequency_hz": 80,
-    "source_channels": [0, 1, 2, 4, 5],
-    "remove_bass_from_sources": true
-  }
+"bass_management": {
+  "enabled": true,
+  "lfe_channel": 2,
+  "source_channels": [0, 1],
+  "remove_bass_from_sources": false
 }
 ```
 
-This extracts bass from all main channels, sends it to channel 3, and removes bass from the source channels (standard 5.1 bass management).
-
-### Bass Copy (No Removal)
-
-For systems where speakers can handle full-range and you just want additional bass reinforcement:
+**Small satellites** that need help higher up:
 
 ```json
-{
-  "bass_management": {
-    "enabled": true,
-    "lfe_channel": 7,
-    "crossover_frequency_hz": 100,
-    "source_channels": [0, 1],
-    "remove_bass_from_sources": false
-  }
+"bass_management": {
+  "enabled": true,
+  "lfe_channel": 3,
+  "source_channels": [0, 1, 2, 4, 5],
+  "crossover_frequency_hz": 120,
+  "lfe_gain": 1.4
 }
 ```
 
-Bass is copied to the subwoofer but left in the main speakers.
+## Choosing a crossover
 
-### Stereo with Subwoofer
+| Crossover | Suits |
+|-----------|-------|
+| 60 Hz | Large main speakers |
+| 80 Hz | Most installations (the usual starting point) |
+| 100–120 Hz | Small or satellite speakers |
 
-Simple stereo setup with added subwoofer on channel 2:
-
-```json
-{
-  "bass_management": {
-    "enabled": true,
-    "lfe_channel": 2,
-    "crossover_frequency_hz": 80,
-    "source_channels": [0, 1],
-    "remove_bass_from_sources": false
-  }
-}
-```
-
-## Crossover Frequency
-
-The crossover frequency determines what counts as "bass":
-
-| Frequency | Use Case |
-|-----------|----------|
-| 60 Hz | Large full-range speakers, minimal subwoofer use |
-| 80 Hz | Standard home theater, most installations |
-| 100 Hz | Smaller speakers, more subwoofer contribution |
-| 120 Hz | Small satellite speakers, maximum bass redirection |
-
-## LFE Routing Behavior
-
-A few things to know about how content reaches the LFE channel:
-
-- **Count-normalized level.** The bass extracted from each source channel is summed and then divided by the
-  number of active source channels, so the sub level does not scale with how many channels feed it. Feeding
-  correlated bass from two channels gives the same sub level as one (it is **not** +6 dB louder). Use
-  `lfe_gain` to trim the result.
-- **The LFE index is added to, not replaced.** Extracted bass is *summed onto* whatever is already on the
-  `lfe_channel`. If another voice routes full-range material directly to that output index (e.g. via a Play
-  `channel_map`, or a configured input route), the LFE carries that directly-routed content **plus** the
-  extracted bass — the directly routed content is **not** crossed over (it bypasses the high-pass). This is the
-  additive-LFE behavior; route content to the LFE index deliberately. A configured **input route** whose
-  destination is the LFE channel is flagged with a one-time startup warning so the bypass is not a silent
-  surprise; a Play `channel_map` to the LFE channel is a per-command runtime decision and is not warned.
-- **Out-of-range LFE is a no-op (with a warning).** If `lfe_channel` is greater than or equal to the device's
-  output channel count, bass management cannot redirect anything and does nothing; a one-time warning is
-  logged at startup. The mains are left full-range (no bass is lost, but none is redirected either).
-
-## Technical Details
-
-- 4th-order Linkwitz-Riley crossover (two cascaded Butterworth biquads per filter), so the low- and
-  high-pass outputs are in phase and recombine flat through the crossover (24 dB/oct slopes)
-- Low-pass filter for LFE extraction; matching high-pass for source-channel bass removal (when enabled)
-- The filter state is flushed to zero once it decays below an inaudible threshold, keeping the IIR tail out
-  of the (CPU-expensive) floating-point denormal range on the audio thread
-- Processing happens in real-time with minimal latency
-
-## Tips
-
-1. **Match your speakers** — Set crossover based on your main speakers' low-frequency capabilities
-2. **Start with 80 Hz** — The industry standard works well for most setups
-3. **Test with music** — Use familiar music to verify the blend sounds natural
-4. **Check phase** — If bass sounds thin, try flipping subwoofer polarity at the amp
+The config editor's device picker plays a 50 Hz tone through the real signal path, so you can check
+that bass on a source channel reaches the subwoofer before going live.
 
 ## Troubleshooting
 
-**No bass in subwoofer:**
-- Verify `enabled` is `true`
-- Check `lfe_channel` matches your physical wiring
-- Confirm `source_channels` includes channels with bass content
-
-**Too much bass:**
-- Lower the crossover frequency
-- Reduce subwoofer volume at the amplifier
-
-**Thin sound from main speakers:**
-- Set `remove_bass_from_sources` to `false`
-- Or lower the crossover frequency
+- **No bass from the subwoofer:** check that `enabled` is `true`, that `lfe_channel` is the output
+  wired to the subwoofer, and that the startup log has no warning about the LFE channel being out of
+  range.
+- **Thin mains:** lower the crossover, or set `remove_bass_from_sources` to `false`.
+- **Too much or too little bass:** adjust `lfe_gain`, or the subwoofer's own level. A boost in
+  `audio.channel_volumes` for the LFE channel also raises content routed there directly.
+- **Bass sounds hollow at the crossover:** try reversing the subwoofer's polarity at the amplifier.

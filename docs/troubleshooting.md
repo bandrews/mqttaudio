@@ -1,420 +1,160 @@
 # Troubleshooting
 
-Common issues and solutions for mqttaudio.
+Start with the log: most failures name their cause there.
+
+- The log goes to **standard output**. Under systemd, read it with `journalctl -u mqttaudio`.
+- Configuration errors are printed to **standard error** before the daemon exits.
+- `--verbose` (or `"logging": {"level": "debug"}`) adds detail; `RUST_LOG=mqttaudio::cache=debug`
+  narrows it to one area.
+- Over HTTP, a failed command answers with the reason; MQTT commands only log it.
+
+## The daemon will not start
+
+| Message | Cause and fix |
+|---------|---------------|
+| `Failed to load configuration: Parse error: ...` | The config file is not valid JSON. The message gives the line and column |
+| `Configuration validation failed:` followed by a list | Each line names a setting and its allowed values. Fix them all; see [Configuration](configuration.md) |
+| `Failed to find output device: Output device not found: ...` | `audio.device` or `--device` does not match any device. Copy the **Device ID** from `--list-devices`; on Linux that is the ALSA ID (`plughw:CARD=...,DEV=0`), not the description. A `--device` option overrides the config |
+| `Failed to configure output device '...'` | The device exists but none of its configurations fit. Remove `audio.channels` and `audio.sample_rate` to let the daemon choose, or pick values the device lists |
+| `Audio output unavailable: ...` | The stream could not be opened. On Linux, a `hw:` device may need a format the daemon does not produce: use the `plughw:` ID for the same card |
+| `Failed to initialize cache: ...` | `cache.directory` cannot be created or written. Point it at a writable directory, or set `cache.enabled` to `false` |
+| `No command interface is available ...` | Neither MQTT nor the HTTP server is running. Check `mqtt.topic`, and whether the HTTP port is already in use |
+| `Failed to connect to MQTT broker: MQTT TLS configuration error: ...` | The CA file in `mqtt.tls.ca_path` cannot be read or parsed |
+
+An unreachable broker does not stop startup: the daemon logs `MQTT error: ...` and retries every
+`mqtt.reconnect_delay_seconds`.
+
+## Commands have no effect
+
+1. **Is the daemon receiving them?** At `debug` level each MQTT message is logged as
+   `Received MQTT message on topic ...`. If nothing appears, check that the daemon's topic
+   (`Ready to receive MQTT commands on topic: ...` at startup) matches the one you publish to, that
+   it logged `MQTT connected`, and that both use the same broker.
+2. **Did the command parse?** `Failed to parse command: ...` means the JSON is malformed, the
+   command name is unknown (names are case-sensitive), or a parameter has the wrong type.
+   `internal_id` and `input` must be JSON strings, such as `"3"`.
+3. **Did it find its target?** `No sample matches the selector ...` means nothing playing matched.
+   A `stop` sent while its sound is still loading arrives first and finds nothing; `stopall` and
+   `fadeall` do cancel pending loads.
+4. **Was part of it ignored?** Parameters with misspelled names are ignored without a message.
+   A windowed (streamed) sound ignores `seek`, `speed` and some `play` options, with a warning;
+   see [Commands: Full and windowed plays](commands.md#full-and-windowed-plays).
+5. **Is the daemon overloaded?** `Command queue full; dropped MQTT command` means commands arrive
+   faster than they are processed. `Too many concurrent loads; command rejected` means 32 plays
+   or cache commands were already loading.
+
+## A sound does not play
+
+Look for `Load failed: ...` or `Failed to load ...` in the log:
+
+| Message contains | Cause |
+|------------------|-------|
+| `is outside security.allowed_directories` | The file is not under a directory in `security.allowed_directories` |
+| `Cannot resolve path` | The file does not exist (with an allowlist configured) |
+| `I/O error` | The file cannot be read: missing, or no permission for the daemon's user |
+| `Unsupported audio format`, `Unsupported format`, `No default audio track found`, `No audio track found` | The file is not in a format mqttaudio decodes: WAV, AIFF, CAF, FLAC, MP3, MP1/MP2, Ogg Vorbis, AAC and ALAC (in MP4/M4A), or Matroska/WebM with one of those codecs. Opus is not supported |
+| `Decode error` | The file is damaged or unusual. `ffprobe <file>` shows what it contains |
+| `HTTP 404 Not Found from ...` (or another status), `HTTP request error` | The URL failed. Try it with `curl -I <url>` from the same machine |
+| `Download stalled: no data for 60 seconds` | The server stopped sending partway through |
+| `No audio decoded before the prebuffer deadline` | The first audio took longer than `cache.stream_prebuffer_deadline_ms` to arrive |
+
+If the log says the sound is playing but you hear nothing:
+
+- **Volume.** The sound's `volume`, its voice's `voice_volume`, and any active ducking rule
+  multiply. `GET /status/samples` and `/status/voices` show all three.
+- **Channels.** A mono file plays on output 0 only unless it has a `channel_map`. Routes to an output
+  the device does not have are dropped without a message. `GET /status` shows the output channel
+  count.
+- **The system mixer.** Check that the device is not muted or turned down outside mqttaudio
+  (`alsamixer` on Linux).
+
+## Clicks, dropouts and stutter
+
+- **Check `xruns`** on `GET /status`, and `Audio stream error: ...` lines in the log. They mean the
+  output device ran out of audio. Raise `audio.buffer_size` (try `1024`), close other programs using
+  the device, and make sure you run a release build (`cargo build --release`); debug builds are much
+  slower.
+- **Pitch correction** costs noticeably more CPU than plain speed changes. Many simultaneous
+  pitch-corrected sounds can overload a small machine.
+- **Sounds that stutter at the start** of a windowed play point to slow storage or network: raise
+  `cache.stream_prebuffer_ms` (and the deadline with it), or `precache` the file.
+- **The device disappearing** (a USB interface unplugged) logs
+  `Audio stream error after a stable run; rebuilding output...`. The daemon retries with backoff
+  and, if the device does not come back, exits with
+  `Output device could not be (re)built after several attempts` so a service manager can restart it.
+
+## Distortion
+
+`clip_count` on `GET /status` counts samples that reached the output limiter's ceiling. If it keeps
+rising, the mix is too hot: lower sound or voice volumes, `audio.master_gain`, or boosts in
+`audio.channel_volumes`. Several sources routed to one output add together; lower their route
+`gain`s.
+
+## A changed file still plays the old version
+
+- **Local files** already in memory are re-read when their size or modification time changes,
+  unless `cache.freshness` (or the play's `freshness`) is `pinned`.
+- **Downloaded files** are re-checked with the server once they are older than
+  `cache.revalidate_after_seconds` (300 by default), so a change can take a few minutes to show.
+- To pick up a change at once, send `cache_reload` with the file or URL.
+
+See [Caching](features/caching.md#freshness) for the details. `cache_clear` empties both caches; the
+disk cache lives in `cache.directory` and can also be deleted by hand while the daemon is stopped.
+
+## Live inputs
 
-## No Audio Output
+**`Failed to open input device '...': Input device not found: ...`**: the message lists the devices
+that could be opened for capture at that moment and, on Linux, what ALSA reported for the name you
+gave:
 
-### Check Audio Device
+- **Device or resource busy.** Another program holds the capture side: PipeWire or PulseAudio,
+  another recorder, or a second copy of the daemon. `fuser -v /dev/snd/*` shows who.
+- **Permission denied.** The daemon's user cannot open the device. For a systemd service, add the
+  service user to the `audio` group (`sudo usermod -aG audio mqttaudio`) and restart it.
+- **No such device.** The name does not exist; compare it with `arecord -L`.
 
-List available devices:
-```bash
-./mqttaudio --list-devices
-```
+A device listed by an interactive `--list-inputs` can still be missing at service start, because
+only devices that can be opened at that moment are listed. Run the listing as the service user
+(`sudo -u mqttaudio mqttaudio --list-inputs`) to see what the service sees.
 
-Copy the exact **Device ID** from the listing into `--device` or `audio.device`.
-The output includes both CLI options and JSON config lines.
+The daemon keeps running without an input that failed; `GET /ready` answers `503` and names it.
 
-On Linux, locate your card by its **Description**, then use its `plughw:` ID.
-For example, a card described as `GIGAPort HD+, USB Audio` may need:
-```bash
-./mqttaudio --device 'plughw:CARD=HD,DEV=0' --topic audio/commands
-```
+**`Input device '...' sample rate (44100 Hz) differs from output (48000 Hz) - resampling will add latency`**:
+capture opened at a different rate from the output, because the device does not offer the output's
+rate or is held at another one. It works, with a little more delay. On an interface that uses one
+clock for both directions, capture can only run at the rate the card is already running at; if
+something else (a `dmix` or `dsnoop` device, a sound server, another program) holds the card at
+another rate, free it and capture follows the output rate.
 
-The corresponding JSON setting inside `"audio"` is
-`"device": "plughw:CARD=HD,DEV=0"`. Replace the ID with the one from your listing.
-On macOS/Windows, copy the displayed Device ID, which is usually a friendly name.
+**`Input device '...' latency_ms 5 is below the 11 ms its ring needs to hold one resampler burst; using 11 ms`**:
+the configured latency was too small to work and was raised. Set `latency_ms` to the value shown to
+silence the warning.
 
-- **Output device not found:** check that you copied the Device ID, including its
-  prefix, rather than the description. Check for a `--device` flag overriding your config.
-- **Format error / Invalid argument when opening `hw:`:** try the matching `plughw:`
-  entry, and choose a channel count and sample rate supported by the hardware.
-  This is a stream configuration failure, not a missing device.
-- **Permission denied / device busy:** check access to the audio device for the
-  account running mqttaudio and whether another process is using the device.
+**Choppy microphone audio.** Watch `/status/inputs`: rising `dropped_frames` means capture fills the
+buffer faster than the output drains it, rising `underrun_frames` means the output finds it empty,
+and rising `trimmed_frames` means latency is being cut back. Both dropped and underrun frames rising
+together, alongside ALSA `underrun occurred` messages, usually means the output side is stalling
+(often through a `dmix` chain) rather than the microphone. A log line
+`Input '...' capture counters moved: ...` reports errors in the capture path itself.
 
-See [Finding Your Audio Device](getting-started.md#finding-your-audio-device)
-for a complete example and an explanation of the ALSA prefixes.
+## Ducking does nothing
 
-### Check Volume
+- Voice names are case-sensitive: `"narration"` and `"Narration"` are different voices.
+- A rule applies while its `primary_voice` has a sound playing. Check `GET /status/voices`: the
+  primary must be listed, and ducked voices show a `ducking_multiplier` below `1.0`.
+- A live input as `primary_voice` needs an `activity_threshold` to duck only while someone speaks.
+  Without one it counts as active whenever it is open, so the ducked voices stay down.
 
-Make sure volume is set in your play command:
-```json
-{
-  "command": "play",
-  "file": "/sounds/test.wav",
-  "volume": 1.0
-}
-```
+See [Ducking](features/ducking.md).
 
-Also check system volume and that the device isn't muted at the OS level.
+## Reporting a problem
 
-### Check Sample Rate
+Include:
 
-Some devices only support specific sample rates:
-```bash
-./mqttaudio --sample-rate 44100 --topic audio/commands
-```
+1. `mqttaudio --version` and the operating system
+2. The output of `--list-devices` (and `--list-inputs` for input problems)
+3. The config file, with passwords and tokens removed
+4. The log with `--verbose`, from startup until the problem
+5. The commands you sent, and what you expected to happen
 
-### Check Logs
-
-Run with verbose logging:
-```bash
-./mqttaudio --verbose --topic audio/commands
-```
-
-Look for errors about devices, files, or playback.
-
----
-
-## MQTT Connection Issues
-
-### Verify Broker is Running
-
-Test with mosquitto tools:
-```bash
-# Terminal 1: Subscribe
-mosquitto_sub -t test -v
-
-# Terminal 2: Publish
-mosquitto_pub -t test -m "hello"
-```
-
-### Check Server and Port
-
-```bash
-./mqttaudio --server mqtt.example.com --port 1883 --topic audio/commands
-```
-
-### Check Topic
-
-Make sure you're publishing to the same topic mqttaudio is subscribed to:
-```bash
-# mqttaudio subscribes to:
-./mqttaudio --topic "audio/commands"
-
-# You must publish to:
-mosquitto_pub -t "audio/commands" -m '...'
-```
-
-### Network Issues
-
-Try connecting to localhost first to rule out network problems:
-```bash
-./mqttaudio --server localhost --topic audio/commands
-```
-
----
-
-## Files Not Playing
-
-### Local Files: Check Permissions
-
-If `security.allowed_directories` is configured, the file must live inside
-one of the listed directories - a rejected play logs "Play rejected" with
-the offending path:
-
-```json
-{
-  "security": {
-    "allowed_directories": ["/opt/sounds", "/home/user/audio"]
-  }
-}
-```
-
-With no `security` section (or an empty list), any file the daemon can read
-is playable.
-
-### HTTP Files: Check Network
-
-Test the URL directly:
-```bash
-curl -I https://example.com/sound.wav
-```
-
-### Check File Format
-
-Supported formats: WAV, MP3, OGG, FLAC
-
-Verify the file is valid:
-```bash
-ffprobe /path/to/file.wav
-```
-
-### Check Logs for Decode Errors
-
-```bash
-./mqttaudio --verbose --topic audio/commands
-```
-
-Look for messages like:
-- "Failed to decode..."
-- "Unsupported format..."
-- "Error opening file..."
-
----
-
-## Audio Glitches and Dropouts
-
-### Increase Buffer Size
-
-Larger buffers reduce glitches at the cost of latency:
-
-```json
-{
-  "audio": {
-    "buffer_size": 1024
-  }
-}
-```
-
-Common values: 256 (low latency), 512 (default), 1024 (stable), 2048 (very stable)
-
-### Reduce Simultaneous Samples
-
-If you're playing many sounds at once, reduce the count. mqttaudio handles 20+ samples, but your system may have limits.
-
-### Check CPU Usage
-
-Monitor CPU during playback. High CPU usage causes glitches.
-
-```bash
-top -p $(pgrep mqttaudio)
-```
-
-### Check for Other Audio Applications
-
-Other applications using the audio device can cause conflicts. Close other audio software if possible.
-
----
-
-## Cache Issues
-
-### Cache Directory Permissions
-
-Check write access:
-```bash
-ls -la ~/.mqttaudio/cache/
-```
-
-Create if needed:
-```bash
-mkdir -p ~/.mqttaudio/cache
-```
-
-### Clear Corrupted Cache
-
-```bash
-rm -rf ~/.mqttaudio/cache/*
-```
-
-Or via MQTT:
-```json
-{"command": "cache_clear"}
-```
-
-### File Not Updating
-
-If a file on your server changed but mqttaudio plays the old version:
-
-```json
-{
-  "command": "cache_invalidate",
-  "file": "https://example.com/updated.wav"
-}
-```
-
----
-
-## Microphone/Input Issues
-
-### Find Your Device
-
-```bash
-./mqttaudio --list-inputs
-```
-
-### Check Device Name
-
-Device names must match exactly (case-sensitive):
-```json
-{
-  "inputs": [
-    {
-      "device": "USB Microphone",  // Must match exactly
-      ...
-    }
-  ]
-}
-```
-
-The index number printed by `--list-inputs` also works: `"device": "0"`.
-
-### Device Listed But "Input device not found"
-
-Input enumeration only shows devices that can be opened for capture at that
-moment, so a device visible in an interactive `--list-inputs` can still be
-missing when the daemon starts (typically under systemd). The error message
-lists the devices that were available and, on Linux, why a direct ALSA capture
-open of the requested name fails:
-
-- **Device or resource busy** - another process holds the capture side: a
-  sound server (PipeWire, PulseAudio), another capture application, or a
-  second copy of the daemon. `fuser -v /dev/snd/*` shows the holder
-- **Permission denied** - the daemon's user cannot open the device. For a
-  systemd service, add the service user to the `audio` group:
-  `sudo usermod -aG audio USER`, then restart the service
-- **No such device** - the name does not exist; compare against `arecord -L`
-
-To see exactly what the daemon sees, run the listing as the service user:
-```bash
-sudo -u SERVICE_USER ./mqttaudio --list-inputs
-```
-
-### Check Routing
-
-Verify routes point to valid output channels:
-```json
-"routes": [
-  {"source_channel": 0, "dest_channel": 0}
-]
-```
-
-### Sample Rate Mismatch
-
-If input and output sample rates differ, you'll see a warning:
-```
-WARN Input device sample rate differs from output - resampling will add latency
-```
-
-This works but adds latency. For best results, use matching sample rates.
-
-On a shared-clock interface (one USB card doing both directions), capture
-cannot be forced to a rate the card is not running at. If capture keeps
-opening at the wrong rate despite `sample_rate`, something else is holding
-the card at that rate - a `dmix`/`dsnoop` device from asound.conf, a sound
-server, or another application. Free the card and capture will follow the
-output rate. Choppiness with both overruns *and* starvation in the input
-health log, alongside ALSA `underrun occurred` messages, points at the
-output side stalling (typically a dmix chain) rather than at the mic.
-
----
-
-## Ducking Not Working
-
-### Check Voice Names
-
-Voice names are case-sensitive. These are different:
-- `"voice": "Narration"`
-- `"voice": "narration"`
-
-### Verify Rules
-
-Check your config has the right voice names:
-```json
-{
-  "ducking_rules": [
-    {
-      "primary_voice": "narration",
-      "ducked_voices": ["music"],
-      ...
-    }
-  ]
-}
-```
-
-Then play audio with matching voice names:
-```json
-{
-  "command": "play",
-  "file": "/sounds/speech.wav",
-  "voice": "narration"
-}
-```
-
-### Check That Primary Voice is Playing
-
-Ducking only triggers when the primary voice has active samples. The voice must be playing something.
-
----
-
-## Channel Routing Issues
-
-### Check Output Channel Count
-
-```bash
-./mqttaudio --list-devices
-```
-
-If your device has 2 channels, you can't route to channel 4.
-
-### Verify Channel Map Format
-
-```json
-"channel_map": [
-  {"src": 0, "dest": 2},
-  {"src": 1, "dest": 3}
-]
-```
-
-Both `src` and `dest` are 0-indexed integers.
-
-### Check Source Channel Exists
-
-A stereo file has channels 0 and 1. You can't route `src: 3` from a stereo file.
-
----
-
-## Performance Issues
-
-### Check Callback Timing
-
-With `--verbose`, look for timing warnings:
-```
-WARN Audio callback exceeded budget: 12ms (limit: 10.67ms)
-```
-
-### Reduce Load
-
-1. Reduce simultaneous samples
-2. Increase buffer size
-3. Disable pitch correction (uses more CPU)
-4. Use simpler channel routing
-
-### Profile
-
-Build with release optimizations:
-```bash
-cargo build --release
-./target/release/mqttaudio --topic audio/commands
-```
-
-Debug builds are significantly slower.
-
----
-
-## Getting Help
-
-### Gather Information
-
-When reporting issues, include:
-
-1. **mqttaudio version:** `./mqttaudio --version`
-2. **Operating system and version**
-3. **Audio device:** Output of `--list-devices`
-4. **Configuration:** Your config file (remove sensitive data)
-5. **Logs:** Output with `--verbose`
-6. **Commands:** The MQTT commands you're sending
-7. **Expected vs actual behavior**
-
-### Log Locations
-
-mqttaudio logs to stderr by default. Capture logs:
-```bash
-./mqttaudio --verbose --topic audio/commands 2> mqttaudio.log
-```
-
-### Report Issues
-
-File issues at: https://github.com/bandrews/mqttaudio/issues
-
-Include the information above for faster resolution.
+Report issues at <https://github.com/bandrews/mqttaudio/issues>.

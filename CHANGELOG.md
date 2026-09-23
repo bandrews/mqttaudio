@@ -108,6 +108,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`tests/scripts/demo_ducking.sh` stops only mqttaudio itself.** Its cleanup killed every process whose
   command line mentioned `mqttaudio`, such as an editor open on the repository.
 
+### Documentation
+
+- The guides were rewritten against the code: commands, configuration, the HTTP API, troubleshooting and
+  every feature guide now describe the daemon's actual behavior, limits and log messages. A new
+  [Deployment](docs/deployment.md) guide covers systemd, containers, locking the daemon down, logging and
+  monitoring, [Known Issues](docs/bugs.md) lists only open problems, and the architecture guide matches the
+  current engine.
+
 ### Security
 
 - **`POST /telemetry` requires the auth token when one is set.** Turning telemetry on changes daemon
@@ -171,9 +179,9 @@ talkback, and HTTP integration work. See [release validation](docs/releases/v2.1
   extractor cannot parse now returns `400 {"success":false,"error":"Invalid JSON: …"}` instead of axum's
   plaintext rejection, so every `/command` error parses the same way. Clients that special-cased the
   plaintext body must read the JSON shape.
-- **Removed the dead `audio.channel_names` config field (Sprint 14, D60).** It was deserialized and never
-  read (channel routing uses `channel_aliases`). Old configs carrying the key still parse — unknown keys are
-  tolerated.
+- **`audio.channel_names` holds display labels.** The v2.1 line removed this unread field (Sprint 14, D60);
+  this release keeps it as a channel-number-to-label map that `audio.channel_volumes` keys may use, while
+  routing resolves only `channel_aliases` (see the routing error entry below).
 - **Resampler interpolation stays `Linear` — R1 closed by measurement (Sprint 14, D59 overridden on
   evidence).** At the daemon's quality presets, Linear and Cubic sinc-table interpolation measure identical
   to ~0.015% of an already ≈-60 dB residual, so the planned switch was dropped rather than changing every
@@ -340,9 +348,9 @@ talkback, and HTTP integration work. See [release validation](docs/releases/v2.1
   parsed and validated but never affected output; they are now applied as the final per-channel gain stage
   (resolved once at startup, supporting numeric or alias channel keys). Anyone who set `channel_volumes`
   expecting attenuation will now hear it.
-- **Play `volume` is clamped to `[0, 1]`.** A Play command with `volume > 1.0` (or negative) is now clamped
-  at construction, matching the runtime `volume` command. Previously a Play could amplify above unity (e.g.
-  `volume: 5.0` gave a 5× contribution into the mix); such configs will now play at unity instead.
+- **Play `volume` is clamped to the gain range.** A Play command with a negative `volume`, or one above 4.0
+  (see *Gains above unity*), is now clamped at construction, matching the runtime `volume` command.
+  Previously a Play could amplify without bound (e.g. `volume: 5.0` gave a 5× contribution into the mix).
 - **Reverse playback no longer adds comb/low-pass distortion.** At any fractional reverse speed (e.g.
   `-0.5`, `-0.75`, `-1.5`) the sub-sample interpolation was blending the wrong neighbor (frame `n-1`
   instead of frame `n+1`), distorting all reverse playback. Interpolation now uses the same direction-
@@ -384,10 +392,9 @@ talkback, and HTTP integration work. See [release validation](docs/releases/v2.1
   ducked voice faded ~2× too fast and saw inconsistent gain within a buffer), and the gain is interpolated per
   frame across the buffer instead of stepping once per buffer (removing zipper/stair noise on the fade).
 - **Live-input voices can now trigger ducking.** A microphone/line input whose configured `voice_id` is a
-  ducking rule's `primary_voice` now ducks the rule's background voices while its input stream is open
-  (previously input voices were inert as ducking primaries and ducked nothing). Signal-gated activation
-  (ducking only while the input is actually loud) is a later change; for now the input counts as active for
-  the lifetime of its stream.
+  ducking rule's `primary_voice` now ducks the rule's background voices while it is active (previously input
+  voices were inert as ducking primaries and ducked nothing): with an `activity_threshold` while its level is
+  above it (see *Microphone-triggered ducking*), otherwise for the lifetime of its stream.
 - **`input_mute` now restores the prior volume on unmute instead of forcing `1.0`.** Unmuting an input
   returns it to the level it had when muted (e.g. a calibrated `0.7`), rather than jumping to full scale.
   Anyone relying on unmute bumping a calibrated input up to unity will see a difference. (Setting an explicit
@@ -407,14 +414,15 @@ talkback, and HTTP integration work. See [release validation](docs/releases/v2.1
   steered from the measured ring-buffer fill toward half-full, so the ring stays bounded indefinitely. The
   equal-rate raw passthrough path is gone. This is inaudible in steady state (the steering authority is a
   fraction of a percent); if any pitch wobble is ever observed on an input, the steering gain is too high.
-- **Out-of-range input routes now log a warning (previously silent).** Once an input device opens and its
-  channel count is known, any route whose source channel is `>=` that count is logged as a warning (the mixer
-  silently drops such routes). No audio change — only a new diagnostic so the misconfiguration is visible.
-- **`/status/samples` no longer reports live per-sample playback position.** HTTP status is now served
-  from a control-side snapshot (the audio thread owns playback state lock-free, so the control plane never
-  reads it). The endpoint still reports each sample's static metadata — `id`, `voice`, `file`,
-  `total_frames`, `total_ms`, `sample_rate`, `volume`, `voice_volume`, `speed`, `loop_mode` — but
-  `position`, `position_ms`, and `progress_percent` are now always `0`. (Lock-free RT engine, Sprint 5.)
+- **Out-of-range input routes are reported (previously silent).** An input whose routes read a source
+  channel the device does not have now fails to open with an error naming the channel count it needs,
+  instead of silently dropping those routes.
+- **`/status/samples` reports live per-sample playback position only with telemetry on.** HTTP status is
+  now served from a control-side snapshot (the audio thread owns playback state lock-free, so the control
+  plane never reads it). The endpoint still reports each sample's static metadata — `id`, `voice`, `file`,
+  `total_frames`, `total_ms`, `sample_rate`, `volume`, `voice_volume`, `speed`, `loop_mode` — while
+  `position`, `position_ms`, and `progress_percent` are `0` unless the opt-in live-position telemetry (see
+  *Added*) is enabled. (Lock-free RT engine, Sprint 5.)
 - **Looping a still-downloading stream no longer buzzes.** A `loop: true` play of an HTTP/streaming
   source now plays forward (emitting silence past the loaded edge) and only begins looping once the
   stream is fully downloaded, instead of replaying a tiny growing prefix in a tight buzz. A looped
@@ -650,9 +658,9 @@ open/anonymous deployment behaves exactly as before unless you configure them.
   `stopall` and other control commands are never queued behind a slow
   download - and a stop cancels loads still in flight.
 - **HTTP cache revalidation**: cached URLs are checked against the server
-  with conditional requests after `cache.revalidate_after_seconds` (0 = every
-  access); changed files re-download automatically, unreachable servers fall
-  back to the cached copy. Streamed plays and runtime precache now persist
+  with conditional requests once they are older than
+  `cache.revalidate_after_seconds`; changed files re-download automatically,
+  unreachable servers fall back to the cached copy. Streamed plays and runtime precache now persist
   to the disk cache too.
 - **WebSocket log streaming**: `/ws` now actually streams the daemon's log
   lines, and honors `auth_token` (via the `token` query parameter).
@@ -681,10 +689,11 @@ open/anonymous deployment behaves exactly as before unless you configure them.
   stream is opened. By default the stream opens with the smallest channel count
   the routes need, at the output sample rate so no resampling is required.
 - Input health counters (backlog, overruns, trims, starvation) reported through
-  `GET /status/inputs` and logged every 10 seconds when non-zero.
-- A clear startup error when a device offers no f32 capture format, naming the
-  `plughw:` alias as the fix, and when routing references a channel the device
-  cannot reach.
+  `GET /status/inputs`; errors in the capture path are logged when their
+  counters change.
+- A clear error when an input opens on a device that offers no supported
+  capture format, naming the `plughw:` alias as the fix, or that cannot reach a
+  routed channel.
 
 ### Removed
 

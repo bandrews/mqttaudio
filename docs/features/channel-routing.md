@@ -1,189 +1,133 @@
 # Channel Routing
 
-mqttaudio supports flexible multichannel audio routing, allowing you to play audio to any combination of output channels.
+mqttaudio treats the output device as a row of numbered channels and lets each play put each of its
+file's channels on any of them.
 
-## Concepts
+## Channels
 
-### Channels
+Outputs are numbered from 0. What each number feeds depends on your interface and wiring; a common
+layout is:
 
-Audio channels are numbered starting from 0:
-
-| Channel | Typical 5.1 | Typical 7.1 |
-|---------|-------------|-------------|
-| 0 | Front Left | Front Left |
-| 1 | Front Right | Front Right |
+| Channel | 5.1 | 7.1 |
+|---------|-----|-----|
+| 0 | Front left | Front left |
+| 1 | Front right | Front right |
 | 2 | Center | Center |
-| 3 | LFE (Sub) | LFE (Sub) |
-| 4 | Rear Left | Side Left |
-| 5 | Rear Right | Side Right |
-| 6 | — | Rear Left |
-| 7 | — | Rear Right |
+| 3 | LFE (subwoofer) | LFE (subwoofer) |
+| 4 | Rear left | Side left |
+| 5 | Rear right | Side right |
+| 6 | | Rear left |
+| 7 | | Rear right |
 
-Your actual channel layout depends on your audio interface and system configuration.
+`--list-devices` shows each device's channel count (`Native: 8 ch, ...`), and `GET /status` shows
+the count the daemon opened (`output_channels`).
 
-### Default Routing
+## Default routing
 
-Without explicit channel mapping:
-- **Mono files** play on channel 0
-- **Stereo files** play on channels 0 and 1
-- **Multichannel files** play on sequential channels (0, 1, 2, 3...)
+Without a `channel_map`, file channel 0 plays on output 0, channel 1 on output 1, and so on. A mono
+file therefore plays on output 0 only, and a stereo file on outputs 0 and 1.
 
-## Channel Mapping
+## Channel maps
 
-Use `channel_map` in the play command to route audio to specific outputs:
-
-```json
-{
-  "command": "play",
-  "file": "/sounds/stereo.wav",
-  "channel_map": [
-    {"src": 0, "dest": 4},
-    {"src": 1, "dest": 5}
-  ]
-}
-```
-
-This plays a stereo file on channels 4 and 5 instead of 0 and 1.
-
-### One-to-Many Routing
-
-Route a single source channel to multiple outputs (useful for PA announcements):
+A play's `channel_map` lists routes, each from a file channel (`src`) to an output (`dest`):
 
 ```json
 {
   "command": "play",
-  "file": "/sounds/announcement.wav",
-  "channel_map": [
-    {"src": 0, "dest": 0},
-    {"src": 0, "dest": 1},
-    {"src": 0, "dest": 2},
-    {"src": 0, "dest": 3},
-    {"src": 0, "dest": 4},
-    {"src": 0, "dest": 5}
-  ]
+  "file": "/opt/sounds/stereo.wav",
+  "channel_map": [{"src": 0, "dest": 4}, {"src": 1, "dest": 5}]
 }
 ```
 
-### Partial Routing
+- **One to many.** Repeat a `src` to send it to several outputs, for example a mono announcement to
+  every speaker.
+- **Some channels only.** File channels without a route are not heard: `[{"src": 0, "dest": 0}]`
+  plays only the left channel of a stereo file.
+- **Many to one.** Routes to the same output add together, which can clip; lower their gains.
+- **Missing outputs.** A route to an output the device does not have is silently dropped.
 
-You don't need to map all source channels. To play only the left channel of a stereo file:
+### Per-route gain
+
+Each route may carry a `gain` (default `1.0`, range `0.0`–`8.0`) that scales only that route:
 
 ```json
-{
-  "command": "play",
-  "file": "/sounds/stereo.wav",
-  "channel_map": [
-    {"src": 0, "dest": 0}
-  ]
-}
+"channel_map": [
+  {"src": 0, "dest": 0, "gain": 0.5},
+  {"src": 2, "dest": 0, "gain": 0.5},
+  {"src": 1, "dest": 1, "gain": 0.5},
+  {"src": 3, "dest": 1, "gain": 0.5}
+]
 ```
 
-### Per-Route Gain
+This folds a four-channel file down to stereo without the sums clipping.
 
-Each route accepts an optional `gain` (default `1.0`, unity). It scales only that route, so one source
-channel can reach several outputs at different levels instead of being sent at full level to each:
+## Naming channels
+
+`audio.channel_aliases` gives outputs names, which then work anywhere a channel number does: in
+`channel_map`s, input routes, bass management and `channel_volumes`.
 
 ```json
-{
-  "command": "play",
-  "file": "/sounds/mono.wav",
-  "channel_map": [
-    {"src": 0, "dest": 0},
-    {"src": 0, "dest": 1, "gain": 0.4}
-  ]
+"audio": {
+  "channel_aliases": {"front_left": 0, "front_right": 1, "lfe": 3, "booth_left": 6, "booth_right": 7}
 }
 ```
 
-This plays the mono source at full level on channel 0 with a quieter copy on channel 1. Values above
-`1.0` boost; gains are clamped to `0.0`–`8.0`. A route without `gain` is unity, so existing maps are
-unchanged. The same gain tames a downmix that sums several source channels into one destination so the
-sum does not clip (see [commands](../commands.md)).
+```json
+{"command": "play", "file": "/opt/sounds/hint.wav", "channel_map": [{"src": 0, "dest": "booth_left"}, {"src": 1, "dest": "booth_right"}]}
+```
 
-To level-match a speaker for every play rather than per command, set a per-output-channel gain in
-`audio.channel_volumes` instead (see [configuration](../configuration.md)).
+An unknown name fails the play with HTTP `400`. (`audio.channel_names` holds display labels and is
+not used for routing; the error message says so if you mix them up.)
+
+## Reusing maps
+
+Put maps you use often in [macros](../configuration.md#macros):
+
+```json
+"macros": {
+  "everywhere": {"channel_map": [{"src": 0, "dest": 0}, {"src": 0, "dest": 1}, {"src": 0, "dest": 4}, {"src": 0, "dest": 5}]},
+  "booth": {"channel_map": [{"src": 0, "dest": "booth_left"}, {"src": 1, "dest": "booth_right"}]}
+}
+```
+
+```json
+{"command": "play", "file": "/opt/sounds/announcement.wav", "macro": "everywhere"}
+```
+
+## Levelling speakers
+
+To trim a speaker for every play, set `audio.channel_volumes` rather than route gains; it applies to
+the finished mix of each output. See [Configuration](../configuration.md#audio).
+
+## The subwoofer channel
+
+With [bass management](bass-management.md) on, a route straight to the LFE channel reaches the
+subwoofer unfiltered, and the extracted bass is added on top. Route to it only for content made for
+the subwoofer.
 
 ## Examples
 
-### Surround Sound Installation
-
-Route a 4-channel ambient file to specific speakers:
+Four-channel ambience on the front and rear pairs of a 5.1 system:
 
 ```bash
-mosquitto_pub -t audio/commands -m '{
-  "command": "play",
-  "file": "/sounds/forest-quad.wav",
-  "channel_map": [
-    {"src": 0, "dest": 0},
-    {"src": 1, "dest": 1},
-    {"src": 2, "dest": 4},
-    {"src": 3, "dest": 5}
-  ],
-  "loop": true
-}'
+mosquitto_pub -t audio/commands -m '{"command": "play", "file": "/opt/sounds/forest-quad.wav", "loop": true,
+  "channel_map": [{"src": 0, "dest": 0}, {"src": 1, "dest": 1}, {"src": 2, "dest": 4}, {"src": 3, "dest": 5}]}'
 ```
 
-### Multi-Zone Audio
-
-Play the same mono file to multiple zones:
+The same mono announcement in three stereo zones:
 
 ```bash
-# Zone 1: channels 0-1
-# Zone 2: channels 2-3
-# Zone 3: channels 4-5
-
-mosquitto_pub -t audio/commands -m '{
-  "command": "play",
-  "file": "/sounds/announcement.wav",
-  "channel_map": [
-    {"src": 0, "dest": 0},
-    {"src": 0, "dest": 1},
-    {"src": 0, "dest": 2},
-    {"src": 0, "dest": 3},
-    {"src": 0, "dest": 4},
-    {"src": 0, "dest": 5}
-  ]
-}'
+mosquitto_pub -t audio/commands -m '{"command": "play", "file": "/opt/sounds/closing.wav",
+  "channel_map": [{"src": 0, "dest": 0}, {"src": 0, "dest": 1}, {"src": 0, "dest": 2},
+                  {"src": 0, "dest": 3}, {"src": 0, "dest": 4}, {"src": 0, "dest": 5}]}'
 ```
 
-### Headphone Zone
-
-Route stereo music to a headphone output on channels 6-7:
+Music on a headphone output wired to channels 6 and 7:
 
 ```bash
-mosquitto_pub -t audio/commands -m '{
-  "command": "play",
-  "file": "/sounds/music.mp3",
-  "channel_map": [
-    {"src": 0, "dest": 6},
-    {"src": 1, "dest": 7}
-  ],
-  "voice": "headphones",
-  "loop": true
-}'
+mosquitto_pub -t audio/commands -m '{"command": "play", "file": "/opt/sounds/music.mp3", "voice": "headphones",
+  "loop": true, "channel_map": [{"src": 0, "dest": 6}, {"src": 1, "dest": 7}]}'
 ```
 
-## Listing Available Channels
-
-To see how many channels your audio device supports:
-
-```bash
-./mqttaudio --list-devices
-```
-
-Example output:
-```
-Available audio output devices:
-  0. Built-in Output
-     Sample rate: 48000 Hz
-     Channels: 2
-  1. MOTU 8A
-     Sample rate: 48000 Hz
-     Channels: 8
-```
-
-## Tips
-
-1. **Check your device** — Make sure you have enough output channels for your routing plan
-2. **Test with simple files first** — Verify routing with mono test tones before complex multichannel content
-3. **Use voices for organization** — Group related channel routings by voice for easier control
-4. **Document your setup** — Keep notes on which physical speakers are connected to which channels
+Test a new installation with a mono tone on one output at a time before playing real content; the
+config editor's device picker can do this without a running daemon.
