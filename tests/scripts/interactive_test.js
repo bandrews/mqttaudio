@@ -9,7 +9,8 @@ const fs = require('fs');
 const readline = require('readline');
 
 // Configuration
-const HTTP_PORT = process.env.HTTP_PORT || 8765;
+// A number, because it is written into the generated config's http.port
+const HTTP_PORT = Number(process.env.HTTP_PORT) || 8765;
 const HTTP_HOST = process.env.HTTP_HOST || '127.0.0.1';
 const BASE_URL = `http://${HTTP_HOST}:${HTTP_PORT}`;
 const PROJECT_ROOT = path.resolve(__dirname, '../..');

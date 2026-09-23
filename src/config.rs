@@ -888,7 +888,10 @@ impl Config {
         // Override logging settings
         if verbose {
             self.logging.verbose = true;
-            self.logging.level = "debug".to_string();
+            // Raise the level to at least debug; a more detailed level stays.
+            if self.logging.level != "trace" {
+                self.logging.level = "debug".to_string();
+            }
         }
         if let Some(lt) = log_topic {
             self.logging.mqtt_topic = Some(lt);
@@ -1186,6 +1189,13 @@ impl Config {
                     "bass_management.source_channels must not be empty when enabled".to_string(),
                 );
             }
+            let lfe_gain = self.bass_management.lfe_gain;
+            if !lfe_gain.is_finite() || !(0.0..=8.0).contains(&lfe_gain) {
+                errors.push(
+                    "bass_management.lfe_gain must be a finite value between 0.0 and 8.0"
+                        .to_string(),
+                );
+            }
             // Validate channel aliases resolve
             let resolved_lfe = self.resolve_channel(&self.bass_management.lfe_channel);
             if let Err(ref e) = resolved_lfe {
@@ -1296,9 +1306,13 @@ impl Config {
 
         // HTTP validation
         if self.http.enabled {
-            // Validate bind address is not empty
-            if self.http.bind_address.is_empty() {
-                errors.push("http.bind_address must not be empty".to_string());
+            // The server binds an IP address; a host name would only fail later,
+            // after the audio device is already open
+            if self.http.bind_address.parse::<std::net::IpAddr>().is_err() {
+                errors.push(format!(
+                    "http.bind_address must be an IP address such as 127.0.0.1 or 0.0.0.0 (got '{}')",
+                    self.http.bind_address
+                ));
             }
             // Auth token should be reasonably long if set
             if let Some(ref token) = self.http.auth_token {
@@ -2017,6 +2031,54 @@ mod tests {
 
         assert!(config.logging.verbose);
         assert_eq!(config.logging.level, "debug");
+    }
+
+    #[test]
+    fn verbose_keeps_a_more_detailed_level() {
+        let mut config = Config::default();
+        config.logging.level = "trace".to_string();
+
+        config.merge_cli_args(
+            None, None, None, None, None, None, true, None, None, None, None, None,
+        );
+
+        assert!(config.logging.verbose);
+        assert_eq!(config.logging.level, "trace");
+    }
+
+    #[test]
+    fn http_bind_address_must_be_an_ip_address() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.http.enabled = true;
+        for good in ["127.0.0.1", "0.0.0.0", "::1"] {
+            config.http.bind_address = good.to_string();
+            assert_eq!(config.validate(), Ok(()), "{good} is a valid bind address");
+        }
+        config.http.bind_address = "localhost".to_string();
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("http.bind_address")),
+            "a host name must be rejected at startup, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn lfe_gain_must_be_a_finite_trim_within_range() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        config.bass_management.enabled = true;
+        config.bass_management.source_channels = vec![ChannelRef::Index(0), ChannelRef::Index(1)];
+        for bad in [-1.0, 9.0, f32::NAN] {
+            config.bass_management.lfe_gain = bad;
+            let errors = config.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|e| e.contains("lfe_gain")),
+                "lfe_gain {bad} must be rejected, got {errors:?}"
+            );
+        }
+        config.bass_management.lfe_gain = 2.0;
+        assert_eq!(config.validate(), Ok(()));
     }
 
     #[test]

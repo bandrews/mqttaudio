@@ -63,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`config.example.json` loads.** It declared `audio.channel_aliases` twice, which the daemon rejects,
   so the documented starting config exited with a parse error. Its notes now give the correct channel
   volume range and input behavior, and its example input routes a mono microphone to two outputs.
+- **More configuration mistakes are caught at startup.** `http.bind_address` must be an IP address: a
+  host name such as `localhost` used to pass validation and then fail when the HTTP server started,
+  leaving the daemon running without it. `bass_management.lfe_gain` must be a finite value between 0.0
+  and 8.0. `--verbose` raises the log level to `debug` without lowering a configured `trace`.
 - **Configuration errors are reported accurately.** An out-of-range `audio.channel_volumes` entry
   names the real limit (`4`) instead of the text `MAX_GAIN`, and an out-of-range
   `ducking_rules[].target_volume` is reported once instead of twice.
