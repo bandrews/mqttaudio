@@ -91,9 +91,10 @@ while the primary plays.
 
 ## Checking it
 
-`GET /status/voices` shows each voice's `ducking_multiplier` (below `1.0` while ducked), and
-`GET /metrics` lists the currently ducked voices. If nothing ducks, check that the voice names match
-exactly (they are case-sensitive) and that the primary voice really has a sound playing.
+`GET /status/voices` shows the `ducking_multiplier` of each voice with sounds playing: the level it
+is at or fading to, below `1.0` while ducked. `GET /metrics` (`ducking`) lists every ducked voice,
+including live inputs. If nothing ducks, check that the voice names match exactly (they are
+case-sensitive) and that the primary voice really has a sound playing or an active input.
 
 ## Choosing values
 

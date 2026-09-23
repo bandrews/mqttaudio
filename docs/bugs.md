@@ -31,15 +31,16 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 ### Playback and commands
 
 - **Ignored commands report success.** `seek` and `speed` on a windowed sound, and a `play` dropped
-  because all 256 sounds loop, answer HTTP `200` without doing anything.
+  because all 256 sounds loop, answer HTTP `200` without doing anything. Neither a play dropped at the
+  256 limit nor the sound it displaces is logged.
 - **The seek/speed gate for windowed voices is too broad.** `selector_targets_streamed_voice`
   (`src/main.rs`) skips the whole command when the selector's `voice` has had a windowed sound since
   the voice was last idle, including fully loaded sounds that could seek.
 - **Pitch correction never engages on a cold play whose file is not kept in memory.** The stretcher
   needs the complete buffer that the upgrade pass swaps in once the decode is promoted into the memory
   cache. A file larger than the free budget, or one changed or invalidated during its decode, is never
-  promoted, so that play continues without pitch correction (the `speed` command's warning says it is
-  deferred).
+  promoted, so that play continues without pitch correction. A `speed` sent while the decode is still
+  running warns that correction is deferred; one sent after promotion failed gets no warning.
 - **A play can leave phantom state when the audio command queue is full.** The play paths register
   the voice, its activity count, ducking and the status entry before sending the sound to the audio
   thread, and do not undo them when the send fails (the HTTP caller gets `500`). The phantom stays in
@@ -63,6 +64,13 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
   `get_or_load_streaming_with_freshness`.
 - **Precache and `cache_reload` ignore the budget and windowing.** They always decode in full, and
   log success when the result is then too big to keep.
+- **A play during a precache's decode does not use it.** A play of a local file over the auto limits
+  that arrives before a `precache` or `cache_reload` of it has finished is windowed instead of joining
+  the decode, and a play of a URL opens its own request before joining the download.
+- **A runtime `precache` or `cache_reload` of a URL holds the cache while it connects.**
+  `loading::prepare` keeps the cache lock across the request, so an unresponsive server (up to the
+  30-second response limit) delays every play, cached ones included, and `/metrics`, `/status` and
+  `/status/cache`.
 - **Freshness does not match decision D46.** D46 says a play never waits on the network, `dev`
   checks on every play, and `pinned` checks nothing. In the code, a play of a URL that is only on
   disk revalidates in the foreground in every mode once it is due: the conditional request is bounded

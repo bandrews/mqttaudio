@@ -55,7 +55,10 @@ card, so `hw:1,0`, `hw:CARD=UMC1820,DEV=0` and `plughw:CARD=UMC1820,DEV=0` can f
 Prefer the `plughw:` form: ALSA then converts formats the card does not offer natively.
 
 An input that fails to open is logged, reported by `GET /ready` (`503`) and `/status/inputs`
-(`"ready": false` with the error), and left out; the rest of the daemon runs normally.
+(`"ready": false` with the error), and left out; the rest of the daemon runs normally. Both reflect
+startup only: an input that stops later, such as an unplugged USB microphone, logs
+`Input stream error: ...` and is not reopened, while `/ready` stays `200`. Restart the daemon after
+reconnecting it.
 
 ## Routes
 
@@ -132,9 +135,10 @@ buffer between capture and output is. That keeps the buffer, and so the delay, s
 any length, even when both devices nominally run at the same rate.
 
 `latency_ms` sets the capture buffering. The converter hands over audio in blocks of 1024 frames, so
-the buffer must hold at least two: a smaller `latency_ms` is raised to the minimum (11 ms at a 48 kHz
-output, 12 ms at 44.1 kHz) with a warning naming the value used. The real delay from microphone to
-speaker is roughly twice `latency_ms` plus about 11 ms of conversion.
+the buffer must hold at least two: a smaller `latency_ms` is raised to the minimum, with a warning
+naming the value used. The minimum depends on both rates: 11 ms with capture and output at 48 kHz,
+12 ms with 44.1 kHz capture, 6 ms with 96 kHz capture into a 48 kHz output. The real delay from
+microphone to speaker is roughly twice `latency_ms` plus about 11 ms of conversion.
 
 | `latency_ms` | Suits |
 |--------------|-------|
@@ -190,8 +194,9 @@ Current limitations:
   close it.
 - **`destination` and `gain` are checked but not applied.** The microphone plays through its
   configured routes at its configured volume. The allowed destinations are a fixed list.
-- **Only a lease blocks ordinary commands.** Without an active lease, `input_mute` can unmute the
-  microphone.
+- **Only a lease blocks ordinary commands, and only partly.** Without an active lease, `input_mute`
+  can unmute the microphone. With one, only `input_mute` naming it by `voice_id` is refused; selecting
+  it by position, or raising it with `input_volume`, still unmutes it.
 - The acquire reply does not include the `lease_id`; read it from `GET /status/talkback`.
 
 ## Troubleshooting

@@ -64,8 +64,9 @@ With `pitch_correction`, the tempo changes and the pitch stays. Speed is limited
 cannot be negative. It costs noticeably more CPU than a plain speed change.
 
 Every `speed` command sets pitch correction on or off, so send `"pitch_correction": true` each time
-you want to keep it. A sound still being decoded for its first play gets pitch correction when the
-decode finishes; a warning says so.
+you want to keep it. A sound still being decoded for its first play changes speed at once without
+correction, and a warning says correction is deferred; it starts once the decoded file is kept in the
+memory cache, and never if it is not kept (see [Caching](caching.md#full-and-windowed-plays)).
 
 ## Volume
 
@@ -85,7 +86,8 @@ further; the three multiply. See [Voice Management](voice-management.md).
 ```
 
 `stop` fades out over `fade_out_ms` (10 ms by default, just enough to avoid a click). `fadeall`
-fades out everything; `voice_fade_out` fades one voice. A fade-out that starts while a sound is
+fades out every sound, leaving live inputs playing (use `input_mute` for those); `voice_fade_out`
+fades one voice. A fade-out that starts while a sound is
 fading in, or during another fade-out, continues from the sound's current level.
 
 ## Looping

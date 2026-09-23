@@ -93,15 +93,16 @@ rejected (HTTP `400`), and one that matches no playing sound fails with HTTP `40
 | `channel_map` | array | channel *n* → output *n* | Where each source channel plays; see [Channel map](#channel-map) |
 | `mode` | string | `cache.load_mode` | `auto`, `full` or `stream`; see [Full and windowed plays](#full-and-windowed-plays) |
 | `window_ms` | integer | `cache.stream_window_ms` | Window length for a windowed play, `100`–`60000` |
-| `prebuffer_ms` | integer | `cache.stream_prebuffer_ms` | Audio buffered before a windowed play starts; at most `window_ms` |
+| `prebuffer_ms` | integer | `cache.stream_prebuffer_ms` | Audio buffered before a windowed play starts, capped at the window. At most `window_ms` when the play sets both (HTTP `400`) |
 | `freshness` | string | `cache.freshness` | `trusting`, `dev` or `pinned`. On a play, only decides whether an edited local file already in memory is re-read (not with `pinned`); see [Caching](features/caching.md#freshness) |
 | `cacheable` | boolean | `true` | For a URL that is not cached yet: `false` keeps the download out of the disk cache (for a live stream or a one-off file). A response without `Content-Length` is never saved |
 
 Without a `channel_map`, source channel 0 plays on output 0, channel 1 on output 1, and so on: a mono
 file plays on output 0 only. Source channels beyond the device's channel count are not heard.
 
-When 256 sounds are already playing, a new play replaces the oldest sound that is not looping,
-without a fade. If all 256 loop, the new play is dropped.
+When 256 full plays are running, a new full play replaces the oldest one that is not looping, without
+a fade; if all 256 loop, the new play is dropped. Either way the command reports success and nothing
+is logged. Windowed plays do not count toward the limit.
 
 #### Full and windowed plays
 
@@ -115,11 +116,13 @@ small however long the file is, but it:
   only once (`loop` is ignored, with a warning);
 - ignores `seek` and `speed`.
 
-`mode: "auto"` plays a file in full unless it is larger than `cache.full_load_max_bytes` decoded,
-longer than `cache.full_load_max_seconds`, or too big for the memory still free in the cache budget.
-A URL of unknown length is always windowed. `"full"` asks for a full play but still falls back to
-windowed when the file would not fit in memory; `"stream"` always plays windowed. A URL that is
-already in the disk cache is always played in full. [Caching](features/caching.md) has the details.
+`"auto"`, or leaving `mode` out, uses `cache.load_mode` (default `auto`). In `auto` a file plays in
+full unless it is larger than `cache.full_load_max_bytes` decoded, longer than
+`cache.full_load_max_seconds`, or too big for the memory still free in the cache budget; a URL of
+unknown length is always windowed. `"full"` asks for a full play but still falls back to windowed when
+the file would not fit in memory, and `"stream"` plays windowed. Whatever the mode, a URL already in
+the memory or disk cache plays in full, and so does a local file already in the memory cache unless the
+play itself says `"stream"`. [Caching](features/caching.md#how-a-play-is-loaded) has the details.
 
 #### Channel map
 
@@ -224,10 +227,11 @@ warning.
   `±0.01`. With it, speed is clamped to `0.05`–`8.0` and cannot be negative (HTTP `400`).
 - `speed: 0` is rejected (HTTP `400`); use `stop`.
 - Each `speed` command sets pitch correction on or off, so one without `pitch_correction` turns it off.
-- Reverse playback starts from the current position, so a sound still at its start ends at once.
-  `seek` first to play backwards from a point.
-- A sound that is still loading for its first play gets pitch correction once the load completes; a
-  warning says so.
+- Reverse playback starts from the current position, so a sound still at its start ends at once (a
+  looping one wraps to its end). `seek` first to play backwards from a point.
+- A sound still being decoded for its first play changes speed at once without pitch correction, and a
+  warning says correction is deferred. Correction starts once the decoded file is kept in the memory
+  cache, and never if it is not kept; see [Caching](features/caching.md#full-and-windowed-plays).
 - Applies to full plays only, with the same windowed-voice rule as `seek`.
 
 ## Voices
@@ -289,7 +293,8 @@ Sets the input's volume (`0.0`–`4.0`) at once, and unmutes it.
 ```
 
 Muting silences the input at once and remembers its volume; unmuting restores that volume. While a
-[talkback](#talkback) lease holds the input, unmuting it with this command is refused (HTTP `403`).
+[talkback](#talkback) lease holds the input, unmuting it by its `voice_id` is refused (HTTP `403`);
+selecting it by position, or raising it with `input_volume`, is not checked.
 
 ## Cache
 
@@ -300,7 +305,10 @@ Muting silences the input at once and remembers its volume; unmuting restores th
 ```
 
 Loads a file into the memory cache, and a URL into the disk cache too (when it is enabled), so a
-later play starts instantly. The command completes once loading has started; the decode continues in the background.
+later play starts instantly with every feature. The command completes once loading has started; the
+decode continues in the background, and a failure is only logged. Send it ahead of the cue: a play of
+a local file over the auto limits that arrives before the decode finishes is windowed.
+
 The file is always decoded in full, and a file too large for the memory budget is not kept in memory
 (a URL stays in the disk cache). Directories are accepted only in the config's `cache.precache`.
 
@@ -310,7 +318,8 @@ The file is always decoded in full, and a file too large for the memory budget i
 {"command": "cache_clear"}
 ```
 
-Empties the memory cache and deletes every file in the disk cache.
+Empties the memory cache and deletes every file in the disk cache. Loads in progress still finish
+into the memory cache, but downloads in progress are not saved to disk.
 
 ### cache_invalidate
 
@@ -326,8 +335,8 @@ Drops one file (or URL) from both caches, so its next play reads it again.
 {"command": "cache_reload", "file": "/opt/sounds/cue-12.wav"}
 ```
 
-`cache_invalidate` followed by `precache`: the next play gets the current file without waiting for
-it to load. Use it after replacing a file in place.
+`cache_invalidate` followed by `precache`, so once the reload has finished the next play gets the
+current file without waiting for it to load. Use it after replacing a file in place.
 
 ## Talkback
 
@@ -353,6 +362,8 @@ and current limitations.
 
 - Acquiring unmutes the input and starts a lease. The holder renews it by acquiring again before it
   expires; another client is refused (HTTP `403`) until then.
+- Acquiring fails with HTTP `404` when no input with the `voice_id` `GM_MIC` (or `mic`) is open, and
+  with `403` for a value outside its range or list.
 - Releasing needs the holder's `client_id` and the current `lease_id`.
 - `talkback_hard_mute` ends the current lease, whoever holds it, and mutes its input.
 
@@ -401,7 +412,7 @@ mosquitto_pub -t $TOPIC -m '{"command": "play", "file": "/opt/sounds/theme.mp3",
   "volume": 0.3, "loop": true, "crossfade_ms": 100, "fade_in": 2000}'
 
 # A narration; with a ducking rule for "narration" the music dips on its own
-mosquitto_pub -t $TOPIC -m '{"command": "play", "file": "/opt/sounds/intro.wav", "voice": "narration"}'
+mosquitto_pub -t $TOPIC -m '{"command": "play", "file": "/opt/sounds/intro.wav", "id": "intro", "voice": "narration"}'
 
 # Four-channel ambience on outputs 4-7
 mosquitto_pub -t $TOPIC -m '{"command": "play", "file": "/opt/sounds/quad.wav",

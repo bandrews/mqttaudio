@@ -43,7 +43,8 @@ to control as a group later.
 
 The level ramps smoothly, applies to every sound playing in the voice, and is inherited by sounds
 started in the voice while it still has sounds playing. A live input whose `voice_id` matches is set
-too. Each command fails (HTTP `404`, logged over MQTT) when the voice has nothing playing.
+too. `voice_stop` and `voice_fade_out` fail (HTTP `404`, logged over MQTT) when the voice has nothing
+playing; `voice_volume` fails only when, in addition, no open input uses the voice.
 
 ## Levels multiply
 
@@ -56,7 +57,7 @@ A sound's loudness is its own `volume` × its voice's level × any ducking appli
 | Ducking rules | The voice, automatically while a primary voice plays |
 
 Each ranges up to `4.0` (+12 dB) except ducking, which only lowers. `GET /status/voices` shows each
-voice's level and current ducking multiplier:
+voice that has sounds playing, with its level and the ducking multiplier it is at or fading to:
 
 ```json
 {"voices": [{"id": "music", "sample_count": 1, "volume": 0.3, "ducking_multiplier": 0.2}]}

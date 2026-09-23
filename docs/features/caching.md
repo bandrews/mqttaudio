@@ -32,10 +32,17 @@ backwards and change speed with pitch correction. The first play of a file does 
 whole decode: it starts as soon as its start position is decoded and the rest decodes in the
 background. When the decode finishes, the file enters the memory cache.
 
-While that first decode is still running, a `seek` past the decoded part plays silence until the
-decode catches up, and looping waits until the end has been decoded. Pitch correction starts only
-once the finished decode has entered the memory cache and been swapped in; a file too large to keep
-plays on without it.
+If its start position is not decoded within `cache.stream_prebuffer_deadline_ms` (300 ms), the play
+starts anyway, silent until the decode catches up, or fails with
+`No audio decoded before the prebuffer deadline` if nothing at all has decoded. While that first
+decode is still running, a `seek` past the decoded part plays silence until the decode catches up,
+and looping waits until the end has been decoded.
+
+A `speed` with pitch correction on such a sound changes its speed at once without correcting the
+pitch, and a warning says correction is deferred. Correction starts once the finished decode has
+entered the memory cache and been swapped in. A file that is not kept (too large for the room left,
+or changed or invalidated during the decode) never gets it, and later `speed` commands on that sound
+change its pitch without a warning.
 
 A **windowed** play streams: a background thread decodes into a buffer `cache.stream_window_ms` long
 (1.5 s by default), and memory stays at that size however long the file is. A windowed play starts
@@ -45,7 +52,8 @@ audio arrives. Windowed audio never enters the memory cache.
 
 ### How a play is loaded
 
-With `"mode": "auto"` (the play's `mode`, else `cache.load_mode`):
+A play's `mode` is `"auto"`, `"full"` or `"stream"`; leaving it out, or `"auto"`, uses
+`cache.load_mode` (default `auto`). In `auto`:
 
 | File | Played in full when | Otherwise |
 |------|---------------------|-----------|
@@ -55,15 +63,18 @@ With `"mode": "auto"` (the play's `mode`, else `cache.load_mode`):
 | Other URL | Its estimated decoded size is at most `full_load_max_bytes` and fits in the free room | Windowed |
 | URL without a `Content-Length` | Never | Windowed |
 
-A local file's size and length come from its header. A URL's decoded size is estimated from its
-`Content-Length`: twice the download for WAV, FLAC, AIFF and ALAC files, 25 times for anything else.
+A local file's size and length come from its header. A URL's decoded size, or a local file's when
+its header gives no length, is estimated from the file size by extension: twice the size for `.wav`,
+`.wave`, `.flac`, `.aiff`, `.aif`, `.alac` and `.wv`, 25 times for anything else (including ALAC in
+`.m4a`).
 
-`"mode": "full"` plays in full whenever the estimate fits in the free room. `"mode": "stream"` is
-always windowed, for local files and uncached URLs.
+`full` plays in full whenever the estimate fits in the free room, and `stream` always windows, with
+two exceptions. A URL already in the memory or disk cache always plays in full, whatever its size and
+`mode`; one on disk is decoded whole again, which for a very long file can far exceed the budget, so
+keep such files out of the disk cache with `"cacheable": false` (see [Known Issues](../bugs.md)). A
+local file already in the memory cache plays in full unless the play itself says `"stream"`.
 
-A URL that is already in the disk cache is always decoded in full, whatever its size and mode.
-Precache and `cache_reload` also always decode in full. Keep very long remote files out of the disk
-cache (with `"cacheable": false`) to avoid decoding them whole; see [Known Issues](../bugs.md).
+Precache and `cache_reload` always decode in full.
 
 ### How much memory audio needs
 
@@ -85,7 +96,9 @@ startup, at least 128 MiB and at most 1 GiB. Set a fixed size with `cache.max_me
 [Configuration](../configuration.md#cache).
 
 The room a new full play may use is the budget minus the files that are playing and the loads still
-in progress. `GET /metrics` shows the budget (`cache.memory_cap_bytes`), the room left
+in progress. A load whose length is not yet known, such as an Ogg or MP3 URL loading in full, holds
+all the room left until it finishes, so other files decided meanwhile play windowed unless they are
+already in memory. `GET /metrics` shows the budget (`cache.memory_cap_bytes`), the room left
 (`cache.memory_headroom_bytes`) and what the cache holds (`cache.memory_bytes`).
 
 The budget covers the memory cache, not the whole process. For a hard limit on everything, run the
@@ -117,7 +130,11 @@ once they are older than `cache.revalidate_after_seconds` (300 s):
 - A file that is also in the memory cache is checked by a background pass every 30 seconds. In `dev`
   mode that pass checks every such file each time, ignoring the age; in `pinned` mode it does not
   run.
-- A file only on disk is checked when it is played, in every mode. The check waits at most 5 seconds.
+- A file only on disk is checked when it is played, in every mode. The play waits up to 5 seconds
+  for the server's answer and, if the file changed, for the whole new download.
+
+Checks and re-downloads, including the background pass's, hold the cache while they wait on the
+server, so other plays and cache commands wait too.
 
 A `304 Not Modified` restarts the file's age. A `200` downloads the new version, and plays from then
 on use it. If the server cannot be reached, the cached copy plays and the file is not checked again for
@@ -143,9 +160,14 @@ A directory contributes its `.wav`, `.mp3`, `.ogg` and `.flac` files (not subdir
 `cache.precache_blocking` on (the default) each entry is fully decoded before the daemon takes
 commands; off, the daemon starts each load and then takes commands while they finish.
 
-At runtime, the `precache` command does the same for one file or URL. Precaching always decodes the
-whole file, whatever its size, and a file larger than the budget's free room is not kept in memory
-afterwards (a URL stays on disk). Precache the files that fit.
+At runtime, the `precache` command starts loading one file or URL and answers once the load has
+started, whatever `cache.precache_blocking` says; the decode finishes in the background, and a failure
+is only logged. Send it well before the cue: a play that arrives while the decode is still running
+joins it for a URL (after opening a request of its own), but plays windowed for a local file over the
+auto limits.
+
+Precaching always decodes the whole file, whatever its size, and a file larger than the budget's free
+room is not kept in memory afterwards (a URL stays on disk). Precache the files that fit.
 
 ## Cache commands
 
@@ -154,14 +176,15 @@ afterwards (a URL stays on disk). Precache the files that fit.
 | `precache` | Load a file or URL into the caches |
 | `cache_invalidate` | Drop one file or URL from both caches, and abandon a load of it in progress |
 | `cache_reload` | `cache_invalidate`, then `precache` |
-| `cache_clear` | Empty the memory cache and delete every file in the disk cache. Loads already in progress still finish and fill the cache again |
+| `cache_clear` | Empty the memory cache and delete every file in the disk cache. Loads already in progress still finish and fill the memory cache again; downloads in progress are not saved to disk |
 
 Sounds that are playing keep playing after their file leaves a cache. See
 [Commands](../commands.md#cache).
 
 ## First-play latency
 
-- **Cached in memory:** the play starts in the next audio block.
+- **Cached in memory:** the play starts in the next audio block, unless it has to wait for the cache
+  or one of the four load slots (see below).
 - **Cold full play of a local file:** a few milliseconds of decoding before the first block.
 - **Windowed play:** waits for `cache.stream_prebuffer_ms` (150 ms) of audio, at most
   `cache.stream_prebuffer_deadline_ms` (300 ms). On a fast network or disk, `50` and `150` start
@@ -170,5 +193,9 @@ Sounds that are playing keep playing after their file leaves a cache. See
 - **Every play** waits for the next audio block: up to 10.7 ms at the default 512-frame buffer and
   48 kHz.
 
-`GET /metrics` reports `latency.play_to_first_mix_ns`, the time from a play being queued to its first
-audio being mixed, so you can measure your own hardware.
+Every play, cached or not, first waits for the cache and for one of four load slots. A freshness check
+or re-download of a URL, a `precache` or `cache_reload` of an uncached URL (up to 30 seconds against a
+server that does not answer), or four loads already running delay it.
+
+`GET /metrics` reports `latency.play_to_first_mix_ns`, the time from a loaded play being handed to the
+audio thread to its first mixed audio. It leaves out loading, downloading and prebuffering.

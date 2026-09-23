@@ -19,7 +19,7 @@ Start with the log: most failures name their cause there.
 | `Audio output unavailable: ...` | The stream could not be opened. On Linux, a `hw:` device may need a format the daemon does not produce: use the `plughw:` ID for the same card |
 | `Failed to initialize cache: ...` | `cache.directory` cannot be created or written. Point it at a writable directory, or set `cache.enabled` to `false` |
 | `No command interface is available ...` | Neither MQTT nor the HTTP server is running. Check `mqtt.topic`, and whether the HTTP port is already in use |
-| `Failed to connect to MQTT broker: MQTT TLS configuration error: ...` | The CA file in `mqtt.tls.ca_path` cannot be read or parsed |
+| `Failed to connect to MQTT broker: MQTT TLS configuration error: ...` | The CA file in `mqtt.tls.ca_path` cannot be read. With the HTTP server on, the daemon continues without MQTT (`Continuing with HTTP-only mode`). A file that can be read but is not a valid certificate shows up only when connecting, as repeated `MQTT error: ...` lines |
 
 An unreachable broker does not stop startup: the daemon logs `MQTT error: ...` and retries every
 `mqtt.reconnect_delay_seconds`.
@@ -30,15 +30,17 @@ An unreachable broker does not stop startup: the daemon logs `MQTT error: ...` a
    `Received MQTT message on topic ...`. If nothing appears, check that the daemon's topic
    (`Ready to receive MQTT commands on topic: ...` at startup) matches the one you publish to, that
    it logged `MQTT connected`, and that both use the same broker.
-2. **Did the command parse?** `Failed to parse command: ...` means the JSON is malformed, the
-   command name is unknown (names are case-sensitive), or a parameter has the wrong type.
-   `internal_id` and `input` must be JSON strings, such as `"3"`.
+2. **Did the command parse?** `Macro expansion error: JSON parse error: ...` means the MQTT payload
+   is not valid JSON (HTTP `/command` answers `400 Invalid JSON`). `Failed to parse command: ...`
+   means the command name is unknown (names are case-sensitive), a required parameter is missing, or
+   a parameter has the wrong type. `internal_id` and `input` must be JSON strings, such as `"3"`.
 3. **Did it find its target?** `No sample matches the selector ...` means nothing playing matched.
    A `stop` sent while its sound is still loading arrives first and finds nothing; `stopall` and
    `fadeall` do cancel pending loads.
 4. **Was part of it ignored?** Parameters with misspelled names are ignored without a message.
-   A windowed (streamed) sound ignores `seek`, `speed` and some `play` options, with a warning;
-   see [Commands: Full and windowed plays](commands.md#full-and-windowed-plays).
+   A windowed (streamed) sound ignores some `play` options, with a warning, and `seek` and `speed`,
+   with a warning only when the command selects by `voice`; see
+   [Commands: Full and windowed plays](commands.md#full-and-windowed-plays).
 5. **Is the daemon overloaded?** `Command queue full; dropped MQTT command` means commands arrive
    faster than they are processed. `Too many concurrent loads; command rejected` means 32 plays
    or cache commands were already loading.
@@ -52,8 +54,9 @@ Look for `Load failed: ...` or `Failed to load ...` in the log:
 | `is outside security.allowed_directories` | The file is not under a directory in `security.allowed_directories` |
 | `Cannot resolve path` | The file does not exist (with an allowlist configured) |
 | `I/O error` | The file cannot be read: missing, or no permission for the daemon's user |
-| `Unsupported audio format`, `Unsupported format`, `No default audio track found`, `No audio track found` | The file is not in a format mqttaudio decodes: WAV, AIFF, CAF, FLAC, MP3, MP1/MP2, Ogg Vorbis, AAC and ALAC (in MP4/M4A), or Matroska/WebM with one of those codecs. Opus is not supported |
-| `Decode error` | The file is damaged or unusual. `ffprobe <file>` shows what it contains |
+| `unsupported feature`, `Unsupported audio format`, `Unsupported format`, `No default audio track found`, `No audio track found` | The file is not in a format mqttaudio decodes: WAV, AIFF, CAF, FLAC, MP3, MP1/MP2, Ogg Vorbis, AAC and ALAC (in MP4/M4A), or Matroska/WebM with one of those codecs. Opus is not supported |
+| Any other `Decode error` | The file is damaged or unusual. `ffprobe <file>` shows what it contains |
+| `Audio decoding failed` | The decode failed before the play could start. An earlier `Failed to create decoder for ...` or `Decode error for ...` line gives the reason |
 | `HTTP 404 Not Found from ...` (or another status), `HTTP request error` | The URL failed. Try it with `curl -I <url>` from the same machine |
 | `Download stalled: no data for 60 seconds` | The server stopped sending partway through |
 | `No audio decoded before the prebuffer deadline` | The first audio took longer than `cache.stream_prebuffer_deadline_ms` to arrive |
@@ -117,7 +120,9 @@ A device listed by an interactive `--list-inputs` can still be missing at servic
 only devices that can be opened at that moment are listed. Run the listing as the service user
 (`sudo -u mqttaudio mqttaudio --list-inputs`) to see what the service sees.
 
-The daemon keeps running without an input that failed; `GET /ready` answers `503` and names it.
+The daemon keeps running without an input that failed; `GET /ready` answers `503` and names it. An
+input that stops after startup, such as an unplugged USB microphone, logs `Input stream error: ...`
+and is not reopened, and `/ready` still answers `200`. Restart the daemon after reconnecting it.
 
 **`Input device '...' sample rate (44100 Hz) differs from output (48000 Hz) - resampling will add latency`**:
 capture opened at a different rate from the output, because the device does not offer the output's
@@ -140,8 +145,10 @@ together, alongside ALSA `underrun occurred` messages, usually means the output 
 ## Ducking does nothing
 
 - Voice names are case-sensitive: `"narration"` and `"Narration"` are different voices.
-- A rule applies while its `primary_voice` has a sound playing. Check `GET /status/voices`: the
-  primary must be listed, and ducked voices show a `ducking_multiplier` below `1.0`.
+- A rule applies while its `primary_voice` has a sound playing, or is a live input that is active.
+  Check `GET /status/voices`: a primary with sounds must be listed there, and ducked voices show a
+  `ducking_multiplier` below `1.0`. A voice used only by a live input is not listed there;
+  `GET /metrics` (`ducking`) lists every ducked voice, inputs included.
 - A live input as `primary_voice` needs an `activity_threshold` to duck only while someone speaks.
   Without one it counts as active whenever it is open, so the ducked voices stay down.
 
