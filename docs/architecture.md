@@ -119,9 +119,11 @@ Last-Modified revalidation.
 
 1. Advance every ducked voice's gain ramp once for the block.
 2. Mix active samples (full-load), live inputs and streamed sources into the f32 bus, applying
-   sample, voice and ducking gains, fades and channel routes (with per-route gains).
-3. Bass management (`src/audio/bass_management.rs`): Linkwitz-Riley crossover, bass from the
-   source channels summed into the LFE channel.
+   sample, voice and ducking gains, fades and channel routes (with per-route gains). With bass
+   management on, each sound also adds what it plays on the source channels to a per-frame bass
+   send, divided by the number of source channels it plays on (D63).
+3. Bass management (`src/audio/bass_management.rs`): the send's bass, through a Linkwitz-Riley
+   low-pass, added to the LFE channel; the source channels high-passed if asked.
 4. Per-channel calibration gain × master gain.
 5. Replace any non-finite sample with silence.
 6. Soft-knee limiter toward the configured ceiling, then a hard clamp at the ceiling.

@@ -2084,3 +2084,62 @@ async fn cors_permissive_serves_other_sites_and_their_authorization_header() {
         .unwrap();
     assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
 }
+
+/// POST a JSON body to a typed route and return its status and the command it
+/// forwarded to the daemon.
+async fn post_typed(uri: &str, body: serde_json::Value) -> (StatusCode, serde_json::Value) {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let status = app.oneshot(request).await.unwrap().status();
+    let forwarded = match rx.try_recv() {
+        Ok(payload) => serde_json::from_str(&payload).unwrap(),
+        Err(_) => serde_json::Value::Null,
+    };
+    (status, forwarded)
+}
+
+#[tokio::test]
+async fn typed_talkback_acquire_sends_source_id_only_when_given() {
+    let lease = serde_json::json!({
+        "client_id": "panel-1", "destination": "ROOM_1", "gain": 0.0, "lease_ms": 1000
+    });
+    let (status, forwarded) = post_typed("/talkback/acquire", lease.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        forwarded["message"].get("source_id").is_none(),
+        "the daemon picks the talkback microphone, got {forwarded}"
+    );
+
+    let mut named = lease;
+    named["source_id"] = serde_json::json!("gm_mic");
+    let (_, forwarded) = post_typed("/talkback/acquire", named).await;
+    assert_eq!(forwarded["message"]["source_id"], "gm_mic");
+}
+
+#[tokio::test]
+async fn typed_talkback_release_needs_only_the_client_id() {
+    let (status, forwarded) = post_typed(
+        "/talkback/release",
+        serde_json::json!({"client_id": "panel-1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(forwarded["command"], "talkback_release");
+    assert!(
+        forwarded["message"].get("lease_id").is_none(),
+        "{forwarded}"
+    );
+
+    let (_, forwarded) = post_typed(
+        "/talkback/release",
+        serde_json::json!({"client_id": "panel-1", "lease_id": "lease-0002"}),
+    )
+    .await;
+    assert_eq!(forwarded["message"]["lease_id"], "lease-0002");
+}

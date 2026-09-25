@@ -708,45 +708,48 @@ pub async fn handle_input_mute(
 #[derive(Deserialize)]
 pub struct TalkbackAcquireParams {
     pub client_id: String,
-    #[serde(default = "default_talkback_source")]
-    pub source_id: String,
+    /// The talkback source; the daemon's talkback microphone when absent
+    #[serde(default)]
+    pub source_id: Option<String>,
     pub destination: String,
     pub gain: f32,
     pub lease_ms: u64,
-}
-
-fn default_talkback_source() -> String {
-    "GM_MIC".to_string()
 }
 
 pub async fn handle_talkback_acquire(
     State(state): State<AppState>,
     Json(params): Json<TalkbackAcquireParams>,
 ) -> impl IntoResponse {
-    let command = json!({ "command": "talkback_acquire", "message": {
+    let mut message = json!({
         "client_id": params.client_id,
-        "source_id": params.source_id,
         "destination": params.destination,
         "gain": params.gain,
         "lease_ms": params.lease_ms
-    }});
+    });
+    if let Some(source_id) = params.source_id {
+        message["source_id"] = json!(source_id);
+    }
+    let command = json!({ "command": "talkback_acquire", "message": message });
     send_command(&state, &command.to_string()).await
 }
 
 #[derive(Deserialize)]
 pub struct TalkbackReleaseParams {
     pub client_id: String,
-    pub lease_id: String,
+    /// The lease to end; the holder's current lease when absent
+    #[serde(default)]
+    pub lease_id: Option<String>,
 }
 
 pub async fn handle_talkback_release(
     State(state): State<AppState>,
     Json(params): Json<TalkbackReleaseParams>,
 ) -> impl IntoResponse {
-    let command = json!({ "command": "talkback_release", "message": {
-        "client_id": params.client_id,
-        "lease_id": params.lease_id
-    }});
+    let mut message = json!({ "client_id": params.client_id });
+    if let Some(lease_id) = params.lease_id {
+        message["lease_id"] = json!(lease_id);
+    }
+    let command = json!({ "command": "talkback_release", "message": message });
     send_command(&state, &command.to_string()).await
 }
 
