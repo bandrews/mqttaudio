@@ -58,7 +58,7 @@ parser/handler defaults.
 | `voice_stop` | `voice` | — | 10 ms fade. `404` if the voice has no sounds. |
 | `input_volume` | `input`, `volume` | `fade_ms`(20; 0..60000, 0 = instant) | `input` is a **string** — index `"0"` or a `voice_id`. A bare number is a `400` on `/command`/MQTT, `422` on the typed route. Clears mute. |
 | `input_mute` | `input`, **`mute`** | `fade_ms`(20; 0..60000, 0 = instant) | `mute` required on every path. A muted input never triggers ducking. Unmuting by `voice_id` is `403` while a talkback lease holds the input (not checked by index, nor for `input_volume`). |
-| `precache` (`soundPrecache`) | `file` | — | Completes when loading has started. |
+| `precache` (`soundPrecache`) | `file` | — | Loads as an `auto` play would: decodes files within the limits, downloads over-limit URLs to disk only. Completes when loading has started. |
 | `cache_clear` | — | — | Clears memory + disk. |
 | `cache_invalidate` | `file` | — | Exact key/file string. |
 | `cache_reload` | `file` | — | Invalidate + re-precache; completes when loading has started. |

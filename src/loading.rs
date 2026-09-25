@@ -14,15 +14,26 @@ pub enum PreparedPlayback {
     Done,
 }
 
-pub struct PreparedStream(Option<audio::streamed_source::StreamHandles>);
+/// A windowed play's producer, stopped if the play is abandoned before it starts.
+pub struct PreparedStream {
+    handles: Option<audio::streamed_source::StreamHandles>,
+    loops: bool,
+}
 impl PreparedStream {
+    /// Whether the stream can loop: one reading a file (local, or a URL's disk
+    /// copy) can, one reading a download cannot.
+    pub fn loops(&self) -> bool {
+        self.loops
+    }
     pub fn into_handles(mut self) -> audio::streamed_source::StreamHandles {
-        self.0.take().expect("prepared stream owns its handles")
+        self.handles
+            .take()
+            .expect("prepared stream owns its handles")
     }
 }
 impl Drop for PreparedStream {
     fn drop(&mut self) {
-        if let Some(handles) = &self.0 {
+        if let Some(handles) = &self.handles {
             handles
                 .stop_flag
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -118,11 +129,10 @@ pub async fn prepare(
         }
         CacheReload { file } | Precache { file } => {
             authorize(config, file)?;
-            let mut cache = cache.lock().await;
             if matches!(command, CacheReload { .. }) {
-                cache.invalidate(file).map_err(error)?;
+                cache.lock().await.invalidate(file).map_err(error)?;
             }
-            cache.precache_streaming(file, rate).await.map_err(error)?;
+            precache(file, config, cache, rate).await?;
             return Ok(PreparedPlayback::Done);
         }
         _ => {}
@@ -159,183 +169,401 @@ pub async fn prepare(
     let prebuffer_ms = prebuffer_ms
         .unwrap_or(config.cache.stream_prebuffer_ms)
         .min(window_ms);
-    let window_frames = (window_ms as usize * rate as usize / 1000).max(1);
-    let quality = config.advanced.resampler_quality;
-    let http = file.starts_with("http://") || file.starts_with("https://");
-    // Each residency check below first folds finished loads (a runtime precache,
-    // an earlier cold play) into the caches, so their decode is used rather than
-    // repeated or windowed.
-    let (cached, probe) = {
-        let mut cache = cache.lock().await;
-        cache.cleanup_completed_loads();
-        (
-            if http {
-                cache.is_cached(file)
+    let window = Window {
+        frames: (window_ms as usize * rate as usize / 1000).max(1),
+        prebuffer_frames: prebuffer_ms as usize * rate as usize / 1000,
+        deadline: std::time::Duration::from_millis(
+            config.cache.stream_prebuffer_deadline_ms.max(prebuffer_ms) as u64,
+        ),
+        rate,
+        quality: config.advanced.resampler_quality,
+    };
+    let freshness = freshness.unwrap_or(config.cache.freshness);
+    let stream_asked = *mode == config::LoadMode::Stream;
+    let full = |buffer| full_ready(buffer, command, config);
+
+    // A decode already in memory or in progress is shared rather than repeated or
+    // windowed, unless the play itself asks to stream.
+    let source = examine(cache, file, freshness).await;
+    if !stream_asked && (source.resident || source.loading) {
+        let buffer = load_full(cache, file, rate, freshness).await?;
+        return full(buffer).await;
+    }
+
+    // A local file, or a URL with a copy on disk, is probed and decided on its file.
+    if let Some(path) = source.local_path {
+        let windowed = stream_asked || {
+            let probe = probe_file(cache, &path, &window).await?;
+            let mut admission = cache.lock().await;
+            admission.cleanup_completed_loads();
+            if admission.is_resident(file) || admission.is_loading(file) {
+                false
             } else {
-                cache.is_resident(file)
-            },
-            cache.cached_probe(file),
-        )
-    };
-    let decide = |probe: &cache::strategy::Probe, headroom: usize| {
-        cache::strategy::decide(
-            *mode,
-            config.cache.load_mode,
-            probe,
-            config.cache.full_load_max_bytes,
-            config.cache.full_load_max_seconds,
-            headroom,
-        ) == cache::strategy::Strategy::Windowed
-    };
-    let handles = if http && !cached {
-        let open = cache::http_stream::open_http_stream(file)
-            .await
-            .map_err(error)?;
-        let length = open.content_length();
-        let persist = persistence(&open, file, *cacheable, cache).await;
-        let mut admission = cache.lock().await;
-        admission.cleanup_completed_loads();
-        if admission.is_loading(file) || admission.is_resident(file) {
-            let buffer = admission
-                .get_or_load_streaming_with_freshness(
-                    file,
-                    rate,
-                    freshness.unwrap_or(config.cache.freshness),
-                )
-                .await
-                .map_err(error)?;
-            drop(admission);
-            return full_ready(buffer, command, config).await;
-        }
-        let windowed = length.is_none()
-            || decide(
-                &cache::strategy::probe_http(length, file),
-                admission.memory_headroom(),
-            );
-        let reader = open.into_bounded_reader(persist);
+                probe.is_some_and(|probe| {
+                    decides_windowed(config, *mode, &probe, admission.memory_headroom())
+                })
+            }
+        };
         if !windowed {
-            let buffer = admission.start_streaming_load_from_reader(
+            let buffer = load_full(cache, file, rate, freshness).await?;
+            return full(buffer).await;
+        }
+        let stream = stream_file(path, *loop_mode, &window).await?;
+        return Ok(PreparedPlayback::Stream(stream));
+    }
+
+    // An uncached URL: its response decides, and is then decoded or streamed.
+    let open = cache::http_stream::open_http_stream(file)
+        .await
+        .map_err(error)?;
+    let length = open.content_length();
+    let persist = persistence(&open, file, *cacheable, cache).await;
+    let mut admission = cache.lock().await;
+    admission.cleanup_completed_loads();
+    if !stream_asked && (admission.is_loading(file) || admission.is_resident(file)) {
+        drop(admission);
+        let buffer = load_full(cache, file, rate, freshness).await?;
+        return full(buffer).await;
+    }
+    let windowed = stream_asked
+        || length.is_none()
+        || decides_windowed(
+            config,
+            *mode,
+            &cache::strategy::probe_http(length, file),
+            admission.memory_headroom(),
+        );
+    let reader = open.into_bounded_reader(persist);
+    if !windowed {
+        let buffer = admission.start_streaming_load_from_reader(
+            file,
+            reader,
+            rate,
+            wav_frames(file, length),
+        );
+        drop(admission);
+        return full(buffer).await;
+    }
+    drop(admission);
+    let label = file.clone();
+    let handles = tokio::task::spawn_blocking(move || {
+        audio::streamed_source::spawn_stream_from_source(
+            reader,
+            label,
+            window.rate,
+            window.quality,
+            window.frames,
+        )
+    })
+    .await
+    .map_err(error)?
+    .map_err(error)?;
+    let stream = PreparedStream {
+        handles: Some(handles),
+        loops: false,
+    };
+    Ok(PreparedPlayback::Stream(prebuffer(stream, &window).await))
+}
+
+/// How a windowed play buffers: its window and prebuffer in frames, how long it
+/// waits for the prebuffer, and how it decodes.
+struct Window {
+    frames: usize,
+    prebuffer_frames: usize,
+    deadline: std::time::Duration,
+    rate: u32,
+    quality: config::ResamplerQuality,
+}
+
+/// What the caches hold for a file, after folding in finished loads and dropping a
+/// local file's decode if the file changed on disk.
+struct Source {
+    resident: bool,
+    loading: bool,
+    /// The file to probe or stream from: the local file itself, or a URL's disk copy
+    local_path: Option<std::path::PathBuf>,
+}
+
+async fn examine(cache: &Cache, file: &str, freshness: config::FreshnessMode) -> Source {
+    let mut cache = cache.lock().await;
+    cache.cleanup_completed_loads();
+    let http = file.starts_with("http://") || file.starts_with("https://");
+    if http {
+        cache.revalidate_disk_if_due(file).await;
+    } else {
+        cache.drop_changed_local(file, freshness);
+    }
+    Source {
+        resident: cache.is_resident(file),
+        loading: cache.is_loading(file),
+        local_path: if http {
+            cache.disk_file(file)
+        } else {
+            Some(std::path::PathBuf::from(file))
+        },
+    }
+}
+
+/// Whether the load-strategy decision windows a file with this probe.
+fn decides_windowed(
+    config: &config::Config,
+    mode: config::LoadMode,
+    probe: &cache::strategy::Probe,
+    headroom: usize,
+) -> bool {
+    cache::strategy::decide(
+        mode,
+        config.cache.load_mode,
+        probe,
+        config.cache.full_load_max_bytes,
+        config.cache.full_load_max_seconds,
+        headroom,
+    ) == cache::strategy::Strategy::Windowed
+}
+
+/// The header probe of the file at `path`, from the probe cache or read afresh.
+async fn probe_file(
+    cache: &Cache,
+    path: &std::path::Path,
+    window: &Window,
+) -> Result<Option<cache::strategy::Probe>, CommandError> {
+    let key = path.to_string_lossy().into_owned();
+    if let Some(probe) = cache.lock().await.cached_probe(&key) {
+        return Ok(Some(probe));
+    }
+    let (rate, quality) = (window.rate, window.quality);
+    let probe_key = key.clone();
+    let probe = tokio::task::spawn_blocking(move || {
+        cache::strategy::probe_local_file(&probe_key, rate, quality)
+    })
+    .await
+    .map_err(error)?;
+    if let Some(probe) = probe {
+        cache.lock().await.store_probe(&key, probe);
+    }
+    Ok(probe)
+}
+
+/// Load `file` in full: from memory, by joining a load in progress, or by starting
+/// a progressive decode.
+async fn load_full(
+    cache: &Cache,
+    file: &str,
+    rate: u32,
+    freshness: config::FreshnessMode,
+) -> Result<audio::streaming::SampleBuffer, CommandError> {
+    cache
+        .lock()
+        .await
+        .get_or_load_streaming_with_freshness(file, rate, freshness)
+        .await
+        .map_err(error)
+}
+
+/// Stream the file at `path` through a window, looping at its end when asked.
+async fn stream_file(
+    path: std::path::PathBuf,
+    looping: bool,
+    window: &Window,
+) -> Result<PreparedStream, CommandError> {
+    let (rate, quality, frames) = (window.rate, window.quality, window.frames);
+    let handles = tokio::task::spawn_blocking(move || {
+        audio::streamed_source::spawn_local_file_stream(
+            path.to_string_lossy().into_owned(),
+            rate,
+            quality,
+            frames,
+            looping,
+        )
+    })
+    .await
+    .map_err(error)?
+    .map_err(error)?;
+    let stream = PreparedStream {
+        handles: Some(handles),
+        loops: true,
+    };
+    Ok(prebuffer(stream, window).await)
+}
+
+/// Wait until a windowed play has buffered its prebuffer, or its deadline passes.
+async fn prebuffer(stream: PreparedStream, window: &Window) -> PreparedStream {
+    stream
+        .handles
+        .as_ref()
+        .expect("prepared handles")
+        .wait_prebuffer(window.prebuffer_frames, window.deadline)
+        .await;
+    stream
+}
+
+/// Frames estimated from a URL's `Content-Length`: only uncompressed WAV maps bytes
+/// to frames (about 4 bytes per 16-bit stereo frame).
+fn wav_frames(url: &str, length: Option<u64>) -> Option<usize> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    length
+        .filter(|_| path.to_lowercase().ends_with(".wav"))
+        .map(|n| (n / 4) as usize)
+}
+
+/// What a started precache is doing in the background.
+pub enum Precaching {
+    /// Nothing to wait for: already cached, already loading, or not kept.
+    Nothing,
+    /// Decoding in full into the memory cache.
+    Decode(audio::streaming::SampleBuffer),
+    /// Downloading into the disk cache without decoding.
+    Download(tokio::task::JoinHandle<()>),
+}
+
+impl Precaching {
+    /// Wait until the background work has finished (or failed).
+    pub async fn finished(self) {
+        match self {
+            Precaching::Nothing => {}
+            Precaching::Decode(buffer) => {
+                let Some(notify) = buffer.notifier_blocking() else {
+                    return;
+                };
+                loop {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if buffer.is_complete() || buffer.has_failed() {
+                        break;
+                    }
+                    // A progress signal can land while the decoder holds the
+                    // buffer, so the state is also rechecked periodically.
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_millis(100), notified).await;
+                }
+            }
+            Precaching::Download(task) => {
+                let _ = task.await;
+            }
+        }
+    }
+}
+
+/// Start precaching `file` the way a play of it would load: a file within the
+/// load-strategy limits is decoded in full into the memory cache; one over them
+/// (it would play windowed) is not decoded, and a URL is downloaded into the disk
+/// cache instead. Returns once the work has started.
+pub async fn precache(
+    file: &str,
+    config: &config::Config,
+    cache: &Cache,
+    rate: u32,
+) -> Result<Precaching, CommandError> {
+    authorize(config, file)?;
+    let window = Window {
+        frames: 1,
+        prebuffer_frames: 0,
+        deadline: std::time::Duration::ZERO,
+        rate,
+        quality: config.advanced.resampler_quality,
+    };
+    let freshness = config.cache.freshness;
+    let source = examine(cache, file, freshness).await;
+    if source.resident {
+        tracing::info!("Precache: {} is already in memory", file);
+        return Ok(Precaching::Nothing);
+    }
+    if source.loading {
+        return Ok(Precaching::Decode(
+            load_full(cache, file, rate, freshness).await?,
+        ));
+    }
+
+    if let Some(path) = source.local_path {
+        let probe = probe_file(cache, &path, &window).await?;
+        let windowed = {
+            let admission = cache.lock().await;
+            probe.is_some_and(|probe| {
+                decides_windowed(
+                    config,
+                    config::LoadMode::Auto,
+                    &probe,
+                    admission.memory_headroom(),
+                )
+            })
+        };
+        if windowed {
+            tracing::info!(
+                "Precache: {} is over the limits for loading in full, so it plays windowed \
+                 and is not decoded ahead",
+                file
+            );
+            return Ok(Precaching::Nothing);
+        }
+        tracing::info!("Precache started: {}", file);
+        return Ok(Precaching::Decode(
+            load_full(cache, file, rate, freshness).await?,
+        ));
+    }
+
+    let open = cache::http_stream::open_http_stream(file)
+        .await
+        .map_err(error)?;
+    let length = open.content_length();
+    let persist = persistence(&open, file, None, cache).await;
+    let mut admission = cache.lock().await;
+    admission.cleanup_completed_loads();
+    if admission.is_resident(file) || admission.is_loading(file) {
+        drop(admission);
+        return Ok(Precaching::Decode(
+            load_full(cache, file, rate, freshness).await?,
+        ));
+    }
+    let windowed = length.is_none()
+        || decides_windowed(
+            config,
+            config::LoadMode::Auto,
+            &cache::strategy::probe_http(length, file),
+            admission.memory_headroom(),
+        );
+    if !windowed {
+        let reader = open.into_bounded_reader(persist);
+        tracing::info!("Precache started: {}", file);
+        return Ok(Precaching::Decode(
+            admission.start_streaming_load_from_reader(
                 file,
                 reader,
                 rate,
-                length
-                    .filter(|_| {
-                        file.split(['?', '#'])
-                            .next()
-                            .unwrap_or(file)
-                            .to_lowercase()
-                            .ends_with(".wav")
-                    })
-                    .map(|n| (n / 4) as usize),
-            );
-            drop(admission);
-            return full_ready(buffer, command, config).await;
-        }
-        drop(admission);
-        let label = file.clone();
-        Some(
-            tokio::task::spawn_blocking(move || {
-                audio::streamed_source::spawn_stream_from_source(
-                    reader,
-                    label,
-                    rate,
-                    quality,
-                    window_frames,
-                )
-                .map(|handles| PreparedStream(Some(handles)))
-            })
-            .await
-            .map_err(error)?
-            .map_err(error)?,
-        )
-    } else if !http {
-        let probe = if cached || *mode == config::LoadMode::Stream {
-            probe
-        } else {
-            match probe {
-                Some(probe) => Some(probe),
-                None => {
-                    let path = file.clone();
-                    let probe = tokio::task::spawn_blocking(move || {
-                        cache::strategy::probe_local_file(&path, rate, quality)
-                    })
-                    .await
-                    .map_err(error)?;
-                    if let Some(probe) = probe {
-                        cache.lock().await.store_probe(file, probe);
+                wav_frames(file, length),
+            ),
+        ));
+    }
+    drop(admission);
+    let Some(persist) = persist else {
+        tracing::warn!(
+            "Precache: {} is over the limits for loading in full and cannot be kept on disk \
+             (the disk cache is off or the server sent no Content-Length); nothing precached",
+            file
+        );
+        return Ok(Precaching::Nothing);
+    };
+    tracing::info!(
+        "Precache: {} is over the limits for loading in full; downloading it to the disk cache",
+        file
+    );
+    let mut reader = open.into_bounded_reader(Some(persist));
+    let label = file.to_string();
+    Ok(Precaching::Download(tokio::task::spawn_blocking(
+        move || {
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                match std::io::Read::read(&mut reader, &mut chunk) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Precache download of {} failed: {}", label, e);
+                        break;
                     }
-                    probe
                 }
             }
-        };
-        let mut admission = cache.lock().await;
-        admission.cleanup_completed_loads();
-        let windowed = *mode == config::LoadMode::Stream
-            || (!admission.is_resident(file)
-                && probe
-                    .as_ref()
-                    .is_some_and(|probe| decide(probe, admission.memory_headroom())));
-        if !windowed {
-            let buffer = admission
-                .get_or_load_streaming_with_freshness(
-                    file,
-                    rate,
-                    freshness.unwrap_or(config.cache.freshness),
-                )
-                .await
-                .map_err(error)?;
-            drop(admission);
-            return full_ready(buffer, command, config).await;
-        }
-        drop(admission);
-        if windowed {
-            let path = file.clone();
-            let looping = *loop_mode;
-            Some(
-                tokio::task::spawn_blocking(move || {
-                    audio::streamed_source::spawn_local_file_stream(
-                        path,
-                        rate,
-                        quality,
-                        window_frames,
-                        looping,
-                    )
-                    .map(|handles| PreparedStream(Some(handles)))
-                })
-                .await
-                .map_err(error)?
-                .map_err(error)?,
-            )
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-    if let Some(handles) = handles {
-        let deadline = config.cache.stream_prebuffer_deadline_ms.max(prebuffer_ms);
-        handles
-            .0
-            .as_ref()
-            .expect("prepared handles")
-            .wait_prebuffer(
-                prebuffer_ms as usize * rate as usize / 1000,
-                std::time::Duration::from_millis(deadline as u64),
-            )
-            .await;
-        return Ok(PreparedPlayback::Stream(handles));
-    }
-    let buffer = cache
-        .lock()
-        .await
-        .get_or_load_streaming_with_freshness(
-            file,
-            rate,
-            freshness.unwrap_or(config.cache.freshness),
-        )
-        .await
-        .map_err(error)?;
-    full_ready(buffer, command, config).await
+        },
+    )))
 }
 
 async fn full_ready(
@@ -349,7 +577,7 @@ async fn full_ready(
         } => start_position_ms.unwrap_or(0),
         _ => 0,
     };
-    if let Some(notify) = buffer.notifier() {
+    if let Some(notify) = buffer.notifier_blocking() {
         let deadline = tokio::time::Instant::now()
             + std::time::Duration::from_millis(config.cache.stream_prebuffer_deadline_ms as u64);
         loop {
@@ -416,33 +644,104 @@ mod tests {
         }
     }
 
-    /// Run a runtime `precache` of `file` and wait for its background decode to finish.
-    async fn precache_and_wait(file: &str, config: &config::Config, cache: &Cache) {
-        let precache = AudioCommand::Precache {
-            file: file.to_string(),
-        };
-        prepare(&precache, config, cache, 48000).await.unwrap();
+    fn test_cache() -> (tempfile::TempDir, Cache) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache: Cache = Arc::new(Mutex::new(
+            cache::CacheManager::new(dir.path().join("cache")).unwrap(),
+        ));
+        (dir, cache)
+    }
+
+    /// Write `seconds` of a quiet 440 Hz mono 16-bit WAV at 48 kHz to `path`.
+    fn write_wav(path: &std::path::Path, seconds: f32) {
+        let frames = (seconds * 48000.0) as usize;
+        let mut bytes = Vec::with_capacity(44 + frames * 2);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + frames as u32 * 2).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // mono
+        bytes.extend_from_slice(&48000u32.to_le_bytes());
+        bytes.extend_from_slice(&96000u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(frames as u32 * 2).to_le_bytes());
+        for i in 0..frames {
+            let v = ((i as f32 * 440.0 * std::f32::consts::TAU / 48000.0).sin() * 3000.0) as i16;
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while cache.lock().await.is_loading(file) {
+        while !done() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "precache of {file} did not finish"
+                "timed out waiting for {what}"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 
-    /// Serve `body` as a WAV file on a local port, closing each connection after one
-    /// response, and return its URL and a count of the requests received.
-    async fn serve_wav_counting(body: Vec<u8>) -> (String, Arc<AtomicUsize>) {
+    async fn wait_until_loaded(file: &str, cache: &Cache) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while cache.lock().await.is_loading(file) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "load of {file} did not finish"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn wait_until_on_disk(file: &str, cache: &Cache) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cache.lock().await.is_cached(file) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{file} never reached the disk cache"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Run a runtime `precache` of `file` and wait for its background load to finish.
+    async fn precache_and_wait(file: &str, config: &config::Config, cache: &Cache) {
+        let precache = AudioCommand::Precache {
+            file: file.to_string(),
+        };
+        prepare(&precache, config, cache, 48000).await.unwrap();
+        wait_until_loaded(file, cache).await;
+    }
+
+    /// How the scripted server answers one request.
+    enum Reply {
+        /// The whole file at once.
+        Whole,
+        /// Nothing until `release` fires, then the whole file.
+        HeldUntil(tokio::sync::oneshot::Receiver<()>),
+        /// The headers and the first `head` bytes, the rest when `release` fires.
+        PartUntil(usize, tokio::sync::oneshot::Receiver<()>),
+    }
+
+    /// Serve `body` as a WAV file on a local port, answering the requests in turn
+    /// as `replies` says (later ones get the whole file) and closing each connection
+    /// after its response. Returns the URL and a count of the requests received.
+    async fn serve_wav(body: Vec<u8>, replies: Vec<Reply>) -> (String, Arc<AtomicUsize>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/cue.wav", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicUsize::new(0));
         let counter = requests.clone();
+        let body = Arc::new(body);
         tokio::spawn(async move {
+            let mut replies = replies.into_iter();
             while let Ok((mut socket, _)) = listener.accept().await {
                 counter.fetch_add(1, Ordering::SeqCst);
+                let reply = replies.next().unwrap_or(Reply::Whole);
                 let body = body.clone();
                 tokio::spawn(async move {
                     let mut request = [0u8; 4096];
@@ -451,6 +750,19 @@ mod tests {
                         "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
+                    match reply {
+                        Reply::Whole => {}
+                        Reply::HeldUntil(release) => {
+                            let _ = release.await;
+                        }
+                        Reply::PartUntil(head, release) => {
+                            let _ = socket.write_all(header.as_bytes()).await;
+                            let _ = socket.write_all(&body[..head]).await;
+                            let _ = release.await;
+                            let _ = socket.write_all(&body[head..]).await;
+                            return;
+                        }
+                    }
                     let _ = socket.write_all(header.as_bytes()).await;
                     let _ = socket.write_all(&body).await;
                 });
@@ -459,117 +771,202 @@ mod tests {
         (url, requests)
     }
 
-    /// Serve `body` as a WAV file for two requests: the first response's body is held
-    /// until the second request arrives, and the second response until `release`
-    /// fires. Returns the URL.
-    async fn serve_wav_until_second_request(
-        body: Vec<u8>,
-        release: tokio::sync::oneshot::Receiver<()>,
-    ) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/cue.wav", listener.local_addr().unwrap());
-        tokio::spawn(async move {
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let mut request = [0u8; 4096];
-            let (mut first, _) = listener.accept().await.unwrap();
-            let _ = first.read(&mut request).await;
-            let _ = first.write_all(header.as_bytes()).await;
-            let (mut second, _) = listener.accept().await.unwrap();
-            let _ = second.read(&mut request).await;
-            let _ = first.write_all(&body).await;
-            drop(first);
-            let _ = release.await;
-            let _ = second.write_all(header.as_bytes()).await;
-            let _ = second.write_all(&body).await;
-        });
-        url
+    fn is_full_from_memory(prepared: &PreparedPlayback) -> bool {
+        matches!(
+            prepared,
+            PreparedPlayback::Full(audio::streaming::SampleBuffer::Complete(_))
+        )
     }
 
     #[tokio::test]
     async fn a_precache_that_finishes_while_a_play_opens_its_url_is_used() {
+        // The play finds nothing cached and opens its own request; a precache of the
+        // same URL starts and finishes while that request is pending.
         let (release, released) = tokio::sync::oneshot::channel();
-        let url = serve_wav_until_second_request(std::fs::read(TEST_WAV).unwrap(), released).await;
-        let dir = tempfile::tempdir().unwrap();
-        let cache: Cache = Arc::new(Mutex::new(
-            cache::CacheManager::new(dir.path().to_path_buf()).unwrap(),
-        ));
+        let (url, requests) = serve_wav(
+            std::fs::read(TEST_WAV).unwrap(),
+            vec![Reply::HeldUntil(released)],
+        )
+        .await;
+        let (_dir, cache) = test_cache();
         let config = config::Config::default();
-        let precache = AudioCommand::Precache { file: url.clone() };
-        prepare(&precache, &config, &cache, 48000).await.unwrap();
-
-        // The play finds the precache still loading and opens its own request, which
-        // lets the precache's download finish; its response waits for `release`.
         let playing = tokio::spawn({
             let (url, config, cache) = (url.clone(), config.clone(), cache.clone());
             async move { prepare(&play(&url), &config, &cache, 48000).await }
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while cache.lock().await.is_loading(&url) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "precache did not finish"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_until("the play's request", || {
+            requests.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        precache_and_wait(&url, &config, &cache).await;
         release.send(()).unwrap();
 
         let prepared = playing.await.unwrap().unwrap();
         assert!(
-            matches!(
-                prepared,
-                PreparedPlayback::Full(audio::streaming::SampleBuffer::Complete(_))
-            ),
-            "the play did not use the precached decode"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_finished_precache_of_a_long_local_file_plays_in_full() {
-        // A precache decodes the whole file so a later play is full-featured, even
-        // for a file over the auto limits that a cold play would window.
-        let dir = tempfile::tempdir().unwrap();
-        let cache: Cache = Arc::new(Mutex::new(
-            cache::CacheManager::new(dir.path().to_path_buf()).unwrap(),
-        ));
-        let mut config = config::Config::default();
-        config.cache.full_load_max_seconds = 1;
-        precache_and_wait(TEST_WAV, &config, &cache).await;
-
-        let prepared = prepare(&play(TEST_WAV), &config, &cache, 48000)
-            .await
-            .unwrap();
-        assert!(
-            matches!(
-                prepared,
-                PreparedPlayback::Full(audio::streaming::SampleBuffer::Complete(_))
-            ),
+            is_full_from_memory(&prepared),
             "the play did not use the precached decode"
         );
     }
 
     #[tokio::test]
     async fn a_finished_precache_of_a_url_plays_without_downloading_again() {
-        let (url, requests) = serve_wav_counting(std::fs::read(TEST_WAV).unwrap()).await;
-        let dir = tempfile::tempdir().unwrap();
-        let cache: Cache = Arc::new(Mutex::new(
-            cache::CacheManager::new(dir.path().to_path_buf()).unwrap(),
-        ));
+        let (url, requests) = serve_wav(std::fs::read(TEST_WAV).unwrap(), vec![]).await;
+        let (_dir, cache) = test_cache();
         let config = config::Config::default();
         precache_and_wait(&url, &config, &cache).await;
 
         let prepared = prepare(&play(&url), &config, &cache, 48000).await.unwrap();
         assert!(
-            matches!(
-                prepared,
-                PreparedPlayback::Full(audio::streaming::SampleBuffer::Complete(_))
-            ),
+            is_full_from_memory(&prepared),
             "the play did not use the precached decode"
         );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_play_during_a_url_precache_joins_it_without_a_second_request() {
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (url, requests) = serve_wav(
+            std::fs::read(TEST_WAV).unwrap(),
+            vec![Reply::PartUntil(64 * 1024, released)],
+        )
+        .await;
+        let (_dir, cache) = test_cache();
+        let config = config::Config::default();
+        let precache = AudioCommand::Precache { file: url.clone() };
+        prepare(&precache, &config, &cache, 48000).await.unwrap();
+
+        let prepared = prepare(&play(&url), &config, &cache, 48000).await.unwrap();
+        assert!(
+            matches!(prepared, PreparedPlayback::Full(_)),
+            "the play must join the precache's load"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "no second download");
+        release.send(()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_play_joins_a_full_load_of_a_long_local_file_in_progress() {
+        // A full decode of a file over the auto limits is already running (a play
+        // asked for "full"); a later auto play shares it instead of windowing.
+        let (dir, cache) = test_cache();
+        let file = dir.path().join("long.wav");
+        write_wav(&file, 120.0);
+        let file = file.to_str().unwrap().to_string();
+        let mut config = config::Config::default();
+        config.cache.full_load_max_bytes = u64::MAX;
+        let mut full = play(&file);
+        if let AudioCommand::Play { mode, .. } = &mut full {
+            *mode = config::LoadMode::Full;
+        }
+        assert!(matches!(
+            prepare(&full, &config, &cache, 48000).await.unwrap(),
+            PreparedPlayback::Full(_)
+        ));
+
+        let prepared = prepare(&play(&file), &config, &cache, 48000).await.unwrap();
+        assert!(
+            matches!(prepared, PreparedPlayback::Full(_)),
+            "the play must share the decode in progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_disk_cached_url_over_the_limits_streams_from_disk_and_can_loop() {
+        let (url, requests) = serve_wav(std::fs::read(TEST_WAV).unwrap(), vec![]).await;
+        let (_dir, cache) = test_cache();
+        let mut config = config::Config::default();
+        // A windowed first play with a window longer than the file saves it to disk.
+        let mut first = play(&url);
+        if let AudioCommand::Play {
+            mode, window_ms, ..
+        } = &mut first
+        {
+            *mode = config::LoadMode::Stream;
+            *window_ms = Some(5000);
+        }
+        let first = prepare(&first, &config, &cache, 48000).await.unwrap();
+        assert!(matches!(first, PreparedPlayback::Stream(ref s) if !s.loops()));
+        wait_until_on_disk(&url, &cache).await;
+
+        config.cache.full_load_max_seconds = 1;
+        let mut again = play(&url);
+        if let AudioCommand::Play { loop_mode, .. } = &mut again {
+            *loop_mode = true;
+        }
+        let prepared = prepare(&again, &config, &cache, 48000).await.unwrap();
+        assert!(
+            matches!(prepared, PreparedPlayback::Stream(ref s) if s.loops()),
+            "a cached URL over the limits must stream from its disk copy, which can loop"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "played from disk");
+        assert!(!cache.lock().await.is_resident(&url), "not decoded whole");
+    }
+
+    #[tokio::test]
+    async fn an_edited_file_now_over_the_limits_plays_windowed() {
+        let (dir, cache) = test_cache();
+        let file = dir.path().join("cue.wav");
+        write_wav(&file, 2.0);
+        let file = file.to_str().unwrap().to_string();
+        let mut config = config::Config::default();
+        config.cache.full_load_max_seconds = 3;
+        assert!(matches!(
+            prepare(&play(&file), &config, &cache, 48000).await.unwrap(),
+            PreparedPlayback::Full(_)
+        ));
+        wait_until_loaded(&file, &cache).await;
+
+        write_wav(std::path::Path::new(&file), 4.0);
+        let prepared = prepare(&play(&file), &config, &cache, 48000).await.unwrap();
+        assert!(
+            matches!(prepared, PreparedPlayback::Stream(_)),
+            "the edited file is over the limits now"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_precache_of_a_local_file_over_the_limits_does_not_decode_it() {
+        let (_dir, cache) = test_cache();
+        let mut config = config::Config::default();
+        config.cache.full_load_max_seconds = 1;
+        let started = precache(TEST_WAV, &config, &cache, 48000).await.unwrap();
+        assert!(matches!(started, Precaching::Nothing));
+        let cache = cache.lock().await;
+        assert!(!cache.is_loading(TEST_WAV) && !cache.is_resident(TEST_WAV));
+    }
+
+    #[tokio::test]
+    async fn a_precache_of_a_url_over_the_limits_downloads_it_to_disk_only() {
+        let (url, requests) = serve_wav(std::fs::read(TEST_WAV).unwrap(), vec![]).await;
+        let (_dir, cache) = test_cache();
+        let mut config = config::Config::default();
+        config.cache.full_load_max_bytes = 1000;
+        precache(&url, &config, &cache, 48000)
+            .await
+            .unwrap()
+            .finished()
+            .await;
+        wait_until_on_disk(&url, &cache).await;
+        assert!(!cache.lock().await.is_resident(&url), "not decoded");
+
+        let prepared = prepare(&play(&url), &config, &cache, 48000).await.unwrap();
+        assert!(matches!(prepared, PreparedPlayback::Stream(_)));
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "played from disk");
+    }
+
+    #[tokio::test]
+    async fn a_blocking_precache_waits_for_the_decode() {
+        let (_dir, cache) = test_cache();
+        let config = config::Config::default();
+        precache(TEST_WAV, &config, &cache, 48000)
+            .await
+            .unwrap()
+            .finished()
+            .await;
+        let mut cache = cache.lock().await;
+        cache.cleanup_completed_loads();
+        assert!(cache.is_resident(TEST_WAV));
     }
 
     /// Prepare a windowed play of the test file with `window_ms` and `prebuffer_ms`
@@ -633,7 +1030,10 @@ mod tests {
         )
         .unwrap();
         let stop = handles.stop_flag.clone();
-        let prepared = PreparedStream(Some(handles));
+        let prepared = PreparedStream {
+            handles: Some(handles),
+            loops: true,
+        };
         drop(prepared);
         assert!(stop.load(std::sync::atomic::Ordering::Acquire));
     }

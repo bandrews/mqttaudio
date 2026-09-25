@@ -288,6 +288,16 @@ impl SampleBuffer {
         }
     }
 
+    /// The decode-progress notifier of a streaming buffer, waiting for the lock if
+    /// the decoder holds it; `None` for a complete buffer. For loading and control
+    /// threads only, never the audio callback.
+    pub fn notifier_blocking(&self) -> Option<Arc<Notify>> {
+        match self {
+            SampleBuffer::Complete(_) => None,
+            SampleBuffer::Streaming(buf) => buf.read().ok().map(|b| b.notifier()),
+        }
+    }
+
     /// Try to convert to Arc<DecodedBuffer> if complete.
     /// Returns None if streaming or if streaming buffer isn't complete yet.
     pub fn as_complete(&self) -> Option<Arc<DecodedBuffer>> {

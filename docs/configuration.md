@@ -161,7 +161,7 @@ signal passes unchanged; above that it is compressed smoothly into the ceiling. 
 |---------|---------|-------------|
 | `enabled` | `true` | Keep downloaded files in `directory` so replays and restarts skip the download |
 | `directory` | `~/.mqttaudio/cache` | Disk cache location (`~` expands). While `enabled` is on it is created at startup if missing, and startup fails if it cannot be; an existing directory that is not writable only shows up as errors when the cache writes |
-| `precache` | `[]` | Files, directories (their `.wav`, `.mp3`, `.ogg` and `.flac` files, not subdirectories) and URLs to load at startup |
+| `precache` | `[]` | Files, directories (their `.wav`, `.mp3`, `.ogg` and `.flac` files, not subdirectories) and URLs to load at startup, each the way a play of it would load (see [Precaching](features/caching.md#precaching)) |
 | `precache_blocking` | `true` | `true`: finish loading each precache entry before starting. `false`: start loading each entry, then begin taking commands while they finish |
 | `max_memory_mb` | `0` | Memory cache budget in MiB. `0` sizes it automatically: 40% of available memory, at least 128 MiB and at most 1024 MiB |
 | `memory_budget` | none | Replaces `max_memory_mb` when present; see below |

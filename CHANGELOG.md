@@ -34,6 +34,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Cached URLs, edited files and precaches go through the full-or-windowed decision.** A URL already
+  in the disk cache was always decoded whole, however long (a two-hour 5.1 file is about 8 GB), and so
+  was a local file re-read after an edit and every `precache` and `cache_reload`. They now follow the
+  same rules as a first play: a cached URL over the limits streams from its disk copy (and can loop),
+  an edited file is decided afresh, and a precache of a file that would play windowed does not decode
+  it (a URL is downloaded to the disk cache instead). A precache no longer holds the cache while it
+  connects to the server.
+- **A play shares a load already in progress.** A play of a local file over the auto limits that
+  arrived while a full load of it (a precache, or a `"full"` play) was still decoding was windowed, and
+  a play of a URL being precached opened a second request before joining the download. Both now
+  share the load.
+- **Waiting for a first play's audio no longer skips under contention.** The wait for a cold play's
+  start position read the decode's progress signal with a non-blocking lock, so when the decoder held
+  the lock at that moment the play started without waiting.
 - **A muted microphone no longer triggers ducking.** Mute is applied in the mix while capture keeps
   running, and activity detection read the captured level, so a muted input that picked up sound
   kept ducking the room; an input without an `activity_threshold` ducked the whole time it was open.

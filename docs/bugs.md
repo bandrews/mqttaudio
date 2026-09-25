@@ -51,20 +51,6 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 
 ### Cache and loading
 
-- **A URL in the disk cache is always decoded in full.** `loading::prepare` skips the windowing
-  decision for cached URLs, so a long remote file that was cached by a windowed play is decoded
-  whole on its next play (a two-hour 5.1 file is about 8 GB). The same applies to a local file
-  re-decoded after an edit, which bypasses the decision in
-  `get_or_load_streaming_with_freshness`.
-- **Precache and `cache_reload` ignore the budget and windowing.** They always decode in full, and
-  log success when the result is then too big to keep.
-- **A play during a precache's decode does not use it.** A play of a local file over the auto limits
-  that arrives before a `precache` or `cache_reload` of it has finished is windowed instead of joining
-  the decode, and a play of a URL opens its own request before joining the download.
-- **A runtime `precache` or `cache_reload` of a URL holds the cache while it connects.**
-  `loading::prepare` keeps the cache lock across the request, so an unresponsive server (up to the
-  30-second response limit) delays every play, cached ones included, and `/metrics`, `/status` and
-  `/status/cache`.
 - **Freshness does not match decision D46.** D46 says a play never waits on the network, `dev`
   checks on every play, and `pinned` checks nothing. In the code, a play of a URL that is only on
   disk revalidates in the foreground in every mode once it is due: the conditional request is bounded
@@ -81,9 +67,8 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
   entry registered.
 - **Promotion copies the decoded buffer.** `cleanup_completed_loads` promotes with `to_vec()`, a
   transient second copy of the whole decode, made before the memory cache decides whether to keep it.
-  Full loads are not all bounded by `full_load_max_bytes` (`mode: "full"`, files without a size
-  estimate, cached URLs, edits, precache), and the copy runs on the control loop when the upgrade pass
-  triggers it.
+  Full loads are not all bounded by `full_load_max_bytes` (`mode: "full"` and files without a size
+  estimate), and the copy runs on the control loop when the upgrade pass triggers it.
 - **The disk cache has no size limit or eviction.**
 
 ### Live inputs
@@ -137,8 +122,7 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 
 ### Code health
 
-- `handle_command` (`src/main.rs`) still has arms for `precache` and the cache commands, which
-  `loading::prepare` completes first, and empty-selector branches in `seek`, `speed`, `stop` and
+- `handle_command` (`src/main.rs`) has empty-selector branches in `seek`, `speed`, `stop` and
   `volume` that the selector pre-check makes unreachable.
 - `CacheError`'s variant names carry a targeted `#[allow(clippy::enum_variant_names)]`
   (`src/cache/disk.rs`).

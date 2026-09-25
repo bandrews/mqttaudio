@@ -121,9 +121,10 @@ small however long the file is, but it:
 full unless it is larger than `cache.full_load_max_bytes` decoded, longer than
 `cache.full_load_max_seconds`, or too big for the memory still free in the cache budget; a URL of
 unknown length is always windowed. `"full"` asks for a full play but still falls back to windowed when
-the file would not fit in memory, and `"stream"` plays windowed. Whatever the mode, a URL already in
-the memory or disk cache plays in full, and so does a local file already in the memory cache unless the
-play itself says `"stream"`. [Caching](features/caching.md#how-a-play-is-loaded) has the details.
+the file would not fit in memory, and `"stream"` plays windowed. A file already in memory, or being
+loaded in full, is shared unless the play itself says `"stream"`. A URL already on disk is decided
+like a local file and, when windowed, streams from its disk copy.
+[Caching](features/caching.md#how-a-play-is-loaded) has the details.
 
 #### Channel map
 
@@ -307,13 +308,12 @@ many milliseconds, and `0` makes it instant. A muted input does not trigger duck
 {"command": "precache", "file": "https://example.com/sounds/intro.mp3"}
 ```
 
-Loads a file into the memory cache, and a URL into the disk cache too (when it is enabled), so a
-later play starts instantly with every feature. The command completes once loading has started; the
-decode continues in the background, and a failure is only logged. Send it ahead of the cue: a play of
-a local file over the auto limits that arrives before the decode finishes is windowed.
-
-The file is always decoded in full, and a file too large for the memory budget is not kept in memory
-(a URL stays in the disk cache). Directories are accepted only in the config's `cache.precache`.
+Loads a file the way an `auto` play of it would, so a later play starts instantly: a file that would
+play in full is decoded into the memory cache (and a URL saved to the disk cache when it is enabled);
+one that would play windowed is not decoded, and a URL is downloaded into the disk cache instead. The
+command completes once loading has started; the load continues in the background, a play that
+arrives meanwhile shares it, and a failure is only logged. Directories are accepted only in the
+config's `cache.precache`. See [Caching](features/caching.md#precaching).
 
 ### cache_clear
 

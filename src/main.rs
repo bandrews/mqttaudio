@@ -872,45 +872,33 @@ async fn main() {
         }
     };
 
-    // Precache files from config on startup (expands directories to audio files)
+    // Precache files from config on startup (expands directories to audio files),
+    // loading each the way a play of it would (see `loading::precache`).
     let precache_files = config.expand_precache_entries();
     if !precache_files.is_empty() {
-        if config.cache.precache_blocking {
-            tracing::info!("Precaching {} files (blocking)...", precache_files.len());
-            for file_path in &precache_files {
-                let mut cache_mgr = cache_manager.lock().await;
-                match cache_mgr.precache(file_path, output_sample_rate).await {
-                    Ok(()) => {
-                        if config.logging.verbose {
-                            cache_mgr.log_stats();
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to precache {}: {}", file_path, e);
-                    }
-                }
-                drop(cache_mgr);
+        let blocking = config.cache.precache_blocking;
+        tracing::info!(
+            "Precaching {} files ({})...",
+            precache_files.len(),
+            if blocking {
+                "blocking"
+            } else {
+                "in the background"
+            }
+        );
+        for file_path in &precache_files {
+            match loading::precache(file_path, &config, &cache_manager, output_sample_rate).await {
+                Ok(started) if blocking => started.finished().await,
+                Ok(_) => {}
+                Err(e) => tracing::error!("Failed to precache {}: {}", file_path, e.message),
+            }
+        }
+        if blocking {
+            cache_manager.lock().await.cleanup_completed_loads();
+            if config.logging.verbose {
+                cache_manager.lock().await.log_stats();
             }
             tracing::info!("Startup precaching complete");
-        } else {
-            tracing::info!(
-                "Starting background precache for {} files (non-blocking)...",
-                precache_files.len()
-            );
-            for file_path in &precache_files {
-                let mut cache_mgr = cache_manager.lock().await;
-                match cache_mgr
-                    .precache_streaming(file_path, output_sample_rate)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::error!("Failed to start precache for {}: {}", file_path, e);
-                    }
-                }
-                drop(cache_mgr);
-            }
-            tracing::info!("Background precache initiated (files loading asynchronously)");
         }
     }
 
@@ -2136,6 +2124,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
 
             let buffer_result = match ctx.prepared.take() {
                 Some(PreparedPlayback::Stream(handles)) => {
+                    let stream_loops = handles.loops();
                     let handles = handles.into_handles();
                     stages.decision();
                     // A windowed source plays forward from the start of the file,
@@ -2156,12 +2145,12 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             crossfade_ms
                         );
                     }
-                    // A URL is read once as it downloads, so only a local file can loop.
-                    let loops = loop_mode && !file.starts_with("http");
+                    // A download is read once, so only a stream from a file can loop.
+                    let loops = loop_mode && stream_loops;
                     if loop_mode && !loops {
                         tracing::warn!(
-                            "Play of {} is windowed (streamed) from a URL, which plays once; \
-                             loop is ignored",
+                            "Play of {} is windowed (streamed) as it downloads, which plays \
+                             once; loop is ignored",
                             file
                         );
                     }
@@ -2570,75 +2559,11 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 tracing::warn!("Voice '{}' not found", voice);
             }
         }
-        mqtt::commands::AudioCommand::Precache { file } => {
-            // Non-blocking precache - starts loading and returns immediately
-            let mut cache_mgr = cache_manager.lock().await;
-            match cache_mgr
-                .precache_streaming(&file, output_sample_rate)
-                .await
-            {
-                Ok(()) => {
-                    if config.logging.verbose {
-                        cache_mgr.log_stats();
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to start precache for {}: {}", file, e);
-                }
-            }
-        }
-        mqtt::commands::AudioCommand::CacheClear => {
-            let mut cache_mgr = cache_manager.lock().await;
-            if config.logging.verbose {
-                let mem = cache_mgr.memory_stats();
-                let disk = cache_mgr.disk_stats();
-                tracing::debug!(
-                    "Clearing cache - Memory: {} entries ({:.2} MB), Disk: {} entries ({:.2} MB)",
-                    mem.entry_count,
-                    mem.size_bytes as f64 / (1024.0 * 1024.0),
-                    disk.entry_count,
-                    disk.size_bytes as f64 / (1024.0 * 1024.0)
-                );
-            }
-            match cache_mgr.clear_all() {
-                Ok(()) => {
-                    tracing::info!("Cache cleared successfully");
-                }
-                Err(e) => {
-                    tracing::error!("Failed to clear cache: {}", e);
-                }
-            }
-        }
-        mqtt::commands::AudioCommand::CacheInvalidate { file } => {
-            let mut cache_mgr = cache_manager.lock().await;
-            match cache_mgr.invalidate(&file) {
-                Ok(()) => {
-                    tracing::info!("Invalidated cache for: {}", file);
-                    if config.logging.verbose {
-                        cache_mgr.log_stats();
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Failed to invalidate {}: {}", file, e);
-                }
-            }
-        }
-        mqtt::commands::AudioCommand::CacheReload { file } => {
-            // Invalidate then re-precache, so the next play is both fresh and instant —
-            // the explicit refresh path for a content pipeline that just republished
-            // an asset (no per-load freshness cost).
-            let mut cache_mgr = cache_manager.lock().await;
-            if let Err(e) = cache_mgr.invalidate(&file) {
-                tracing::error!("Failed to invalidate {} for reload: {}", file, e);
-            }
-            match cache_mgr
-                .precache_streaming(&file, output_sample_rate)
-                .await
-            {
-                Ok(()) => tracing::info!("Reloaded cache for: {}", file),
-                Err(e) => tracing::error!("Failed to reload {}: {}", file, e),
-            }
-        }
+        // Completed by `loading::prepare` before this match is reached.
+        mqtt::commands::AudioCommand::Precache { .. }
+        | mqtt::commands::AudioCommand::CacheClear
+        | mqtt::commands::AudioCommand::CacheInvalidate { .. }
+        | mqtt::commands::AudioCommand::CacheReload { .. } => {}
         mqtt::commands::AudioCommand::InputVolume {
             input,
             volume: new_volume,

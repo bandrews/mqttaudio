@@ -266,6 +266,45 @@ impl CacheManager {
         self.memory_cache.contains(file_path)
     }
 
+    /// The disk-cache file holding `url`, if the URL is cached on disk.
+    pub fn disk_file(&self, url: &str) -> Option<PathBuf> {
+        let disk = self.disk_cache.as_ref()?;
+        if !disk.is_cached(url) {
+            return None;
+        }
+        disk.get_entry(url)
+            .map(|entry| disk.get_cached_file_path(entry))
+    }
+
+    /// Drop the memory-cached decode of a local file that changed on disk since it
+    /// was loaded, unless `freshness` is pinned, so the next load decides afresh how
+    /// to play the new version. Returns whether it was dropped.
+    pub fn drop_changed_local(&mut self, file_path: &str, freshness: FreshnessMode) -> bool {
+        if freshness == FreshnessMode::Pinned
+            || file_path.starts_with("http://")
+            || file_path.starts_with("https://")
+            || !self.memory_cache.contains(file_path)
+            || !self.local_file_changed(file_path)
+        {
+            return false;
+        }
+        tracing::info!("Local file changed on disk; reloading: {}", file_path);
+        self.memory_cache.remove(file_path);
+        self.local_stats.remove(file_path);
+        true
+    }
+
+    /// Ask the server whether the disk-cached copy of `url` is still current, if it
+    /// is due for a check.
+    pub async fn revalidate_disk_if_due(&mut self, url: &str) {
+        let window = std::time::Duration::from_secs(self.revalidate_after_seconds);
+        if let Some(disk) = self.disk_cache.as_mut() {
+            if disk.is_cached(url) {
+                let _ = disk.revalidate_if_due(url, window).await;
+            }
+        }
+    }
+
     /// Whether `file_path` is cached in memory or on disk. A cached URL is served
     /// full-featured from the cache rather than windowed.
     pub fn is_cached(&self, file_path: &str) -> bool {

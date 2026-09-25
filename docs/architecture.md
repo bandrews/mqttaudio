@@ -87,7 +87,11 @@ the audio thread hands back.
 full-versus-windowed decision from a header probe, the size/duration thresholds and the memory
 budget's headroom):
 
-- **Memory-cache hit.** The decoded buffer is shared by `Arc`; the play starts on the next block.
+- **Memory-cache hit, or a full load in progress.** The decoded (or decoding) buffer is shared by
+  `Arc`; a play never repeats a decode that is already running. Before deciding, `prepare` folds
+  finished loads into the caches and drops a local file's decode if the file changed on disk.
+- **Local file or disk-cached URL.** The file (for a URL, its disk copy) is probed and decided;
+  a windowed play streams from the file, so it can loop.
 - **Full load (cold).** A progressive decoder fills a `SampleBuffer::Streaming` in the background
   and the play starts as soon as the requested start position is decoded. Seeking works on the
   progressive buffer, and looping starts once the decode has finished. The finished decode is then
@@ -100,6 +104,10 @@ budget's headroom):
   response is then either decoded into a full-load buffer or read through a bounded,
   back-pressured reader for a windowed play. Cacheable downloads are teed to the disk cache as
   they play.
+
+`loading::precache` loads a file for `precache`, `cache_reload` and the startup list the way an
+`auto` play would: a file that would play windowed is not decoded, and such a URL is only downloaded
+into the disk cache.
 
 The caches (`src/cache/`) are a memory cache of decoded PCM with a hard byte budget and LRU
 eviction, and a disk cache of downloaded files keyed by a SHA-256 of the URL, with ETag /

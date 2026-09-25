@@ -57,24 +57,20 @@ A play's `mode` is `"auto"`, `"full"` or `"stream"`; leaving it out, or `"auto"`
 
 | File | Played in full when | Otherwise |
 |------|---------------------|-----------|
-| Already in the memory cache | Always | |
-| Local file | Its decoded size is at most `cache.full_load_max_bytes` (32 MiB), it is at most `cache.full_load_max_seconds` (60 s) long, and it fits in the budget's free room | Windowed |
-| URL already in the disk cache | Always | |
-| Other URL | Its estimated decoded size is at most `full_load_max_bytes` and fits in the free room | Windowed |
-| URL without a `Content-Length` | Never | Windowed |
+| Already in the memory cache, or being loaded in full | Always, sharing that decode | |
+| Local file, or URL already in the disk cache | Its decoded size is at most `cache.full_load_max_bytes` (32 MiB), it is at most `cache.full_load_max_seconds` (60 s) long, and it fits in the budget's free room | Windowed, from the file |
+| Other URL | Its estimated decoded size is at most `full_load_max_bytes` and fits in the free room | Windowed, as it downloads |
+| URL without a `Content-Length` | Never | Windowed, as it downloads |
 
-A local file's size and length come from its header. A URL's decoded size, or a local file's when
-its header gives no length, is estimated from the file size by extension: twice the size for `.wav`,
-`.wave`, `.flac`, `.aiff`, `.aif`, `.alac` and `.wv`, 25 times for anything else (including ALAC in
-`.m4a`).
+A file's size and length come from its header. A URL's decoded size, or a file's when its header
+gives no length, is estimated from the file size by extension: twice the size for `.wav`, `.wave`,
+`.flac`, `.aiff`, `.aif`, `.alac` and `.wv`, 25 times for anything else (including ALAC in `.m4a`).
 
-`full` plays in full whenever the estimate fits in the free room, and `stream` always windows, with
-two exceptions. A URL already in the memory or disk cache always plays in full, whatever its size and
-`mode`; one on disk is decoded whole again, which for a very long file can far exceed the budget, so
-keep such files out of the disk cache with `"cacheable": false` (see [Known Issues](../bugs.md)). A
-local file already in the memory cache plays in full unless the play itself says `"stream"`.
-
-Precache and `cache_reload` always decode in full.
+`full` plays in full whenever the estimate fits in the free room, and `stream` always windows, except
+that a file already in memory or being loaded in full is shared unless the play itself says
+`"stream"`. A local file that changed on disk since it was loaded is decided afresh (unless its
+`freshness` is `pinned`). A windowed play of a local file or of a URL's disk copy can loop; one that
+plays as it downloads cannot.
 
 ### How much memory audio needs
 
@@ -156,24 +152,24 @@ List files that must start instantly in `cache.precache`:
 }
 ```
 
-A directory contributes its `.wav`, `.mp3`, `.ogg` and `.flac` files (not subdirectories). With
-`cache.precache_blocking` on (the default) each entry is fully decoded before the daemon takes
-commands; off, the daemon starts each load and then takes commands while they finish.
+A directory contributes its `.wav`, `.mp3`, `.ogg` and `.flac` files (not subdirectories).
 
-At runtime, the `precache` command starts loading one file or URL and answers once the load has
-started, whatever `cache.precache_blocking` says; the decode finishes in the background, and a failure
-is only logged. Send it well before the cue: a play that arrives while the decode is still running
-joins it for a URL (after opening a request of its own), but plays windowed for a local file over the
-auto limits.
+A precache loads a file the way an `auto` play of it would. A file that would play in full is
+decoded into the memory cache (and a URL saved to the disk cache). A file that would play windowed
+is not decoded, so precaching never fills memory with files too large or long to keep: a local file
+is left as it is, and a URL is downloaded into the disk cache, so its plays stream from disk.
 
-Precaching always decodes the whole file, whatever its size, and a file larger than the budget's free
-room is not kept in memory afterwards (a URL stays on disk). Precache the files that fit.
+With `cache.precache_blocking` on (the default) each entry has finished loading before the daemon
+takes commands; off, the daemon starts each load and then takes commands while they finish. At
+runtime, the `precache` command starts loading one file or URL and answers once the load has started,
+whatever `cache.precache_blocking` says; the load finishes in the background, and a failure is only
+logged. A play that arrives meanwhile shares the load.
 
 ## Cache commands
 
 | Command | Does |
 |---------|------|
-| `precache` | Load a file or URL into the caches |
+| `precache` | Load a file or URL into the caches, as a play of it would ([Precaching](#precaching)) |
 | `cache_invalidate` | Drop one file or URL from both caches, and abandon a load of it in progress |
 | `cache_reload` | `cache_invalidate`, then `precache` |
 | `cache_clear` | Empty the memory cache and delete every file in the disk cache. Loads already in progress still finish and fill the memory cache again; downloads in progress are not saved to disk |
