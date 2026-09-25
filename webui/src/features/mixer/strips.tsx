@@ -1,11 +1,13 @@
 // ABOUTME: Mixer strips: VoiceStrip (volume, fade-out, stop) and InputStrip (volume, mute).
-// ABOUTME: Each control sends its command straight through the connected client.
+// ABOUTME: Each control sends its command through the connected client and shows a refusal's error.
 
 // Voice and input control strips (Sprint W5): live volume faders, voice fade-out
 // (time_ms), voice stop, and input mute. input_mute restores the prior level on
-// the daemon (not a hardcoded 1.0).
+// the daemon (not a hardcoded 1.0). A command the daemon refuses shows its error
+// at the bottom of the strip.
 
 import { useState } from 'react';
+import Alert from '@mui/material/Alert';
 import Button from '@mui/material/Button';
 import Chip from '@mui/material/Chip';
 import FormControlLabel from '@mui/material/FormControlLabel';
@@ -16,10 +18,10 @@ import Switch from '@mui/material/Switch';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import type { InputInfo, VoiceInfo } from '../../api/contract';
-import { useClient } from '../../state/clientContext';
+import { useCommandRunner } from '../console/useCommandRunner';
 
 export function VoiceStrip({ voice }: { voice: VoiceInfo }) {
-  const client = useClient();
+  const { state, run } = useCommandRunner();
   const [vol, setVol] = useState(voice.volume);
   const [timeMs, setTimeMs] = useState('2000');
   const ducked = voice.ducking_multiplier < 1;
@@ -43,25 +45,26 @@ export function VoiceStrip({ voice }: { voice: VoiceInfo }) {
           step={0.01}
           value={vol}
           onChange={(_e, v) => setVol(v as number)}
-          onChangeCommitted={(_e, v) => client?.voiceVolume({ voice: voice.id, volume: v as number })}
+          onChangeCommitted={(_e, v) => run((c) => c.voiceVolume({ voice: voice.id, volume: v as number }))}
           aria-label={`voice ${voice.id} volume`}
         />
       </Stack>
       <Stack direction="row" spacing={1} alignItems="center" mt={0.5}>
         <TextField size="small" label="time_ms" value={timeMs} onChange={(e) => setTimeMs(e.target.value)} sx={{ width: 110 }} />
-        <Button size="small" variant="outlined" onClick={() => client?.voiceFadeOut({ voice: voice.id, time_ms: Number(timeMs) || 0 })}>
+        <Button size="small" variant="outlined" onClick={() => run((c) => c.voiceFadeOut({ voice: voice.id, time_ms: Number(timeMs) || 0 }))}>
           Fade out
         </Button>
-        <Button size="small" variant="outlined" color="warning" onClick={() => client?.voiceStop({ voice: voice.id })}>
+        <Button size="small" variant="outlined" color="warning" onClick={() => run((c) => c.voiceStop({ voice: voice.id }))}>
           Stop
         </Button>
       </Stack>
+      {state.status === 'error' && <Alert severity="error" sx={{ py: 0 }}>{state.message}</Alert>}
     </Paper>
   );
 }
 
 export function InputStrip({ input }: { input: InputInfo }) {
-  const client = useClient();
+  const { state, run } = useCommandRunner();
   const [vol, setVol] = useState(input.volume);
   return (
     <Paper variant="outlined" sx={{ p: 1.5 }}>
@@ -74,7 +77,7 @@ export function InputStrip({ input }: { input: InputInfo }) {
             <Switch
               size="small"
               checked={input.muted}
-              onChange={(e) => client?.inputMute({ input: String(input.index), mute: e.target.checked })}
+              onChange={(e) => run((c) => c.inputMute({ input: String(input.index), mute: e.target.checked }))}
               inputProps={{ 'aria-label': `mute input ${input.index}` }}
             />
           }
@@ -92,10 +95,11 @@ export function InputStrip({ input }: { input: InputInfo }) {
           step={0.01}
           value={vol}
           onChange={(_e, v) => setVol(v as number)}
-          onChangeCommitted={(_e, v) => client?.inputVolume({ input: String(input.index), volume: v as number })}
+          onChangeCommitted={(_e, v) => run((c) => c.inputVolume({ input: String(input.index), volume: v as number }))}
           aria-label={`input ${input.index} volume`}
         />
       </Stack>
+      {state.status === 'error' && <Alert severity="error" sx={{ py: 0 }}>{state.message}</Alert>}
     </Paper>
   );
 }

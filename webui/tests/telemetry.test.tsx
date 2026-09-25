@@ -6,7 +6,12 @@ import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { renderWithClient, mockReadClient } from './_helpers';
 import { DaemonClient } from '../src/api/client';
-import type { DaemonConnection, Subscription, SubscriptionHandlers } from '../src/api/connection';
+import {
+  HttpError,
+  type DaemonConnection,
+  type Subscription,
+  type SubscriptionHandlers,
+} from '../src/api/connection';
 import { NowPlayingBoard } from '../src/features/dashboard/NowPlayingBoard';
 import { TelemetrySwitch } from '../src/features/telemetry/TelemetrySwitch';
 import { isWindowed } from '../src/features/mixer/windowed';
@@ -106,5 +111,21 @@ describe('TelemetrySwitch (DW3)', () => {
     await waitFor(() => expect(toggle).not.toBeChecked());
     await user.click(toggle);
     expect(setTelemetry).toHaveBeenCalledWith(true);
+  });
+
+  it('shows the error and keeps telemetry off when the daemon refuses the change', async () => {
+    const user = userEvent.setup();
+    const setTelemetry = vi.fn().mockRejectedValue(new HttpError(401, '/telemetry'));
+    const client = mockReadClient({
+      telemetry: async () => ({ enabled: false }),
+      setTelemetry,
+    });
+    renderWithClient(<TelemetrySwitch />, client);
+    const toggle = screen.getByRole('checkbox', { name: 'telemetry' });
+    await waitFor(() => expect(toggle).not.toBeChecked());
+    await user.click(toggle);
+    expect(setTelemetry).toHaveBeenCalledWith(true);
+    expect(await screen.findByRole('alert')).toHaveTextContent('HTTP 401 for /telemetry');
+    expect(toggle).not.toBeChecked();
   });
 });
