@@ -1,3 +1,6 @@
+// ABOUTME: React hook that subscribes to the /ws log stream and keeps the latest lines.
+// ABOUTME: Tracks connection state, reconnects with backoff, stops on 401 and marks gaps.
+
 // Drives the /ws log-stream subscription with a real connection lifecycle
 // (Sprint W1, F3/F4): connect -> on the {type:"connected"} welcome go live; on
 // each {type:"log"} append; on close, classify via a /version re-probe (401 ->

@@ -1,3 +1,6 @@
+// ABOUTME: Tests for DaemonClient.config and the ConfigView component.
+// ABOUTME: Checks GET /config, the restart banner, snippets, live ducking and the section editor.
+
 import { describe, it, expect } from 'vitest';
 import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';

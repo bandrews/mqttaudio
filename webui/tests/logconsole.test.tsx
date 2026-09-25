@@ -1,3 +1,6 @@
+// ABOUTME: Tests LogConsole against a mock client that drives /ws frames and closes.
+// ABOUTME: Covers welcome and log frames, backoff reconnect with a gap marker, and 401 handling.
+
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, act } from '@testing-library/react';
 import { LogConsole } from '../src/features/logs/LogConsole';

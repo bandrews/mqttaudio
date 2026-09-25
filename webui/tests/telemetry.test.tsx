@@ -1,3 +1,6 @@
+// ABOUTME: Tests for telemetry: the windowed flag, setTelemetry, progress bars and the switch.
+// ABOUTME: Mocks the client to cover telemetry on/off and windowed samples.
+
 import { describe, it, expect, vi } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';

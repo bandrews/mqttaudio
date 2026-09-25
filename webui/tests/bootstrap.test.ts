@@ -1,3 +1,6 @@
+// ABOUTME: Unit tests for bootstrap's auth detection with a scripted connection.
+// ABOUTME: Covers an open daemon, a 401 on /version, and an unreachable /health.
+
 import { describe, it, expect } from 'vitest';
 import { bootstrap } from '../src/api/bootstrap';
 import { HttpError, type DaemonConnection, type SubscriptionHandlers, type Subscription } from '../src/api/connection';

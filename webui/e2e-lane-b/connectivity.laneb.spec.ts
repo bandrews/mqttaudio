@@ -1,3 +1,6 @@
+// ABOUTME: Lane B e2e: drives the SPA via the dev proxy against a real daemon this spec spawns.
+// ABOUTME: Covers restart recovery, dashboard/console/matrix/mixer play-stop, config and telemetry.
+
 import { test, expect } from '@playwright/test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { resolve } from 'node:path';

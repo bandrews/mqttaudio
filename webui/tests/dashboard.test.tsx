@@ -1,3 +1,6 @@
+// ABOUTME: Tests for the dashboard panels with mocked read endpoints.
+// ABOUTME: Covers the health header, now playing, voices, inputs and cache table.
+
 import { describe, it, expect } from 'vitest';
 import { screen } from '@testing-library/react';
 import { renderWithClient, mockReadClient } from './_helpers';

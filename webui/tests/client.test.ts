@@ -1,3 +1,6 @@
+// ABOUTME: Unit tests for DaemonClient using a connection that records requests.
+// ABOUTME: Checks command routes and bodies, input warnings, and read endpoint paths.
+
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DaemonClient } from '../src/api/client';
 import type { DaemonConnection, Subscription, SubscriptionHandlers } from '../src/api/connection';

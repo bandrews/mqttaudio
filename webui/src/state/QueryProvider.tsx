@@ -1,3 +1,6 @@
+// ABOUTME: React providers for server state: a shared TanStack QueryClient and the active client.
+// ABOUTME: Queries run without retries or window-focus refetching.
+
 // Server-state plumbing (DW4): a TanStack Query client plus the active-client
 // context provider. Feature hooks (queries.ts) read both.
 

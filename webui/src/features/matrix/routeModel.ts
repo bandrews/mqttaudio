@@ -1,3 +1,6 @@
+// ABOUTME: Pure functions over matrix routes (src, dest, optional gain) for the matrix mixer.
+// ABOUTME: Toggles routes, sets gains, finds summed destinations and builds the play channel_map.
+
 // Pure model for the channel-map matrix (Sprint W4). A Route is one src->dest
 // edge with an optional gain. Mixing on the daemon is additive summing, so a dest
 // fed by >1 src is a clip risk (API-CONTRACT §4). buildChannelMap emits the

@@ -1,3 +1,6 @@
+// ABOUTME: Connect screen: takes a daemon URL (default /api) and an optional Bearer token.
+// ABOUTME: Runs bootstrap, shows the token field when auth is required, and hands back a client.
+
 // The connect/bootstrap surface (Sprint W0, DW9). Takes a base URL and an
 // optional Bearer token, runs bootstrap (reads /health + /version, detects open
 // vs require_auth), and reveals the token field only when the daemon requires

@@ -1,3 +1,6 @@
+// ABOUTME: Transport types for reaching a daemon: Connection, DaemonConnection and HttpError.
+// ABOUTME: Also holds a connection registry and URL helpers for REST and WebSocket paths.
+
 // The single transport seam all daemon access goes through (DW2). A `Connection`
 // is a first-class entity (base URL + optional token); a `DaemonConnection` is a
 // live transport built from one. No React/UI module may import `fetch`/`WebSocket`

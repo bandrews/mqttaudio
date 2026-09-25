@@ -1,3 +1,6 @@
+// ABOUTME: Connection bootstrap: checks /health for liveness, then probes /version.
+// ABOUTME: A 401 on /version means a token is required; any other failure is returned as an error.
+
 // Connection bootstrap + auth detection (DW9). Reads /health (always open) for
 // liveness, then probes a gated endpoint (/version, in the status group that
 // require_auth gates) to decide whether a token is needed: a 200 means open, a

@@ -1,3 +1,6 @@
+// ABOUTME: Tests for the mixer's windowed check, SampleTransport, VoiceStrip and InputStrip.
+// ABOUTME: Uses a spy client to check the commands each control sends.
+
 import { describe, it, expect, vi } from 'vitest';
 import { screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';

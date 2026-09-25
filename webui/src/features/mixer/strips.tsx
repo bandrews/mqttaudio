@@ -1,3 +1,6 @@
+// ABOUTME: Mixer strips: VoiceStrip (volume, fade-out, stop) and InputStrip (volume, mute).
+// ABOUTME: Each control sends its command straight through the connected client.
+
 // Voice and input control strips (Sprint W5): live volume faders, voice fade-out
 // (time_ms), voice stop, and input mute. input_mute restores the prior level on
 // the daemon (not a hardcoded 1.0).

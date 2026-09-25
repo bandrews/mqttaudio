@@ -1,3 +1,6 @@
+// ABOUTME: Test helpers: render a component with a fresh QueryClient and a given client.
+// ABOUTME: mockReadClient supplies an inert socket and a 'live' probe, plus any overrides.
+
 import type { ReactElement } from 'react';
 import { render } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';

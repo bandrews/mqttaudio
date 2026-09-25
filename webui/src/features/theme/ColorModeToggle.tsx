@@ -1,3 +1,6 @@
+// ABOUTME: Top-bar icon button that switches between light and dark color modes.
+// ABOUTME: Reads the mode and toggle function from the color-mode context.
+
 // Light/dark color-mode toggle (Sprint W9).
 
 import IconButton from '@mui/material/IconButton';

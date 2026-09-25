@@ -1,3 +1,6 @@
+// ABOUTME: Tests for console validation, macro helpers and the console components.
+// ABOUTME: Uses a spy client to check the commands the cue launcher, raw editor and forms send.
+
 import { describe, it, expect, vi } from 'vitest';
 import { screen, fireEvent, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';

@@ -1,3 +1,6 @@
+// ABOUTME: Lane A Playwright smoke test for the log console against a route-mocked daemon.
+// ABOUTME: Mocks /health, /version and the /ws socket, then checks welcome and log frames render.
+
 import { test, expect } from '@playwright/test';
 
 // Lane A headless smoke: connect through the (route-mocked) daemon and prove the

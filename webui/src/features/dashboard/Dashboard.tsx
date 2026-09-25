@@ -1,3 +1,6 @@
+// ABOUTME: Monitor tab: the health header above a two-column grid of dashboard panels.
+// ABOUTME: Lays out now playing and the log console beside meters, voices, inputs and the cache.
+
 // The live monitoring dashboard (Sprint W2): the persistent health header over a
 // responsive grid of the now-playing board, voices/inputs racks, cache table, and
 // the log console. All poll-driven via the TanStack Query layer (DW6); no faked

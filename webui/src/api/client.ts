@@ -1,3 +1,6 @@
+// ABOUTME: DaemonClient: the typed methods the UI uses to send commands and read daemon state.
+// ABOUTME: Posts play via /command and other commands to their typed routes, warning on bad input.
+
 // Typed client over a DaemonConnection. A thin, faithful mirror of API-CONTRACT:
 // the full play surface goes via POST /command (DW10), the other commands via
 // their typed routes (encoding the typed field names, e.g. voice_fade_out's

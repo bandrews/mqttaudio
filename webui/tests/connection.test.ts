@@ -1,3 +1,6 @@
+// ABOUTME: Tests the connection registry, URL helpers and ProxyBrowserConnection.
+// ABOUTME: Stubs the global fetch and WebSocket to check headers, bodies, errors and socket URLs.
+
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
   ConnectionRegistry,

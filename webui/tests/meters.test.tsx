@@ -1,3 +1,6 @@
+// ABOUTME: Tests the state-channel client methods and the Meters panel.
+// ABOUTME: Checks /ws/state and /status/meters paths, bars from a tick, and the telemetry-off hint.
+
 import { describe, it, expect, vi } from 'vitest';
 import { screen, act, waitFor } from '@testing-library/react';
 import { renderWithClient, mockReadClient } from './_helpers';

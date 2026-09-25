@@ -1,3 +1,6 @@
+// ABOUTME: Placeholder Electron implementation of DaemonConnection whose methods all throw.
+// ABOUTME: Keeps the transport seam type-checked so an Electron build can supply a real one.
+
 // Reserved Electron transport seam (DW2/DW13). v1 does not implement it; this
 // stub exists only to prove the seam type-checks: an Electron build supplies a
 // real implementation here (native header-capable WebSocket, multi-instance

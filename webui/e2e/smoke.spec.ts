@@ -1,3 +1,6 @@
+// ABOUTME: Lane A Playwright smoke test: connects the SPA to a route-mocked daemon.
+// ABOUTME: Mocks /health and /version and checks the connected chip and daemon version appear.
+
 import { test, expect } from '@playwright/test';
 
 // Headless smoke (Lane A): load the app against a route-mocked daemon and prove

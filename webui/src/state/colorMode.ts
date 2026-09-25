@@ -1,3 +1,6 @@
+// ABOUTME: React context for the light/dark color mode and its toggle.
+// ABOUTME: useColorMode reads it; AppRoot provides the value.
+
 // Light/dark color-mode context (Sprint W9). Kept in its own module so the
 // provider component (main.tsx) and the toggle stay fast-refresh-friendly.
 

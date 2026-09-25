@@ -1,3 +1,6 @@
+// ABOUTME: Input fields for the internal_id/id/file/voice sample selector used by sample commands.
+// ABOUTME: Warns when internal_id is not numeric and when no selector criterion is set.
+
 // The OR-logic sample selector (internal_id/id/file/voice). Warns loudly when no
 // criterion is set — an empty selector matches nothing and is a silent no-op on
 // the daemon (API-CONTRACT §3).

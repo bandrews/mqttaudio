@@ -1,3 +1,6 @@
+// ABOUTME: Mixer tab: controls for what is playing now.
+// ABOUTME: Lists a transport card per sample and a strip per voice and per live input.
+
 // The mixer (Sprint W5): interactive control over already-playing audio —
 // per-sample transport, voice strips, and input strips. Reads the same query
 // hooks as the monitor dashboard but adds controls.

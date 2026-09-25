@@ -1,3 +1,6 @@
+// ABOUTME: Browser implementation of DaemonConnection using the fetch and WebSocket APIs.
+// ABOUTME: Adds the Bearer token when set, throws HttpError on non-2xx, and resolves socket URLs.
+
 // Browser/proxy implementation of DaemonConnection. This is one of only two
 // modules allowed to touch `fetch`/`WebSocket` directly (DW2). When deployed
 // behind the reverse-proxy sidecar (DW1) the Connection carries no token and the

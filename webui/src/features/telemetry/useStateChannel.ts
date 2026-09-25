@@ -1,3 +1,6 @@
+// ABOUTME: React hook that subscribes to /ws/state while telemetry is enabled.
+// ABOUTME: Keeps the latest tick's output meter peaks and per-sample positions.
+
 // Subscribe to the /ws/state typed state channel (Sprint W7) when telemetry is on,
 // exposing the latest tick (output meters + per-sample positions). When telemetry
 // is off (or there is no client) it subscribes to nothing and the UI falls back to

@@ -1,4 +1,7 @@
 /// <reference types="vitest/config" />
+// ABOUTME: Vite and Vitest config for the web UI.
+// ABOUTME: Proxies /api and /ws to the daemon in dev; runs tests/ under jsdom.
+
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 

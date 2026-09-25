@@ -1,3 +1,6 @@
+// ABOUTME: Computes reconnect delays: exponential backoff with bounded, injectable jitter.
+// ABOUTME: Used by the log stream hook to schedule /ws reconnect attempts.
+
 // Exponential backoff with jitter for reconnect scheduling (Sprint W1, F4). Pure
 // and deterministic: the jitter source is injectable so tests can assert the
 // schedule. Default base 500ms, doubling, capped at 15s, with up to 30% jitter.

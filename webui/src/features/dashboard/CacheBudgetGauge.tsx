@@ -1,3 +1,6 @@
+// ABOUTME: Memory cache budget gauge: bytes in use against the configured cap, from /metrics.
+// ABOUTME: Shows free headroom and disk usage when capped, and an indeterminate bar when unlimited.
+
 // Memory-cache budget gauge (Sprint W2, F2): resident bytes vs the resolved cap
 // with headroom, from /metrics. A null cap means an unlimited budget.
 

@@ -1,3 +1,6 @@
+// ABOUTME: Tests the Connect screen's auth-required path with a scripted transport.
+// ABOUTME: A 401 on /version reveals the token field; a supplied token then connects.
+
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';

@@ -1,3 +1,6 @@
+// ABOUTME: Playwright config for Lane C: runs the e2e/ specs in Chromium, WebKit and Firefox.
+// ABOUTME: Serves the app with Vite on port 4174; needs WebKit and Firefox browsers installed.
+
 import { defineConfig, devices } from '@playwright/test';
 
 // Lane C cross-engine parity. Runs the same headless, fixture-backed e2e specs

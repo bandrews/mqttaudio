@@ -1,3 +1,6 @@
+// ABOUTME: Guard test: scans src/ for direct fetch or WebSocket use.
+// ABOUTME: Only the two connection implementations may use them.
+
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';

@@ -1,3 +1,6 @@
+// ABOUTME: Per-sample transport card: seek slider, speed slider with pitch toggle, and Stop.
+// ABOUTME: Windowed samples get a streamed badge and no seek or speed controls.
+
 // Per-sample transport (Sprint W5): a seek scrubber, a speed control with a
 // pitch-correction toggle (which re-clamps the range and disables reverse), and a
 // stop. Windowed/streamed voices are forward-only — seek/speed/reverse are

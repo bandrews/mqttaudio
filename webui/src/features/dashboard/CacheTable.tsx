@@ -1,3 +1,6 @@
+// ABOUTME: Cache table: entry counts and sizes for the memory and disk caches.
+// ABOUTME: Reads /status/cache through the polling query layer.
+
 // Cache table (Sprint W2, F6): memory and disk cache totals from /status/cache.
 
 import Paper from '@mui/material/Paper';

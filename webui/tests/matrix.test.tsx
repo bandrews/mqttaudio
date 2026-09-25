@@ -1,3 +1,6 @@
+// ABOUTME: Tests for the matrix route model and the MatrixMixer component.
+// ABOUTME: Checks route toggling, summed destinations, channel_map building and the play sent.
+
 import { describe, it, expect, vi } from 'vitest';
 import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';

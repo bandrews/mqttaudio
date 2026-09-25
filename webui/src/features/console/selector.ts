@@ -1,3 +1,6 @@
+// ABOUTME: Sample selector helpers: trim fields and drop empty ones from a SampleSelector.
+// ABOUTME: isSelectorEmpty reports when no internal_id/id/file/voice criterion remains.
+
 // Selector helpers (kept separate from the component so fast-refresh stays happy).
 
 import type { SampleSelector } from '../../api/contract';

@@ -1,3 +1,6 @@
+// ABOUTME: Root app shell: shows the Connect screen until a daemon connection is established.
+// ABOUTME: Then renders the top bar and the Monitor, Mixer, Console, Matrix and Config tabs.
+
 // Root app shell. Sprint W0 ships only the connect/bootstrap surface: connect to
 // a daemon, then show its identity. Feature UI (dashboard, command bench, matrix
 // mixer, transport, telemetry, config) is added by Sprints W2+ inside the

@@ -1,3 +1,6 @@
+// ABOUTME: Tests the query option factories' poll cadences.
+// ABOUTME: Also checks that each query function calls the matching client read method.
+
 import { describe, it, expect, vi } from 'vitest';
 import {
   POLL,

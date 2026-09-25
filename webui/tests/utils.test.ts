@@ -1,3 +1,6 @@
+// ABOUTME: Unit tests for the display formatters and the counter delta helper.
+// ABOUTME: Covers byte, duration and uptime formatting, and diffCounter resets.
+
 import { describe, it, expect } from 'vitest';
 import { formatBytes, formatDuration, formatUptime } from '../src/utils/format';
 import { diffCounter } from '../src/state/rates';

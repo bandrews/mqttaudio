@@ -1,3 +1,6 @@
+// ABOUTME: Playwright config for Lane A: headless Chromium runs of the e2e/ specs.
+// ABOUTME: Serves the app with Vite on port 4173; the specs mock the daemon with route handlers.
+
 import { defineConfig, devices } from '@playwright/test';
 
 // Headless E2E (Lane A). The app is served by Vite against a route-mocked

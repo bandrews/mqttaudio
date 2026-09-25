@@ -1,3 +1,6 @@
+// ABOUTME: Console tab: forms for the sample, voice, input and cache commands with validation.
+// ABOUTME: Also hosts the cue launcher and the raw /command editor; shows each command's result.
+
 // Command test-bench (Sprint W3): forms for every runtime command with client-
 // side validation, the OR-logic selector with its empty-selector warning, the cue
 // launcher (full play surface via /command), and the raw /command editor.

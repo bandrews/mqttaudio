@@ -1,3 +1,6 @@
+// ABOUTME: Counter delta helpers for the daemon's cumulative clip and xrun counters.
+// ABOUTME: useDelta returns the change since the value it last saw, clamped to zero on a reset.
+
 // Client-side rate/delta computation (DW6 label hygiene): the daemon's clip and
 // xrun counters are cumulative, so the UI must diff successive polls rather than
 // present a counter as an instantaneous rate. `useDelta` tracks the previous

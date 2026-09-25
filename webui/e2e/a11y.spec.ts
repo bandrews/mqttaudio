@@ -1,3 +1,6 @@
+// ABOUTME: Lane A accessibility gate: runs axe (WCAG 2 A/AA rules) against the served SPA.
+// ABOUTME: Fails on serious/critical violations on the connect screen and a route-mocked dashboard.
+
 import { test, expect } from '@playwright/test';
 import AxeBuilder from '@axe-core/playwright';
 

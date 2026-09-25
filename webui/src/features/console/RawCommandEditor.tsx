@@ -1,3 +1,6 @@
+// ABOUTME: Raw command editor: a text box of command JSON, prefilled with a play template.
+// ABOUTME: Parses it as JSON and posts it verbatim to /command; invalid JSON is not sent.
+
 // Raw /command editor (Sprint W3, F3): send arbitrary command JSON to POST
 // /command — the universal path that reaches the full play surface
 // (channel_map/mode/window_ms/prebuffer_ms/freshness/cacheable) which the typed

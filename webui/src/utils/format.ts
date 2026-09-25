@@ -1,3 +1,6 @@
+// ABOUTME: Display formatters: byte sizes, durations and uptime.
+// ABOUTME: Invalid or negative inputs format as an em dash.
+
 // Small display formatters shared across the dashboard.
 
 /** Human-readable bytes (KiB/MiB/GiB, base 1024). */

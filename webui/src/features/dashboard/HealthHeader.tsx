@@ -1,3 +1,6 @@
+// ABOUTME: Dashboard health header: active counts, output channels and uptime.
+// ABOUTME: Shows clip and stream-error counters with the change since the last poll, and cache use.
+
 // Persistent health header (Sprint W2, F1): active counts, output channels,
 // uptime, and the two health counters — clips (limiter held at ceiling) and
 // "stream errors / rebuilds" (cpal fatal stream-error callbacks, NOT per-buffer

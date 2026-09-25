@@ -1,3 +1,6 @@
+// ABOUTME: Now playing panel: each active sample from /status/samples with its metadata.
+// ABOUTME: Shows a progress bar when telemetry is on, and notes streamed or unavailable positions.
+
 // Now-playing board (Sprint W2, F3): the active samples from /status/samples with
 // their static metadata. Live position is NOT available until Sprint W6 (the
 // daemon hard-codes position/progress to 0), so this shows "live position

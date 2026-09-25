@@ -1,3 +1,6 @@
+// ABOUTME: Output meters panel: a peak level bar per output channel from /ws/state ticks.
+// ABOUTME: Only subscribes while telemetry is on; otherwise shows a hint to enable it.
+
 // Live output meters (Sprint W7), driven by the /ws/state tick channel. Each
 // output channel shows its peak as a bar that moves at the tick rate (~15 Hz).
 // Off by default; needs Telemetry enabled. Falls back to a hint when off.

@@ -1,3 +1,6 @@
+// ABOUTME: TanStack Query hooks for the daemon's read endpoints, one per endpoint.
+// ABOUTME: Status/metrics poll every 1.5 s, cache/telemetry 3 s, health 10 s; version/config once.
+
 // TanStack Query hooks over the typed client, carrying the DW6 poll cadences as
 // defaults: /metrics + /status* at 1-2s, /status/cache at 2-5s, /version once.
 // Sprint W2 (the dashboard) consumes these; this sprint only ships the seam, so

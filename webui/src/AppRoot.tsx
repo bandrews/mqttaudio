@@ -1,3 +1,6 @@
+// ABOUTME: Top-level React component: holds the light/dark mode state and builds the MUI theme.
+// ABOUTME: Wraps App in the theme, CssBaseline, color-mode context and query providers.
+
 // Top-level providers: color mode (light/dark), MUI theme, and the query layer.
 // Kept separate from main.tsx (the entry point) and App (the shell) so each is a
 // clean fast-refresh boundary.

@@ -1,3 +1,6 @@
+// ABOUTME: Matrix tab: a source-by-destination grid with per-route gain that builds a channel_map.
+// ABOUTME: Badges summed destinations as clip risks and posts the play to /command.
+
 // Channel-map matrix mixer (Sprint W4): a src×dest grid that builds a
 // play.channel_map and fires it via /command (DW10 — the typed /play drops
 // channel_map). Additive summing means a destination fed by >1 source is a

@@ -1,3 +1,6 @@
+// ABOUTME: TypeScript types for the daemon HTTP API: command params, responses, status payloads.
+// ABOUTME: Mirrors docs/webui/API-CONTRACT.md, wire quirks included, plus a command alias map.
+
 // Code-verified mirror of the mqttaudio daemon surface (see docs/webui/API-CONTRACT.md).
 // These types are deliberately faithful to the wire contract, quirks and all:
 // internal_id/input are strings, mode/freshness are lowercase unions, and the

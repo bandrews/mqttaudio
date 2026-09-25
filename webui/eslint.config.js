@@ -1,3 +1,6 @@
+// ABOUTME: ESLint flat config for the web UI: TypeScript, React hooks and fast-refresh rules.
+// ABOUTME: Also forbids the fetch/WebSocket globals in src/ outside the connection implementations.
+
 import js from '@eslint/js';
 import globals from 'globals';
 import reactHooks from 'eslint-plugin-react-hooks';

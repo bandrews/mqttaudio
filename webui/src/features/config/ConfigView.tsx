@@ -1,3 +1,6 @@
+// ABOUTME: Config tab: shows the daemon's running config from GET /config, read-only.
+// ABOUTME: Builds restart-required config snippets and shows live ducking from /metrics.
+
 // Config visibility & tuning (Sprint W8). The daemon reads config once at startup
 // (no hot-reload, DW8), so this DISPLAYS the running config (GET /config, secrets
 // redacted) and produces validated config-JSON snippets flagged "restart

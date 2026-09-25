@@ -1,3 +1,6 @@
+// ABOUTME: Voices panel: each voice from /status/voices with its sample count and volume.
+// ABOUTME: Flags ducked voices and draws an effective level bar of volume times ducking multiplier.
+
 // Voices rack (Sprint W2, F4): the live voices from /status/voices with their
 // volume and resolved ducking multiplier. A multiplier < 1.0 means the voice is
 // being ducked.

@@ -1,3 +1,6 @@
+// ABOUTME: Log console panel: streams daemon log lines from /ws with autoscroll.
+// ABOUTME: Shows the stream's connection state and the daemon version from the welcome frame.
+
 // Live log console over the daemon's /ws stream (Sprint W1, F3). Shows a
 // connection indicator and the streamed tracing lines with autoscroll. These are
 // LOGS, not playback/state events (Sprint W7 owns state events).

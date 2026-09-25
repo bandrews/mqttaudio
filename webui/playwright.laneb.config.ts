@@ -1,3 +1,6 @@
+// ABOUTME: Playwright config for Lane B: serial Chromium runs of e2e-lane-b/ against a real daemon.
+// ABOUTME: Serves the app with Vite on port 4273, proxying to the daemon on 127.0.0.1:8099.
+
 import { defineConfig, devices } from '@playwright/test';
 
 // Lane B (real browser + live daemon). Runs the SPA through the Vite dev proxy

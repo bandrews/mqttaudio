@@ -1,3 +1,6 @@
+// ABOUTME: Unit tests for nextBackoff.
+// ABOUTME: Checks exponential growth, the cap, and bounded jitter.
+
 import { describe, it, expect } from 'vitest';
 import { nextBackoff } from '../src/api/backoff';
 
