@@ -216,11 +216,12 @@ export interface MetricsInfo {
 }
 
 /**
- * Alternate names the daemon accepts for play, stopall and precache. fadeall also
- * has alternates (soundFadeAll, fadeout, soundFadeOut), which this map omits.
+ * Alternate names the daemon accepts for a command, keyed by the canonical name.
+ * No other command has an alternate name.
  */
-export const COMMAND_ALIASES: Record<string, string> = {
-  play: 'soundPlay',
-  stopall: 'soundStopAll',
-  precache: 'soundPrecache',
+export const COMMAND_ALIASES: Readonly<Record<string, readonly string[]>> = {
+  play: ['soundPlay'],
+  stopall: ['soundStopAll'],
+  precache: ['soundPrecache'],
+  fadeall: ['soundFadeAll', 'fadeout', 'soundFadeOut'],
 };
