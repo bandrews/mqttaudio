@@ -1,5 +1,5 @@
 // ABOUTME: Top-bar switch that turns daemon telemetry on or off via POST /telemetry.
-// ABOUTME: Updates the cached telemetry state after a change, or shows the error when it fails.
+// ABOUTME: Updates the telemetry cache and refreshes samples on a change; shows the error on failure.
 
 // Telemetry opt-in toggle (Sprint W6, DW3). OFF by default. When on, the daemon
 // publishes live sample positions (and, from Sprint W7, meters + state events).
