@@ -2689,6 +2689,9 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     status.unmuted_volume = volume;
                     status.muted = false;
                 }
+                if is_talkback_input(config, ctx.inputs, &input) {
+                    ctx.talkback.input_opened();
+                }
                 ctx.refresh();
             }
         }
@@ -2746,6 +2749,14 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     } else {
                         status.volume = status.unmuted_volume;
                         status.muted = false;
+                    }
+                }
+                // The talkback status reports whether the microphone is open.
+                if is_talkback_input(config, ctx.inputs, &input) {
+                    if mute {
+                        ctx.talkback.input_closed();
+                    } else {
+                        ctx.talkback.input_opened();
                     }
                 }
                 ctx.refresh();
@@ -4948,6 +4959,38 @@ mod tests {
             .run(acquire("gm-b", "ALL", 0.0, 250))
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn applied_live_follows_an_input_mute_during_a_lease() {
+        let mut fixture = talkback_fixture();
+        fixture.run(acquire("gm", "ALL", 0.0, 500)).await;
+        assert!(fixture.talkback.status(0).applied_live);
+
+        let mute = |mute| AudioCommand::InputMute {
+            input: "0".to_string(),
+            mute,
+            fade_ms: 0,
+        };
+        assert!(fixture.run(mute(true)).await.is_none());
+        assert!(
+            !fixture.talkback.status(0).applied_live,
+            "the operator closed the microphone"
+        );
+        assert!(fixture.run(mute(false)).await.is_none());
+        assert!(fixture.talkback.status(0).applied_live);
+
+        assert!(fixture.run(mute(true)).await.is_none());
+        let level = AudioCommand::InputVolume {
+            input: "GM_MIC".to_string(),
+            volume: 0.9,
+            fade_ms: 0,
+        };
+        assert!(fixture.run(level).await.is_none());
+        assert!(
+            fixture.talkback.status(0).applied_live,
+            "input_volume unmutes it"
+        );
     }
 
     #[tokio::test]

@@ -75,7 +75,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `applied_live: true` until then.
 - **An expired talkback lease no longer refuses the next client** for up to 20 ms before the expiry
   pass ran.
-
 - **Plays never wait on a server to check a cached file (decision D46).** A play of a URL cached only
   on disk asked the server whether it changed before playing, in every freshness mode: up to 5 seconds
   for the answer and, when it had changed, the whole download again (the `200` answer was thrown

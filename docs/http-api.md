@@ -319,9 +319,9 @@ what rising values mean.
 ```
 
 `state` is `live` while a lease is held and `muted` otherwise. `applied_live` is whether the
-microphone is open: it turns on once a lease's unmute is queued and off once the mute that follows
-is queued, so it stays `true` after a lease ends while that mute waits for room in the audio command
-queue (see [Microphone Input](features/microphone-input.md#talkback)). `source_id` is the talkback
+microphone is open, as of the last mute or unmute queued for it (a lease's, or an `input_mute` or
+`input_volume` during one), so it stays `true` after a lease ends while that lease's mute waits for
+room in the audio command queue (see [Microphone Input](features/microphone-input.md#talkback)). `source_id` is the talkback
 input's `voice_id`. `now_ms` and `lease_expires_at_ms` are milliseconds since the daemon started, so
 their difference is the time left. `last_transition` is `acquired`, `renewed`, `released`, `expired`
 or `hard-muted`; `last_error` is the last refused request's reason.
