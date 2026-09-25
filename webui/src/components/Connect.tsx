@@ -2,10 +2,10 @@
 // ABOUTME: Runs bootstrap, shows the token field when auth is required, and hands back a client.
 
 // The connect/bootstrap surface (Sprint W0, DW9). Takes a base URL and an
-// optional Bearer token, runs bootstrap (reads /health + /version, detects open
-// vs require_auth), and reveals the token field only when the daemon requires
-// auth. On success it hands the caller a connected DaemonClient. It renders no
-// feature UI.
+// optional Bearer token, runs bootstrap (reads /health + /version, probes /ws to
+// detect whether the daemon wants a token), and reveals the token field only when
+// the daemon requires auth. On success it hands the caller a connected
+// DaemonClient. It renders no feature UI.
 
 import { useState } from 'react';
 import Alert from '@mui/material/Alert';
@@ -63,7 +63,7 @@ export function Connect({ onConnected, makeTransport = defaultMakeTransport }: C
         setError('This daemon requires authentication. Enter a Bearer token.');
         return;
       }
-      if (result.authRequired && !result.version) {
+      if (result.authRequired) {
         setError('Authentication failed — check the token.');
         return;
       }

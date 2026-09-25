@@ -1,5 +1,5 @@
 // ABOUTME: Unit tests for bootstrap's auth detection with a scripted connection.
-// ABOUTME: Covers an open daemon, a 401 on /version, and an unreachable /health.
+// ABOUTME: Covers the /ws token probe, its /version fallback, and an unreachable /health.
 
 import { describe, it, expect } from 'vitest';
 import { bootstrap } from '../src/api/bootstrap';
@@ -42,6 +42,38 @@ describe('bootstrap (DW9 auth detection)', () => {
     const result = await bootstrap(conn);
     expect(result).toMatchObject({ healthy: true, authRequired: true });
     expect(result.version).toBeUndefined();
+  });
+
+  it('token without require_auth: /ws 401 -> authRequired true, identity still read from /version', async () => {
+    const conn = new ScriptedConnection({
+      '/health': () => ({ status: 'ok', service: 'mqttaudio', version: '2.0.0' }),
+      '/ws': () => new HttpError(401, '/ws'),
+      '/version': () => ({ name: 'mqttaudio', version: '2.0.0' }),
+    });
+    const result = await bootstrap(conn);
+    expect(result).toMatchObject({ healthy: true, authRequired: true, service: 'mqttaudio' });
+    expect(result.version?.version).toBe('2.0.0');
+  });
+
+  it('token accepted: /ws refuses only the missing upgrade (400) -> authRequired false', async () => {
+    const conn = new ScriptedConnection({
+      '/health': () => ({ status: 'ok', service: 'mqttaudio', version: '2.0.0' }),
+      '/ws': () => new HttpError(400, '/ws'),
+      '/version': () => ({ name: 'mqttaudio', version: '2.0.0' }),
+    });
+    const result = await bootstrap(conn);
+    expect(result).toMatchObject({ healthy: true, authRequired: false });
+    expect(result.version?.version).toBe('2.0.0');
+  });
+
+  it('no daemon answer on /ws (a proxy 502) -> falls back to the /version probe', async () => {
+    const conn = new ScriptedConnection({
+      '/health': () => ({ status: 'ok', service: 'mqttaudio', version: '2.0.0' }),
+      '/ws': () => new HttpError(502, '/ws'),
+      '/version': () => new HttpError(401, '/version'),
+    });
+    const result = await bootstrap(conn);
+    expect(result).toMatchObject({ healthy: true, authRequired: true });
   });
 
   it('unreachable daemon: /health throws -> healthy false', async () => {

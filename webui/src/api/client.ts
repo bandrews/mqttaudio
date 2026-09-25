@@ -8,6 +8,7 @@
 // fabricates a selector.
 
 import { HttpError, type DaemonConnection, type Subscription, type SubscriptionHandlers } from './connection';
+import { probeTokenRefused } from './bootstrap';
 
 /** Connection lifecycle states surfaced to the UI (Sprint W1, F4). */
 export type ConnectionState = 'connecting' | 'live' | 'offline' | 'unauthorized';
@@ -225,11 +226,17 @@ export class DaemonClient {
   }
 
   /**
-   * Re-probe a gated endpoint (/version) to classify the connection: `live` on
-   * 200, `unauthorized` on 401 (auth required/failed — do not blind-retry),
-   * `offline` on a network/other failure (retry with backoff).
+   * Re-probe the daemon to classify the connection: `unauthorized` when it
+   * refuses this connection's credentials (auth required/failed — do not
+   * blind-retry), read from the /ws token probe or, when that cannot tell, a 401
+   * on /version; `live` when it answers; `offline` on a network/other failure
+   * (retry with backoff).
    */
   async probeConnection(): Promise<Exclude<ConnectionState, 'connecting'>> {
+    const tokenRefused = await probeTokenRefused(this.conn);
+    if (tokenRefused !== undefined) {
+      return tokenRefused ? 'unauthorized' : 'live';
+    }
     try {
       await this.conn.get('/version');
       return 'live';

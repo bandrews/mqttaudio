@@ -1,9 +1,14 @@
 // ABOUTME: Unit tests for DaemonClient using a connection that records requests.
-// ABOUTME: Checks command routes and bodies, input warnings, and read endpoint paths.
+// ABOUTME: Checks command routes and bodies, input warnings, read paths and the connection probe.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { DaemonClient } from '../src/api/client';
-import type { DaemonConnection, Subscription, SubscriptionHandlers } from '../src/api/connection';
+import {
+  HttpError,
+  type DaemonConnection,
+  type Subscription,
+  type SubscriptionHandlers,
+} from '../src/api/connection';
 
 interface PostCall {
   path: string;
@@ -173,5 +178,61 @@ describe('DaemonClient read endpoints (§5)', () => {
       '/version',
       '/health',
     ]);
+  });
+});
+
+// Answers each GET from a script; an Error result is thrown, a missing path is a 404.
+class ScriptedConnection implements DaemonConnection {
+  connection = { id: 't', label: 't', baseUrl: 'http://h:8080' };
+  constructor(private readonly responses: Record<string, () => unknown>) {}
+  async get<T>(path: string): Promise<T> {
+    const handler = this.responses[path];
+    if (!handler) throw new HttpError(404, path);
+    const value = handler();
+    if (value instanceof Error) throw value;
+    return value as T;
+  }
+  async post<T>(): Promise<T> {
+    return {} as T;
+  }
+  subscribe(_path: string, _handlers: SubscriptionHandlers): Subscription {
+    return { close: () => {} };
+  }
+}
+
+describe('DaemonClient.probeConnection', () => {
+  const version = () => ({ name: 'mqttaudio', version: '2.0.0' });
+
+  it('is unauthorized when the /ws probe 401s, even though /version is open', async () => {
+    const client = new DaemonClient(
+      new ScriptedConnection({ '/ws': () => new HttpError(401, '/ws'), '/version': version }),
+    );
+    expect(await client.probeConnection()).toBe('unauthorized');
+  });
+
+  it('is live when /ws refuses only the missing upgrade', async () => {
+    const client = new DaemonClient(
+      new ScriptedConnection({ '/ws': () => new HttpError(400, '/ws'), '/version': version }),
+    );
+    expect(await client.probeConnection()).toBe('live');
+  });
+
+  it('falls back to /version when websockets are disabled (/ws 404)', async () => {
+    const gated = new DaemonClient(
+      new ScriptedConnection({ '/version': () => new HttpError(401, '/version') }),
+    );
+    expect(await gated.probeConnection()).toBe('unauthorized');
+    const open = new DaemonClient(new ScriptedConnection({ '/version': version }));
+    expect(await open.probeConnection()).toBe('live');
+  });
+
+  it('is offline when the daemon cannot be reached', async () => {
+    const client = new DaemonClient(
+      new ScriptedConnection({
+        '/ws': () => new TypeError('Failed to fetch'),
+        '/version': () => new TypeError('Failed to fetch'),
+      }),
+    );
+    expect(await client.probeConnection()).toBe('offline');
   });
 });

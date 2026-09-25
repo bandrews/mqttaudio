@@ -3,10 +3,10 @@
 
 // Drives the /ws log-stream subscription with a real connection lifecycle
 // (Sprint W1, F3/F4): connect -> on the {type:"connected"} welcome go live; on
-// each {type:"log"} append; on close, classify via a /version re-probe (401 ->
-// unauthorized and stop; otherwise reconnect with exponential backoff) and mark
-// the gap so dropped messages during a disconnect are visible. /ws is logs-only —
-// these lines are never treated as state/playback events.
+// each {type:"log"} append; on close, classify via client.probeConnection()
+// (401 -> unauthorized and stop; otherwise reconnect with exponential backoff)
+// and mark the gap so dropped messages during a disconnect are visible. /ws is
+// logs-only — these lines are never treated as state/playback events.
 
 import { useEffect, useRef, useState } from 'react';
 import type { ConnectionState, DaemonClient } from '../../api/client';
