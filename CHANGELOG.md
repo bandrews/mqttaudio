@@ -35,6 +35,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `curl`.
 - **`Cargo.toml` declares `rust-version = "1.88"`**, the version the dependencies need, and no longer
   lists the unused `dasp` crate.
+- **Each sound reaches the subwoofer at its own level (decision D63).** Bass management divided the
+  summed bass of the source channels by their number, so a sound on one of five mains reached the
+  subwoofer 14 dB down, and with `remove_bass_from_sources` on it was also removed from its main.
+  Each sound and live input now sends its bass as it is mixed, divided by the number of source
+  channels it plays on: a soundtrack on every main is not multiplied, an effect on one main keeps its
+  level, and different sounds add up. Content that played on every source channel sounds the same as
+  before.
 - **Talkback needs the `talkback` section.** The talkback microphone was the input whose `voice_id`
   was `GM_MIC`, or else `mic`. To upgrade, set `talkback.input` to that input and list the
   destinations your clients use in `talkback.destinations`; without the section the talkback commands

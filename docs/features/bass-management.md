@@ -1,8 +1,8 @@
 # Bass Management
 
 Bass management sends the low frequencies of chosen output channels to a subwoofer channel, so small
-main speakers do not have to reproduce deep bass. It works on the finished mix, after every sound and
-live input has been routed.
+main speakers do not have to reproduce deep bass. Each sound and live input sends its bass as it is
+mixed, so every sound reaches the subwoofer at its own level.
 
 ## Turning it on
 
@@ -33,9 +33,10 @@ There are no command-line options for bass management.
 
 For every audio block:
 
-1. Each source channel passes through a low-pass filter at the crossover frequency.
-2. The filtered bass of all source channels is added up, divided by the number of source channels,
-   multiplied by `lfe_gain`, and added to the LFE channel.
+1. Each sound or live input playing on source channels sends what it plays there, divided by the
+   number of source channels it plays on.
+2. The sends of all sounds are added up, passed through a low-pass filter at the crossover
+   frequency, multiplied by `lfe_gain`, and added to the LFE channel.
 3. With `remove_bass_from_sources` on, each source channel is replaced by its high-passed version, so
    the bass plays only from the subwoofer. Off, the mains stay full-range and the subwoofer adds to
    them.
@@ -47,18 +48,20 @@ After bass management, `audio.channel_volumes` trims each output, including the 
 
 ### Level on the subwoofer
 
-Because the sum is divided by the number of source channels, bass that is on every source channel
-(a full-range mix) reaches the subwoofer at its original level, however many channels there are. Bass
-on only some of them arrives quieter: a sound playing on one channel of five reaches the subwoofer at
-a fifth of its level (-14 dB), and with `remove_bass_from_sources` on it is also removed from that
-channel. If your content often plays on a few channels, list only those channels, set
-`remove_bass_from_sources` to `false`, or raise `lfe_gain`.
+Each sound reaches the subwoofer at its own level, however many source channels it plays on: a
+soundtrack played on all five mains is not five times as loud there, and an effect on one main is
+not quieter. Different sounds add up, so two effects on two mains play on the subwoofer together, as
+they would on one speaker.
+
+A sound played on several channels at different levels (per-route `gain` in `channel_map`) sends the
+average of its levels on those channels. A stereo file sends the average of its two channels, so bass
+panned to one side arrives 6 dB lower than centered bass.
 
 ### Content routed straight to the LFE channel
 
 A sound or input routed directly to the LFE channel reaches the subwoofer full-range: it bypasses
-the crossover, and the extracted bass is added on top. Route there only content made for the
-subwoofer. A configured input route to the LFE channel logs a warning at startup.
+the crossover, and the extracted bass is added on top. Route there content made for the subwoofer,
+such as LFE effects. A configured input route to the LFE channel logs a warning at startup.
 
 ### Channels the device does not have
 

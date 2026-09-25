@@ -1277,3 +1277,78 @@ fn windowed_source_mix_is_allocation_free_after_warmup() {
         "streamed-source mix freed {deallocs} times across 8 blocks (incl. underrun)"
     );
 }
+
+#[test]
+fn bass_managed_mix_is_allocation_free_from_the_first_block() {
+    // The bass send is sized at construction, so even the first block of a scene
+    // with a sample, a live input and a windowed source on the managed channels
+    // sends and extracts bass without touching the heap.
+    use mqttaudio::audio::bass_management::{BassManagement, BassManagementConfig};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    let mains = vec![(0, 0), (0, 1), (0, 2), (0, 4), (0, 5)];
+    let sample = ActiveSample::new_with_mapping(
+        1,
+        "effects".to_string(),
+        decoded(sine(40.0, SR, SR as usize, 1, 0.3), 1, SR),
+        1.0,
+        1.0,
+        mains.clone(),
+        "boom.wav".to_string(),
+        None,
+        false,
+        0,
+    );
+    let (mut input_producer, input_consumer) = create_ring_buffer(BLOCK * 8);
+    input_producer.push_slice(&sine(60.0, SR, BLOCK * 4, 1, 0.3));
+    let input = LiveInput::new(
+        0,
+        "mic".to_string(),
+        input_consumer,
+        1,
+        1.0,
+        mains.clone(),
+        BLOCK * 8,
+    );
+    let (mut stream_producer, stream_consumer) = create_ring_buffer(BLOCK * 8);
+    stream_producer.push_slice(&sine(30.0, SR, BLOCK * 4, 1, 0.3));
+    let source = StreamedSource::new(
+        2,
+        "bed".to_string(),
+        "stream.wav".to_string(),
+        None,
+        stream_consumer,
+        1,
+        1.0,
+        mains,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let bass_management = BassManagement::new(
+        BassManagementConfig {
+            enabled: true,
+            lfe_channel: 3,
+            source_channels: vec![0, 1, 2, 4, 5],
+            ..Default::default()
+        },
+        SR,
+        6,
+    );
+    let mut state = SceneBuilder::new(6)
+        .sample(sample)
+        .live_input(input)
+        .bass_management(bass_management)
+        .build();
+    state.streamed_sources.push(source);
+    let mut block = vec![0.0f32; BLOCK * 6];
+
+    let (allocs, deallocs) = count_allocs(|| {
+        for _ in 0..4 {
+            mix_audio(&mut block, &mut state);
+        }
+    });
+
+    assert_eq!(allocs, 0, "bass-managed mix allocated {allocs} times");
+    assert_eq!(deallocs, 0, "bass-managed mix freed {deallocs} times");
+}

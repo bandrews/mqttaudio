@@ -129,8 +129,8 @@ Rationale is given so you understand intent and can judge whether new evidence t
   management high-passes the mains). The additive "LFE+Main" mode remains available by setting it `false`.
   *Behavior change* for existing bass-mgmt users — changelog + README it.
 - **D31 · Crossover.** **4th-order Linkwitz-Riley** (cascade two identical Butterworth biquads for LP and HP).
-- **D32 · LFE gain compensation.** Normalize the summed LFE by the **active source count** so sub level is
-  count-independent; expose an `lfe_gain` trim (default 1.0). Add a one-time warning when
+- **D32 · LFE gain compensation — count normalization SUPERSEDED by D63.** Normalize the summed LFE by the
+  **active source count** so sub level is count-independent; expose an `lfe_gain` trim (default 1.0). Add a one-time warning when
   `lfe_channel >= output_channels` (bass silently dropped). No final-LFE low-pass for now (YAGNI; note it).
 
 ## Sprint 8 — Live input
@@ -318,3 +318,15 @@ daemon-side plumbing, never front-end work.
   both registry branches, pass the broadcaster into `start_server`. *Why:* `/ws` log streaming
   is documented as working and never has; the layer exists and is tested — it was simply never
   installed.
+
+## Documentation and behavior cleanup (owner Q&A, 2026-09)
+
+- **D63 · Bass follows the sound.** The LFE feed is no longer the bus's source channels averaged
+  (D32): each sound, live input and windowed source sends its signal on the source channels at
+  one over the number of source channels it plays on (routes at zero gain excluded), and the sum
+  of those sends is low-passed once into the LFE. *Why:* dividing the bus by the source count put
+  a sound playing on one of five mains 14 dB down on the subwoofer, and with
+  `remove_bass_from_sources` removed it from its main as well. The owner wants a sound played on
+  every main not to multiply its bass, and different sounds on different mains to add up; only a
+  per-sound share does both, which the mixed bus cannot tell apart. The send is sized for 8192
+  frames at construction (D58's cap), so the mix does not allocate for it.

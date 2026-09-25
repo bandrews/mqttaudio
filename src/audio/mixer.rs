@@ -1,7 +1,7 @@
 // ABOUTME: Real-time audio mixer performing sample mixing and channel routing.
 // ABOUTME: Runs in audio callback thread with strict real-time constraints.
 
-use crate::audio::bass_management::BassManagement;
+use crate::audio::bass_management::{BassManagement, BassSend};
 use crate::audio::ducking::DuckingApplier;
 use crate::audio::pitch_correction::PitchCorrector;
 use crate::audio::streaming::SampleBuffer;
@@ -1655,6 +1655,12 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
     // per-sample position store below is skipped — no new RT work beyond this load.
     let publish_positions = state.telemetry_enabled.load(Ordering::Relaxed);
 
+    // Each sound sends its bass for bass management as it is mixed (D63).
+    let mut bass = match state.bass_management.as_mut() {
+        Some(bm) => bm.send(frames),
+        None => BassSend::none(),
+    };
+
     // Mix each active sample into the output
     for sample in &mut state.active_samples {
         // This voice's duck multipliers at the buffer's start and end (D1); the mix
@@ -1666,7 +1672,7 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
         sample.publish_first_mix_if_started();
 
         let position_advanced =
-            mix_sample_into_output(sample, output, frames, output_channels, duck);
+            mix_sample_into_output(sample, output, frames, output_channels, duck, &mut bass);
 
         // Advance playback position (accounting for speed). The pitch path advances
         // its own position by the exact input frames it fed the stretcher (F11), so
@@ -1690,7 +1696,7 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
         // This input voice's duck multipliers at the buffer endpoints (D1/D2).
         let duck = ducking.map_or((1.0, 1.0), |a| a.buffer_endpoints(&input.voice_id));
 
-        mix_live_input_into_output(input, output, frames, output_channels, duck);
+        mix_live_input_into_output(input, output, frames, output_channels, duck, &mut bass);
         input.publish_health();
     }
 
@@ -1699,7 +1705,7 @@ pub fn mix_audio(output: &mut [f32], state: &mut MixerState) {
         // This voice's duck multipliers at the buffer endpoints (D1/D2).
         let duck = ducking.map_or((1.0, 1.0), |a| a.buffer_endpoints(&source.voice_id));
 
-        mix_streamed_source_into_output(source, output, frames, output_channels, duck);
+        mix_streamed_source_into_output(source, output, frames, output_channels, duck, &mut bass);
     }
 
     // Apply bass management (LFE extraction and crossover filtering)
@@ -1772,13 +1778,14 @@ fn mix_sample_into_output(
     frames: usize,
     output_channels: usize,
     duck: (f32, f32),
+    bass: &mut BassSend,
 ) -> bool {
     // Use pitch-corrected path if pitch corrector is enabled
     // Note: pitch correction requires Complete buffers (direct data slice access);
     // a progressive buffer, even one that has finished decoding, plays on the
     // normal path until the control thread swaps in its Complete buffer
     if sample.pitch_corrector.is_some() && matches!(sample.buffer, SampleBuffer::Complete(_)) {
-        mix_sample_with_pitch_correction(sample, output, frames, output_channels, duck);
+        mix_sample_with_pitch_correction(sample, output, frames, output_channels, duck, bass);
         return true;
     }
 
@@ -1794,6 +1801,13 @@ fn mix_sample_into_output(
     // crossfade is active); 0 for a plain loop. A reverse loop skips as many frames
     // of the tail. Constant for the whole block.
     let loop_restart = sample.loop_restart_frame() as f64;
+
+    let bass_share = bass_share(
+        bass,
+        &sample.channel_map,
+        &sample.channel_route_gains,
+        buffer_channels,
+    );
 
     // Calculate current precise position (integer + fractional parts)
     let mut src_pos = sample.precise_position();
@@ -1921,7 +1935,9 @@ fn mix_sample_into_output(
             };
 
             // Mix with combined volume, fade, and the per-route downmix gain applied
-            output[dest_idx] += blended_val * final_volume * route_gain;
+            let routed = blended_val * final_volume * route_gain;
+            output[dest_idx] += routed;
+            bass.add(frame_idx, dest_ch, routed * bass_share);
         }
 
         // Advance fade state
@@ -1952,6 +1968,7 @@ fn mix_sample_with_pitch_correction(
     frames: usize,
     output_channels: usize,
     duck: (f32, f32),
+    bass: &mut BassSend,
 ) {
     // Pitch correction requires direct slice access, only available for Complete buffers
     let decoded_buffer = match sample.buffer.as_complete() {
@@ -2098,6 +2115,7 @@ fn mix_sample_with_pitch_correction(
             &stretched,
             &decoded_buffer,
             speed,
+            bass,
         );
     }
 
@@ -2141,7 +2159,14 @@ fn apply_pitch_block(
     stretched: &[f32],
     decoded: &DecodedBuffer,
     speed: f32,
+    bass: &mut BassSend,
 ) {
+    let bass_share = bass_share(
+        bass,
+        &sample.channel_map,
+        &sample.channel_route_gains,
+        src_channels,
+    );
     for frame_idx in 0..frames {
         // Advance voice volume toward target (smooth ramping to avoid pops)
         sample.advance_volumes();
@@ -2182,7 +2207,9 @@ fn apply_pitch_block(
                 if let Some(pos) = direct_pos {
                     value += interpolated_source_sample(decoded, pos, src_ch) * gain_direct;
                 }
-                output[dest_idx] += value * final_volume * route_gain;
+                let routed = value * final_volume * route_gain;
+                output[dest_idx] += routed;
+                bass.add(frame_idx, dest_ch, routed * bass_share);
             }
         }
 
@@ -2204,6 +2231,25 @@ fn channel_route_gain(gains: &[f32], route_idx: usize) -> f32 {
     gains.get(route_idx).copied().unwrap_or(1.0)
 }
 
+/// A sound's share of the bass send (D63), from its `channel_map` routes whose
+/// source channel is below `channels` (the routes it mixes) and their gains.
+fn bass_share(
+    bass: &BassSend,
+    channel_map: &[(usize, usize)],
+    route_gains: &[f32],
+    channels: usize,
+) -> f32 {
+    bass.share(
+        channel_map
+            .iter()
+            .enumerate()
+            .filter(|(_, &(src_ch, _))| src_ch < channels)
+            .map(|(route_idx, &(_, dest_ch))| {
+                (dest_ch, channel_route_gain(route_gains, route_idx))
+            }),
+    )
+}
+
 /// Consume one frame from a ring voice's `consumer` and mix it into `output` at
 /// `frame_idx` through `channel_map`, scaled by `gain` and by each route's entry in
 /// `route_gains` (unity where absent, D29). On an underrun (fewer than
@@ -2212,8 +2258,9 @@ fn channel_route_gain(gains: &[f32], route_idx: usize) -> f32 {
 /// toward zero over `UNDERRUN_FADE_FRAMES` (`underrun_frames` carries the elapsed
 /// count across the block), so the transition to silence has no hard step (F3).
 ///
-/// Shared by the live-input and streamed-source mix paths; allocates nothing, never
-/// blocks, and supports up to 64 input channels.
+/// Each route also goes to the bass send at `bass_share` (D63). Shared by the
+/// live-input and streamed-source mix paths; allocates nothing, never blocks, and
+/// supports up to 64 input channels.
 #[allow(clippy::too_many_arguments)]
 fn mix_ring_voice_frame(
     consumer: &mut HeapConsumer<f32>,
@@ -2226,6 +2273,8 @@ fn mix_ring_voice_frame(
     gain: f32,
     last_frame: &mut [f32; 64],
     underrun_frames: &mut usize,
+    bass: &mut BassSend,
+    bass_share: f32,
 ) {
     // Read one frame worth of samples, or — on underrun — hold the last frame and
     // fade it toward silence so there is no hard cut.
@@ -2254,8 +2303,9 @@ fn mix_ring_voice_frame(
             continue;
         }
         let dest_idx = frame_idx * output_channels + dest_ch;
-        output[dest_idx] +=
-            last_frame[src_ch] * final_gain * channel_route_gain(route_gains, route_idx);
+        let routed = last_frame[src_ch] * final_gain * channel_route_gain(route_gains, route_idx);
+        output[dest_idx] += routed;
+        bass.add(frame_idx, dest_ch, routed * bass_share);
     }
 }
 
@@ -2271,7 +2321,14 @@ fn mix_live_input_into_output(
     frames: usize,
     output_channels: usize,
     duck: (f32, f32),
+    bass: &mut BassSend,
 ) {
+    let bass_share = bass_share(
+        bass,
+        &input.channel_map,
+        &input.route_gains,
+        input.input_channels.min(64),
+    );
     let mut last_frame = [0.0f32; 64];
     let mut underrun_frames = 0usize;
     let available_frames = input.backlog_frames();
@@ -2305,6 +2362,8 @@ fn mix_live_input_into_output(
             gain,
             &mut last_frame,
             &mut underrun_frames,
+            bass,
+            bass_share,
         );
     }
 }
@@ -2321,7 +2380,14 @@ fn mix_streamed_source_into_output(
     frames: usize,
     output_channels: usize,
     duck: (f32, f32),
+    bass: &mut BassSend,
 ) {
+    let bass_share = bass_share(
+        bass,
+        &source.channel_map,
+        &source.channel_route_gains,
+        source.input_channels.min(64),
+    );
     let mut last_frame = [0.0f32; 64];
     let mut underrun_frames = 0usize;
 
@@ -2347,6 +2413,8 @@ fn mix_streamed_source_into_output(
             gain,
             &mut last_frame,
             &mut underrun_frames,
+            bass,
+            bass_share,
         );
 
         // Advance the fade once per frame (the duck fade is advanced once per buffer
@@ -5782,6 +5850,92 @@ mod tests {
         )
     }
 
+    /// A mixer over 5.1 with bass management taking the five mains' bass to the
+    /// LFE (3), keeping the mains full-range so their level can be compared.
+    fn five_one_with_bass_management() -> MixerState {
+        use crate::audio::bass_management::BassManagementConfig;
+        let mut state = MixerState::new(6);
+        state.bass_management = Some(BassManagement::new(
+            BassManagementConfig {
+                enabled: true,
+                lfe_channel: 3,
+                source_channels: vec![0, 1, 2, 4, 5],
+                remove_bass_from_sources: false,
+                ..Default::default()
+            },
+            48000,
+            6,
+        ));
+        state
+    }
+
+    #[test]
+    fn a_streamed_source_on_one_main_reaches_the_subwoofer_at_its_own_level() {
+        let frames = 4800;
+        let mut state = five_one_with_bass_management();
+        state.streamed_sources.push(StreamedSource::new(
+            7,
+            "music".to_string(),
+            "long.wav".to_string(),
+            None,
+            create_test_ring_buffer_with_data(&vec![0.5; frames]),
+            1,
+            1.0,
+            vec![(0, 0)],
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let mut output = vec![0.0f32; frames * 6];
+        mix_audio(&mut output, &mut state);
+
+        let last = (frames - 1) * 6;
+        assert!(
+            (output[last + 3] - 0.5).abs() < 0.02,
+            "a settled 0.5 on one main should reach the LFE at 0.5, got {}",
+            output[last + 3]
+        );
+    }
+
+    #[test]
+    fn a_pitch_corrected_sound_on_one_main_reaches_the_subwoofer_at_its_own_level() {
+        let buffer = Arc::new(DecodedBuffer::new(vec![0.5f32; 48000], 1, 48000));
+        let mut sample = ActiveSample::new_with_mapping(
+            1,
+            "test".to_string(),
+            buffer,
+            1.0,
+            1.0,
+            vec![(0, 0)],
+            TEST_FILE.to_string(),
+            None,
+            false,
+            0,
+        );
+        sample.set_speed(1.5);
+        sample.enable_pitch_correction();
+        let mut state = five_one_with_bass_management();
+        state.active_samples.push(sample);
+
+        let block = 512;
+        let mut output = vec![0.0f32; block * 6];
+        for _ in 0..40 {
+            mix_audio(&mut output, &mut state);
+        }
+        let level = |channel: usize| {
+            let sum: f32 = output.iter().skip(channel).step_by(6).map(|v| v * v).sum();
+            (sum / block as f32).sqrt()
+        };
+        let (main, lfe) = (level(0), level(3));
+        assert!(
+            main > 0.1,
+            "the stretched sound should be playing, got {main}"
+        );
+        assert!(
+            (lfe - main).abs() < main * 0.1,
+            "the LFE should carry the main's level ({main}), got {lfe}"
+        );
+    }
+
     #[test]
     fn streamed_source_not_finished_with_data_and_no_eof() {
         // Audio queued and the producer has not signalled EOF: still playing.
@@ -5824,7 +5978,14 @@ mod tests {
         let mut src = streamed_with_data(&[1.0; 4], 2, true);
         let frames = 70;
         let mut output = vec![0.0f32; frames * 2];
-        mix_streamed_source_into_output(&mut src, &mut output, frames, 2, (1.0, 1.0));
+        mix_streamed_source_into_output(
+            &mut src,
+            &mut output,
+            frames,
+            2,
+            (1.0, 1.0),
+            &mut BassSend::none(),
+        );
 
         // Frames 0..2 read real audio at unity.
         assert!((output[0] - 1.0).abs() < 1e-6);
@@ -5849,7 +6010,14 @@ mod tests {
         src.channel_map = vec![(0, 0), (0, 1)];
         src.set_channel_route_gains(vec![0.25]);
         let mut output = vec![0.0f32; 4];
-        mix_streamed_source_into_output(&mut src, &mut output, 2, 2, (1.0, 1.0));
+        mix_streamed_source_into_output(
+            &mut src,
+            &mut output,
+            2,
+            2,
+            (1.0, 1.0),
+            &mut BassSend::none(),
+        );
 
         assert!((output[0] - 0.2).abs() < 1e-6, "dest 0 got {}", output[0]);
         assert!((output[1] - 0.8).abs() < 1e-6, "dest 1 got {}", output[1]);
@@ -5868,7 +6036,14 @@ mod tests {
             start: 1.0,
         });
         let mut output = vec![0.0f32; 20];
-        mix_streamed_source_into_output(&mut src, &mut output, 10, 2, (1.0, 1.0));
+        mix_streamed_source_into_output(
+            &mut src,
+            &mut output,
+            10,
+            2,
+            (1.0, 1.0),
+            &mut BassSend::none(),
+        );
 
         // Frame 0: 1 - 0/10 = 1.0; frame 5: 1 - 5/10 = 0.5; frame 9: 1 - 9/10 = 0.1.
         assert!((output[0] - 1.0).abs() < 1e-6);

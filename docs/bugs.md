@@ -57,6 +57,7 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 - **The output callback's mix bus can allocate.** It starts empty and is resized inside the callback
   (`build_typed_output_stream` in `src/audio/engine.rs`), so the first block allocates, and so does any
   larger block when the device picks its own buffer size. The allocation harness does not cover it.
+  Bass management's send is sized for 8192 frames and grows the same way for a longer block.
 
 ### HTTP API
 
@@ -69,12 +70,6 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
   JSON command route is reachable cross-site too. Setting a token closes this.
 - **The 30-second command timeout starts after queuing**, so a request can wait longer while the
   command queue is full.
-
-### Bass management
-
-- **The LFE sum is divided by the configured source count**, not by how many sources carry signal:
-  bass on one of five source channels reaches the subwoofer 14 dB down, and with
-  `remove_bass_from_sources` on it is also removed from that channel.
 
 ### Configuration editor
 
@@ -114,8 +109,8 @@ These are deliberate trade-offs, recorded so they are not mistaken for bugs.
   proportional, so the buffer settles near, not exactly at, its target; the trim ceiling allows for
   the offset.
 - **`fadeall` and `stopall` leave live inputs running.** Use `input_mute`.
-- **No low-pass on the summed LFE bus.** Each contribution is already low-passed; only content routed
-  straight to the LFE channel reaches it unfiltered (D32).
+- **Content routed straight to the LFE channel is not low-passed.** Only the bass the sounds send from
+  the source channels passes the crossover (D32, D63).
 - **Per-route gain exists for play `channel_map`s only**, not for input routes (D29).
 - **A cold play of a rate-converted file uses the chunked resampler**, whose output differs very
   slightly from the one-shot decoder's (tolerance-tested, inaudible).

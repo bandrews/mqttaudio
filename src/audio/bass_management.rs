@@ -169,7 +169,7 @@ pub struct BassManagementConfig {
     pub crossover_frequency_hz: f32,
     pub source_channels: Vec<usize>,
     pub remove_bass_from_sources: bool,
-    /// Linear trim applied to the (count-normalized) summed LFE (D32). Default 1.0.
+    /// Linear trim applied to the bass sent to the LFE (D32). Default 1.0.
     pub lfe_gain: f32,
 }
 
@@ -186,11 +186,70 @@ impl Default for BassManagementConfig {
     }
 }
 
+/// Frames the bass send is sized for at construction: `audio.buffer_size`'s
+/// maximum, and the block-size cap the output stream assumes otherwise (D58).
+const PRESIZED_BLOCK_FRAMES: usize = 8192;
+
+/// Where a block's sounds send the signal whose bass the subwoofer plays (D63): one
+/// value per frame, which the mix fills as it routes each sound onto the source
+/// channels. Each sound sends its routed signal at its [`BassSend::share`], so it
+/// reaches the subwoofer at its own level however many source channels play it,
+/// while different sounds add up.
+pub struct BassSend<'a> {
+    /// Whether each output channel is a source channel
+    managed: &'a [bool],
+    frames: &'a mut [f32],
+}
+
+impl BassSend<'_> {
+    /// A send that takes nothing, for a mix without bass management.
+    pub fn none() -> BassSend<'static> {
+        BassSend {
+            managed: &[],
+            frames: &mut [],
+        }
+    }
+
+    /// The share of a sound's routed signal that goes to the send: one over the
+    /// number of source channels it plays on. `routes` yields each route the sound
+    /// mixes, as its output channel and gain; a route at zero gain carries nothing
+    /// and does not count.
+    pub fn share(&self, routes: impl Iterator<Item = (usize, f32)>) -> f32 {
+        let carried = routes
+            .filter(|&(dest, gain)| gain != 0.0 && self.carries(dest))
+            .count();
+        if carried == 0 {
+            0.0
+        } else {
+            1.0 / carried as f32
+        }
+    }
+
+    /// Add `value`, already scaled by the sound's share, as routed to output
+    /// channel `dest` at `frame`; only a source channel's route reaches the send.
+    #[inline]
+    pub fn add(&mut self, frame: usize, dest: usize, value: f32) {
+        if self.carries(dest) {
+            if let Some(slot) = self.frames.get_mut(frame) {
+                *slot += value;
+            }
+        }
+    }
+
+    fn carries(&self, dest: usize) -> bool {
+        self.managed.get(dest).copied().unwrap_or(false)
+    }
+}
+
 /// Bass management processor
 pub struct BassManagement {
     config: BassManagementConfig,
-    /// 4th-order Linkwitz-Riley low-pass per channel, extracting bass for the LFE
-    lowpass_filters: Vec<Lr4Filter>,
+    /// Whether each output channel is a source channel: in range and not the LFE
+    managed: Vec<bool>,
+    /// The block's bass send, filled by the mix (see [`BassSend`])
+    send: Vec<f32>,
+    /// 4th-order Linkwitz-Riley low-pass extracting the send's bass for the LFE
+    lowpass: Lr4Filter,
     /// 4th-order Linkwitz-Riley high-pass per channel, removing bass from the
     /// source channels (if enabled)
     highpass_filters: Vec<Lr4Filter>,
@@ -234,34 +293,51 @@ impl BassManagement {
         let lp_coeffs = BiquadCoefficients::lowpass(config.crossover_frequency_hz, sample_rate);
         let hp_coeffs = BiquadCoefficients::highpass(config.crossover_frequency_hz, sample_rate);
 
-        // Create filters for each source channel
-        let mut lowpass_filters = Vec::with_capacity(output_channels);
+        // A high-pass for each source channel
         let mut highpass_filters = Vec::with_capacity(output_channels);
 
         for ch in 0..output_channels {
-            if config.source_channels.contains(&ch) {
-                lowpass_filters.push(Lr4Filter::new(lp_coeffs.clone()));
-                if config.remove_bass_from_sources {
-                    highpass_filters.push(Lr4Filter::new(hp_coeffs.clone()));
-                } else {
-                    highpass_filters.push(Lr4Filter::passthrough());
-                }
+            if config.source_channels.contains(&ch) && config.remove_bass_from_sources {
+                highpass_filters.push(Lr4Filter::new(hp_coeffs.clone()));
             } else {
-                lowpass_filters.push(Lr4Filter::passthrough());
                 highpass_filters.push(Lr4Filter::passthrough());
             }
         }
+        let managed = (0..output_channels)
+            .map(|ch| {
+                config.enabled
+                    && config.lfe_channel < output_channels
+                    && ch != config.lfe_channel
+                    && config.source_channels.contains(&ch)
+            })
+            .collect();
 
         Self {
             config,
-            lowpass_filters,
+            managed,
+            send: vec![0.0; PRESIZED_BLOCK_FRAMES],
+            lowpass: Lr4Filter::new(lp_coeffs),
             highpass_filters,
             sample_rate,
         }
     }
 
-    /// Process an interleaved output buffer
-    /// Extracts bass from source channels and adds to LFE channel
+    /// Start a block of `frames`: clear the send and hand it to the mix. A block
+    /// longer than the send was sized for grows it, allocating.
+    pub fn send(&mut self, frames: usize) -> BassSend<'_> {
+        if self.send.len() < frames {
+            self.send.resize(frames, 0.0);
+        }
+        let block = &mut self.send[..frames];
+        block.fill(0.0);
+        BassSend {
+            managed: &self.managed,
+            frames: block,
+        }
+    }
+
+    /// Process an interleaved output buffer: add the bass of the block's send to
+    /// the LFE channel, and high-pass the source channels if asked.
     pub fn process(&mut self, output: &mut [f32], output_channels: usize) {
         if !self.config.enabled {
             return;
@@ -275,47 +351,22 @@ impl BassManagement {
             return;
         }
 
-        // Count the source channels that actually contribute this call (the ones
-        // that pass the in-range / not-the-LFE guard below), once per call rather
-        // than per frame. The summed LFE is then normalized by this count so the
-        // sub level is independent of how many sources feed it: two correlated
-        // sources no longer sum to +6 dB (D32). An `lfe_gain` trim rides on top.
-        let active_sources = self
-            .config
-            .source_channels
-            .iter()
-            .filter(|&&src_ch| src_ch < output_channels && src_ch != lfe_ch)
-            .count();
-        if active_sources == 0 {
-            return;
-        }
-        let lfe_scale = self.config.lfe_gain / active_sources as f32;
-
         for frame_idx in 0..frames {
-            let mut lfe_sum = 0.0_f32;
+            // Extract the bass of the sounds sent this frame, trimmed by lfe_gain.
+            let sent = self.send.get(frame_idx).copied().unwrap_or(0.0);
+            let lfe_idx = frame_idx * output_channels + lfe_ch;
+            output[lfe_idx] += self.lowpass.process(sent) * self.config.lfe_gain;
 
-            // Process each source channel
-            for &src_ch in &self.config.source_channels {
-                if src_ch >= output_channels || src_ch == lfe_ch {
-                    continue;
-                }
-
-                let idx = frame_idx * output_channels + src_ch;
-                let sample = output[idx];
-
-                // Extract bass for LFE
-                let bass = self.lowpass_filters[src_ch].process(sample);
-                lfe_sum += bass;
-
-                // Optionally high-pass the source channel
-                if self.config.remove_bass_from_sources {
-                    output[idx] = self.highpass_filters[src_ch].process(sample);
+            // Optionally high-pass the source channels
+            if self.config.remove_bass_from_sources {
+                for &src_ch in &self.config.source_channels {
+                    if src_ch >= output_channels || src_ch == lfe_ch {
+                        continue;
+                    }
+                    let idx = frame_idx * output_channels + src_ch;
+                    output[idx] = self.highpass_filters[src_ch].process(output[idx]);
                 }
             }
-
-            // Add the count-normalized, gain-trimmed extracted bass to the LFE.
-            let lfe_idx = frame_idx * output_channels + lfe_ch;
-            output[lfe_idx] += lfe_sum * lfe_scale;
         }
     }
 
@@ -563,6 +614,25 @@ mod tests {
 
     // === BassManagement Tests ===
 
+    /// Run `bm` over `output` as the mixer does for one sound whose signal is on
+    /// each channel in `routes`: send it at its share, then process the block.
+    fn process_sound(
+        bm: &mut BassManagement,
+        output: &mut [f32],
+        channels: usize,
+        routes: &[usize],
+    ) {
+        let frames = output.len() / channels;
+        let mut send = bm.send(frames);
+        let share = send.share(routes.iter().map(|&dest| (dest, 1.0)));
+        for frame in 0..frames {
+            for &dest in routes {
+                send.add(frame, dest, output[frame * channels + dest] * share);
+            }
+        }
+        bm.process(output, channels);
+    }
+
     /// Recombined-magnitude ratio (output/input) of the crossover at a single
     /// frequency: feed a sine into source channel 0 (high-passed into channel 0)
     /// with the low-passed bass routed to the LFE on channel 1, then sum the two
@@ -590,7 +660,7 @@ mod tests {
             output[frame * channels] = (2.0 * PI * freq * t).sin() * amplitude;
         }
 
-        bm.process(&mut output, channels);
+        process_sound(&mut bm, &mut output, channels, &[0]);
 
         // Sum the high-passed source (ch 0) and the low-passed LFE (ch 1) — the
         // acoustic recombination the crossover is meant to keep flat. Skip the
@@ -606,10 +676,9 @@ mod tests {
         recombined_rms / input_rms
     }
 
-    /// LFE-channel RMS produced by feeding the same correlated low-frequency tone
-    /// into every listed source channel. Without count compensation the LFE level
-    /// scales with the number of sources (two correlated sources sum to +6 dB);
-    /// with D32 normalization it is independent of source count.
+    /// LFE-channel RMS produced by one sound playing a low-frequency tone on every
+    /// listed source channel. Summed at full level, the LFE would scale with the
+    /// number of channels (two sum to +6 dB); at the sound's share (D63) it does not.
     fn lfe_rms_for_sources(source_channels: Vec<usize>) -> f32 {
         let sample_rate = 48000.0_f32;
         let lfe_channel = 5;
@@ -636,7 +705,7 @@ mod tests {
             }
         }
 
-        bm.process(&mut output, channels);
+        process_sound(&mut bm, &mut output, channels, &source_channels);
 
         let skip = 2000;
         let mut power = 0.0_f64;
@@ -652,8 +721,8 @@ mod tests {
         let one_source = lfe_rms_for_sources(vec![0]);
         let two_sources = lfe_rms_for_sources(vec![0, 1]);
 
-        // Correlated bass into one vs two sources must yield the same LFE level
-        // once normalized by the active source count (D32).
+        // One sound on one or two source channels must yield the same LFE level
+        // (D63).
         let ratio_db = 20.0 * (two_sources / one_source).log10();
         assert!(
             ratio_db.abs() <= 1.0,
@@ -695,7 +764,7 @@ mod tests {
         let mut output = vec![0.5; 60];
         let original = output.clone();
 
-        bm.process(&mut output, 6);
+        process_sound(&mut bm, &mut output, 6, &[0, 1]);
 
         // Buffer should be unchanged when disabled
         assert_eq!(output, original);
@@ -730,7 +799,7 @@ mod tests {
             output[frame * channels + 1] = sample; // Right
         }
 
-        bm.process(&mut output, channels);
+        process_sound(&mut bm, &mut output, channels, &[0, 1]);
 
         // LFE channel (3) should now have content
         let mut lfe_power = 0.0_f32;
@@ -777,7 +846,7 @@ mod tests {
             original_power += sample * sample;
         }
 
-        bm.process(&mut output, channels);
+        process_sound(&mut bm, &mut output, channels, &[0]);
 
         // Source channel should have reduced bass
         let mut filtered_power = 0.0_f32;
@@ -827,7 +896,7 @@ mod tests {
             original_power += sample * sample;
         }
 
-        bm.process(&mut output, channels);
+        process_sound(&mut bm, &mut output, channels, &[0]);
 
         let mut filtered_power = 0.0_f32;
         for frame in 100..frames {
@@ -861,7 +930,7 @@ mod tests {
         let original = output.clone();
 
         // Should not crash, should be no-op
-        bm.process(&mut output, 6);
+        process_sound(&mut bm, &mut output, 6, &[0, 1]);
 
         // Buffer should be unchanged
         assert_eq!(output, original);
@@ -889,7 +958,7 @@ mod tests {
             output[frame * channels + 3] = 0.5;
         }
 
-        bm.process(&mut output, channels);
+        process_sound(&mut bm, &mut output, channels, &[3]);
 
         // LFE content should be preserved (not doubled by extracting from itself)
         // Allow for filter transient
@@ -929,7 +998,7 @@ mod tests {
             output[frame * channels + 3] = 0.2; // Existing LFE content
         }
 
-        bm.process(&mut output, channels);
+        process_sound(&mut bm, &mut output, channels, &[0]);
 
         // LFE should have both existing content AND extracted bass
         // Measure power in the LFE channel after filter settling
