@@ -1,5 +1,5 @@
 // ABOUTME: Input fields for the internal_id/id/file/voice sample selector used by sample commands.
-// ABOUTME: Warns when internal_id is not numeric and when no selector criterion is set.
+// ABOUTME: Flags an internal_id that is not numeric and warns when no selector criterion is set.
 
 // The OR-logic sample selector (internal_id/id/file/voice). Warns loudly when no
 // criterion is set — the daemon rejects an empty selector with a 400
@@ -31,8 +31,8 @@ export function SelectorField({
           label="internal_id"
           value={value.internal_id ?? ''}
           onChange={(e) => set('internal_id', e.target.value)}
-          error={!!idIssue.warning}
-          helperText={idIssue.warning}
+          error={!!idIssue.error}
+          helperText={idIssue.error}
           inputProps={{ 'aria-label': 'internal_id' }}
         />
         <TextField
@@ -59,8 +59,8 @@ export function SelectorField({
       </Stack>
       {empty && (
         <Alert severity="warning" aria-label="empty selector warning">
-          No selector set — the daemon will match nothing (a silent no-op). Set at least one of internal_id /
-          id / file / voice.
+          No selector set — the daemon refuses a command with no selector (400). Set at least one of
+          internal_id / id / file / voice.
         </Alert>
       )}
     </Stack>

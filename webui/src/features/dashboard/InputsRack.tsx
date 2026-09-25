@@ -35,7 +35,7 @@ export function InputsRack() {
               <Chip size="small" variant="outlined" label={`${input.channels} ch`} />
               <Chip size="small" variant="outlined" label={`vol ${input.volume.toFixed(2)}`} />
               {input.muted ? (
-                <Tooltip title="Derived as volume == 0.0">
+                <Tooltip title="The mute state the audio thread has applied; unmuting restores the level the input had before it was muted.">
                   <Chip size="small" color="default" label="muted" aria-label={`${input.voice_id} muted`} />
                 </Tooltip>
               ) : (

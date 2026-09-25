@@ -131,8 +131,9 @@ export function MatrixMixer() {
           </Alert>
         )}
         <Alert severity="info">
-          An unknown channel alias silently aborts the play; numeric destinations always apply, and out-of-range
-          destinations are skipped.
+          An unknown channel name refuses the play with a 400; numeric destinations within the
+          device's outputs apply, and destinations beyond the device's outputs are skipped without a
+          warning.
         </Alert>
         <Box component="pre" sx={{ m: 0, p: 1, bgcolor: 'background.default', borderRadius: 1, fontSize: 12, overflowX: 'auto' }} aria-label="matrix JSON preview">
           {JSON.stringify({ command: 'play', message }, null, 2)}

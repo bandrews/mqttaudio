@@ -63,11 +63,25 @@ describe('DaemonClient command JSON (API-CONTRACT §2, DW10)', () => {
     });
   });
 
-  it('warns when play volume is out of range but still sends it (daemon clamps)', async () => {
+  it('warns when play volume is outside [0,4] but still sends it (daemon clamps)', async () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     await client.play({ file: '/s.wav', volume: 2 });
+    expect(warn).not.toHaveBeenCalled();
+    await client.play({ file: '/s.wav', volume: 5 });
     expect(warn).toHaveBeenCalledOnce();
-    expect((conn.last().body as { message: { volume: number } }).message.volume).toBe(2);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('outside [0,4]'));
+    expect((conn.last().body as { message: { volume: number } }).message.volume).toBe(5);
+    warn.mockRestore();
+  });
+
+  it('warns when a volume command is outside [0,4] but still sends it (daemon clamps)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await client.volume({ id: 's', volume: 3 });
+    expect(warn).not.toHaveBeenCalled();
+    await client.volume({ id: 's', volume: -1 });
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('outside [0,4]'));
+    expect(conn.last().body).toEqual({ id: 's', volume: -1 });
     warn.mockRestore();
   });
 
@@ -75,6 +89,7 @@ describe('DaemonClient command JSON (API-CONTRACT §2, DW10)', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     await client.stop({});
     expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('the daemon refuses it with a 400'));
     expect(conn.last().path).toBe('/stop');
     expect(conn.last().body).toEqual({});
     warn.mockRestore();
@@ -101,8 +116,24 @@ describe('DaemonClient command JSON (API-CONTRACT §2, DW10)', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     await client.speed({ id: 's', speed: 9, pitch_correction: true });
     expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenLastCalledWith(expect.stringContaining('the daemon will clamp it'));
     await client.speed({ id: 's', speed: -2, pitch_correction: false });
     expect(warn).toHaveBeenCalledTimes(1); // -2 is within [-100,100], no extra warn
+    warn.mockRestore();
+  });
+
+  it('speed warns that the daemon refuses speed 0 and reverse with pitch correction', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await client.speed({ id: 's', speed: -2, pitch_correction: true });
+    expect(warn).toHaveBeenLastCalledWith(
+      expect.stringContaining('the daemon refuses it with a 400'),
+    );
+    await client.speed({ id: 's', speed: 0, pitch_correction: false });
+    expect(warn).toHaveBeenLastCalledWith(
+      expect.stringContaining('the daemon refuses it with a 400'),
+    );
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(conn.last().body).toEqual({ id: 's', speed: 0, pitch_correction: false });
     warn.mockRestore();
   });
 

@@ -54,8 +54,8 @@ export function RawCommandEditor() {
         Raw command (POST /command)
       </Typography>
       <Typography variant="caption" color="text.secondary">
-        The full play surface (channel_map, mode, window_ms, prebuffer_ms, freshness, cacheable) is only
-        reachable here or via MQTT — the typed /play endpoint drops these fields.
+        The play fields mode, window_ms, prebuffer_ms, freshness and cacheable reach the daemon only
+        through /command or MQTT — the typed /play endpoint drops them.
       </Typography>
       <Box mt={1}>
         <TextField

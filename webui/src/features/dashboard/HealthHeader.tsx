@@ -83,7 +83,7 @@ export function HealthHeader() {
           />
           <CounterChip
             label="stream errors"
-            tip="cpal stream-error callbacks that triggered a stream rebuild (cumulative); not per-buffer underruns"
+            tip="Errors the audio output stream reported since startup (cumulative), including underruns the audio system recovered from on its own"
             value={xruns.value}
             delta={xruns.delta}
             warn

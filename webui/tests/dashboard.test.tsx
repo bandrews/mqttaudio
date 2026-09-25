@@ -3,6 +3,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { renderWithClient, mockReadClient } from './_helpers';
 import { HealthHeader } from '../src/features/dashboard/HealthHeader';
 import { NowPlayingBoard } from '../src/features/dashboard/NowPlayingBoard';
@@ -56,6 +57,22 @@ describe('HealthHeader (F1/F2)', () => {
     // cache budget gauge: 1.5 MiB used / 1.0 GiB cap
     expect(await screen.findByLabelText('cache memory budget')).toHaveTextContent('1.5 MiB');
     expect(screen.getByLabelText('cache memory budget')).toHaveTextContent('GiB');
+  });
+
+  it('explains stream errors as every error the output stream reported, recovered underruns included', async () => {
+    const user = userEvent.setup();
+    const client = mockReadClient({
+      status: async () => status,
+      metrics: async () => metrics,
+    } as Partial<DaemonClient>);
+    renderWithClient(<HealthHeader />, client);
+
+    await user.hover(await screen.findByLabelText('stream errors 1'));
+    const tip = await screen.findByRole('tooltip');
+    expect(tip).toHaveTextContent(/errors the audio output stream reported since startup/i);
+    expect(tip).toHaveTextContent(
+      /including underruns the audio system recovered from on its own/i,
+    );
   });
 });
 
@@ -128,6 +145,22 @@ describe('InputsRack (F5)', () => {
     renderWithClient(<InputsRack />, client);
     expect(await screen.findByLabelText('aux muted')).toBeInTheDocument();
     expect(screen.getByText('mic')).toBeInTheDocument();
+  });
+
+  it('explains muted as the applied mute state, not a volume of zero', async () => {
+    const user = userEvent.setup();
+    const client = mockReadClient({
+      statusInputs: async () => ({
+        inputs: [{ index: 1, voice_id: 'aux', volume: 0, channels: 2, muted: true }],
+      }),
+    } as Partial<DaemonClient>);
+    renderWithClient(<InputsRack />, client);
+
+    await user.hover(await screen.findByLabelText('aux muted'));
+    const tip = await screen.findByRole('tooltip');
+    expect(tip).toHaveTextContent(/the mute state the audio thread has applied/i);
+    expect(tip).toHaveTextContent(/unmuting restores/i);
+    expect(tip).not.toHaveTextContent(/volume == 0/);
   });
 });
 

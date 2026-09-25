@@ -60,8 +60,8 @@ export class DaemonClient {
 
   /** Play. Routed via /command so the full surface (channel_map/mode/...) reaches the daemon (DW10). */
   play(params: PlayParams): Promise<CommandResponse> {
-    if (params.volume !== undefined && (params.volume < 0 || params.volume > 1)) {
-      console.warn(`play: volume ${params.volume} is outside [0,1]; the daemon will clamp it.`);
+    if (params.volume !== undefined && (params.volume < 0 || params.volume > 4)) {
+      console.warn(`play: volume ${params.volume} is outside [0,4]; the daemon will clamp it.`);
     }
     return this.command('play', compact({ ...params }));
   }
@@ -82,8 +82,8 @@ export class DaemonClient {
 
   volume(params: VolumeParams): Promise<CommandResponse> {
     this.warnEmptySelector('volume', params);
-    if (params.volume < 0 || params.volume > 1) {
-      console.warn(`volume: ${params.volume} is outside [0,1]; the daemon will clamp it.`);
+    if (params.volume < 0 || params.volume > 4) {
+      console.warn(`volume: ${params.volume} is outside [0,4]; the daemon will clamp it.`);
     }
     return this.conn.post<CommandResponse>('/volume', compact({ ...params }));
   }
@@ -96,7 +96,11 @@ export class DaemonClient {
   speed(params: SpeedParams): Promise<CommandResponse> {
     this.warnEmptySelector('speed', params);
     const [lo, hi] = params.pitch_correction ? [0.05, 8.0] : [-100, 100];
-    if (params.speed < lo || params.speed > hi) {
+    if (params.speed === 0 || (params.pitch_correction && params.speed < 0)) {
+      console.warn(
+        `speed: ${params.speed} with pitch_correction=${!!params.pitch_correction}; the daemon refuses it with a 400.`,
+      );
+    } else if (params.speed < lo || params.speed > hi) {
       console.warn(
         `speed: ${params.speed} is outside [${lo},${hi}] for pitch_correction=${!!params.pitch_correction}; the daemon will clamp it.`,
       );
@@ -149,7 +153,7 @@ export class DaemonClient {
   private warnEmptySelector(command: string, sel: SampleSelector): void {
     if (isSelectorEmpty(sel)) {
       console.warn(
-        `${command}: no selector set (internal_id/id/file/voice) — the daemon will match nothing (a silent no-op).`,
+        `${command}: no selector set (internal_id/id/file/voice) — the daemon refuses it with a 400.`,
       );
     }
   }

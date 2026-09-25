@@ -33,9 +33,16 @@ describe('validation (mirrors the daemon)', () => {
     expect(validateSpeed(9, true).warning).toMatch(/clamp/);
     expect(validateSpeed(-50, false)).toEqual({});
   });
-  it('warns when internal_id is not digits', () => {
+  it('errors on speed 0, which the daemon refuses with or without pitch correction', () => {
+    expect(validateSpeed(0, false).error).toMatch(/speed 0/);
+    expect(validateSpeed(0, true).error).toMatch(/speed 0/);
+  });
+  it('errors when internal_id is not digits, since the daemon refuses it', () => {
     expect(validateInternalId('7')).toEqual({});
-    expect(validateInternalId('abc').warning).toMatch(/digits/);
+    const issue = validateInternalId('abc');
+    expect(issue.error).toMatch(/digits/);
+    expect(issue.error).toMatch(/refuse/);
+    expect(issue.warning).toBeUndefined();
   });
 });
 
@@ -69,6 +76,15 @@ describe('CueLauncher (F4)', () => {
 });
 
 describe('RawCommandEditor (F3)', () => {
+  it('names the play fields only /command carries; the typed /play takes channel_map', () => {
+    renderWithClient(<RawCommandEditor />, spyClient());
+    const note = screen.getByText(/the typed \/play endpoint/i);
+    expect(note).toHaveTextContent(
+      'mode, window_ms, prebuffer_ms, freshness and cacheable reach the daemon only through /command or MQTT',
+    );
+    expect(note).not.toHaveTextContent(/channel_map/);
+  });
+
   it('sends valid JSON and rejects invalid JSON without sending', async () => {
     const user = userEvent.setup();
     const client = spyClient();
@@ -95,7 +111,26 @@ describe('RawCommandEditor (F3)', () => {
 describe('Command forms', () => {
   it('shows the empty-selector warning by default', () => {
     renderWithClient(<SampleControl />, spyClient());
-    expect(screen.getByLabelText('empty selector warning')).toBeInTheDocument();
+    const warning = screen.getByLabelText('empty selector warning');
+    expect(warning).toHaveTextContent(/the daemon refuses a command with no selector \(400\)/i);
+    expect(warning).not.toHaveTextContent(/no-op/);
+  });
+
+  it('flags a non-numeric internal_id as an error on the field', async () => {
+    const user = userEvent.setup();
+    renderWithClient(<SampleControl />, spyClient());
+    await user.type(screen.getByLabelText('internal_id'), 'abc');
+    expect(screen.getByLabelText('internal_id')).toHaveAttribute('aria-invalid', 'true');
+    expect(screen.getByText(/the daemon refuses a non-numeric value/i)).toBeInTheDocument();
+  });
+
+  it('blocks Set speed at speed 0', async () => {
+    const user = userEvent.setup();
+    renderWithClient(<SampleControl />, spyClient());
+    const speed = screen.getByLabelText('speed');
+    await user.clear(speed);
+    await user.type(speed, '0');
+    expect(screen.getByRole('button', { name: 'Set speed' })).toBeDisabled();
   });
 
   it('voice fade-out emits the typed time_ms key', async () => {

@@ -20,6 +20,7 @@ export function validateVolume(v: number): FieldIssue {
 export function validateSpeed(v: number, pitch: boolean): FieldIssue {
   if (!Number.isFinite(v)) return { error: 'speed must be a number' };
   const [lo, hi] = pitch ? [0.05, 8] : [-100, 100];
+  if (v === 0) return { error: 'speed 0 is refused by the daemon; use stop to end playback' };
   if (pitch && v < 0) return { error: 'reverse (negative speed) is not supported with pitch correction' };
   if (v < lo || v > hi) return { warning: `speed ${v} is outside [${lo},${hi}]; the daemon will clamp it` };
   return {};
@@ -27,7 +28,7 @@ export function validateSpeed(v: number, pitch: boolean): FieldIssue {
 
 export function validateInternalId(s: string): FieldIssue {
   if (s && !/^\d+$/.test(s)) {
-    return { warning: 'internal_id should be digits (it is matched as a number); a non-numeric value never matches' };
+    return { error: 'internal_id must be digits; the daemon refuses a non-numeric value (400)' };
   }
   return {};
 }

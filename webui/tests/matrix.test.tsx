@@ -95,6 +95,16 @@ describe('MatrixMixer (F1-F5)', () => {
     expect(await screen.findByText('Command completed')).toBeInTheDocument();
   });
 
+  it('says an unknown channel name refuses the play and a destination beyond the outputs is skipped', async () => {
+    const client = statusClient();
+    renderWithClient(<MatrixMixer />, client);
+    await screen.findByLabelText('route 0 to 0');
+    const note = screen.getByText(/unknown channel name/i);
+    expect(note).toHaveTextContent(/refuses the play with a 400/i);
+    expect(note).toHaveTextContent(/beyond the device's outputs are skipped without a warning/i);
+    expect(note).not.toHaveTextContent(/silently aborts/i);
+  });
+
   it('disables Play with no routes selected', async () => {
     const client = statusClient();
     renderWithClient(<MatrixMixer />, client);
