@@ -1,10 +1,11 @@
 // ABOUTME: Root app shell: shows the Connect screen until a daemon connection is established.
 // ABOUTME: Then renders the top bar and the Monitor, Mixer, Console, Matrix and Config tabs.
 
-// Root app shell. Sprint W0 ships only the connect/bootstrap surface: connect to
-// a daemon, then show its identity. Feature UI (dashboard, command bench, matrix
-// mixer, transport, telemetry, config) is added by Sprints W2+ inside the
-// ConnectedView's body.
+// Root app shell. Until a daemon is connected it shows the connect/bootstrap
+// surface; then the ConnectedView shows the daemon's identity, the telemetry and
+// color-mode switches in the top bar, and the feature tabs: the monitor
+// dashboard, mixer (transport and strips), command console, matrix mixer and
+// config.
 
 import { useState } from 'react';
 import AppBar from '@mui/material/AppBar';

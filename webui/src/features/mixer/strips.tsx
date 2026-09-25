@@ -1,5 +1,5 @@
 // ABOUTME: Mixer strips: VoiceStrip (volume, fade-out, stop) and InputStrip (volume, mute).
-// ABOUTME: Each control sends its command through the connected client and shows a refusal's error.
+// ABOUTME: Each control sends its command through the client and shows the error if it is refused.
 
 // Voice and input control strips (Sprint W5): live volume faders, voice fade-out
 // (time_ms), voice stop, and input mute. input_mute restores the prior level on

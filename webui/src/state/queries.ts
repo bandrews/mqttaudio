@@ -3,7 +3,7 @@
 
 // TanStack Query hooks over the typed client, carrying the DW6 poll cadences as
 // defaults: /metrics + /status* at 1-2s, /status/cache at 2-5s, /version once.
-// Sprint W2 (the dashboard) consumes these; this sprint only ships the seam, so
+// The feature views (dashboard, mixer, matrix, config, telemetry) consume these;
 // the cadences are asserted via the exported option factories.
 
 import { useQuery, type UseQueryOptions } from '@tanstack/react-query';

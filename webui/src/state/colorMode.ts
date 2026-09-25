@@ -2,7 +2,7 @@
 // ABOUTME: useColorMode reads it; AppRoot provides the value.
 
 // Light/dark color-mode context (Sprint W9). Kept in its own module so the
-// provider component (main.tsx) and the toggle stay fast-refresh-friendly.
+// provider component (AppRoot.tsx) and the toggle stay fast-refresh-friendly.
 
 import { createContext, useContext } from 'react';
 

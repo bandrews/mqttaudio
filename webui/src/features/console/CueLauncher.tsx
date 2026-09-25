@@ -1,5 +1,5 @@
 // ABOUTME: Cue launcher: builds a play command from form fields and shows a live JSON preview.
-// ABOUTME: Sends it as a nested {command, macro?, message} to /command and shows the command's result.
+// ABOUTME: Sends a nested {command, macro?, message} to /command and shows the command's result.
 
 // Cue launcher (Sprint W3, F4): compose a play from a file + options and fire it.
 // Sent through client.rawCommand() -> POST /command, so the full surface (mode,
