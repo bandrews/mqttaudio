@@ -235,7 +235,7 @@ async fn main() {
 
     tracing::info!("mqttaudio {} starting", env!("CARGO_PKG_VERSION"));
     tracing::info!("{}", config_source_message(config_path.as_deref()));
-    tracing::info!("Copyright © 2016-2025 Mo Fang Heavy Industries LLC");
+    tracing::info!("Copyright © 2016-2026 Mo Fang Heavy Industries LLC");
 
     // Handle --list-devices
     if args.list_devices {

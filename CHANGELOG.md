@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`Cargo.toml` declares `rust-version = "1.88"`**, the version the dependencies need, and no longer
+  lists the unused `dasp` crate.
+
 ### Fixed
 
 - **Per-route `gain` in `channel_map` now applies to streamed plays.** A windowed play (`mode: "stream"`,
@@ -148,6 +153,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Removed
 
+- **`.github/workflows/webui-ci.yml`**, since GitHub Actions is disabled for this repository; the web UI
+  gate runs locally.
+- **The second, unfinished code of conduct** (`code_of_conduct.md`). The Contributor Covenant 3.0 in
+  [CONTRIBUTING.md](CONTRIBUTING.md) applies, with its contact address filled in. The license and
+  copyright notices read 2016-2026, and the README no longer pairs the MIT license with "All Rights
+  Reserved".
 - **`--lfe-channel` and `--crossover-frequency` are rejected.** The 2.1.0-rc.1 notes list them as
   removed, but the release candidate still accepted both flags and ignored their values. Bass
   management is configured in the `bass_management` config section.

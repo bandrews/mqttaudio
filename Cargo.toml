@@ -2,6 +2,7 @@
 name = "mqttaudio"
 version = "2.1.0-rc.1"
 edition = "2021"
+rust-version = "1.88"
 authors = ["Mo Fang Heavy Industries LLC"]
 description = "MQTT-controlled multichannel audio player for interactive entertainment"
 license = "MIT"
@@ -34,9 +35,6 @@ ratatui = "0.30"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-
-# DSP utilities
-dasp = "0.11"
 
 # Time-stretching for pitch correction
 signalsmith-stretch = "0.1"

@@ -1983,7 +1983,6 @@ dependencies = [
  "clap",
  "cpal",
  "criterion",
- "dasp",
  "dirs",
  "futures",
  "futures-util",

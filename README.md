@@ -113,4 +113,4 @@ If you prefer a purely human developed alternative, the much simpler 1.0 version
 
 ## Copyright
 
-Copyright (c) 2016-2025 Mo Fang Heavy Industries LLC.  All Rights Reserved.
+Copyright (c) 2016-2026 Mo Fang Heavy Industries LLC. Released under the [MIT License](LICENSE).

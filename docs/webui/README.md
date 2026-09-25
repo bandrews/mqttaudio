@@ -84,10 +84,9 @@ pnpm build              # type-check + production build to webui/dist
 
 `test:e2e:crossbrowser` needs the extra engines once: `pnpm exec playwright install webkit firefox`.
 
-The Lane A web gate is build, typecheck, lint, unit/component tests and headless Playwright with a11y checks on
-Chromium (the steps in `.github/workflows/webui-ci.yml`). GitHub Actions is disabled for this repository, so
-run them locally with the commands above. Lane B (real browser + live daemon) runs locally on a machine with an
-audio device. Cross-engine rendering/interaction/a11y parity (WebKit + Gecko) is covered by `test:e2e:crossbrowser`;
+The Lane A web gate is `pnpm typecheck`, `pnpm lint`, `pnpm build`, `pnpm test` and `pnpm test:e2e` (headless
+Playwright with a11y checks on Chromium). GitHub Actions is disabled for this repository, so run them locally.
+Lane B (real browser + live daemon) runs locally on a machine with an audio device. Cross-engine rendering/interaction/a11y parity (WebKit + Gecko) is covered by `test:e2e:crossbrowser`;
 the residual human pass — a real screen-reader walk-through and an ears-on "audio unaffected" listen — is
 tracked in [`MANUAL-VERIFICATION.md`](MANUAL-VERIFICATION.md).
 

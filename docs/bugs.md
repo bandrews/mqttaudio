@@ -147,8 +147,6 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 - **The container health check needs the token in the environment.** With
   `MQTTAUDIO_HTTP_REQUIRE_AUTH=true` it requires `MQTTAUDIO_HTTP_AUTH_TOKEN`, although `/ready`
   never needs a token, and it assumes port 8080 while `http.port` defaults to `0`.
-- **No declared minimum Rust version.** Dependencies need Rust 1.88 (ratatui 0.30, time 0.3.47), but
-  `Cargo.toml` has no `rust-version` and no build checks it.
 - **A unit test failed once under full-suite load** (recorded when the binary still compiled its
   own copy of every module; name not captured) and passed on every rerun. The suites have
   timing-sensitive tests; capture the name if it recurs.
@@ -158,7 +156,6 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 - `handle_command` (`src/main.rs`) still has arms for `precache` and the cache commands, which
   `loading::prepare` completes first, and empty-selector branches in `seek`, `speed`, `stop` and
   `volume` that the selector pre-check makes unreachable.
-- `dasp` is declared in `Cargo.toml` but not used anywhere.
 - `CacheError`'s variant names carry a targeted `#[allow(clippy::enum_variant_names)]`
   (`src/cache/disk.rs`).
 - The ALSA name matcher (`try_match_alsa_device` in `src/audio/device.rs`) compares only the card, not

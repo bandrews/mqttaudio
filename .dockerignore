@@ -3,6 +3,5 @@ docs/
 tests/
 *.md
 LICENSE
-code_of_conduct.md
 config.example.json
 .git/
