@@ -3,9 +3,10 @@
 
 // Persistent health header (Sprint W2, F1): active counts, output channels,
 // uptime, and the two health counters — clips (limiter held at ceiling) and
-// "stream errors / rebuilds" (cpal fatal stream-error callbacks, NOT per-buffer
-// underruns). Counters are cumulative; the Δ chip shows the change since the last
-// poll (diffed client-side, DW6), never an instantaneous rate.
+// "stream errors" (every cpal stream-error callback, including xruns the backend
+// recovered from; only unrecoverable errors rebuild the stream). Counters are
+// cumulative; the Δ chip shows the change since the last poll (diffed
+// client-side, DW6), never an instantaneous rate.
 
 import Chip from '@mui/material/Chip';
 import Paper from '@mui/material/Paper';

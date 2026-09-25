@@ -2,11 +2,10 @@
 // ABOUTME: Badges summed destinations as clip risks and posts the play to /command.
 
 // Channel-map matrix mixer (Sprint W4): a src×dest grid that builds a
-// play.channel_map and fires it via /command (DW10 — the typed /play drops
-// channel_map). Additive summing means a destination fed by >1 source is a
-// clip-risk (badged). Emits numeric destinations (always valid); an unknown alias
-// would silently abort the play (API-CONTRACT §4), so alias-as-dest is left to the
-// raw editor + config.
+// play.channel_map and fires it via /command (DW10). Additive summing means a
+// destination fed by >1 source is a clip-risk (badged). Emits numeric destinations
+// (always valid); an unknown alias fails the play with a 400 (API-CONTRACT §4), so
+// alias-as-dest is left to the raw editor + config.
 
 import { useMemo, useState } from 'react';
 import Alert from '@mui/material/Alert';

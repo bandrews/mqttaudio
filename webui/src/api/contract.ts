@@ -38,7 +38,7 @@ export interface PlayParams {
   cacheable?: boolean;
 }
 
-/** The OR-logic sample selector. An empty selector matches nothing (a silent no-op). */
+/** The OR-logic sample selector. The daemon rejects an empty selector with a 400. */
 export interface SampleSelector {
   internal_id?: string;
   id?: string;
@@ -116,8 +116,8 @@ export interface StatusInfo {
 
 /**
  * A row from `/status/samples`. NOTE: `position`, `position_ms`, and
- * `progress_percent` are hard-coded `0` until Sprint W6 lands live telemetry —
- * never present them as live before then.
+ * `progress_percent` are live only while telemetry is on and `0` otherwise, and
+ * always `0` for a windowed sample — never present them as live in those cases.
  */
 export interface SampleInfo {
   internal_id: string;
@@ -215,7 +215,10 @@ export interface MetricsInfo {
   ducking: Record<string, number>;
 }
 
-/** Legacy command aliases (only these three commands have aliases). */
+/**
+ * Alternate names the daemon accepts for play, stopall and precache. fadeall also
+ * has alternates (soundFadeAll, fadeout, soundFadeOut), which this map omits.
+ */
 export const COMMAND_ALIASES: Record<string, string> = {
   play: 'soundPlay',
   stopall: 'soundStopAll',

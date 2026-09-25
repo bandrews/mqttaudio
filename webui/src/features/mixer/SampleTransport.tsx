@@ -4,10 +4,10 @@
 // Per-sample transport (Sprint W5): a seek scrubber, a speed control with a
 // pitch-correction toggle (which re-clamps the range and disables reverse), and a
 // stop. Windowed/streamed voices are forward-only — seek/speed/reverse are
-// disabled and a "streamed" badge is shown. Live playhead arrives in Sprint W6;
-// the scrubber is set-only here. NOTE: /status/samples has no is-windowed flag
-// yet, so windowed is INFERRED from total_frames === 0 (see docs/bugs.md, Sprint
-// W5); Sprint W6 F4 adds the real flag.
+// disabled and a "streamed" badge is shown. The scrubber follows the live
+// playhead while telemetry is on and is set-only otherwise. Windowed comes from
+// the /status/samples `windowed` flag via isWindowed, which falls back to
+// total_frames === 0 when the flag is absent.
 
 import { useState } from 'react';
 import Box from '@mui/material/Box';

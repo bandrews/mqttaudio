@@ -5,8 +5,8 @@
 // edge with an optional gain. Mixing on the daemon is additive summing, so a dest
 // fed by >1 src is a clip risk (API-CONTRACT §4). buildChannelMap emits the
 // play.channel_map array (numeric dest by default — always valid; an unknown
-// alias would silently abort the play, so alias-as-dest is left to the raw editor
-// / config).
+// alias fails the play with a 400, so alias-as-dest is left to the raw editor /
+// config).
 
 import type { ChannelMapping } from '../../api/contract';
 

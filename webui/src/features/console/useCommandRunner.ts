@@ -2,8 +2,8 @@
 // ABOUTME: Exposes idle/sending/ok/error with the daemon's message or the thrown error text.
 
 // Runs a command through the active client and tracks the result. Note: command
-// endpoints return success on ENQUEUE, not on validity/effect (API-CONTRACT §1),
-// so the UI says "accepted" and points the operator at the dashboard to confirm.
+// endpoints answer once the daemon has carried the command out (API-CONTRACT §1):
+// a 200 means it completed, and an error status rejects with an HttpError.
 
 import { useState } from 'react';
 import type { CommandResponse } from '../../api/contract';

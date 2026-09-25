@@ -1,10 +1,9 @@
 // ABOUTME: isWindowed: whether a sample is a windowed (streamed, forward-only) play.
 // ABOUTME: Used to hide seek/speed controls and progress bars for streamed samples.
 
-// Infer whether a sample is windowed/streamed (forward-only). /status/samples has
-// no is-windowed flag yet, so we infer from total_frames === 0 — streamed plays
-// construct their status with total_frames: 0 (see docs/bugs.md, Sprint W5).
-// Sprint W6 F4 adds a real `windowed` field; this helper is the seam to switch to.
+// Decide whether a sample is windowed/streamed (forward-only). /status/samples
+// reports a `windowed` flag; when it is absent, infer from total_frames === 0 —
+// streamed plays construct their status with total_frames: 0.
 
 import type { SampleInfo } from '../../api/contract';
 

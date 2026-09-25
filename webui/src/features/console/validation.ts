@@ -1,9 +1,10 @@
 // ABOUTME: Client-side validation helpers for console inputs: volume, speed, internal_id, blanks.
 // ABOUTME: Each check returns an optional error and warning message for the form to display.
 
-// Client-side validation mirroring the daemon (API-CONTRACT §2). The parser does
-// NOT clamp, so the console VALIDATES and WARNS (errors block obvious mistakes,
-// warnings inform) — it never silently fixes a value.
+// Client-side validation mirroring the daemon (API-CONTRACT §2). The daemon clamps
+// some out-of-range values and rejects others with a 400, so the console VALIDATES
+// and WARNS (errors block obvious mistakes, warnings inform) — it never silently
+// fixes a value.
 
 export interface FieldIssue {
   error?: string;

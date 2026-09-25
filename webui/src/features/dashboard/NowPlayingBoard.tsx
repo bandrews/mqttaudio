@@ -2,9 +2,10 @@
 // ABOUTME: Shows a progress bar when telemetry is on, and notes streamed or unavailable positions.
 
 // Now-playing board (Sprint W2, F3): the active samples from /status/samples with
-// their static metadata. Live position is NOT available until Sprint W6 (the
-// daemon hard-codes position/progress to 0), so this shows "live position
-// unavailable" rather than a fake progress bar.
+// their static metadata. The daemon reports live position/progress only while
+// telemetry is on (0 otherwise, and always 0 for windowed samples), so the board
+// draws a progress bar only then and otherwise shows "live position unavailable"
+// or "streamed" rather than a fake progress bar.
 
 import Box from '@mui/material/Box';
 import Chip from '@mui/material/Chip';

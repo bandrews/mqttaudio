@@ -2,9 +2,8 @@
 // ABOUTME: Shows its index, channel count, volume, and a muted or live chip.
 
 // Inputs rack (Sprint W2, F5): configured live inputs from /status/inputs with
-// their volume and mute state. NOTE: `muted` is derived by the daemon as
-// `volume == 0.0`, so a deliberately-zeroed input is indistinguishable from a
-// muted one — surfaced here as a caveat.
+// their volume and mute state. NOTE: `muted` is the daemon's own mute flag (set by
+// input_mute, cleared by input_volume), so an input set to volume 0 is not muted.
 
 import Chip from '@mui/material/Chip';
 import Paper from '@mui/material/Paper';

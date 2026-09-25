@@ -2,9 +2,9 @@
 // ABOUTME: Parses it as JSON and posts it verbatim to /command; invalid JSON is not sent.
 
 // Raw /command editor (Sprint W3, F3): send arbitrary command JSON to POST
-// /command — the universal path that reaches the full play surface
-// (channel_map/mode/window_ms/prebuffer_ms/freshness/cacheable) which the typed
-// /play endpoint silently drops (DW10). Validates that the body is JSON.
+// /command — the universal path that reaches the full play surface. The typed
+// /play endpoint silently drops mode/window_ms/prebuffer_ms/freshness/cacheable
+// (DW10). Validates that the body is JSON.
 
 import { useState } from 'react';
 import Alert from '@mui/material/Alert';
