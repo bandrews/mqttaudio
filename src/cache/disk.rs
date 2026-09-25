@@ -382,93 +382,102 @@ impl DiskCache {
         self.metadata.entries.keys().cloned().collect()
     }
 
-    /// If the cached entry is older than `revalidate_after`, issue a conditional
-    /// GET (`If-None-Match` / `If-Modified-Since`). A `304 Not Modified` just
-    /// refreshes `last_validated`; a `200` re-downloads via the atomic-write path;
-    /// any error keeps the existing cached copy. A zero duration always
-    /// revalidates. No-op for URLs that are not cached.
-    ///
-    /// Returns whether the content was re-downloaded (changed), so the caller can drop
-    /// a now-stale decoded copy from the memory cache.
+    /// The freshness check `url` is due for, if any: the cached entry is older than
+    /// `revalidate_after` and no failed check of it is more recent than that. A zero
+    /// duration makes every cached entry due. The request carries what the check
+    /// needs, so [`check_freshness`] can run without the disk cache.
+    pub fn revalidation_request(
+        &self,
+        url: &str,
+        revalidate_after: std::time::Duration,
+    ) -> Option<RevalidationRequest> {
+        let entry = self.get_entry(url)?;
+        if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&entry.last_validated) {
+            let age = chrono::Utc::now().signed_duration_since(last.with_timezone(&chrono::Utc));
+            if age.to_std().is_ok_and(|age| age < revalidate_after) {
+                return None;
+            }
+        }
+        if self
+            .failed_revalidations
+            .get(url)
+            .is_some_and(|failed| failed.elapsed() < revalidate_after)
+        {
+            return None;
+        }
+        let (temp_path, cache_path) = self.windowed_persist_paths(url);
+        Some(RevalidationRequest {
+            url: url.to_string(),
+            etag: entry.etag.clone(),
+            last_modified: entry.last_modified.clone(),
+            local_file: Self::cache_filename_for_url(url),
+            cache_path,
+            temp_path,
+        })
+    }
+
+    /// Record what a freshness check found: a current copy restarts its age, a
+    /// changed one (already saved in place by the check) takes the new validators,
+    /// and a failure is not retried until the revalidation window passes. Returns
+    /// whether the content changed.
+    pub fn record_revalidation(
+        &mut self,
+        url: &str,
+        result: &Revalidation,
+    ) -> Result<bool, CacheError> {
+        match result {
+            Revalidation::Current => {
+                self.failed_revalidations.remove(url);
+                if let Some(entry) = self.metadata.entries.get_mut(url) {
+                    entry.last_validated = chrono::Utc::now().to_rfc3339();
+                }
+                self.save_metadata()?;
+                Ok(false)
+            }
+            Revalidation::Changed {
+                local_file,
+                etag,
+                last_modified,
+                content_type,
+                file_size,
+            } => {
+                self.failed_revalidations.remove(url);
+                self.put_entry(
+                    url.to_string(),
+                    CacheEntry {
+                        local_file: local_file.clone(),
+                        etag: etag.clone(),
+                        last_modified: last_modified.clone(),
+                        last_validated: chrono::Utc::now().to_rfc3339(),
+                        file_size: *file_size,
+                        content_type: content_type.clone(),
+                    },
+                );
+                self.save_metadata()?;
+                Ok(true)
+            }
+            Revalidation::Failed => {
+                self.failed_revalidations
+                    .insert(url.to_string(), std::time::Instant::now());
+                Ok(false)
+            }
+        }
+    }
+
+    /// If the cached entry is due (see [`DiskCache::revalidation_request`]), ask the
+    /// server whether it changed and record the answer; any error keeps the cached
+    /// copy. No-op for URLs that are not cached. Returns whether the content
+    /// changed, so the caller can drop a now-stale decoded copy from memory.
     pub async fn revalidate_if_due(
         &mut self,
         url: &str,
         revalidate_after: std::time::Duration,
     ) -> Result<bool, CacheError> {
-        let entry = match self.get_entry(url) {
-            Some(e) => e.clone(),
-            None => return Ok(false),
+        let Some(request) = self.revalidation_request(url, revalidate_after) else {
+            return Ok(false);
         };
-
-        // Skip while still inside the freshness window.
-        if let Ok(last) = chrono::DateTime::parse_from_rfc3339(&entry.last_validated) {
-            let age = chrono::Utc::now().signed_duration_since(last.with_timezone(&chrono::Utc));
-            if let Ok(age) = age.to_std() {
-                if age < revalidate_after {
-                    return Ok(false);
-                }
-            }
-        }
-
-        // Skip while a recent failed check is still inside the window.
-        if let Some(failed) = self.failed_revalidations.get(url) {
-            if failed.elapsed() < revalidate_after {
-                return Ok(false);
-            }
-        }
-
-        let mut req = super::http_stream::http_client().get(url);
-        if let Some(etag) = &entry.etag {
-            req = req.header(reqwest::header::IF_NONE_MATCH, etag);
-        }
-        if let Some(lm) = &entry.last_modified {
-            req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
-        }
-
-        let changed = match tokio::time::timeout(REVALIDATION_TIMEOUT, req.send()).await {
-            Ok(Ok(resp)) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
-                self.failed_revalidations.remove(url);
-                if let Some(e) = self.metadata.entries.get_mut(url) {
-                    e.last_validated = chrono::Utc::now().to_rfc3339();
-                }
-                self.save_metadata()?;
-                tracing::debug!("Cache revalidated (304 Not Modified): {}", url);
-                false
-            }
-            Ok(Ok(resp)) if resp.status().is_success() => {
-                self.failed_revalidations.remove(url);
-                self.download_and_cache(url).await?;
-                tracing::info!("Cache refreshed (content changed): {}", url);
-                true
-            }
-            Ok(Ok(resp)) => {
-                self.failed_revalidations
-                    .insert(url.to_string(), std::time::Instant::now());
-                tracing::warn!(
-                    "Revalidation got HTTP {} for {}; keeping cached copy",
-                    resp.status(),
-                    url
-                );
-                false
-            }
-            Ok(Err(e)) => {
-                self.failed_revalidations
-                    .insert(url.to_string(), std::time::Instant::now());
-                tracing::warn!(
-                    "Revalidation failed for {}: {}; keeping cached copy",
-                    url,
-                    e
-                );
-                false
-            }
-            Err(_) => {
-                self.failed_revalidations
-                    .insert(url.to_string(), std::time::Instant::now());
-                tracing::warn!("Revalidation of {} timed out; keeping cached copy", url);
-                false
-            }
-        };
-        Ok(changed)
+        let result = check_freshness(&request).await;
+        self.record_revalidation(url, &result)
     }
 
     /// Start a streaming download from HTTP/HTTPS URL.
@@ -484,105 +493,6 @@ impl DiskCache {
         super::http_stream::start_http_stream(url)
             .await
             .map_err(|e| CacheError::HttpError(format!("Streaming download failed: {}", e)))
-    }
-
-    /// Ask the server whether a cached entry is still current, using the
-    /// stored ETag/Last-Modified as a conditional request. An entry without
-    /// validators is re-downloaded outright when a check is due.
-    pub async fn revalidate(&mut self, url: &str) -> Freshness {
-        let Some(entry) = self.get_entry(url) else {
-            return Freshness::Unknown;
-        };
-
-        let mut request = super::http_stream::http_client().get(url);
-        if let Some(etag) = &entry.etag {
-            request = request.header("If-None-Match", etag);
-        }
-        if let Some(last_modified) = &entry.last_modified {
-            request = request.header("If-Modified-Since", last_modified);
-        }
-
-        // A freshness check runs in the play path, so it gets a short bound:
-        // a slow server costs at most this once per revalidation interval
-        let response = match tokio::time::timeout(REVALIDATION_TIMEOUT, request.send()).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                tracing::debug!("Revalidation request for {} failed: {}", url, e);
-                return Freshness::Unknown;
-            }
-            Err(_) => {
-                tracing::debug!("Revalidation request for {} timed out", url);
-                return Freshness::Unknown;
-            }
-        };
-
-        if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-            if let Some(entry) = self.metadata.entries.get_mut(url) {
-                entry.last_validated = chrono::Utc::now().to_rfc3339();
-            }
-            if let Err(e) = self.save_metadata() {
-                tracing::warn!("Failed to save cache metadata: {}", e);
-            }
-            return Freshness::Fresh;
-        }
-
-        if !response.status().is_success() {
-            tracing::debug!(
-                "Revalidation of {} got HTTP {}; serving the cached copy",
-                url,
-                response.status()
-            );
-            return Freshness::Unknown;
-        }
-
-        // The server sent new content: replace the cached file
-        let etag = response
-            .headers()
-            .get("etag")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let last_modified = response
-            .headers()
-            .get("last-modified")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        let cache_filename = Self::cache_filename_for_url(url);
-        let cache_path = self.files_dir().join(&cache_filename);
-        let temp_path = cache_path.with_extension("part");
-        let file_size = match stream_body_to_file(response, &temp_path, &cache_path).await {
-            Ok(size) => size,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to store changed copy of {}: {}; serving the cached copy",
-                    url,
-                    e
-                );
-                return Freshness::Unknown;
-            }
-        };
-
-        self.put_entry(
-            url.to_string(),
-            CacheEntry {
-                local_file: cache_filename,
-                etag,
-                last_modified,
-                last_validated: chrono::Utc::now().to_rfc3339(),
-                file_size,
-                content_type,
-            },
-        );
-        if let Err(e) = self.save_metadata() {
-            tracing::warn!("Failed to save cache metadata: {}", e);
-        }
-
-        Freshness::Replaced
     }
 }
 
@@ -634,14 +544,113 @@ async fn stream_body_to_file(
     Ok(size)
 }
 
-/// Result of checking a cached URL against its server
-pub enum Freshness {
-    /// The cached copy is still current
-    Fresh,
-    /// The server had newer content and the cached file was replaced
-    Replaced,
-    /// The server could not be consulted; the cached copy stays in service
-    Unknown,
+/// A due freshness check of one cached URL, carrying what the request needs so it
+/// can run without holding the disk cache.
+pub struct RevalidationRequest {
+    url: String,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    local_file: String,
+    cache_path: PathBuf,
+    temp_path: PathBuf,
+}
+
+impl RevalidationRequest {
+    /// The URL being checked.
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+}
+
+/// What a freshness check found.
+pub enum Revalidation {
+    /// `304 Not Modified`: the cached copy is current.
+    Current,
+    /// The server sent new content, already saved over the cached file.
+    Changed {
+        local_file: String,
+        etag: Option<String>,
+        last_modified: Option<String>,
+        content_type: Option<String>,
+        file_size: u64,
+    },
+    /// No usable answer; the cached copy stays in service.
+    Failed,
+}
+
+/// Ask the server whether a cached URL changed, with a conditional request
+/// (`If-None-Match` / `If-Modified-Since`) that waits at most 5 seconds for an
+/// answer. A `200` answer's body is saved over the cached file (through a temp file
+/// and a rename, so a play reading the old file keeps it). Holds nothing but the
+/// request, so the caller can run it without the cache.
+pub async fn check_freshness(request: &RevalidationRequest) -> Revalidation {
+    let url = &request.url;
+    let mut get = super::http_stream::http_client().get(url);
+    if let Some(etag) = &request.etag {
+        get = get.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    if let Some(last_modified) = &request.last_modified {
+        get = get.header(reqwest::header::IF_MODIFIED_SINCE, last_modified);
+    }
+    let response = match tokio::time::timeout(REVALIDATION_TIMEOUT, get.send()).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(e)) => {
+            tracing::warn!(
+                "Revalidation failed for {}: {}; keeping cached copy",
+                url,
+                e
+            );
+            return Revalidation::Failed;
+        }
+        Err(_) => {
+            tracing::warn!("Revalidation of {} timed out; keeping cached copy", url);
+            return Revalidation::Failed;
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        tracing::debug!("Cache revalidated (304 Not Modified): {}", url);
+        return Revalidation::Current;
+    }
+    if !response.status().is_success() {
+        tracing::warn!(
+            "Revalidation got HTTP {} for {}; keeping cached copy",
+            response.status(),
+            url
+        );
+        return Revalidation::Failed;
+    }
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let (etag, last_modified, content_type) = (
+        header("etag"),
+        header("last-modified"),
+        header("content-type"),
+    );
+    match stream_body_to_file(response, &request.temp_path, &request.cache_path).await {
+        Ok(file_size) => {
+            tracing::info!("Cache refreshed (content changed): {}", url);
+            Revalidation::Changed {
+                local_file: request.local_file.clone(),
+                etag,
+                last_modified,
+                content_type,
+                file_size,
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Downloading the new version of {} failed: {}; keeping cached copy",
+                url,
+                e
+            );
+            Revalidation::Failed
+        }
+    }
 }
 
 #[cfg(test)]

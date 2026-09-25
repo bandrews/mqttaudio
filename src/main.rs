@@ -1184,7 +1184,7 @@ async fn main() {
                     if freshness_task.as_ref().is_none_or(|task| task.is_finished()) {
                         let cache = cache_manager.clone();
                         freshness_task = Some(tokio::spawn(async move {
-                            let n = cache.lock().await.revalidate_stale_http(window).await;
+                            let n = cache::refresh_stale_http(&cache, window).await;
                             if n > 0 { tracing::info!("Freshness tick refreshed {} entries", n); }
                         }));
                     }

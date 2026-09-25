@@ -120,22 +120,25 @@ The caches notice changed files like this:
 changed, they are decoded again. A `pinned` play (the play's `freshness`, else `cache.freshness`)
 skips the check. Files not in the memory cache are always read fresh.
 
-**Downloaded files** are checked with a conditional request (`If-None-Match` / `If-Modified-Since`)
-once they are older than `cache.revalidate_after_seconds` (300 s):
+**Downloaded files** are checked in the background with a conditional request (`If-None-Match` /
+`If-Modified-Since`); a play never waits for a check. A play of a cached URL uses the copy the cache
+has and, when a check is due, starts one:
 
-- A file that is also in the memory cache is checked by a background pass every 30 seconds. In `dev`
-  mode that pass checks every such file each time, ignoring the age; in `pinned` mode it does not
-  run.
-- A file only on disk is checked when it is played, in every mode. The play waits up to 5 seconds
-  for the server's answer and, if the file changed, for the whole new download.
+- `trusting` (the default): once the copy is older than `cache.revalidate_after_seconds` (300 s).
+- `dev`: on every play, whatever the age.
+- `pinned`: never.
 
-Checks and re-downloads, including the background pass's, hold the cache while they wait on the
-server, so other plays and cache commands wait too.
+(The mode is the play's `freshness`, else `cache.freshness`.) A background pass every 30 seconds
+also checks the downloaded files that are decoded in memory, by the same rules under
+`cache.freshness`.
 
-A `304 Not Modified` restarts the file's age. A `200` downloads the new version, and plays from then
-on use it. If the server cannot be reached, the cached copy plays and the file is not checked again for
-another `revalidate_after_seconds`. A server that sends neither `ETag` nor `Last-Modified` cannot
-answer `304`, so every check downloads the file again.
+A check waits up to 5 seconds for the server's answer. A `304 Not Modified` restarts the file's age.
+A `200` answer is the new version: it is saved over the cached file, its decoded copy leaves the
+memory cache, and plays from then on use it (sounds already playing continue with the old one). If
+the server cannot be reached, the cached copy stays and the file is not checked again for another
+`revalidate_after_seconds`. A server that sends neither `ETag` nor `Last-Modified` cannot answer
+`304`, so every check downloads the file again. Checks hold the cache only to start and to record
+their result, never while a server is answering.
 
 With `cache.enabled` off nothing is kept on disk, so a URL in the memory cache is never checked;
 after it leaves the memory cache, its next play downloads it again.
@@ -179,8 +182,8 @@ Sounds that are playing keep playing after their file leaves a cache. See
 
 ## First-play latency
 
-- **Cached in memory:** the play starts in the next audio block, unless it has to wait for the cache
-  or one of the four load slots (see below).
+- **Cached in memory:** the play starts in the next audio block, unless it has to wait for one of
+  the four load slots (see below).
 - **Cold full play of a local file:** a few milliseconds of decoding before the first block.
 - **Windowed play:** waits for `cache.stream_prebuffer_ms` (150 ms) of audio, at most
   `cache.stream_prebuffer_deadline_ms` (300 ms). On a fast network or disk, `50` and `150` start
@@ -189,9 +192,9 @@ Sounds that are playing keep playing after their file leaves a cache. See
 - **Every play** waits for the next audio block: up to 10.7 ms at the default 512-frame buffer and
   48 kHz.
 
-Every play, cached or not, first waits for the cache and for one of four load slots. A freshness check
-or re-download of a URL, a `precache` or `cache_reload` of an uncached URL (up to 30 seconds against a
-server that does not answer), or four loads already running delay it.
+Every play, cached or not, first takes one of four load slots, so four slow loads already running
+(for example uncached URLs from a slow server) delay it. Freshness checks and downloads never hold
+the cache while they wait on a server.
 
 `GET /metrics` reports `latency.play_to_first_mix_ns`, the time from a loaded play being handed to the
 audio thread to its first mixed audio. It leaves out loading, downloading and prebuffering.

@@ -34,6 +34,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Plays never wait on a server to check a cached file (decision D46).** A play of a URL cached only
+  on disk asked the server whether it changed before playing, in every freshness mode: up to 5 seconds
+  for the answer and, when it had changed, the whole download again (the `200` answer was thrown
+  away). Checks, including the 30-second pass, held the cache while they waited, stalling other
+  plays, cache commands, `/metrics` and `/status`. A play now uses the cached copy at once and starts
+  the check in the background: `trusting` once the copy is older than
+  `cache.revalidate_after_seconds`, `dev` on every play, `pinned` never. A changed file is saved from
+  the check's own answer and serves the plays after it, and checks hold the cache only to start and
+  to record their result.
 - **Cached URLs, edited files and precaches go through the full-or-windowed decision.** A URL already
   in the disk cache was always decoded whole, however long (a two-hour 5.1 file is about 8 GB), and so
   was a local file re-read after an edit and every `precache` and `cache_reload`. They now follow the

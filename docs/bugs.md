@@ -51,13 +51,6 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 
 ### Cache and loading
 
-- **Freshness does not match decision D46.** D46 says a play never waits on the network, `dev`
-  checks on every play, and `pinned` checks nothing. In the code, a play of a URL that is only on
-  disk revalidates in the foreground in every mode once it is due: the conditional request is bounded
-  at 5 s, but a `200` answer is discarded and the whole file downloaded again (30 s header and 60 s
-  stall limits, no overall limit) before the play continues. `dev` only shortens the background pass.
-  Both paths hold the cache lock across their network requests, which stalls `/metrics`, `/status`,
-  `/status/cache` and new loads while a server is slow.
 - **Headroom drops to zero during a load of unknown length.** `memory_headroom` reserves the whole
   free budget for such a load (and for a load whose lock is momentarily write-held), so plays decided
   meanwhile are windowed unless they have no size estimate or are already in memory.

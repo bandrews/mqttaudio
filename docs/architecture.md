@@ -46,7 +46,7 @@ the audio thread hands back.
 | What | Where | Notes |
 |------|-------|-------|
 | Control loop | `main()` in `src/main.rs` | One tokio task: commands, load results, the 20 ms reaper tick, the 30 s cache-freshness tick, shutdown |
-| Freshness pass | spawned from the control loop | Revalidates in-memory downloads every 30 s (not when freshness is `pinned`) |
+| Freshness checks | spawned from the control loop and from plays | Ask servers whether cached downloads changed, in the background: the 30 s pass over in-memory downloads, and a check started by a play of a URL that is due (D46). They hold the cache only to start and to record a result |
 | MQTT event loop | `src/mqtt/client.rs` | Re-subscribes on every reconnect; drops (and counts) commands if the control loop falls behind |
 | HTTP server | `src/http/` | axum; command endpoints wait up to 30 s for the control loop's reply |
 | Load tasks | `src/loading.rs` | One task per `play`/`precache`/cache command; up to 32 in flight, 4 of them loading at once; `stopall`/`fadeall` abort them |

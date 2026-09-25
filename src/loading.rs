@@ -284,12 +284,19 @@ struct Source {
     local_path: Option<std::path::PathBuf>,
 }
 
-async fn examine(cache: &Cache, file: &str, freshness: config::FreshnessMode) -> Source {
-    let mut cache = cache.lock().await;
+async fn examine(shared: &Cache, file: &str, freshness: config::FreshnessMode) -> Source {
+    let mut cache = shared.lock().await;
     cache.cleanup_completed_loads();
     let http = file.starts_with("http://") || file.starts_with("https://");
     if http {
-        cache.revalidate_disk_if_due(file).await;
+        // A cached URL plays its current copy at once; a due check of it runs in
+        // the background, and a changed file serves the plays after it (D46).
+        if let Some(request) = cache.refresh_due(file, freshness) {
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                cache::refresh(&shared, request).await;
+            });
+        }
     } else {
         cache.drop_changed_local(file, freshness);
     }
@@ -721,6 +728,8 @@ mod tests {
     enum Reply {
         /// The whole file at once.
         Whole,
+        /// This body instead of the file, at once.
+        Body(Vec<u8>),
         /// Nothing until `release` fires, then the whole file.
         HeldUntil(tokio::sync::oneshot::Receiver<()>),
         /// The headers and the first `head` bytes, the rest when `release` fires.
@@ -742,7 +751,10 @@ mod tests {
             while let Ok((mut socket, _)) = listener.accept().await {
                 counter.fetch_add(1, Ordering::SeqCst);
                 let reply = replies.next().unwrap_or(Reply::Whole);
-                let body = body.clone();
+                let body = match &reply {
+                    Reply::Body(other) => Arc::new(other.clone()),
+                    _ => body.clone(),
+                };
                 tokio::spawn(async move {
                     let mut request = [0u8; 4096];
                     let _ = socket.read(&mut request).await;
@@ -751,7 +763,7 @@ mod tests {
                         body.len()
                     );
                     match reply {
-                        Reply::Whole => {}
+                        Reply::Whole | Reply::Body(_) => {}
                         Reply::HeldUntil(release) => {
                             let _ = release.await;
                         }
@@ -953,6 +965,146 @@ mod tests {
         let prepared = prepare(&play(&url), &config, &cache, 48000).await.unwrap();
         assert!(matches!(prepared, PreparedPlayback::Stream(_)));
         assert_eq!(requests.load(Ordering::SeqCst), 1, "played from disk");
+    }
+
+    /// A cache whose disk entries are due for a freshness check after `seconds`.
+    fn test_cache_revalidating_after(seconds: u64) -> (tempfile::TempDir, Cache) {
+        let dir = tempfile::tempdir().unwrap();
+        let cache: Cache = Arc::new(Mutex::new(
+            cache::CacheManager::with_options(
+                dir.path().join("cache"),
+                config::ResamplerQuality::Fast,
+                0,
+                Vec::new(),
+                seconds,
+            )
+            .unwrap(),
+        ));
+        (dir, cache)
+    }
+
+    /// Put `url` into the disk cache (only) with a windowed play whose window holds
+    /// the whole file.
+    async fn cache_on_disk(url: &str, config: &config::Config, cache: &Cache) {
+        let mut first = play(url);
+        if let AudioCommand::Play {
+            mode, window_ms, ..
+        } = &mut first
+        {
+            *mode = config::LoadMode::Stream;
+            *window_ms = Some(5000);
+        }
+        prepare(&first, config, cache, 48000).await.unwrap();
+        wait_until_on_disk(url, cache).await;
+    }
+
+    fn with_freshness(mut command: AudioCommand, mode: config::FreshnessMode) -> AudioCommand {
+        if let AudioCommand::Play { freshness, .. } = &mut command {
+            *freshness = Some(mode);
+        }
+        command
+    }
+
+    #[tokio::test]
+    async fn a_play_of_a_cached_url_does_not_wait_for_its_freshness_check() {
+        let (release, released) = tokio::sync::oneshot::channel();
+        let (url, requests) = serve_wav(
+            std::fs::read(TEST_WAV).unwrap(),
+            vec![Reply::Whole, Reply::HeldUntil(released)],
+        )
+        .await;
+        let (_dir, cache) = test_cache_revalidating_after(0);
+        let config = config::Config::default();
+        cache_on_disk(&url, &config, &cache).await;
+
+        let prepared = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            prepare(&play(&url), &config, &cache, 48000),
+        )
+        .await
+        .expect("the play waited on the server")
+        .unwrap();
+        assert!(matches!(prepared, PreparedPlayback::Full(_)));
+        wait_until("the freshness check", || {
+            requests.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        release.send(()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_changed_url_plays_its_new_version_after_the_check_without_a_second_download() {
+        let dir = tempfile::tempdir().unwrap();
+        let shorter = dir.path().join("short.wav");
+        write_wav(&shorter, 1.0);
+        let (url, requests) = serve_wav(
+            std::fs::read(TEST_WAV).unwrap(),
+            vec![Reply::Whole, Reply::Body(std::fs::read(&shorter).unwrap())],
+        )
+        .await;
+        let (_cache_dir, cache) = test_cache_revalidating_after(0);
+        let config = config::Config::default();
+        cache_on_disk(&url, &config, &cache).await;
+
+        // This play uses the cached copy and starts the check, which finds the file
+        // changed and saves the new version.
+        prepare(&play(&url), &config, &cache, 48000).await.unwrap();
+        let disk_file = cache.lock().await.disk_file(&url).unwrap();
+        let new_size = std::fs::metadata(&shorter).unwrap().len();
+        wait_until("the new version on disk", || {
+            std::fs::metadata(&disk_file).is_ok_and(|m| m.len() == new_size)
+        })
+        .await;
+        wait_until_loaded(&url, &cache).await;
+        let pinned = with_freshness(play(&url), config::FreshnessMode::Pinned);
+        let prepared = prepare(&pinned, &config, &cache, 48000).await.unwrap();
+        let PreparedPlayback::Full(buffer) = prepared else {
+            panic!("expected a full play");
+        };
+        wait_until("the decode", || buffer.is_complete()).await;
+        assert_eq!(
+            buffer.metadata_blocking().2,
+            48000,
+            "the one-second version"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "the check's answer was saved"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pinned_play_never_checks() {
+        let (url, requests) = serve_wav(std::fs::read(TEST_WAV).unwrap(), vec![]).await;
+        let (_dir, cache) = test_cache_revalidating_after(0);
+        let config = config::Config::default();
+        cache_on_disk(&url, &config, &cache).await;
+
+        let pinned = with_freshness(play(&url), config::FreshnessMode::Pinned);
+        prepare(&pinned, &config, &cache, 48000).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_dev_play_checks_even_inside_the_window() {
+        let (url, requests) = serve_wav(std::fs::read(TEST_WAV).unwrap(), vec![]).await;
+        let (_dir, cache) = test_cache_revalidating_after(3600);
+        let config = config::Config::default();
+        cache_on_disk(&url, &config, &cache).await;
+
+        prepare(&play(&url), &config, &cache, 48000).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "trusting waits for the window"
+        );
+
+        let dev = with_freshness(play(&url), config::FreshnessMode::Dev);
+        prepare(&dev, &config, &cache, 48000).await.unwrap();
+        wait_until("the dev check", || requests.load(Ordering::SeqCst) == 2).await;
     }
 
     #[tokio::test]

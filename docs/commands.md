@@ -94,7 +94,7 @@ rejected (HTTP `400`), and one that matches no playing sound fails with HTTP `40
 | `mode` | string | `cache.load_mode` | `auto`, `full` or `stream`; see [Full and windowed plays](#full-and-windowed-plays) |
 | `window_ms` | integer | `cache.stream_window_ms` | Window length for a windowed play, `100`–`60000` |
 | `prebuffer_ms` | integer | `cache.stream_prebuffer_ms` | Audio buffered before a windowed play starts, capped at the window. At most `window_ms` when the play sets both (HTTP `400`) |
-| `freshness` | string | `cache.freshness` | `trusting`, `dev` or `pinned`. On a play, only decides whether an edited local file already in memory is re-read (not with `pinned`); see [Caching](features/caching.md#freshness) |
+| `freshness` | string | `cache.freshness` | `trusting`, `dev` or `pinned`: whether an edited local file already in memory is re-read (not with `pinned`), and when a cached URL is checked with its server in the background (`dev` on every play, `pinned` never); see [Caching](features/caching.md#freshness) |
 | `cacheable` | boolean | `true` | For a URL that is not cached yet: `false` keeps the download out of the disk cache (for a live stream or a one-off file). A response without `Content-Length` is never saved |
 
 Without a `channel_map`, source channel 0 plays on output 0, channel 1 on output 1, and so on: a mono

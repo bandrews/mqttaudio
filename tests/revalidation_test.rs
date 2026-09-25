@@ -2,7 +2,7 @@
 // ABOUTME: When due, an unchanged file yields 304 and refreshes last_validated.
 
 use mqttaudio::cache::disk::{CacheEntry, DiskCache};
-use mqttaudio::cache::CacheManager;
+use mqttaudio::cache::{refresh_stale_http, CacheManager};
 use mqttaudio::config::ResamplerQuality;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -164,7 +164,7 @@ async fn revalidate_if_due_reports_whether_content_changed() {
 }
 
 #[tokio::test]
-async fn revalidate_stale_http_drops_changed_memory_entries() {
+async fn the_freshness_pass_drops_changed_memory_entries() {
     let short = "tests/audio/test_440hz_2s.wav";
     let long = "tests/audio/test_beep_5s.wav";
     if !Path::new(short).exists() || !Path::new(long).exists() {
@@ -187,6 +187,7 @@ async fn revalidate_stale_http_drops_changed_memory_entries() {
         cm.is_resident(&url),
         "the HTTP clip should be resident after loading"
     );
+    let cm = std::sync::Arc::new(tokio::sync::Mutex::new(cm));
 
     // Republish a different clip; an out-of-band freshness pass re-downloads it and
     // drops the stale decoded entry so the next play re-decodes the fresh file. Write
@@ -194,12 +195,64 @@ async fn revalidate_stale_http_drops_changed_memory_entries() {
     // file's Last-Modified advances and the conditional GET sees a change.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     std::fs::write(&served, std::fs::read(long).unwrap()).unwrap();
-    let refreshed = cm.revalidate_stale_http(Duration::from_secs(0)).await;
+    let refreshed = refresh_stale_http(&cm, Duration::from_secs(0)).await;
     assert_eq!(refreshed, 1, "the changed entry should be refreshed");
     assert!(
-        !cm.is_resident(&url),
+        !cm.lock().await.is_resident(&url),
         "the stale decoded entry must be dropped after a content change"
     );
 
     let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn the_freshness_pass_does_not_hold_the_cache_while_the_server_answers() {
+    // A slow server must not stall plays, cache commands or /status: the pass takes
+    // the cache only to pick its checks and to record what they found.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let body = std::fs::read("tests/audio/test_440hz_2s.wav").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/clip.wav", listener.local_addr().unwrap());
+    let (checked_tx, checked_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        // The first request (the load) is answered; the second (the check) is held
+        // open without an answer until the test has looked at the cache.
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 4096];
+        let _ = socket.read(&mut request).await;
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.write_all(header.as_bytes()).await;
+        let _ = socket.write_all(&body).await;
+        drop(socket);
+        let (_held, _) = listener.accept().await.unwrap();
+        let _ = checked_rx.await;
+    });
+
+    let cache_dir = TempDir::new().unwrap();
+    let mut cm =
+        CacheManager::with_quality(cache_dir.path().to_path_buf(), ResamplerQuality::Fast).unwrap();
+    cm.get_or_load(&url, 48000).await.unwrap();
+    let cm = std::sync::Arc::new(tokio::sync::Mutex::new(cm));
+    let pass = tokio::spawn({
+        let cm = cm.clone();
+        async move { refresh_stale_http(&cm, Duration::ZERO).await }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        cm.try_lock().is_ok(),
+        "the cache must stay available while a check waits on the server"
+    );
+    let _ = checked_tx.send(());
+    assert_eq!(
+        pass.await.unwrap(),
+        0,
+        "an unanswered check changes nothing"
+    );
+    assert!(
+        cm.lock().await.is_resident(&url),
+        "the cached copy stays in service"
+    );
 }

@@ -725,7 +725,7 @@ pub static MACRO_PARAM_FIELDS: [SubFieldSpec; 14] = [
         key: "freshness",
         label: "freshness",
         kind: FieldKind::Enum(&["trusting", "dev", "pinned"]),
-        help: "Cache freshness override: trusting, dev, or pinned.",
+        help: "Cache freshness override for this play: trusting, dev, or pinned.",
     },
     SubFieldSpec {
         key: "window_ms",
@@ -947,7 +947,7 @@ pub static REGISTRY: [FieldSpec; 57] = [
             min: 0,
             max: u32::MAX as u64,
         },
-        help: "Seconds a downloaded HTTP file is trusted before a conditional re-check. 0 = re-check at every opportunity. Default 300.",
+        help: "Seconds a downloaded HTTP file is trusted before a play of it, or the 30 s background pass, asks the server in the background whether it changed. 0 = check on every play. Default 300.",
     },
     FieldSpec {
         section: Section::Cache,
@@ -1039,7 +1039,7 @@ pub static REGISTRY: [FieldSpec; 57] = [
         label: "freshness",
         path: &["cache", "freshness"],
         kind: FieldKind::Enum(&["trusting", "dev", "pinned"]),
-        help: "Cache freshness: trusting (re-stat local files on play; re-check HTTP files past revalidate_after_seconds), dev (also re-check in-memory HTTP files every 30 s), pinned (no local re-stat, no background re-check).",
+        help: "Cache freshness: trusting (re-stat local files on play; check downloaded files in the background once past revalidate_after_seconds), dev (check downloaded files on every play and pass), pinned (no checks). Plays never wait for a check.",
     },
     // --- Security ---
     FieldSpec {

@@ -38,7 +38,7 @@ fn cache_with_options(
 
 use mqttaudio::audio::streaming_decoder::StreamingDecoder;
 use mqttaudio::cache::http_stream::start_http_stream;
-use mqttaudio::config::ResamplerQuality;
+use mqttaudio::config::{FreshnessMode, ResamplerQuality};
 use std::io::Write;
 use std::path::PathBuf;
 use symphonia::core::probe::Hint;
@@ -597,8 +597,23 @@ async fn test_revalidation_picks_up_changed_file() {
         .unwrap();
     drop(f);
 
-    let mut cache_manager = cache_with_options(cache_dir.path().to_path_buf(), options()).unwrap();
+    // A play never waits on the server: it gets the cached copy, and the freshness
+    // check it starts in the background fetches the replacement for later plays.
+    let cache_manager = std::sync::Arc::new(tokio::sync::Mutex::new(
+        cache_with_options(cache_dir.path().to_path_buf(), options()).unwrap(),
+    ));
+    let request = cache_manager
+        .lock()
+        .await
+        .refresh_due(&url, FreshnessMode::Trusting)
+        .expect("a check is due with a zero revalidation window");
+    assert!(
+        mqttaudio::cache::refresh(&cache_manager, request).await,
+        "the check should find the replacement"
+    );
     let buffer = cache_manager
+        .lock()
+        .await
         .get_or_load_streaming(&url, 48000)
         .await
         .unwrap();

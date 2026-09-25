@@ -172,7 +172,7 @@ signal passes unchanged; above that it is compressed smoothly into the ceiling. 
 | `stream_prebuffer_ms` | `150` | Audio buffered before a windowed play starts; at most `stream_window_ms` |
 | `stream_prebuffer_deadline_ms` | `300` | Longest a play waits for its first audio. A windowed play then starts anyway; a full play fails if nothing has decoded. At least `stream_prebuffer_ms` |
 | `freshness` | `"trusting"` | How changed files are noticed: `trusting`, `dev` or `pinned` (see [Caching](features/caching.md#freshness)) |
-| `revalidate_after_seconds` | `300` | How long a downloaded file is used before asking the server whether it changed |
+| `revalidate_after_seconds` | `300` | How long a downloaded file is used before a play of it (or the 30-second pass) asks the server in the background whether it changed. `0` checks on every play |
 
 `memory_budget` takes one of three forms:
 

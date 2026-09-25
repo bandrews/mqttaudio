@@ -614,16 +614,16 @@ pub enum MemoryCap {
 #[derive(Default)]
 pub enum FreshnessMode {
     /// Re-`stat` a memory-resident local file on each play and re-decode it if it
-    /// changed. Downloaded HTTP files past the revalidation window get a conditional
-    /// GET: from the 30 s background pass while decoded in memory, or on the play
-    /// itself when only on disk. (Default.)
+    /// changed. A downloaded file past the revalidation window gets a conditional
+    /// GET in the background, started by a play of it or by the 30 s pass over the
+    /// files decoded in memory; the play itself uses the current copy (D46).
+    /// (Default.)
     #[default]
     Trusting,
-    /// As `Trusting`, but the background pass re-checks every in-memory HTTP entry
-    /// on each tick, ignoring the revalidation window. For active development.
+    /// As `Trusting`, but every play of a downloaded file, and every pass, checks it
+    /// whatever its age. For active development.
     Dev,
-    /// No local re-`stat` and no background pass. An HTTP file that is only on disk
-    /// is still re-checked on play once past the revalidation window.
+    /// No local re-`stat` and no freshness checks of downloaded files.
     Pinned,
 }
 

@@ -97,8 +97,10 @@ rising, the mix is too hot: lower sound or voice volumes, `audio.master_gain`, o
 
 - **Local files** already in memory are re-read when their size or modification time changes,
   unless `cache.freshness` (or the play's `freshness`) is `pinned`.
-- **Downloaded files** are re-checked with the server once they are older than
-  `cache.revalidate_after_seconds` (300 by default), so a change can take a few minutes to show.
+- **Downloaded files** are re-checked with the server in the background once they are older than
+  `cache.revalidate_after_seconds` (300 by default). The play that starts a check still uses the old
+  copy; the plays after it get the new one, so a change can take a few minutes, and one more play,
+  to show. With `freshness` `dev` every play checks.
 - To pick up a change at once, send `cache_reload` with the file or URL.
 
 See [Caching](features/caching.md#freshness) for the details. `cache_clear` empties both caches; the

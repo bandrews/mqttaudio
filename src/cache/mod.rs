@@ -85,7 +85,9 @@ pub struct CacheManager {
     resampler_quality: ResamplerQuality,
     /// When each URL was last checked against its server (in-memory, so a
     /// dead server is asked at most once per interval rather than per play)
-    last_revalidation_attempt: HashMap<String, std::time::Instant>,
+    /// URLs whose background freshness check is running, so a play starts at most
+    /// one at a time per URL.
+    refreshing: std::collections::HashSet<String>,
     /// Currently active streaming loads (path -> ActiveLoad)
     active_loads: HashMap<String, ActiveLoad>,
     /// Local-path allowlist; empty = allow-all (open by default).
@@ -189,7 +191,7 @@ impl CacheManager {
             memory_cache,
             disk_cache,
             resampler_quality,
-            last_revalidation_attempt: HashMap::new(),
+            refreshing: std::collections::HashSet::new(),
             active_loads: HashMap::new(),
             allowed_directories,
             revalidate_after_seconds,
@@ -294,13 +296,78 @@ impl CacheManager {
         true
     }
 
-    /// Ask the server whether the disk-cached copy of `url` is still current, if it
-    /// is due for a check.
-    pub async fn revalidate_disk_if_due(&mut self, url: &str) {
-        let window = std::time::Duration::from_secs(self.revalidate_after_seconds);
-        if let Some(disk) = self.disk_cache.as_mut() {
-            if disk.is_cached(url) {
-                let _ = disk.revalidate_if_due(url, window).await;
+    /// The freshness check a play of `url` should start in the background, if one is
+    /// due under `freshness`: never when pinned, on every play in dev, and once the
+    /// cached copy is older than `revalidate_after_seconds` otherwise. Marks the URL
+    /// as being checked until [`CacheManager::finish_refresh`].
+    pub fn refresh_due(
+        &mut self,
+        url: &str,
+        freshness: FreshnessMode,
+    ) -> Option<disk::RevalidationRequest> {
+        let window = match freshness {
+            FreshnessMode::Pinned => return None,
+            FreshnessMode::Dev => std::time::Duration::ZERO,
+            FreshnessMode::Trusting => {
+                std::time::Duration::from_secs(self.revalidate_after_seconds)
+            }
+        };
+        self.refresh_request(url, window)
+    }
+
+    /// The checks the background freshness pass should run: every URL cached on
+    /// disk and decoded in memory whose copy is older than `window`.
+    pub fn stale_refreshes(
+        &mut self,
+        window: std::time::Duration,
+    ) -> Vec<disk::RevalidationRequest> {
+        let urls: Vec<String> = self
+            .disk_cache
+            .as_ref()
+            .map(|disk| disk.cached_urls())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|url| self.memory_cache.contains(url))
+            .collect();
+        urls.iter()
+            .filter_map(|url| self.refresh_request(url, window))
+            .collect()
+    }
+
+    fn refresh_request(
+        &mut self,
+        url: &str,
+        window: std::time::Duration,
+    ) -> Option<disk::RevalidationRequest> {
+        if self.refreshing.contains(url) {
+            return None;
+        }
+        let request = self
+            .disk_cache
+            .as_ref()?
+            .revalidation_request(url, window)?;
+        self.refreshing.insert(url.to_string());
+        Some(request)
+    }
+
+    /// Record what a freshness check of `url` found. A changed file drops its stale
+    /// decoded copy (a playing sound keeps its own), so the next play decodes the new
+    /// version. Returns whether it changed.
+    pub fn finish_refresh(&mut self, url: &str, result: &disk::Revalidation) -> bool {
+        self.refreshing.remove(url);
+        let Some(disk) = self.disk_cache.as_mut() else {
+            return false;
+        };
+        match disk.record_revalidation(url, result) {
+            Ok(true) => {
+                self.memory_cache.remove(url);
+                tracing::info!("Refreshed changed cache entry: {}", url);
+                true
+            }
+            Ok(false) => false,
+            Err(e) => {
+                tracing::warn!("Failed to record the freshness check of {}: {}", url, e);
+                false
             }
         }
     }
@@ -430,15 +497,6 @@ impl CacheManager {
                 .is_some_and(|disk| disk.is_cached(file_path))
             {
                 tracing::debug!("Disk cache hit for: {}", file_path);
-                let _ = self
-                    .disk_cache
-                    .as_mut()
-                    .unwrap()
-                    .revalidate_if_due(
-                        file_path,
-                        std::time::Duration::from_secs(self.revalidate_after_seconds),
-                    )
-                    .await;
                 let entry = self
                     .disk_cache
                     .as_ref()
@@ -538,65 +596,22 @@ impl CacheManager {
         Ok(SampleBuffer::Streaming(streaming_buffer))
     }
 
-    /// Whether it is time to ask the server if a cached copy of this URL is
-    /// still current. Gated by an in-memory attempt timestamp so a dead
-    /// server is retried at most once per interval, not once per play.
-    fn revalidation_due(&self, url: &str) -> bool {
-        if !(url.starts_with("http://") || url.starts_with("https://")) {
-            return false;
-        }
-        let Some(disk) = self.disk_cache.as_ref() else {
-            return false;
-        };
-        let Some(entry) = disk.get_entry(url) else {
-            return false;
-        };
-        if !disk.is_cached(url) {
-            return false;
-        }
-
-        let interval = std::time::Duration::from_secs(self.revalidate_after_seconds);
-        if let Some(attempted) = self.last_revalidation_attempt.get(url) {
-            if attempted.elapsed() < interval {
-                return false;
-            }
-        } else {
-            // No attempt this run - go by the persisted validation time
-            if let Ok(validated) = chrono::DateTime::parse_from_rfc3339(&entry.last_validated) {
-                let age = chrono::Utc::now().signed_duration_since(validated);
-                if age.to_std().map(|a| a < interval).unwrap_or(false) {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    /// Revalidate a cached URL against its server if due. A changed file
-    /// replaces the disk copy and drops the stale memory entry; an
-    /// unreachable server leaves the cached copy in service.
+    /// Revalidate a cached URL against its server if due, waiting for the answer.
+    /// A changed file replaces the disk copy and drops the stale memory entry; an
+    /// unreachable server leaves the cached copy in service. Used by the blocking
+    /// [`CacheManager::get_or_load`]; plays refresh in the background instead.
     async fn maybe_revalidate(&mut self, url: &str) {
-        if !self.revalidation_due(url) {
+        let window = std::time::Duration::from_secs(self.revalidate_after_seconds);
+        let Some(disk) = self.disk_cache.as_mut() else {
             return;
-        }
-        self.last_revalidation_attempt
-            .insert(url.to_string(), std::time::Instant::now());
-
-        let disk = self
-            .disk_cache
-            .as_mut()
-            .expect("revalidation_due checked the disk cache");
-        match disk.revalidate(url).await {
-            disk::Freshness::Fresh => {
-                tracing::debug!("Cached copy of {} is still current", url);
-            }
-            disk::Freshness::Replaced => {
+        };
+        match disk.revalidate_if_due(url, window).await {
+            Ok(true) => {
                 tracing::info!("Server copy of {} changed; cache refreshed", url);
                 self.memory_cache.remove(url);
             }
-            disk::Freshness::Unknown => {
-                tracing::warn!("Could not revalidate {}; serving the cached copy", url);
-            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("Could not revalidate {}: {}", url, e),
         }
     }
 
@@ -1111,41 +1126,8 @@ impl CacheManager {
         if let Some(disk) = self.disk_cache.as_mut() {
             disk.remove_entry(file_path)?;
         }
-        self.last_revalidation_attempt.remove(file_path);
         tracing::info!("Invalidated cache for: {}", file_path);
         Ok(())
-    }
-
-    /// Revalidate every disk-cached HTTP entry that is also resident in memory and past
-    /// the freshness `window`, dropping the decoded copy of any that changed so the next
-    /// play re-decodes from the now-fresh disk file (no network on the play). Run
-    /// out-of-band by the freshness tick, so a play never blocks on the network — the
-    /// stale-while-revalidate fix for the warm-memory-hit short-circuit. Returns how
-    /// many entries were refreshed.
-    pub async fn revalidate_stale_http(&mut self, window: std::time::Duration) -> usize {
-        let Some(disk) = self.disk_cache.as_mut() else {
-            return 0;
-        };
-        let urls: Vec<String> = disk
-            .cached_urls()
-            .into_iter()
-            .filter(|u| self.memory_cache.contains(u))
-            .collect();
-        let mut refreshed = 0;
-        for url in urls {
-            match disk.revalidate_if_due(&url, window).await {
-                Ok(true) => {
-                    // Content changed: drop the stale decoded buffer (the playing
-                    // sample keeps its own Arc; the next play re-decodes fresh).
-                    self.memory_cache.remove(&url);
-                    refreshed += 1;
-                    tracing::info!("Refreshed stale HTTP cache entry: {}", url);
-                }
-                Ok(false) => {}
-                Err(e) => tracing::warn!("Revalidation error for {}: {}", url, e),
-            }
-        }
-        refreshed
     }
 
     /// Flush the disk-cache metadata to disk (called on graceful shutdown).
@@ -1237,6 +1219,33 @@ impl CacheManager {
             disk.size_bytes as f64 / (1024.0 * 1024.0)
         );
     }
+}
+
+/// Run a freshness check of a cached URL without holding the cache, then record
+/// what it found. Returns whether the content changed.
+pub async fn refresh(
+    cache: &Arc<tokio::sync::Mutex<CacheManager>>,
+    request: disk::RevalidationRequest,
+) -> bool {
+    let result = disk::check_freshness(&request).await;
+    cache.lock().await.finish_refresh(request.url(), &result)
+}
+
+/// Check every URL that is cached on disk, decoded in memory and older than
+/// `window`, one after another. The cache is held only to pick the checks and to
+/// record each result, never while a server is answering. Returns how many changed.
+pub async fn refresh_stale_http(
+    cache: &Arc<tokio::sync::Mutex<CacheManager>>,
+    window: std::time::Duration,
+) -> usize {
+    let requests = cache.lock().await.stale_refreshes(window);
+    let mut refreshed = 0;
+    for request in requests {
+        if refresh(cache, request).await {
+            refreshed += 1;
+        }
+    }
+    refreshed
 }
 
 /// Cache size statistics
