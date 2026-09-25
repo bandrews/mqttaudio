@@ -144,9 +144,6 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 
 ### Packaging and tooling
 
-- **The container health check needs the token in the environment.** With
-  `MQTTAUDIO_HTTP_REQUIRE_AUTH=true` it requires `MQTTAUDIO_HTTP_AUTH_TOKEN`, although `/ready`
-  never needs a token, and it assumes port 8080 while `http.port` defaults to `0`.
 - **A unit test failed once under full-suite load** (recorded when the binary still compiled its
   own copy of every module; name not captured) and passed on every rerun. The suites have
   timing-sensitive tests; capture the name if it recurs.

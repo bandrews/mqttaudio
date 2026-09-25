@@ -182,6 +182,45 @@ async fn test_ready_endpoint_distinguishes_liveness_from_input_readiness() {
 }
 
 #[tokio::test]
+async fn readiness_check_passes_without_a_token_and_fails_while_not_ready() {
+    // The container health check runs `mqttaudio --check-ready`, which requests
+    // /ready with no credentials, even when every other route needs the token.
+    let (state, _rx) = create_test_state_require_auth("a-long-test-token");
+    let app = create_router(state.clone(), false, false);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let http = mqttaudio::config::HttpConfig {
+        enabled: true,
+        port,
+        ..Default::default()
+    };
+    let mqttaudio::readiness::Probe::Url(url) = mqttaudio::readiness::probe(&http) else {
+        panic!("a fixed port on loopback must be probed");
+    };
+    mqttaudio::readiness::check(&url).await.unwrap();
+
+    state.status.write().unwrap().inputs.push(InputStatus {
+        index: 0,
+        voice_id: "GM_MIC".to_string(),
+        volume: 0.0,
+        channels: 0,
+        muted: true,
+        unmuted_volume: 0.0,
+        applied_volume: None,
+        applied_muted: None,
+        applied_unmuted_volume: None,
+        health: None,
+        ready: false,
+        last_error: Some("device missing".to_string()),
+    });
+    let error = mqttaudio::readiness::check(&url).await.unwrap_err();
+    assert!(error.contains("503"), "{error}");
+}
+
+#[tokio::test]
 async fn test_status_endpoint() {
     let (state, _rx) = create_test_state();
     let app = create_router(state, false, false);

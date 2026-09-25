@@ -7,8 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--check-ready`** asks the daemon described by the configuration (file, command line and
+  `MQTTAUDIO_HTTP_*` variables) for `GET /ready` and exits `0` when it is ready or the HTTP server is
+  off, `1` otherwise. The container image's health check uses it.
+
 ### Changed
 
+- **The container reads its configuration from `MQTTAUDIO_CONFIG`** (`/config/mqttaudio.json` by
+  default) and its health check runs `mqttaudio --check-ready`. The previous check always requested
+  port 8080, although `http.port` defaults to off, and sent the auth token that `/ready` never needs,
+  so it reported unhealthy when the token was only in the config file. The image no longer installs
+  `curl`.
 - **`Cargo.toml` declares `rust-version = "1.88"`**, the version the dependencies need, and no longer
   lists the unused `dasp` crate.
 

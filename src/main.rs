@@ -76,6 +76,11 @@ struct Args {
     /// Override the memory cache cap in MiB (0 = auto-detect a bounded cap)
     #[arg(long)]
     max_cache_mb: Option<u32>,
+
+    /// Ask the daemon this configuration describes for GET /ready and exit 0 if it
+    /// is ready (also when the HTTP server is disabled), 1 otherwise
+    #[arg(long)]
+    check_ready: bool,
 }
 
 /// Build the formatting log layer for the chosen `logging.format`, filtered to
@@ -154,26 +159,36 @@ async fn main() {
         args.max_cache_mb,
     );
 
-    // Container/deployment environments must be able to enable the internal
-    // HTTP gateway without baking a bearer token into the checked-in venue
-    // config. MQTTAUDIO_HTTP_REQUIRE_AUTH without a token fails startup
-    // validation closed rather than exposing an unauthenticated daemon; a
-    // non-loopback bind without auth only logs a warning.
-    if let Ok(bind_address) = std::env::var("MQTTAUDIO_HTTP_BIND_ADDRESS") {
-        if !bind_address.trim().is_empty() {
-            config.http.bind_address = bind_address;
-        }
-    }
-    if let Ok(auth_token) = std::env::var("MQTTAUDIO_HTTP_AUTH_TOKEN") {
-        if !auth_token.is_empty() {
-            config.http.auth_token = Some(auth_token);
-        }
-    }
-    if std::env::var("MQTTAUDIO_HTTP_REQUIRE_AUTH")
-        .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
-    {
-        config.http.require_auth = true;
-        config.http.enabled = true;
+    config.apply_env_overrides();
+
+    // Answer a health check against the daemon this configuration describes,
+    // without starting one.
+    if args.check_ready {
+        std::process::exit(match mqttaudio::readiness::probe(&config.http) {
+            mqttaudio::readiness::Probe::HttpDisabled => {
+                println!("The HTTP server is disabled; there is no readiness to check");
+                0
+            }
+            mqttaudio::readiness::Probe::RandomPort => {
+                eprintln!(
+                    "http.port is 0, so the server's port is not known; set a fixed port to \
+                     check readiness"
+                );
+                1
+            }
+            mqttaudio::readiness::Probe::Url(url) => {
+                match mqttaudio::readiness::check(&url).await {
+                    Ok(()) => {
+                        println!("Ready");
+                        0
+                    }
+                    Err(error) => {
+                        eprintln!("Not ready: {error}");
+                        1
+                    }
+                }
+            }
+        });
     }
 
     // Initialize logging based on config

@@ -53,10 +53,11 @@ mqttaudio [OPTIONS]
 | `--configure` | Open the interactive editor instead of starting |
 | `--list-devices` | List output devices, with ready-to-use `--device` and config lines, and exit |
 | `--list-inputs` | List input devices and exit |
+| `--check-ready` | Ask the daemon this configuration describes for `GET /ready`, then exit: `0` when it is ready or the HTTP server is off, `1` otherwise. For health checks; needs a fixed `http.port` |
 | `-h, --help` / `-V, --version` | Help / version |
 
-`--list-devices` and `--list-inputs` still read the config file, so a file that is not valid JSON
-stops them too.
+`--list-devices`, `--list-inputs` and `--check-ready` still read the config file, so a file that is
+not valid JSON stops them too.
 
 ## Environment variables
 

@@ -29,13 +29,15 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libasound2 ca-certificates curl \
+    libasound2 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/mqttaudio /usr/local/bin/mqttaudio
 
-HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
-  CMD if [ "${MQTTAUDIO_HTTP_REQUIRE_AUTH:-false}" = "true" ]; then \
-        test -n "${MQTTAUDIO_HTTP_AUTH_TOKEN:-}" && curl -fsS -H "Authorization: Bearer ${MQTTAUDIO_HTTP_AUTH_TOKEN}" http://127.0.0.1:8080/ready; \
-      else curl -fsS http://127.0.0.1:8080/ready; fi
+# The daemon and its health check read the same configuration: the file named by
+# MQTTAUDIO_CONFIG plus the MQTTAUDIO_HTTP_* overrides. `--check-ready` asks the
+# configured HTTP port for /ready (no token needed) and passes when HTTP is off.
+ENV MQTTAUDIO_CONFIG=/config/mqttaudio.json
+HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["mqttaudio", "--check-ready"]
 
-CMD ["mqttaudio", "--config", "/config/mqttaudio.json"]
+CMD ["mqttaudio"]

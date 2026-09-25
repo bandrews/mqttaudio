@@ -41,6 +41,7 @@ pub mod http;
 pub mod config;
 pub mod config_editor;
 pub mod loading;
+pub mod readiness;
 pub mod rt_engine;
 pub mod talkback;
 pub mod voice;

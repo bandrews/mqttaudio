@@ -76,13 +76,13 @@ docker build --build-arg MQTTAUDIO_GIT_SHA="$(git rev-parse --short HEAD)" -t mq
 docker run --device /dev/snd -v /srv/mqttaudio:/config -p 8080:8080 mqttaudio
 ```
 
-- The image runs `mqttaudio --config /config/mqttaudio.json`.
-- Its health check calls `GET /ready` on `127.0.0.1:8080` inside the container, so enable the HTTP
-  server on port 8080. To reach the API through `-p 8080:8080`, also listen on all interfaces
+- The image runs `mqttaudio` with `MQTTAUDIO_CONFIG=/config/mqttaudio.json`. Set that variable to
+  use another file.
+- Its health check runs `mqttaudio --check-ready`, which reads the same configuration (file and
+  `MQTTAUDIO_HTTP_*` variables) and requests `GET /ready` on the configured port. It needs a fixed
+  `http.port`; with the HTTP server off it always passes, since there is nothing to check.
+- To reach the API through `-p 8080:8080`, set `http.port` to `8080` and listen on all interfaces
   (`"bind_address": "0.0.0.0"` or `MQTTAUDIO_HTTP_BIND_ADDRESS=0.0.0.0`), with a token.
-- With `MQTTAUDIO_HTTP_REQUIRE_AUTH=true` the health check also requires
-  `MQTTAUDIO_HTTP_AUTH_TOKEN` in the container environment, and reports unhealthy without it even
-  when the token is in the config file (`/ready` itself never needs a token).
 - The image runs as root.
 - The `MQTTAUDIO_GIT_SHA` build argument is compiled in and reported as `git_sha` by
   `GET /version`; it reads `unknown` when not supplied.

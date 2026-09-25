@@ -847,6 +847,30 @@ impl Config {
         ))
     }
 
+    /// Apply the `MQTTAUDIO_HTTP_*` environment overrides. Container and deployment
+    /// environments must be able to enable the internal HTTP gateway without baking
+    /// a bearer token into the checked-in venue config. `MQTTAUDIO_HTTP_REQUIRE_AUTH`
+    /// without a token fails startup validation closed rather than exposing an
+    /// unauthenticated daemon; a non-loopback bind without auth only logs a warning.
+    pub fn apply_env_overrides(&mut self) {
+        if let Ok(bind_address) = std::env::var("MQTTAUDIO_HTTP_BIND_ADDRESS") {
+            if !bind_address.trim().is_empty() {
+                self.http.bind_address = bind_address;
+            }
+        }
+        if let Ok(auth_token) = std::env::var("MQTTAUDIO_HTTP_AUTH_TOKEN") {
+            if !auth_token.is_empty() {
+                self.http.auth_token = Some(auth_token);
+            }
+        }
+        if std::env::var("MQTTAUDIO_HTTP_REQUIRE_AUTH")
+            .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+        {
+            self.http.require_auth = true;
+            self.http.enabled = true;
+        }
+    }
+
     /// Merge CLI arguments into this config (CLI args override config file)
     #[allow(clippy::too_many_arguments)]
     pub fn merge_cli_args(
