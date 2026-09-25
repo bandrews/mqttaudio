@@ -75,6 +75,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `applied_live: true` until then.
 - **An expired talkback lease no longer refuses the next client** for up to 20 ms before the expiry
   pass ran.
+- **The web UI reports what the daemon did.** A command that succeeded showed "Accepted (enqueued)"; it
+  now shows the daemon's "Command completed". A refused seek, speed, stop, fader, fade, mute or
+  telemetry change was dropped without a word (and the telemetry switch flipped anyway); each now
+  shows the daemon's error beside its control. The cue launcher put `macro` inside `message`, where
+  the daemon ignores it, so macros never applied. Connecting to a daemon with a token but without
+  `require_auth` never asked for the token, and the log stream then retried forever; the connect
+  screen now detects it. Help texts that contradicted the daemon (empty selectors, non-numeric
+  `internal_id`, volume range, speed `0`, unknown channel names, the stream-error counter) are
+  corrected.
 - **Plays never wait on a server to check a cached file (decision D46).** A play of a URL cached only
   on disk asked the server whether it changed before playing, in every freshness mode: up to 5 seconds
   for the answer and, when it had changed, the whole download again (the `200` answer was thrown
