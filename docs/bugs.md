@@ -68,6 +68,24 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 - **The 30-second command timeout starts after queuing**, so a request can wait longer while the
   command queue is full.
 
+### Web UI
+
+- **Error alerts show the raw response body** (`{"success":false,"error":"..."}`) rather than the
+  error text, because the transport puts the body in the error.
+- **Faders and sliders keep a refused value.** After the daemon refuses a change, the control stays
+  where the operator left it. The speed slider can land on `0`, which the daemon refuses, and the
+  volume faders stop at `1` although the daemon accepts up to `4`.
+- **A non-numeric `internal_id` is flagged but not blocked** on the sample controls; the daemon's
+  `400` is what the operator sees.
+- **A missing token goes undetected when WebSockets are off.** The connect screen detects a daemon
+  that wants a token through `GET /ws`; with `http.websocket_enabled` off and a token set without
+  `require_auth`, it only learns from the first refused command.
+- **The inputs list cannot show the level an unmute restores**; its input type lacks
+  `unmuted_volume`.
+- **The cue launcher's macro help text names "Sprint W8".**
+- **The end-to-end tests do not stub `GET /ws`**, so the token probe falls back to `/version`
+  there.
+
 ### Configuration editor
 
 - **Saving validates the file alone.** A config that relies on `MQTTAUDIO_HTTP_AUTH_TOKEN` to satisfy
