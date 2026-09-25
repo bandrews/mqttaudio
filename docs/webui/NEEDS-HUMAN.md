@@ -53,6 +53,8 @@ If this file has open entries when the program finishes, surface them in the fin
 - **Proceeded without it:** Everything else in Sprint 10 is complete — cpal bumped to `0.17`, full API
   migration, warning-free `-D warnings` + clippy, full audio suite + alloc harness green, real-device
   enumeration + open-and-run + name round-trip verified, docs updated.
+- **Current state:** the daemon is on cpal `0.18.2`; the round-trip tests above still guard detection by
+  name. Nothing short of the original repro details or hardware can reproduce the specific bug.
 - **Status:** Open
 
 ### [Sprint 9 / Lane C] Residual human-sensory QA before public release
