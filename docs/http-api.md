@@ -62,8 +62,8 @@ All take `POST` with a JSON body (`Content-Type: application/json`).
 | `/voice/stop` | `voice_stop` | `voice` |
 | `/voice/fade_out` | `voice_fade_out` | `voice` and `time_ms` |
 | `/voice/volume` | `voice_volume` | `voice` and `volume` |
-| `/input/volume` | `input_volume` | `input` and `volume` |
-| `/input/mute` | `input_mute` | `input` and `mute` |
+| `/input/volume` | `input_volume` | `input`, `volume` and `fade_ms` |
+| `/input/mute` | `input_mute` | `input`, `mute` and `fade_ms` |
 | `/precache` | `precache` | `file` |
 | `/cache/clear` | `cache_clear` | none |
 | `/cache/invalidate` | `cache_invalidate` | `file` |

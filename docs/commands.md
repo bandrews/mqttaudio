@@ -283,7 +283,7 @@ open answers HTTP `404`.
 {"command": "input_volume", "input": "gm_mic", "volume": 0.8}
 ```
 
-Sets the input's volume (`0.0`–`4.0`) at once, and unmutes it.
+Sets the input's volume (`0.0`–`4.0`) and unmutes it.
 
 ### input_mute
 
@@ -291,9 +291,12 @@ Sets the input's volume (`0.0`–`4.0`) at once, and unmutes it.
 {"command": "input_mute", "input": "gm_mic", "mute": true}
 ```
 
-Muting silences the input at once and remembers its volume; unmuting restores that volume. While a
+Muting silences the input and remembers its volume; unmuting restores that volume. While a
 [talkback](#talkback) lease holds the input, unmuting it by its `voice_id` is refused (HTTP `403`);
 selecting it by position, or raising it with `input_volume`, is not checked.
+
+Both commands take an optional `fade_ms` (default `20`, up to `60000`): the change fades over that
+many milliseconds, and `0` makes it instant. A muted input does not trigger ducking.
 
 ## Cache
 

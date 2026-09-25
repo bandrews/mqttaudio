@@ -556,12 +556,7 @@ async fn main() {
     // reaper logs deltas off-RT, and /metrics sums the totals.
     let mut input_telemetry: Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)> =
         Vec::new();
-    let mut activity_watchers: Vec<(
-        String,
-        Arc<audio::input::InputTelemetry>,
-        Vec<usize>,
-        audio::activity::ActivityDetector,
-    )> = Vec::new();
+    let mut activity_watchers: Vec<InputWatcher> = Vec::new();
     let mut cmd_tx = cmd_tx;
     let mut talkback_lease = talkback::TalkbackLease::default();
     let talkback_status = std::sync::Arc::new(std::sync::RwLock::new(talkback_lease.status(0)));
@@ -717,7 +712,7 @@ async fn main() {
                         muted: false,
                         unmuted_volume: input_config.volume,
                         applied_volume: Some(applied_volume),
-                        applied_muted: Some(applied_muted),
+                        applied_muted: Some(applied_muted.clone()),
                         applied_unmuted_volume: Some(applied_unmuted_volume),
                         health: Some(live_input.health.clone()),
                         ready: true,
@@ -738,34 +733,26 @@ async fn main() {
                     }
 
                     // Let the input's voice trigger ducking as a primary (D4), through
-                    // the same off-RT notify path as sample voices. With an
-                    // activity_threshold the reaper tick follows the capture level
-                    // (D36); without one the voice is active while the stream is open.
-                    if let Some(threshold) = input_config.activity_threshold {
-                        let sources = input_config
+                    // the same off-RT notify path as sample voices. The reaper tick
+                    // follows the capture level with an activity_threshold (D36), or
+                    // counts the voice active while the stream is open without one;
+                    // either way a muted input is silent.
+                    activity_watchers.push(InputWatcher {
+                        voice_id: input_config.voice_id.clone(),
+                        telemetry: capture.active.telemetry.clone(),
+                        channels: input_config
                             .routes
                             .iter()
                             .filter_map(|route| config.resolve_channel(&route.source_channel).ok())
-                            .collect();
-                        activity_watchers.push((
-                            input_config.voice_id.clone(),
-                            capture.active.telemetry.clone(),
-                            sources,
-                            audio::activity::ActivityDetector::new(
-                                threshold,
-                                input_config.activity_hold_ms,
-                                std::time::Instant::now(),
-                            ),
-                        ));
-                    } else {
-                        notify_voice_activity(
-                            &input_config.voice_id,
-                            true,
-                            ducking_engine.as_mut(),
-                            &mut cmd_tx,
-                            &ducking_snapshot,
-                        );
-                    }
+                            .collect(),
+                        muted: Some(applied_muted.clone()),
+                        activity: audio::activity::InputActivity::new(
+                            input_config
+                                .activity_threshold
+                                .map(|threshold| (threshold, input_config.activity_hold_ms)),
+                            std::time::Instant::now(),
+                        ),
+                    });
                 } else {
                     tracing::error!("No logical capture ring available for input {}", idx);
                 }
@@ -1134,21 +1121,26 @@ async fn main() {
                 }
             }
             _ = reaper_tick.tick() => {
-                let mut capture_peaks = std::collections::HashMap::new();
-                for (voice_id, telemetry, channels, detector) in &mut activity_watchers {
-                    let peaks = capture_peaks.entry(Arc::as_ptr(telemetry)).or_insert_with(|| telemetry.peak_levels.iter()
-                        .map(|peak| f32::from_bits(peak.swap(0, std::sync::atomic::Ordering::Relaxed))).collect::<Vec<_>>());
-                    let level = channels.iter().filter_map(|&ch| peaks.get(ch)).copied().fold(0.0f32, f32::max);
-                    if let Some(active) = detector.update(level, std::time::Instant::now()) {
-                        notify_voice_activity(voice_id, active, ducking_engine.as_mut(), &mut cmd_tx, &ducking_snapshot);
-                    }
-                }
+                update_input_activity(
+                    &mut activity_watchers,
+                    std::time::Instant::now(),
+                    ducking_engine.as_mut(),
+                    &mut cmd_tx,
+                    &ducking_snapshot,
+                );
                 let now_ms = start_time.elapsed().as_millis() as u64;
                 if let Some(source_id) = talkback_lease.active_source().map(str::to_string) {
                     if let Some((_transition, status)) = talkback_lease.expire(now_ms) {
                         if let Some(input) = resolve_talkback_input(&input_statuses, &source_id) {
                             if cmd_tx
-                                .push(rt_engine::AudioCommand::SetInputMute { input, mute: true })
+                                .push(rt_engine::AudioCommand::SetInputMute {
+                                    input,
+                                    mute: true,
+                                    fade_frames: fade_frames(
+                                        mqtt::commands::DEFAULT_INPUT_FADE_MS,
+                                        output_sample_rate,
+                                    ),
+                                })
                                 .is_err()
                             {
                                 tracing::error!("Audio command ring full while expiring talkback lease");
@@ -1912,6 +1904,66 @@ async fn finish_streamed_play(
     );
 }
 
+/// One open live input whose voice can trigger ducking: its capture level source,
+/// the capture channels its routes read, the mute state the audio thread applied,
+/// and its activity tracker.
+struct InputWatcher {
+    voice_id: String,
+    telemetry: std::sync::Arc<audio::input::InputTelemetry>,
+    channels: Vec<usize>,
+    muted: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    activity: audio::activity::InputActivity,
+}
+
+/// Feed each input's capture peak since the last tick and its applied mute state
+/// to its activity tracker, and send the ducking changes of inputs that became
+/// active or silent. Inputs sharing a capture read its peaks once.
+fn update_input_activity(
+    watchers: &mut [InputWatcher],
+    now: std::time::Instant,
+    mut ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
+    cmd_tx: &mut rt_engine::CommandProducer,
+    ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
+) {
+    let mut capture_peaks = std::collections::HashMap::new();
+    for watcher in watchers {
+        let telemetry = &watcher.telemetry;
+        let peaks = capture_peaks
+            .entry(std::sync::Arc::as_ptr(telemetry))
+            .or_insert_with(|| {
+                telemetry
+                    .peak_levels
+                    .iter()
+                    .map(|peak| f32::from_bits(peak.swap(0, std::sync::atomic::Ordering::Relaxed)))
+                    .collect::<Vec<_>>()
+            });
+        let level = watcher
+            .channels
+            .iter()
+            .filter_map(|&ch| peaks.get(ch))
+            .copied()
+            .fold(0.0f32, f32::max);
+        let muted = watcher
+            .muted
+            .as_ref()
+            .is_some_and(|muted| muted.load(std::sync::atomic::Ordering::Relaxed));
+        if let Some(active) = watcher.activity.update(level, muted, now) {
+            notify_voice_activity(
+                &watcher.voice_id,
+                active,
+                ducking_engine.as_deref_mut(),
+                cmd_tx,
+                ducking_snapshot,
+            );
+        }
+    }
+}
+
+/// Convert a fade length in milliseconds to frames at `sample_rate`.
+fn fade_frames(fade_ms: u32, sample_rate: u32) -> u32 {
+    (fade_ms as u64 * sample_rate as u64 / 1000).min(u32::MAX as u64) as u32
+}
+
 /// Apply a single parsed command to the shared audio state.
 async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<'_>) {
     let cache_manager = ctx.cache_manager;
@@ -2533,6 +2585,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         mqtt::commands::AudioCommand::InputVolume {
             input,
             volume: new_volume,
+            fade_ms,
         } => {
             // The audio thread resolves the input by index or voice id and clamps.
             tracing::info!("Set input '{}' volume to {:.2}", input, new_volume);
@@ -2554,6 +2607,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             let queued = ctx.send(rt_engine::AudioCommand::SetInputVolume {
                 input: input.clone(),
                 volume,
+                fade_frames: fade_frames(fade_ms, output_sample_rate),
             });
             if queued {
                 if let Some(status) = find_input_status_mut(ctx.inputs, &input) {
@@ -2564,10 +2618,14 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 ctx.refresh();
             }
         }
-        mqtt::commands::AudioCommand::InputMute { input, mute } => {
-            // Mute stores the input's current volume and zeroes it; unmute restores
-            // that stored volume (D34) — the audio thread owns the live input, so the
-            // save/restore happens there.
+        mqtt::commands::AudioCommand::InputMute {
+            input,
+            mute,
+            fade_ms,
+        } => {
+            // Mute stores the input's volume and fades it to silence; unmute fades
+            // back to that stored volume (D34) — the audio thread owns the live
+            // input, so the save/restore happens there.
             tracing::info!(
                 "Input '{}' {}",
                 input,
@@ -2604,6 +2662,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             let queued = ctx.send(rt_engine::AudioCommand::SetInputMute {
                 input: input.clone(),
                 mute,
+                fade_frames: fade_frames(fade_ms, output_sample_rate),
             });
             if queued {
                 if let Some(status) = find_input_status_mut(ctx.inputs, &input) {
@@ -2646,6 +2705,10 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     if !ctx.send(rt_engine::AudioCommand::SetInputMute {
                         input: input.clone(),
                         mute: false,
+                        fade_frames: fade_frames(
+                            mqtt::commands::DEFAULT_INPUT_FADE_MS,
+                            output_sample_rate,
+                        ),
                     }) {
                         ctx.talkback.hard_mute(ctx.now_ms);
                     }
@@ -2670,8 +2733,14 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 Ok((_transition, _status)) => {
                     if let Some(source_id) = source {
                         if let Some(input) = resolve_talkback_input(ctx.inputs, &source_id) {
-                            let _ = ctx
-                                .send(rt_engine::AudioCommand::SetInputMute { input, mute: true });
+                            let _ = ctx.send(rt_engine::AudioCommand::SetInputMute {
+                                input,
+                                mute: true,
+                                fade_frames: fade_frames(
+                                    mqtt::commands::DEFAULT_INPUT_FADE_MS,
+                                    output_sample_rate,
+                                ),
+                            });
                         }
                     }
                     ctx.refresh_talkback(ctx.now_ms);
@@ -2691,7 +2760,14 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             let _ = ctx.talkback.hard_mute(ctx.now_ms);
             if let Some(source_id) = source {
                 if let Some(input) = resolve_talkback_input(ctx.inputs, &source_id) {
-                    let _ = ctx.send(rt_engine::AudioCommand::SetInputMute { input, mute: true });
+                    let _ = ctx.send(rt_engine::AudioCommand::SetInputMute {
+                        input,
+                        mute: true,
+                        fade_frames: fade_frames(
+                            mqtt::commands::DEFAULT_INPUT_FADE_MS,
+                            output_sample_rate,
+                        ),
+                    });
                 }
             }
             ctx.refresh_talkback(ctx.now_ms);
@@ -4361,12 +4437,14 @@ mod tests {
             .run(AudioCommand::InputVolume {
                 input: "1".to_string(),
                 volume: 0.5,
+                fade_ms: 0,
             })
             .await;
         fixture
             .run(AudioCommand::InputMute {
                 input: "2".to_string(),
                 mute: true,
+                fade_ms: 0,
             })
             .await;
         fixture.drain();
@@ -4432,6 +4510,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn input_commands_carry_their_fade_to_the_audio_thread() {
+        let mut fixture = Fixture::new(vec![]);
+        push_live_input(&mut fixture, "mic", 1.0);
+
+        fixture
+            .run(AudioCommand::InputMute {
+                input: "mic".to_string(),
+                mute: true,
+                fade_ms: 20,
+            })
+            .await;
+        match fixture.cmd_rx.pop() {
+            Some(rt_engine::AudioCommand::SetInputMute { fade_frames, .. }) => {
+                assert_eq!(fade_frames, 960, "20 ms at 48 kHz")
+            }
+            other => panic!("expected SetInputMute, got {:?}", other.map(|_| ())),
+        }
+        fixture
+            .run(AudioCommand::InputVolume {
+                input: "mic".to_string(),
+                volume: 0.5,
+                fade_ms: 1000,
+            })
+            .await;
+        match fixture.cmd_rx.pop() {
+            Some(rt_engine::AudioCommand::SetInputVolume { fade_frames, .. }) => {
+                assert_eq!(fade_frames, 48000)
+            }
+            other => panic!("expected SetInputVolume, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    #[tokio::test]
     async fn input_mute_unmute_restores_the_calibrated_volume() {
         // D34: a calibrated input volume must survive a mute/unmute round-trip —
         // unmute restores the prior level (0.7), not a hardcoded 1.0.
@@ -4443,6 +4554,7 @@ mod tests {
             .run(AudioCommand::InputVolume {
                 input: "mic".to_string(),
                 volume: 0.7,
+                fade_ms: 0,
             })
             .await;
         fixture.drain();
@@ -4456,6 +4568,7 @@ mod tests {
             .run(AudioCommand::InputMute {
                 input: "mic".to_string(),
                 mute: true,
+                fade_ms: 0,
             })
             .await;
         fixture.drain();
@@ -4469,6 +4582,7 @@ mod tests {
             .run(AudioCommand::InputMute {
                 input: "mic".to_string(),
                 mute: false,
+                fade_ms: 0,
             })
             .await;
         fixture.drain();
@@ -4510,7 +4624,8 @@ mod tests {
             .await;
         fixture.drain();
         assert!(!fixture.talkback.status(0).applied_live);
-        assert_eq!(fixture.mixer.live_inputs[0].volume, 0.0);
+        assert!(fixture.mixer.live_inputs[0].is_muted());
+        assert_eq!(fixture.mixer.live_inputs[0].target_volume, 0.0);
 
         fixture
             .run(AudioCommand::TalkbackAcquire(
@@ -4614,6 +4729,65 @@ mod tests {
                 .unwrap()
                 .contains_key("music"),
             "a restored voice must be cleared from the ducking snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_muted_input_does_not_duck_even_when_its_room_is_loud() {
+        let rule = DuckingRule {
+            primary_voice: "mic".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0,
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+        let telemetry = Arc::new(audio::input::InputTelemetry {
+            dropped_frames: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            peak_levels: vec![std::sync::atomic::AtomicU32::new(0)],
+            resample_errors: Default::default(),
+            overflow_dropped_samples: Default::default(),
+            ratio_rejects: Default::default(),
+            scratch_regrows: Default::default(),
+        });
+        let muted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let now = std::time::Instant::now();
+        let mut watchers = vec![InputWatcher {
+            voice_id: "mic".to_string(),
+            telemetry: telemetry.clone(),
+            channels: vec![0],
+            muted: Some(muted.clone()),
+            activity: audio::activity::InputActivity::new(Some((0.1, 0)), now),
+        }];
+        let loud = |telemetry: &audio::input::InputTelemetry| {
+            telemetry.peak_levels[0].store(0.9f32.to_bits(), std::sync::atomic::Ordering::Relaxed)
+        };
+
+        loud(&telemetry);
+        update_input_activity(
+            &mut watchers,
+            now,
+            fixture.ducking_engine.as_mut(),
+            &mut fixture.cmd_tx,
+            &fixture.ducking_snapshot,
+        );
+        assert!(
+            fixture.ducking_snapshot.read().unwrap().is_empty(),
+            "a muted microphone must not duck"
+        );
+
+        muted.store(false, std::sync::atomic::Ordering::Relaxed);
+        loud(&telemetry);
+        update_input_activity(
+            &mut watchers,
+            now,
+            fixture.ducking_engine.as_mut(),
+            &mut fixture.cmd_tx,
+            &fixture.ducking_snapshot,
+        );
+        assert_eq!(
+            fixture.ducking_snapshot.read().unwrap().get("music"),
+            Some(&0.1),
+            "the unmuted microphone speaking ducks the music"
         );
     }
 

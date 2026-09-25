@@ -50,6 +50,49 @@ impl ActivityDetector {
     }
 }
 
+/// Whether one live input counts as active for ducking. With a threshold it
+/// follows the capture level through an [`ActivityDetector`]; without one it is
+/// active while its stream is open. A muted input counts as silent either way:
+/// capture keeps running while muted (the mute is applied in the mix), so the
+/// captured level alone would keep ducking the room.
+pub struct InputActivity {
+    detector: Option<ActivityDetector>,
+    active: bool,
+}
+
+impl InputActivity {
+    /// `threshold` is the activity level and hold time in milliseconds; `None`
+    /// makes the input active whenever it is unmuted. Starts inactive.
+    pub fn new(threshold: Option<(f32, u32)>, now: Instant) -> Self {
+        Self {
+            detector: threshold.map(|(level, hold_ms)| ActivityDetector::new(level, hold_ms, now)),
+            active: false,
+        }
+    }
+
+    /// Feed the peak capture level since the last update and whether the input is
+    /// muted. Returns `Some(active)` when the input's activity changes.
+    pub fn update(&mut self, level: f32, muted: bool, now: Instant) -> Option<bool> {
+        let active = match &mut self.detector {
+            Some(detector) => {
+                detector.update(if muted { 0.0 } else { level }, now);
+                detector.active
+            }
+            None => !muted,
+        };
+        if active == self.active {
+            return None;
+        }
+        self.active = active;
+        Some(active)
+    }
+
+    #[cfg(test)]
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +162,44 @@ mod tests {
             det.update(0.0, now + Duration::from_millis(950)),
             Some(false)
         );
+    }
+
+    #[test]
+    fn a_muted_input_with_a_threshold_does_not_activate() {
+        let now = t0();
+        let mut input = InputActivity::new(Some((0.1, 500)), now);
+
+        assert_eq!(input.update(0.9, true, now), None);
+        assert!(!input.is_active());
+    }
+
+    #[test]
+    fn muting_a_speaking_input_releases_it_after_the_hold() {
+        let now = t0();
+        let mut input = InputActivity::new(Some((0.1, 500)), now);
+
+        assert_eq!(input.update(0.9, false, now), Some(true));
+        // Still loud in the room, but muted: it holds, then releases.
+        assert_eq!(
+            input.update(0.9, true, now + Duration::from_millis(200)),
+            None
+        );
+        assert_eq!(
+            input.update(0.9, true, now + Duration::from_millis(600)),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn an_input_without_a_threshold_is_active_while_open_and_unmuted() {
+        let now = t0();
+        let mut input = InputActivity::new(None, now);
+
+        assert_eq!(input.update(0.0, false, now), Some(true));
+        assert_eq!(input.update(0.0, false, now), None);
+        assert_eq!(input.update(0.0, true, now), Some(false));
+        assert_eq!(input.update(0.0, true, now), None);
+        assert_eq!(input.update(0.0, false, now), Some(true));
     }
 
     #[test]

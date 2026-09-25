@@ -270,7 +270,7 @@ input:
 | `latency_ms` | `20` | Capture buffering, `5`–`500`; the microphone-to-speaker delay is roughly twice this plus about 11 ms. Raised, with a warning, to the smallest value that works (11 ms at 48 kHz) |
 | `channels` | smallest count that covers the routes | Capture channel count to open, `1`–`64`; must be one the device offers |
 | `sample_rate` | the output rate | Capture rate to ask for, `8000`–`192000` |
-| `activity_threshold` | none | Peak level (above `0.0`, up to `1.0`) at which the input counts as active for ducking rules. Without it the input is active whenever it is open |
+| `activity_threshold` | none | Peak level (above `0.0`, up to `1.0`) at which the input counts as active for ducking rules. Without it the input is active whenever it is open and not muted. A muted input is never active |
 | `activity_hold_ms` | `750` | How long the input stays active after the level drops, up to `10000` |
 
 Inputs that share a device and settings share one capture stream. An input that fails to open is

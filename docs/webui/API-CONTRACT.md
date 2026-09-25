@@ -56,8 +56,8 @@ parser/handler defaults.
 | `voice_volume` | `voice`, `volume` | — | Clamped `0..4`; also reaches a live input with that `voice_id`. `404` if neither exists. |
 | `voice_fade_out` | `voice`, **`time`** | — | **Wire key is `time` (ms).** Typed REST body uses `time_ms` (§5). |
 | `voice_stop` | `voice` | — | 10 ms fade. `404` if the voice has no sounds. |
-| `input_volume` | `input`, `volume` | — | `input` is a **string** — index `"0"` or a `voice_id`. A bare number is a `400` on `/command`/MQTT, `422` on the typed route. Instant, clears mute. |
-| `input_mute` | `input`, **`mute`** | — | `mute` required on every path. Instant. Unmuting by `voice_id` is `403` while a talkback lease holds the input (not checked by index, nor for `input_volume`). |
+| `input_volume` | `input`, `volume` | `fade_ms`(20; 0..60000, 0 = instant) | `input` is a **string** — index `"0"` or a `voice_id`. A bare number is a `400` on `/command`/MQTT, `422` on the typed route. Clears mute. |
+| `input_mute` | `input`, **`mute`** | `fade_ms`(20; 0..60000, 0 = instant) | `mute` required on every path. A muted input never triggers ducking. Unmuting by `voice_id` is `403` while a talkback lease holds the input (not checked by index, nor for `input_volume`). |
 | `precache` (`soundPrecache`) | `file` | — | Completes when loading has started. |
 | `cache_clear` | — | — | Clears memory + disk. |
 | `cache_invalidate` | `file` | — | Exact key/file string. |

@@ -841,6 +841,35 @@ async fn a_seek_the_target_cannot_take_answers_conflict() {
 }
 
 #[tokio::test]
+async fn input_routes_forward_an_optional_fade() {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+    for (uri, body) in [
+        (
+            "/input/mute",
+            r#"{"input": "gm_mic", "mute": true, "fade_ms": 250}"#,
+        ),
+        ("/input/volume", r#"{"input": "gm_mic", "volume": 0.5}"#),
+    ] {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+    }
+    let mute: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+    assert_eq!(mute["message"]["fade_ms"], 250);
+    let volume: serde_json::Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+    assert!(volume["message"]["fade_ms"].is_null());
+    for payload in [mute, volume] {
+        mqttaudio::mqtt::commands::parse_command(&payload.to_string()).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn test_speed_endpoint() {
     let (state, mut rx) = create_test_state();
     let app = create_router(state, false, false);

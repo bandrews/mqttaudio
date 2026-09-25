@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`input_volume` and `input_mute` fade.** Both take an optional `fade_ms` (default 20, up to 60000;
+  `0` is instant), so a microphone is muted, unmuted or turned up without a click. They changed the
+  level instantly before.
 - **`--check-ready`** asks the daemon described by the configuration (file, command line and
   `MQTTAUDIO_HTTP_*` variables) for `GET /ready` and exits `0` when it is ready or the HTTP server is
   off, `1` otherwise. The container image's health check uses it.
@@ -25,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A muted microphone no longer triggers ducking.** Mute is applied in the mix while capture keeps
+  running, and activity detection read the captured level, so a muted input that picked up sound
+  kept ducking the room; an input without an `activity_threshold` ducked the whole time it was open.
+  A muted input now counts as silent: one that was active releases after its `activity_hold_ms`.
 - **`seek` and `speed` report when they cannot apply.** A command whose selector matched only windowed
   (streamed) sounds answered `200` and did nothing; it now fails with `409`. A selector naming a voice
   in which a windowed sound had played skipped the whole command, including the voice's fully loaded

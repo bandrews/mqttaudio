@@ -150,7 +150,7 @@ together, alongside ALSA `underrun occurred` messages, usually means the output 
   `ducking_multiplier` below `1.0`. A voice used only by a live input is not listed there;
   `GET /metrics` (`ducking`) lists every ducked voice, inputs included.
 - A live input as `primary_voice` needs an `activity_threshold` to duck only while someone speaks.
-  Without one it counts as active whenever it is open, so the ducked voices stay down.
+  Without one it counts as active whenever it is open and not muted, so the ducked voices stay down.
 
 See [Ducking](features/ducking.md).
 

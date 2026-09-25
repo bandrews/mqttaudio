@@ -656,6 +656,7 @@ pub async fn handle_voice_volume(
 pub struct InputVolumeParams {
     input: String,
     volume: f32,
+    fade_ms: Option<u32>,
 }
 
 pub async fn handle_input_volume(
@@ -666,7 +667,8 @@ pub async fn handle_input_volume(
         "command": "input_volume",
         "message": {
             "input": params.input,
-            "volume": params.volume
+            "volume": params.volume,
+            "fade_ms": params.fade_ms
         }
     });
 
@@ -679,6 +681,7 @@ pub struct InputMuteParams {
     /// Required, matching the MQTT command: an omitted field must error
     /// rather than silently unmute
     mute: bool,
+    fade_ms: Option<u32>,
 }
 
 pub async fn handle_input_mute(
@@ -689,7 +692,8 @@ pub async fn handle_input_mute(
         "command": "input_mute",
         "message": {
             "input": params.input,
-            "mute": params.mute
+            "mute": params.mute,
+            "fade_ms": params.fade_ms
         }
     });
 

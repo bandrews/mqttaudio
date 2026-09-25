@@ -91,10 +91,6 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 
 ### Live inputs
 
-- **Input mute and volume changes are instant.** `input_mute` and `input_volume` set the level
-  without a ramp, which can click (`LiveInput::set_muted` / `set_volume`); `voice_volume` ramps.
-- **Activity detection reads the captured level before volume and mute**, so a muted microphone
-  still triggers its ducking rules.
 - **A lost input device is not reopened**, and `/ready` is decided once at startup, so it stays
   `200` after an input dies. Restart after reconnecting a USB microphone. Physical unplug/replug and
   multichannel USB duplex remain field checks for the release candidate.

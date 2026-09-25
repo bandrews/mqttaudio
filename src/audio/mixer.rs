@@ -870,12 +870,13 @@ fn wrap_loop_position(pos: f64, buffer_frames: usize, crossfade_samples: usize) 
     }
 }
 
-/// Step a smoothed volume one frame toward its target.
-/// Linear ramping at a fixed rate: ~22ms for a full 0-1 transition at 44.1kHz.
+/// Per-frame step of the default volume ramp: ~22ms for a full 0-1 transition at
+/// 44.1kHz.
+const RAMP_RATE: f32 = 0.001;
+
+/// Step a smoothed volume one frame toward its target at the default rate.
 /// Returns true while still ramping.
 fn ramp_toward(current: &mut f32, target: f32) -> bool {
-    const RAMP_RATE: f32 = 0.001;
-
     if (*current - target).abs() < RAMP_RATE {
         *current = target;
         false
@@ -916,6 +917,10 @@ pub struct LiveInput {
     /// Per-input volume (0.0 - MAX_GAIN) - current smoothed value
     pub volume: f32,
     pub target_volume: f32,
+    /// Per-frame change of `volume` during a fade toward `target_volume`
+    volume_step: f32,
+    /// Frames left in that fade; `volume` lands exactly on `target_volume` at 0
+    volume_fade_frames: u32,
     pub max_backlog_frames: usize,
     pub trimmed_frames: u64,
     pub underrun_frames: u64,
@@ -967,6 +972,8 @@ impl LiveInput {
             input_channels,
             volume,
             target_volume: volume,
+            volume_step: 0.0,
+            volume_fade_frames: 0,
             max_backlog_frames,
             trimmed_frames: 0,
             underrun_frames: 0,
@@ -1049,36 +1056,44 @@ impl LiveInput {
         self.volume * self.voice_volume
     }
 
-    /// Set this input's volume directly. An explicit level clears any muted state,
-    /// so the value takes effect immediately and a later unmute does not revert it
-    /// (D34). The value is clamped to a valid gain.
-    pub fn set_volume(&mut self, volume: f32) {
-        self.volume = volume.clamp(0.0, crate::config::MAX_GAIN);
-        self.target_volume = self.volume;
-        self.muted = false;
-        self.pre_mute_volume = self.volume;
+    /// Fade this input's level to `target` over `fade_frames` frames, or at once
+    /// when `fade_frames` is 0.
+    fn fade_volume_to(&mut self, target: f32, fade_frames: u32) {
+        self.target_volume = target;
+        self.volume_fade_frames = fade_frames;
+        if fade_frames == 0 {
+            self.volume = target;
+        } else {
+            self.volume_step = (target - self.volume) / fade_frames as f32;
+        }
         self.publish_status();
     }
 
-    /// Mute or unmute this input. Muting stores the current volume and zeroes it;
-    /// unmuting restores the stored pre-mute volume rather than a hardcoded 1.0
-    /// (D34). Guarded by `muted` so a repeated mute does not overwrite the stored
-    /// level with 0.0, and a repeated unmute is a no-op.
-    pub fn set_muted(&mut self, mute: bool) {
+    /// Set this input's volume, fading over `fade_frames` (0 for instant). An
+    /// explicit level clears any muted state, so a later unmute does not revert it
+    /// (D34). The value is clamped to a valid gain.
+    pub fn set_volume(&mut self, volume: f32, fade_frames: u32) {
+        let volume = volume.clamp(0.0, crate::config::MAX_GAIN);
+        self.muted = false;
+        self.pre_mute_volume = volume;
+        self.fade_volume_to(volume, fade_frames);
+    }
+
+    /// Mute or unmute this input, fading over `fade_frames` (0 for instant).
+    /// Muting stores the level it was heading for and fades to silence; unmuting
+    /// fades back to that stored level rather than a hardcoded 1.0 (D34). Guarded
+    /// by `muted` so a repeated mute does not overwrite the stored level with 0.0,
+    /// and a repeated unmute is a no-op.
+    pub fn set_muted(&mut self, mute: bool, fade_frames: u32) {
         if mute {
             if !self.muted {
                 self.pre_mute_volume = self.target_volume;
-                self.volume = 0.0;
-                self.target_volume = 0.0;
                 self.muted = true;
-                self.publish_status();
+                self.fade_volume_to(0.0, fade_frames);
             }
         } else if self.muted {
-            self.volume = self.pre_mute_volume;
-            self.target_volume = self.volume;
-            self.target_volume = self.volume;
             self.muted = false;
-            self.publish_status();
+            self.fade_volume_to(self.pre_mute_volume, fade_frames);
         }
     }
 
@@ -1088,10 +1103,12 @@ impl LiveInput {
         self.target_voice_volume = target.clamp(0.0, crate::config::MAX_GAIN);
     }
 
-    /// Set the input volume target for smooth ramping. A nonzero level is
-    /// remembered as the level unmute restores.
+    /// Set the input volume target for smooth ramping at the default rate. A
+    /// nonzero level is remembered as the level unmute restores.
     pub fn set_target_volume(&mut self, target: f32) {
-        self.target_volume = target.clamp(0.0, crate::config::MAX_GAIN);
+        let target = target.clamp(0.0, crate::config::MAX_GAIN);
+        let fade_frames = ((target - self.volume).abs() / RAMP_RATE).ceil() as u32;
+        self.fade_volume_to(target, fade_frames);
         if self.target_volume > 0.0 {
             self.pre_mute_volume = self.target_volume;
         }
@@ -1109,7 +1126,14 @@ impl LiveInput {
 
     pub fn advance_volumes(&mut self) {
         ramp_toward(&mut self.voice_volume, self.target_voice_volume);
-        ramp_toward(&mut self.volume, self.target_volume);
+        if self.volume_fade_frames > 0 {
+            self.volume_fade_frames -= 1;
+            self.volume = if self.volume_fade_frames == 0 {
+                self.target_volume
+            } else {
+                self.volume + self.volume_step
+            };
+        }
         self.publish_status();
     }
 }
@@ -2442,15 +2466,73 @@ mod tests {
         let (_producer, consumer) = crate::audio::input::create_ring_buffer(1024);
         let mut input = test_live_input("mic".to_string(), consumer, 2, 0.7, vec![(0, 0)]);
 
-        input.set_muted(true);
+        input.set_muted(true, 0);
         assert!(input.is_muted());
-        input.set_muted(false);
+        input.set_muted(false, 0);
         assert_eq!(input.target_volume, 0.7);
 
         input.set_target_volume(2.0);
-        input.set_muted(true);
-        input.set_muted(false);
+        input.set_muted(true, 0);
+        input.set_muted(false, 0);
         assert_eq!(input.target_volume, 2.0, "a boosted mic comes back boosted");
+    }
+
+    #[test]
+    fn input_mute_with_a_fade_ramps_to_silence_and_back_over_the_fade() {
+        let (_producer, consumer) = crate::audio::input::create_ring_buffer(1024);
+        let mut input = test_live_input("mic".to_string(), consumer, 1, 1.0, vec![(0, 0)]);
+
+        input.set_muted(true, 100);
+        assert!(input.is_muted(), "the mute takes effect at once");
+        for _ in 0..50 {
+            input.advance_volumes();
+        }
+        assert!(
+            (input.volume - 0.5).abs() < 0.02,
+            "halfway through the fade, got {}",
+            input.volume
+        );
+        for _ in 0..50 {
+            input.advance_volumes();
+        }
+        assert_eq!(input.volume, 0.0);
+
+        input.set_muted(false, 100);
+        for _ in 0..50 {
+            input.advance_volumes();
+        }
+        assert!(
+            (input.volume - 0.5).abs() < 0.02,
+            "halfway back, got {}",
+            input.volume
+        );
+        for _ in 0..50 {
+            input.advance_volumes();
+        }
+        assert_eq!(input.volume, 1.0);
+    }
+
+    #[test]
+    fn input_volume_with_a_fade_reaches_the_level_when_the_fade_ends() {
+        let (_producer, consumer) = crate::audio::input::create_ring_buffer(1024);
+        let mut input = test_live_input("mic".to_string(), consumer, 1, 1.0, vec![(0, 0)]);
+
+        input.set_volume(3.0, 200);
+        for _ in 0..100 {
+            input.advance_volumes();
+        }
+        assert!(
+            (input.volume - 2.0).abs() < 0.05,
+            "halfway through the fade, got {}",
+            input.volume
+        );
+        for _ in 0..100 {
+            input.advance_volumes();
+        }
+        assert_eq!(input.volume, 3.0);
+
+        input.set_volume(0.5, 0);
+        assert_eq!(input.volume, 0.5, "a zero fade is instant");
     }
 
     #[test]

@@ -79,12 +79,12 @@ between words:
 ```
 
 The level is the peak of the input's routed channels as captured, checked every 20 ms, before the
-input's volume and mute. Set the threshold above the room's background noise: watch the levels in
-the config editor's input picker to find it. Because mute does not change the captured level, a
-muted microphone that picks up sound still triggers its rules.
+input's volume. Set the threshold above the room's background noise: watch the levels in the config
+editor's input picker to find it. A muted input is inactive, however loud the room is: when it is
+muted while active, its rules release after `activity_hold_ms`.
 
-Without `activity_threshold`, an input is active the whole time it is open, so its rules duck
-permanently.
+Without `activity_threshold`, an input is active whenever it is open and not muted, so its rules
+duck until it is muted.
 
 **As a ducked voice.** List an input's `voice_id` in `ducked_voices` to turn the microphone down
 while the primary plays.

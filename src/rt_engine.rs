@@ -52,11 +52,21 @@ pub enum AudioCommand {
     },
     /// Set the target voice volume for samples and live inputs in `voice`.
     SetVoiceVolume { voice: String, volume: f32 },
-    /// Set a live input's volume, selected by numeric index or by voice id.
-    SetInputVolume { input: String, volume: f32 },
-    /// Mute or unmute a live input, selected by numeric index or by voice id.
-    /// Unmuting restores the volume the input had when it was muted (D34).
-    SetInputMute { input: String, mute: bool },
+    /// Set a live input's volume, selected by numeric index or by voice id, fading
+    /// over `fade_frames` (0 for instant). An explicit volume clears any mute (D34).
+    SetInputVolume {
+        input: String,
+        volume: f32,
+        fade_frames: u32,
+    },
+    /// Mute or unmute a live input, selected by numeric index or by voice id,
+    /// fading over `fade_frames` (0 for instant). Unmuting restores the volume the
+    /// input had when it was muted (D34).
+    SetInputMute {
+        input: String,
+        mute: bool,
+        fade_frames: u32,
+    },
     /// Seek the samples matching `selector` to `position_ms`.
     SeekMatching {
         selector: SampleSelector,
@@ -248,11 +258,19 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
                 }
             }
         }
-        AudioCommand::SetInputVolume { input, volume } => {
-            apply_input_volume(state, input, *volume);
+        AudioCommand::SetInputVolume {
+            input,
+            volume,
+            fade_frames,
+        } => {
+            with_live_input(state, input, |live| live.set_volume(*volume, *fade_frames));
         }
-        AudioCommand::SetInputMute { input, mute } => {
-            apply_input_mute(state, input, *mute);
+        AudioCommand::SetInputMute {
+            input,
+            mute,
+            fade_frames,
+        } => {
+            with_live_input(state, input, |live| live.set_muted(*mute, *fade_frames));
         }
         AudioCommand::SeekMatching {
             selector,
@@ -552,18 +570,6 @@ fn with_live_input(state: &mut MixerState, input: &str, f: impl FnOnce(&mut Live
     if let Some(live) = state.live_inputs.iter_mut().find(|l| l.voice_id == input) {
         f(live);
     }
-}
-
-/// Set a live input's volume, selecting by numeric index first, then by voice id.
-/// An explicit volume clears any muted state (D34).
-fn apply_input_volume(state: &mut MixerState, input: &str, volume: f32) {
-    with_live_input(state, input, |live| live.set_volume(volume));
-}
-
-/// Mute or unmute a live input, selecting by numeric index first, then by voice id.
-/// Unmuting restores the input's pre-mute volume rather than 1.0 (D34).
-fn apply_input_mute(state: &mut MixerState, input: &str, mute: bool) {
-    with_live_input(state, input, |live| live.set_muted(mute));
 }
 
 #[cfg(test)]
@@ -876,6 +882,7 @@ mod tests {
             AudioCommand::SetInputMute {
                 input: "mic".to_string(),
                 mute: true,
+                fade_frames: 0,
             },
             48000,
         );
@@ -887,6 +894,7 @@ mod tests {
             AudioCommand::SetInputMute {
                 input: "mic".to_string(),
                 mute: false,
+                fade_frames: 0,
             },
             48000,
         );
@@ -908,6 +916,7 @@ mod tests {
             AudioCommand::SetInputMute {
                 input: "mic".to_string(),
                 mute: true,
+                fade_frames: 0,
             },
             48000,
         );
@@ -919,6 +928,7 @@ mod tests {
             AudioCommand::SetInputVolume {
                 input: "0".to_string(),
                 volume: 0.4,
+                fade_frames: 0,
             },
             48000,
         );
@@ -930,6 +940,7 @@ mod tests {
             AudioCommand::SetInputMute {
                 input: "mic".to_string(),
                 mute: false,
+                fade_frames: 0,
             },
             48000,
         );

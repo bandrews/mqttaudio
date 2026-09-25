@@ -95,8 +95,8 @@ At runtime:
 ```
 
 - `input` is the `voice_id` or the input's position in `inputs` (`"0"`), always as a string.
-- `input_volume` and `input_mute` take effect at once, without a fade. Unmuting restores the volume
-  the input had when muted, and setting a volume also unmutes.
+- `input_volume` and `input_mute` fade over 20 ms, or over their `fade_ms` (`0` for instant).
+  Unmuting restores the volume the input had when muted, and setting a volume also unmutes.
 - `voice_volume` sets a separate voice level that ramps smoothly and multiplies with the input's
   volume, the same as for sounds.
 
@@ -122,10 +122,10 @@ it has stayed below it for `activity_hold_ms`:
 ]
 ```
 
-The level is the peak across the input's routed channels as captured, before its volume and mute, so
-set the threshold above the room noise (the config editor's input picker shows live levels) and
-remember that a muted microphone that hears sound still triggers ducking. Without a threshold the
-input counts as active whenever it is open. See [Ducking](ducking.md).
+The level is the peak across the input's routed channels as captured, before its volume, so set the
+threshold above the room noise (the config editor's input picker shows live levels). A muted input is
+inactive however loud the room is. Without a threshold the input counts as active whenever it is open
+and not muted. See [Ducking](ducking.md).
 
 ## Latency and clock drift
 

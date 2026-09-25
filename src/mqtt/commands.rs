@@ -276,6 +276,9 @@ pub struct InputVolumeMessage {
     /// Input index (0-based) or voice_id
     pub input: String,
     pub volume: f32,
+    /// Fade length in milliseconds; `DEFAULT_INPUT_FADE_MS` when absent, 0 for instant
+    #[serde(default)]
+    pub fade_ms: Option<u32>,
 }
 
 /// Input mute command parameters
@@ -284,6 +287,9 @@ pub struct InputMuteMessage {
     /// Input index (0-based) or voice_id
     pub input: String,
     pub mute: bool,
+    /// Fade length in milliseconds; `DEFAULT_INPUT_FADE_MS` when absent, 0 for instant
+    #[serde(default)]
+    pub fade_ms: Option<u32>,
 }
 
 /// Fail-closed talkback lease request. Destination names are validated again
@@ -436,10 +442,12 @@ pub enum AudioCommand {
     InputVolume {
         input: String,
         volume: f32,
+        fade_ms: u32,
     },
     InputMute {
         input: String,
         mute: bool,
+        fade_ms: u32,
     },
     TalkbackAcquire(TalkbackAcquireMessage),
     TalkbackRelease(TalkbackReleaseMessage),
@@ -590,6 +598,25 @@ fn validate_internal_id(internal_id: &Option<String>) -> Result<(), ParseError> 
     Ok(())
 }
 
+/// Fade applied by `input_volume` and `input_mute` when the command gives none:
+/// short enough to feel instant, long enough not to click.
+pub const DEFAULT_INPUT_FADE_MS: u32 = 20;
+
+/// Longest fade `input_volume` and `input_mute` accept.
+pub const MAX_INPUT_FADE_MS: u32 = 60_000;
+
+/// Resolve an input command's `fade_ms`, defaulting to [`DEFAULT_INPUT_FADE_MS`].
+fn input_fade_ms(fade_ms: Option<u32>) -> Result<u32, ParseError> {
+    let fade_ms = fade_ms.unwrap_or(DEFAULT_INPUT_FADE_MS);
+    if fade_ms > MAX_INPUT_FADE_MS {
+        return Err(ParseError::InvalidParameter(format!(
+            "fade_ms must be at most {} (got {})",
+            MAX_INPUT_FADE_MS, fade_ms
+        )));
+    }
+    Ok(fade_ms)
+}
+
 /// Hold a play's window overrides to the limits configuration validation applies
 /// to `cache.stream_window_ms` and `cache.stream_prebuffer_ms`.
 fn validate_window_overrides(
@@ -736,6 +763,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             Ok(AudioCommand::InputVolume {
                 input: input_msg.input,
                 volume: input_msg.volume,
+                fade_ms: input_fade_ms(input_msg.fade_ms)?,
             })
         }
         "input_mute" => {
@@ -747,6 +775,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             Ok(AudioCommand::InputMute {
                 input: input_msg.input,
                 mute: input_msg.mute,
+                fade_ms: input_fade_ms(input_msg.fade_ms)?,
             })
         }
         "talkback_acquire" => {
@@ -1664,7 +1693,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::InputVolume { input, volume } => {
+            AudioCommand::InputVolume { input, volume, .. } => {
                 assert_eq!(input, "0");
                 assert_eq!(volume, 0.5);
             }
@@ -1679,12 +1708,58 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::InputVolume { input, volume } => {
+            AudioCommand::InputVolume { input, volume, .. } => {
                 assert_eq!(input, "gamemaster_mic");
                 assert_eq!(volume, 0.8);
             }
             _ => panic!("Expected InputVolume command"),
         }
+    }
+
+    #[test]
+    fn input_level_commands_fade_briefly_unless_told_otherwise() {
+        match parse_command(r#"{"command": "input_mute", "input": "mic", "mute": true}"#).unwrap() {
+            AudioCommand::InputMute { fade_ms, .. } => {
+                assert_eq!(fade_ms, DEFAULT_INPUT_FADE_MS)
+            }
+            other => panic!("Expected InputMute, got {other:?}"),
+        }
+        match parse_command(r#"{"command": "input_volume", "input": "mic", "volume": 0.5}"#)
+            .unwrap()
+        {
+            AudioCommand::InputVolume { fade_ms, .. } => {
+                assert_eq!(fade_ms, DEFAULT_INPUT_FADE_MS)
+            }
+            other => panic!("Expected InputVolume, got {other:?}"),
+        }
+        match parse_command(
+            r#"{"command": "input_mute", "input": "mic", "mute": true, "fade_ms": 0}"#,
+        )
+        .unwrap()
+        {
+            AudioCommand::InputMute { fade_ms, .. } => assert_eq!(fade_ms, 0),
+            other => panic!("Expected InputMute, got {other:?}"),
+        }
+        match parse_command(
+            r#"{"command": "input_volume", "input": "mic", "volume": 0.5, "fade_ms": 1500}"#,
+        )
+        .unwrap()
+        {
+            AudioCommand::InputVolume { fade_ms, .. } => assert_eq!(fade_ms, 1500),
+            other => panic!("Expected InputVolume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_input_fade_longer_than_a_minute_is_rejected() {
+        assert!(parse_command(
+            r#"{"command": "input_mute", "input": "mic", "mute": true, "fade_ms": 60001}"#
+        )
+        .is_err());
+        assert!(parse_command(
+            r#"{"command": "input_volume", "input": "mic", "volume": 1.0, "fade_ms": 60001}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -1705,7 +1780,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::InputMute { input, mute } => {
+            AudioCommand::InputMute { input, mute, .. } => {
                 assert_eq!(input, "0");
                 assert!(mute);
             }
@@ -1719,7 +1794,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::InputMute { input, mute } => {
+            AudioCommand::InputMute { input, mute, .. } => {
                 assert_eq!(input, "mic1");
                 assert!(!mute);
             }
@@ -2552,7 +2627,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::InputVolume { input, volume } => {
+            AudioCommand::InputVolume { input, volume, .. } => {
                 assert_eq!(input, "mic1");
                 assert_eq!(volume, 0.8);
             }
@@ -2566,7 +2641,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::InputMute { input, mute } => {
+            AudioCommand::InputMute { input, mute, .. } => {
                 assert_eq!(input, "0");
                 assert!(mute);
             }
