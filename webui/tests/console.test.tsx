@@ -73,6 +73,22 @@ describe('CueLauncher (F4)', () => {
     });
     expect(await screen.findByText('Command completed')).toBeInTheDocument();
   });
+
+  it('sends macro names at the top level, where the daemon expands them, and previews that payload', async () => {
+    const user = userEvent.setup();
+    const client = spyClient();
+    renderWithClient(<CueLauncher />, client);
+    await user.type(screen.getByLabelText('file'), '/s.wav');
+    await user.type(screen.getByLabelText('macro(s) — comma separated'), 'quiet, wholeroom');
+    await user.click(screen.getByRole('button', { name: 'Play' }));
+    const expected = {
+      command: 'play',
+      macro: ['quiet', 'wholeroom'],
+      message: { file: '/s.wav' },
+    };
+    expect(client.rawCommand).toHaveBeenCalledWith(expected);
+    expect(JSON.parse(screen.getByLabelText('play JSON preview').textContent!)).toEqual(expected);
+  });
 });
 
 describe('RawCommandEditor (F3)', () => {

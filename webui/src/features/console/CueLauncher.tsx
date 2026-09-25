@@ -1,12 +1,13 @@
 // ABOUTME: Cue launcher: builds a play command from form fields and shows a live JSON preview.
-// ABOUTME: Sends it as a nested {command, message} to /command and shows the command's result.
+// ABOUTME: Sends it as a nested {command, macro?, message} to /command and shows the command's result.
 
 // Cue launcher (Sprint W3, F4): compose a play from a file + options and fire it.
-// Routed through client.play() -> POST /command, so the full surface (mode,
+// Sent through client.rawCommand() -> POST /command, so the full surface (mode,
 // freshness, window/prebuffer, cacheable) reaches the daemon (DW10). A live JSON
 // preview shows exactly what will be sent. channel_map is the matrix mixer's job
 // (Sprint W4); macro definitions come from config (Sprint W8) — listing macro
-// names here adds the `macro` field, and command params win over macros.
+// names here adds a top-level `macro` field beside `message` (the only place the
+// daemon expands it), and command params win over macros.
 
 import { useMemo, useState } from 'react';
 import Alert from '@mui/material/Alert';
@@ -47,8 +48,8 @@ export function CueLauncher() {
   const [cacheable, setCacheable] = useState(true);
   const [macros, setMacros] = useState('');
 
-  const params = useMemo<PlayParams & { macro?: string[] }>(() => {
-    const p: PlayParams & { macro?: string[] } = { file: file.trim() };
+  const params = useMemo<PlayParams>(() => {
+    const p: PlayParams = { file: file.trim() };
     if (id.trim()) p.id = id.trim();
     if (voice.trim()) p.voice = voice.trim();
     const v = numOrUndef(volume);
@@ -67,13 +68,19 @@ export function CueLauncher() {
     if (pb !== undefined) p.prebuffer_ms = pb;
     if (freshness) p.freshness = freshness;
     if (!cacheable) p.cacheable = false;
-    const macroList = parseMacroList(macros);
-    if (macroList.length > 0) p.macro = macroList;
     return p;
-  }, [file, id, voice, volume, loop, crossfade, fadeIn, startPos, mode, windowMs, prebufferMs, freshness, cacheable, macros]);
+  }, [file, id, voice, volume, loop, crossfade, fadeIn, startPos, mode, windowMs, prebufferMs, freshness, cacheable]);
+
+  // The daemon expands `macro` only at the top level of the command object.
+  const payload = useMemo(() => {
+    const macroList = parseMacroList(macros);
+    return macroList.length > 0
+      ? { command: 'play', macro: macroList, message: params }
+      : { command: 'play', message: params };
+  }, [params, macros]);
 
   const volIssue = volume.trim() ? validateVolume(Number(volume)) : {};
-  const preview = JSON.stringify({ command: 'play', message: params }, null, 2);
+  const preview = JSON.stringify(payload, null, 2);
   const streamForwardOnlyNote = mode === 'stream';
 
   return (
@@ -133,7 +140,7 @@ export function CueLauncher() {
           {preview}
         </Box>
         <Stack direction="row" spacing={2} alignItems="center">
-          <Button variant="contained" disabled={!file.trim() || state.status === 'sending'} onClick={() => run((c) => c.rawCommand({ command: 'play', message: params }))}>
+          <Button variant="contained" disabled={!file.trim() || state.status === 'sending'} onClick={() => run((c) => c.rawCommand(payload))}>
             Play
           </Button>
           {state.status === 'ok' && <Alert severity="success" sx={{ py: 0 }}>{state.message}</Alert>}

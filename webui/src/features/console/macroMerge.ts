@@ -1,11 +1,12 @@
 // ABOUTME: Macro helpers: merges macro params with command params in the daemon's precedence.
 // ABOUTME: Also parses a comma/space-separated macro name list for the cue launcher.
 
-// Macro precedence preview (API-CONTRACT §1): the daemon resolves a play's
-// effective params as command-params > macro[0] > macro[1] > ... > macro[n]
-// (earlier macros win; explicit command params win over all). The actual macro
-// definitions come from the daemon config (GET /config, Sprint W8); this pure
-// helper reproduces the precedence so the cue launcher can preview the merge.
+// Macro precedence (API-CONTRACT §1): the daemon resolves a play's effective
+// params as command-params > macro[0] > macro[1] > ... > macro[n] (earlier
+// macros win; explicit command params win over all). The actual macro
+// definitions come from the daemon config (GET /config, Sprint W8); mergeMacros
+// reproduces the precedence as a pure function. The cue launcher sends only the
+// macro names (parseMacroList) and leaves the merge to the daemon.
 
 export type Params = Record<string, unknown>;
 
