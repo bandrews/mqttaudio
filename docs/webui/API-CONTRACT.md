@@ -30,7 +30,7 @@ are the things most likely to silently break a UI.
   outside `allowed_directories`, a refused or out-of-range talkback request, unmuting a talkback-held
   input), `404` nothing to act on (missing/undecodable file, failed URL, unmatched selector, empty voice,
   unavailable input, no open talkback microphone), `409` cancelled by a later `stopall`/`fadeall` or a
-  `seek`/`speed` matching only windowed sounds, `500` overloaded (32 loads in flight, full audio queue) or
+  `seek`/`speed` matching only windowed sounds, `500` overloaded (32 loads in flight, a sound limit reached, full audio queue) or
   internal, `504` no result within 30 s of queuing.
   After a `504` the daemon drops the command: a play whose load finishes later never starts (cache
   commands still take effect).

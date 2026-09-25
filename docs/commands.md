@@ -100,9 +100,10 @@ rejected (HTTP `400`), and one that matches no playing sound fails with HTTP `40
 Without a `channel_map`, source channel 0 plays on output 0, channel 1 on output 1, and so on: a mono
 file plays on output 0 only. Source channels beyond the device's channel count are not heard.
 
-When 256 full plays are running, a new full play replaces the oldest one that is not looping, without
-a fade; if all 256 loop, the new play is dropped. Either way the command reports success and nothing
-is logged. Windowed plays do not count toward the limit.
+At most `audio.max_sounds` (256) full plays and `audio.max_streamed_sounds` (64) windowed plays run
+at once. At the full limit a new full play replaces the oldest one that is not looping, without a
+fade, and a warning names it; when every full play loops, the new play fails (HTTP `500`). A windowed
+play over its limit fails the same way.
 
 #### Full and windowed plays
 

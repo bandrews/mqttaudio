@@ -30,9 +30,6 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 
 ### Playback and commands
 
-- **A play dropped at the sound limit reports success.** A `play` dropped because all 256 sounds loop
-  answers HTTP `200` without doing anything. Neither a play dropped at the limit nor the sound it
-  displaces is logged.
 - **Pitch correction never engages on a cold play whose file is not kept in memory.** The stretcher
   needs the complete buffer that the upgrade pass swaps in once the decode is promoted into the memory
   cache. A file larger than the free budget, or one changed or invalidated during its decode, is never
@@ -100,9 +97,6 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 
 ### Mixer capacity
 
-- **Streamed sources and live inputs have no hard cap.** `MixerState` reserves 64 streamed sources
-  and 16 live inputs, but only full-load samples are capped (256, `MAX_VOICES`). Past the reserve the
-  audio thread grows the vector, allocating in the callback.
 - **The output callback's mix bus can allocate.** It starts empty and is resized inside the callback
   (`build_typed_output_stream` in `src/audio/engine.rs`), so the first block allocates, and so does any
   larger block when the device picks its own buffer size. The allocation harness does not cover it.

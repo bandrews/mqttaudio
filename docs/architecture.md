@@ -121,10 +121,14 @@ Last-Modified revalidation.
 
 The callback then converts the bus to the device's sample format (`build_output_stream`).
 
-Mixer storage is reserved up front. Samples have a hard cap of 256 (`MAX_VOICES`): at the cap a new
-play replaces the oldest non-looping sample, or is dropped if every sample loops. Streamed sources
-(64) and live inputs (16) have reserved capacity but no cap yet, and the output callback sizes its
-bus on its first block; see [Known issues](bugs.md).
+Mixer storage is reserved up front (`MixerState::with_limits`): `audio.max_sounds` samples (256 by
+default), `audio.max_streamed_sounds` streamed sources (64) and one slot per configured input. The
+control thread checks both sound limits before sending a play (`admit_under_sound_limits`). Its
+`playing` map never counts fewer sounds than the mixer holds, because a sound enters it before it is
+sent and leaves after the mixer hands it back, so the reserved lists never grow. At the sample limit
+the audio thread replaces the oldest non-looping sample; the control thread logs that, and refuses
+the play when every sample loops or when the streamed limit is reached. The output callback sizes
+its bus on its first block; see [Known issues](bugs.md).
 
 ## Live inputs
 

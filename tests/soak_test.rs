@@ -2,10 +2,11 @@
 // ABOUTME: Asserts the voice pool + graveyard keep memory bounded and nothing panics.
 
 use mqttaudio::audio::input::create_ring_buffer;
-use mqttaudio::audio::mixer::{
-    mix_audio, ActiveSample, StreamedSource, MAX_STREAMED_SOURCES, MAX_VOICES,
-};
+use mqttaudio::audio::mixer::{mix_audio, ActiveSample, StreamedSource};
 use mqttaudio::audio::test_support::{decoded, sine, SceneBuilder};
+use mqttaudio::config::{
+    DEFAULT_MAX_SOUNDS as MAX_VOICES, DEFAULT_MAX_STREAMED_SOUNDS as MAX_STREAMED_SOURCES,
+};
 use mqttaudio::rt_engine::{
     command_channel, command_return_channel, drain_commands, graveyard_channel, reap_finished,
     reap_finished_streamed, streamed_graveyard_channel, AudioCallbackState, AudioCommand,
@@ -141,7 +142,7 @@ fn soak_sustained_plays_and_stops_stays_bounded() {
 
 #[test]
 fn soak_past_the_voice_cap_steals_and_stays_capped() {
-    // Sprint 13 F2 (D18): a burst far past MAX_VOICES with no stops must hold the
+    // Sprint 13 F2 (D18): a burst far past the sound limit with no stops must hold the
     // pool exactly at the cap (steal-oldest), route every displaced sample
     // through the graveyard, and never panic. Long samples so nothing finishes
     // on its own during the burst.

@@ -788,7 +788,7 @@ fn draining_mutation_commands_is_free_free() {
 fn adding_a_sample_into_the_reserved_pool_is_free_free() {
     // A Play (AddSample) into a voice pool with spare capacity must not allocate or
     // free on the RT thread: the un-boxed sample moves into the pre-reserved Vec.
-    // Production reserves MAX_VOICES up front; here we reserve a small headroom.
+    // Production reserves audio.max_sounds up front; here we reserve a small headroom.
     let mut mixer = SceneBuilder::new(2).build();
     mixer.active_samples.reserve(8);
 
@@ -982,11 +982,11 @@ fn pitch_toggle_mid_play_is_rust_side_alloc_free() {
 
 #[test]
 fn over_cap_play_steals_alloc_free() {
-    // Sprint 13 F2 (D18): a Play past the MAX_VOICES hard cap steals the oldest
+    // Sprint 13 F2 (D18): a Play past the default sound limit steals the oldest
     // non-looping voice — swap_remove + a graveyard push + a push into the freed
     // slot — with zero alloc/free on the RT thread (the displaced sample's heap
     // is dropped off-RT by the reaper).
-    use mqttaudio::audio::mixer::MAX_VOICES;
+    use mqttaudio::config::DEFAULT_MAX_SOUNDS as MAX_VOICES;
 
     let mut mixer = SceneBuilder::new(2).build();
     // Fill the pre-reserved pool to the cap, off the armed region.

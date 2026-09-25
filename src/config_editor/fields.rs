@@ -770,7 +770,7 @@ pub fn macro_param_spec(key: &str) -> Option<&'static SubFieldSpec> {
 /// Every config field the editor can set, in display order. The coverage test
 /// in tests/config_editor_test.rs asserts this stays complete as the config
 /// schema grows.
-pub static REGISTRY: [FieldSpec; 55] = [
+pub static REGISTRY: [FieldSpec; 57] = [
     // --- MQTT ---
     FieldSpec {
         section: Section::Mqtt,
@@ -907,6 +907,22 @@ pub static REGISTRY: [FieldSpec; 55] = [
         path: &["audio", "master_gain"],
         kind: FieldKind::Float { min: 0.0, max: 8.0 },
         help: "Linear gain applied to the summed bus before limiting. Default 1.0 (unity).",
+    },
+    FieldSpec {
+        section: Section::Audio,
+        label: "max_sounds",
+        path: &["audio", "max_sounds"],
+        kind: FieldKind::UInt { min: 1, max: 4096 },
+        help: "Most fully loaded sounds that play at once. At the limit a new play replaces the \
+               oldest sound that is not looping, or fails when every sound loops. Default 256.",
+    },
+    FieldSpec {
+        section: Section::Audio,
+        label: "max_streamed_sounds",
+        path: &["audio", "max_streamed_sounds"],
+        kind: FieldKind::UInt { min: 1, max: 1024 },
+        help: "Most windowed (streamed) sounds that play at once; each has its own decode \
+               thread. A windowed play over the limit fails. Default 64.",
     },
     // --- Cache ---
     FieldSpec {

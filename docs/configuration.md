@@ -114,7 +114,9 @@ that is not on this machine without TLS.
   "channel_aliases": {"front_left": 0, "front_right": 1, "center": 2, "lfe": 3},
   "channel_volumes": {"lfe": 1.5, "7": 0.8},
   "output_ceiling_db": -1.0,
-  "master_gain": 1.0
+  "master_gain": 1.0,
+  "max_sounds": 256,
+  "max_streamed_sounds": 64
 }
 ```
 
@@ -129,6 +131,8 @@ that is not on this machine without TLS.
 | `channel_volumes` | `{}` | Per-output calibration gain, `0.0`–`4.0` |
 | `output_ceiling_db` | `-1.0` | Output limiter ceiling in dBFS, `-60.0`–`0.0` |
 | `master_gain` | `1.0` | Gain on the whole mix before the limiter, `0.0`–`8.0` |
+| `max_sounds` | `256` | Most fully loaded sounds playing at once, `1`–`4096`. At the limit a new play replaces the oldest sound that is not looping (logged), or fails when every sound loops |
+| `max_streamed_sounds` | `64` | Most windowed (streamed) sounds playing at once, `1`–`1024`. Each has its own decode thread. A windowed play over the limit fails |
 
 **Channel aliases** let configs and commands say `"lfe"` instead of `3`: in play `channel_map`s,
 input routes, bass management and `channel_volumes`. An unknown name is an error. If the name you

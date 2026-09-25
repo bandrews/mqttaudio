@@ -108,6 +108,32 @@ pub struct AudioConfig {
     /// Linear gain applied to the whole bus before limiting (default 1.0 = unity).
     #[serde(default = "default_master_gain")]
     pub master_gain: f32,
+    /// Most fully loaded sounds that play at once. At the limit a new play
+    /// replaces the oldest one that is not looping, or fails when all loop.
+    #[serde(default = "default_max_sounds")]
+    pub max_sounds: usize,
+    /// Most windowed (streamed) sounds that play at once. A windowed play over
+    /// the limit fails.
+    #[serde(default = "default_max_streamed_sounds")]
+    pub max_streamed_sounds: usize,
+}
+
+/// Default for `audio.max_sounds`.
+pub const DEFAULT_MAX_SOUNDS: usize = 256;
+/// Default for `audio.max_streamed_sounds`.
+pub const DEFAULT_MAX_STREAMED_SOUNDS: usize = 64;
+/// Highest `audio.max_sounds` accepted.
+pub const MAX_SOUNDS_LIMIT: usize = 4096;
+/// Highest `audio.max_streamed_sounds` accepted: each windowed sound has its own
+/// decode thread.
+pub const MAX_STREAMED_SOUNDS_LIMIT: usize = 1024;
+
+fn default_max_sounds() -> usize {
+    DEFAULT_MAX_SOUNDS
+}
+
+fn default_max_streamed_sounds() -> usize {
+    DEFAULT_MAX_STREAMED_SOUNDS
 }
 
 /// A channel reference that can be either a numeric index or a string alias.
@@ -220,6 +246,8 @@ impl Default for AudioConfig {
             channel_names: HashMap::new(),
             output_ceiling_db: DEFAULT_OUTPUT_CEILING_DB,
             master_gain: DEFAULT_MASTER_GAIN,
+            max_sounds: DEFAULT_MAX_SOUNDS,
+            max_streamed_sounds: DEFAULT_MAX_STREAMED_SOUNDS,
         }
     }
 }
@@ -1173,6 +1201,18 @@ impl Config {
         if !master_gain.is_finite() || !(0.0..=8.0).contains(&master_gain) {
             errors.push("audio.master_gain must be a finite value between 0.0 and 8.0".to_string());
         }
+        if !(1..=MAX_SOUNDS_LIMIT).contains(&self.audio.max_sounds) {
+            errors.push(format!(
+                "audio.max_sounds must be between 1 and {}",
+                MAX_SOUNDS_LIMIT
+            ));
+        }
+        if !(1..=MAX_STREAMED_SOUNDS_LIMIT).contains(&self.audio.max_streamed_sounds) {
+            errors.push(format!(
+                "audio.max_streamed_sounds must be between 1 and {}",
+                MAX_STREAMED_SOUNDS_LIMIT
+            ));
+        }
 
         // Ducking target volumes must be finite and within [0.0, 1.0]
         for (i, rule) in self.ducking_rules.iter().enumerate() {
@@ -1902,6 +1942,39 @@ mod tests {
         config.audio.master_gain = 100.0;
         let errors = config.validate().unwrap_err();
         assert!(errors.iter().any(|e| e.contains("master_gain")));
+    }
+
+    #[test]
+    fn sound_limits_default_high_and_are_bounded() {
+        let mut config = Config::default();
+        config.mqtt.topic = Some("test".to_string());
+        assert_eq!(config.audio.max_sounds, 256);
+        assert_eq!(config.audio.max_streamed_sounds, 64);
+        assert!(config.validate().is_ok());
+
+        let parsed: Config = serde_json::from_str(
+            r#"{"mqtt": {"topic": "t"}, "audio": {"max_sounds": 1000, "max_streamed_sounds": 200}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.audio.max_sounds, 1000);
+        assert_eq!(parsed.audio.max_streamed_sounds, 200);
+        assert!(parsed.validate().is_ok());
+
+        config.audio.max_sounds = 0;
+        config.audio.max_streamed_sounds = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("audio.max_sounds")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("audio.max_streamed_sounds")));
+
+        config.audio.max_sounds = MAX_SOUNDS_LIMIT + 1;
+        config.audio.max_streamed_sounds = MAX_STREAMED_SOUNDS_LIMIT + 1;
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("audio.max_sounds")));
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("audio.max_streamed_sounds")));
     }
 
     #[test]

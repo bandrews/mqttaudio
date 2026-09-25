@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Configurable sound limits.** `audio.max_sounds` (default 256, up to 4096) caps fully loaded sounds
+  and `audio.max_streamed_sounds` (default 64, up to 1024) caps windowed ones; the mixer reserves exactly
+  that room, and one slot per configured input. Windowed sounds and live inputs had no cap before, so
+  going past their reserve (64 and 16) allocated on the audio thread. A windowed play over its limit,
+  or a full play when every sound at the limit loops, now fails with `500` instead of reporting success
+  while nothing played, and a play that replaces the oldest sound logs a warning naming it.
 - **`input_volume` and `input_mute` fade.** Both take an optional `fade_ms` (default 20, up to 60000;
   `0` is instant), so a microphone is muted, unmuted or turned up without a click. They changed the
   level instantly before.

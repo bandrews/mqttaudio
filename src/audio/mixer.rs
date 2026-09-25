@@ -1412,18 +1412,9 @@ impl PitchBundle {
     }
 }
 
-/// Pre-reserved capacity for the voice pool, so a Play never reallocates the
-/// `active_samples` Vec on the audio thread. Generous headroom over the documented
-/// "20+ simultaneous" target. (Exceeding it reallocates once — see docs/bugs.md.)
-pub const MAX_VOICES: usize = 256;
-
-/// Pre-reserved capacity for live inputs, so adding a microphone never reallocates
-/// `live_inputs` on the audio thread.
+/// Live-input capacity `MixerState::new` reserves. The daemon reserves exactly one
+/// slot per configured input instead.
 pub const MAX_LIVE_INPUTS: usize = 16;
-
-/// Pre-reserved capacity for windowed streamed sources, so adding one never
-/// reallocates `streamed_sources` on the audio thread.
-pub const MAX_STREAMED_SOURCES: usize = 64;
 
 /// Convert a level in dBFS to a linear amplitude (0 dBFS == 1.0).
 pub fn db_to_linear(db: f32) -> f32 {
@@ -1531,6 +1522,11 @@ pub struct MixerState {
     /// List of active windowed streamed sources (long, large, or live assets)
     pub streamed_sources: Vec<StreamedSource>,
 
+    /// Most samples `active_samples` holds (`audio.max_sounds`); at the limit a new
+    /// sample replaces the oldest non-looping one. The Vec is reserved to this size,
+    /// so admitting a sample never reallocates on the audio thread.
+    pub max_samples: usize,
+
     /// Number of output channels
     pub output_channels: usize,
 
@@ -1580,10 +1576,29 @@ impl MixerState {
     /// would otherwise flag it dead.
     #[allow(dead_code)]
     pub fn new(output_channels: usize) -> Self {
+        Self::with_limits(
+            output_channels,
+            crate::config::DEFAULT_MAX_SOUNDS,
+            crate::config::DEFAULT_MAX_STREAMED_SOUNDS,
+            MAX_LIVE_INPUTS,
+        )
+    }
+
+    /// Create a `MixerState` like [`MixerState::new`], reserving room for
+    /// `max_sounds` samples, `max_streamed_sounds` streamed sources and
+    /// `live_inputs` inputs so none of the lists reallocates on the audio thread.
+    /// The control thread never sends more streamed sources than it reserved.
+    pub fn with_limits(
+        output_channels: usize,
+        max_sounds: usize,
+        max_streamed_sounds: usize,
+        live_inputs: usize,
+    ) -> Self {
         Self {
-            active_samples: Vec::with_capacity(MAX_VOICES),
-            live_inputs: Vec::with_capacity(MAX_LIVE_INPUTS),
-            streamed_sources: Vec::with_capacity(MAX_STREAMED_SOURCES),
+            active_samples: Vec::with_capacity(max_sounds),
+            live_inputs: Vec::with_capacity(live_inputs),
+            streamed_sources: Vec::with_capacity(max_streamed_sounds),
+            max_samples: max_sounds,
             output_channels,
             ducking_applier: None,
             bass_management: None,

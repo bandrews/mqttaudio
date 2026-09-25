@@ -393,7 +393,7 @@ pub fn drain_commands(
     applied
 }
 
-/// Admit a new sample under the hard voice cap (D18). Below `MAX_VOICES` it is a
+/// Admit a new sample under the hard voice cap (D18). Below `max_samples` it is a
 /// plain push into the pre-reserved Vec (no realloc). At the cap, the OLDEST
 /// non-looping voice (lowest internal id) is stolen — moved to the graveyard for
 /// off-RT drop — to admit the new play; if every slot is looping, the NEW sample
@@ -406,7 +406,7 @@ fn add_sample_with_cap(
     sample: ActiveSample,
     graveyard: &mut GraveyardProducer,
 ) {
-    if state.active_samples.len() < crate::audio::mixer::MAX_VOICES {
+    if state.active_samples.len() < state.max_samples {
         state.active_samples.push(sample);
         return;
     }
@@ -612,10 +612,10 @@ mod tests {
 
     #[test]
     fn over_cap_play_steals_the_oldest_non_looping_voice() {
-        // D18: at the MAX_VOICES hard cap, a new play steals the OLDEST
+        // D18: at the sound limit, a new play steals the OLDEST
         // non-looping voice (lowest internal id), which leaves via the graveyard
         // for off-RT drop; the pool never grows.
-        use crate::audio::mixer::MAX_VOICES;
+        use crate::config::DEFAULT_MAX_SOUNDS as MAX_VOICES;
         let mut samples = Vec::with_capacity(MAX_VOICES);
         samples.push(looping_sample(0, "bed", "bed.wav")); // oldest, but looping
         for id in 1..MAX_VOICES as u64 {
@@ -660,7 +660,7 @@ mod tests {
     fn over_cap_play_is_rejected_when_every_voice_loops() {
         // D18: with every slot looping there is nothing to steal; the NEW play is
         // rejected to the graveyard and the pool is untouched.
-        use crate::audio::mixer::MAX_VOICES;
+        use crate::config::DEFAULT_MAX_SOUNDS as MAX_VOICES;
         let samples: Vec<ActiveSample> = (0..MAX_VOICES as u64)
             .map(|id| looping_sample(id, "bed", "bed.wav"))
             .collect();
@@ -685,6 +685,26 @@ mod tests {
             .pop()
             .expect("the rejected sample reaches the graveyard");
         assert_eq!(rejected.id, 9999);
+    }
+
+    #[test]
+    fn the_sound_limit_follows_the_configured_maximum() {
+        let mut state = MixerState::with_limits(2, 3, 2, 0);
+        assert!(state.active_samples.capacity() >= 3);
+        assert!(state.streamed_sources.capacity() >= 2);
+        state.active_samples = (1..=3).map(|id| sample(id, "v", None, "s.wav")).collect();
+
+        let (mut tx, mut rx) = command_channel(8);
+        tx.push(AudioCommand::AddSample(sample(9, "new", None, "new.wav")))
+            .ok()
+            .expect("push add");
+        let (mut returns, _ret_rx) = command_return_channel(8);
+        let (mut grave, mut grave_rx) = graveyard_channel(16);
+        drain_commands(&mut rx, &mut state, &mut returns, &mut grave, 48000, 16);
+
+        assert_eq!(state.active_samples.len(), 3, "the pool stays at the limit");
+        assert!(state.active_samples.iter().any(|s| s.id == 9));
+        assert_eq!(grave_rx.pop().expect("the oldest is replaced").id, 1);
     }
 
     fn state_with(samples: Vec<ActiveSample>) -> MixerState {

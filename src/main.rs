@@ -520,10 +520,6 @@ async fn main() {
     ));
 
     let mixer = MixerState {
-        active_samples: Vec::with_capacity(audio::mixer::MAX_VOICES),
-        live_inputs: Vec::with_capacity(audio::mixer::MAX_LIVE_INPUTS),
-        streamed_sources: Vec::with_capacity(audio::mixer::MAX_STREAMED_SOURCES),
-        output_channels,
         ducking_applier,
         bass_management,
         channel_gains: config.resolve_channel_gains(output_channels),
@@ -532,6 +528,12 @@ async fn main() {
         clip_count: clip_count.clone(),
         telemetry_enabled: telemetry_enabled.clone(),
         output_meters: output_meters.clone(),
+        ..MixerState::with_limits(
+            output_channels,
+            config.audio.max_sounds,
+            config.audio.max_streamed_sounds,
+            config.inputs.len(),
+        )
     };
 
     // Control->audio command ring, audio->reaper graveyard ring, and audio->reaper
@@ -540,10 +542,12 @@ async fn main() {
     // mutex (D15/D22a). Spent heap-owning mutation commands travel back over the
     // return ring so the callback never frees their heap.
     let (cmd_tx, cmd_rx) = rt_engine::command_channel(1024);
-    let (grave_tx, mut grave_rx) = rt_engine::graveyard_channel(1024);
-    // Bounded well above MAX_STREAMED_SOURCES so the callback can always hand a
-    // finished source off for off-RT drop.
-    let (streamed_grave_tx, mut streamed_grave_rx) = rt_engine::streamed_graveyard_channel(256);
+    // The graveyards hold twice the sound limits, so the callback can always hand
+    // every finished sound off for off-RT drop, even when all of them stop at once.
+    let (grave_tx, mut grave_rx) =
+        rt_engine::graveyard_channel((2 * config.audio.max_sounds).max(1024));
+    let (streamed_grave_tx, mut streamed_grave_rx) =
+        rt_engine::streamed_graveyard_channel((2 * config.audio.max_streamed_sounds).max(256));
     let (cmd_return_tx, mut cmd_return_rx) = rt_engine::command_return_channel(1024);
 
     // Initialize audio inputs from config.
@@ -1904,6 +1908,52 @@ async fn finish_streamed_play(
     );
 }
 
+/// Hold a prepared play to `audio.max_sounds` and `audio.max_streamed_sounds`.
+/// The control thread's `playing` map never counts fewer sounds than the audio
+/// thread holds (a sound enters it before it is sent and leaves after the audio
+/// thread returns it), so refusing here keeps the audio thread's pre-reserved
+/// lists from growing. At the full-sound limit the audio thread replaces the
+/// oldest non-looping sound, which is logged; when every sound loops, or at the
+/// windowed limit, the play is refused.
+fn admit_under_sound_limits(ctx: &CommandCtx<'_>, file: &str) -> Result<(), String> {
+    let limits = &ctx.config.audio;
+    if matches!(ctx.prepared, Some(PreparedPlayback::Stream(_))) {
+        let windowed = ctx.playing.values().filter(|s| s.windowed).count();
+        if windowed >= limits.max_streamed_sounds {
+            return Err(format!(
+                "{} windowed sounds are already playing (audio.max_streamed_sounds); play of {} \
+                 refused",
+                windowed, file
+            ));
+        }
+        return Ok(());
+    }
+    let full: Vec<&http::SampleStatus> = ctx.playing.values().filter(|s| !s.windowed).collect();
+    if full.len() < limits.max_sounds {
+        return Ok(());
+    }
+    match full
+        .iter()
+        .filter(|s| !s.loop_mode)
+        .min_by_key(|s| s.internal_id)
+    {
+        Some(oldest) => {
+            tracing::warn!(
+                "{} sounds are playing (audio.max_sounds); play of {} replaces the oldest, {}",
+                full.len(),
+                file,
+                oldest.file_path
+            );
+            Ok(())
+        }
+        None => Err(format!(
+            "All {} playing sounds loop (audio.max_sounds); play of {} refused",
+            full.len(),
+            file
+        )),
+    }
+}
+
 /// One open live input whose voice can trigger ducking: its capture level source,
 /// the capture channels its routes read, the mute state the audio thread applied,
 /// and its activity tracker.
@@ -2076,6 +2126,13 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         } => {
             // Stage clock for this play's latency event (Sprint 11, D50).
             let mut stages = PlayStages::begin();
+
+            if let Err(message) = admit_under_sound_limits(ctx, &file) {
+                tracing::warn!("{}", message);
+                ctx.fail(CommandErrorKind::Internal, message);
+                ctx.prepared.take();
+                return;
+            }
 
             let buffer_result = match ctx.prepared.take() {
                 Some(PreparedPlayback::Stream(handles)) => {
@@ -3436,6 +3493,58 @@ mod tests {
             "an over-threshold asset must auto-window"
         );
         assert!(fixture.mixer.active_samples.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_windowed_play_over_the_streamed_limit_fails() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.config.audio.max_streamed_sounds = 1;
+        assert!(fixture.run(play_stream(Some("bed"))).await.is_none());
+        fixture.drain();
+
+        let error = fixture
+            .run(play_stream(Some("rain")))
+            .await
+            .expect("a second windowed play is over the limit");
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::Internal);
+        assert!(
+            error.message.contains("max_streamed_sounds"),
+            "{}",
+            error.message
+        );
+        assert!(fixture.cmd_rx.pop().is_none(), "nothing reaches the mixer");
+        assert_eq!(fixture.playing.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_full_play_at_the_sound_limit_replaces_the_oldest_or_fails_when_all_loop() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.config.audio.max_sounds = 1;
+        let mut looping = play(Some("bed"), 1.0);
+        if let AudioCommand::Play { loop_mode, .. } = &mut looping {
+            *loop_mode = true;
+        }
+        assert!(fixture.run(looping).await.is_none());
+        fixture.drain();
+
+        let error = fixture
+            .run(play(Some("sfx"), 1.0))
+            .await
+            .expect("every sound at the limit loops");
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::Internal);
+        assert!(error.message.contains("max_sounds"), "{}", error.message);
+
+        let mut fixture = Fixture::new(vec![]);
+        fixture.config.audio.max_sounds = 1;
+        assert!(fixture.run(play(Some("first"), 1.0)).await.is_none());
+        fixture.drain();
+        let warnings = run_capturing_warnings(&mut fixture, play(Some("second"), 1.0)).await;
+        assert!(
+            warnings.iter().any(|w| w.contains("replaces")),
+            "got {warnings:?}"
+        );
     }
 
     #[tokio::test]
