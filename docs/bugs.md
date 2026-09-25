@@ -30,12 +30,9 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 
 ### Playback and commands
 
-- **Ignored commands report success.** `seek` and `speed` on a windowed sound, and a `play` dropped
-  because all 256 sounds loop, answer HTTP `200` without doing anything. Neither a play dropped at the
-  256 limit nor the sound it displaces is logged.
-- **The seek/speed gate for windowed voices is too broad.** `selector_targets_streamed_voice`
-  (`src/main.rs`) skips the whole command when the selector's `voice` has had a windowed sound since
-  the voice was last idle, including fully loaded sounds that could seek.
+- **A play dropped at the sound limit reports success.** A `play` dropped because all 256 sounds loop
+  answers HTTP `200` without doing anything. Neither a play dropped at the limit nor the sound it
+  displaces is logged.
 - **Pitch correction never engages on a cold play whose file is not kept in memory.** The stretcher
   needs the complete buffer that the upgrade pass swaps in once the decode is promoted into the memory
   cache. A file larger than the free budget, or one changed or invalidated during its decode, is never

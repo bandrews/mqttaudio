@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`seek` and `speed` report when they cannot apply.** A command whose selector matched only windowed
+  (streamed) sounds answered `200` and did nothing; it now fails with `409`. A selector naming a voice
+  in which a windowed sound had played skipped the whole command, including the voice's fully loaded
+  sounds; those now seek and change speed, and the windowed ones are skipped with a warning.
 - **Per-route `gain` in `channel_map` now applies to streamed plays.** A windowed play (`mode: "stream"`,
   or a file long or large enough for `auto` to window) resolved its routes but discarded each route's
   `gain`, so the mix ran at unity while a fully loaded play of the same command honoured it. The streamed

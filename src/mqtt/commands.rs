@@ -18,6 +18,9 @@ pub enum CommandErrorKind {
     Forbidden,
     /// Superseded by a later stopall/fadeall before it could take effect
     Cancelled,
+    /// The command cannot apply to its target in its current state (e.g. seeking
+    /// a windowed sound)
+    Unsupported,
     /// Something failed on our side
     Internal,
 }

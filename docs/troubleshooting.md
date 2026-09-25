@@ -38,8 +38,8 @@ An unreachable broker does not stop startup: the daemon logs `MQTT error: ...` a
    A `stop` sent while its sound is still loading arrives first and finds nothing; `stopall` and
    `fadeall` do cancel pending loads.
 4. **Was part of it ignored?** Parameters with misspelled names are ignored without a message.
-   A windowed (streamed) sound ignores some `play` options, with a warning, and `seek` and `speed`,
-   with a warning only when the command selects by `voice`; see
+   A windowed (streamed) sound ignores some `play` options, with a warning, and is skipped by `seek`
+   and `speed`, with a warning (the command fails when it matches only windowed sounds); see
    [Commands: Full and windowed plays](commands.md#full-and-windowed-plays).
 5. **Is the daemon overloaded?** `Command queue full; dropped MQTT command` means commands arrive
    faster than they are processed. `Too many concurrent loads; command rejected` means 32 plays

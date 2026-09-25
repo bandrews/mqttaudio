@@ -816,7 +816,6 @@ async fn main() {
     // snapshot the HTTP handlers read. `active_counts` drives ducking restore;
     // `playing` mirrors the live sample list for status (position excluded).
     let mut active_counts: HashMap<String, usize> = HashMap::new();
-    let mut streamed_voices: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut playing: HashMap<u64, http::SampleStatus> = HashMap::new();
     let status_snapshot = Arc::new(RwLock::new(http::StatusSnapshot {
         active_samples: 0,
@@ -1105,7 +1104,6 @@ async fn main() {
                             cmd_tx: &mut cmd_tx,
                             ducking_engine: &mut ducking_engine,
                             active_counts: &mut active_counts,
-                            streamed_voices: &mut streamed_voices,
                             playing: &mut playing,
                             snapshot: &status_snapshot,
                             ducking_snapshot: &ducking_snapshot,
@@ -1166,7 +1164,6 @@ async fn main() {
                     &mut cmd_tx,
                     ducking_engine.as_mut(),
                     &mut active_counts,
-                    &mut streamed_voices,
                     &mut playing,
                     &voice_manager,
                     &status_snapshot,
@@ -1439,8 +1436,7 @@ fn detect_available_memory() -> Option<u64> {
 /// (which drops a voice once its last entry is gone) and decrement its voice's active
 /// count; when that count reaches zero, restore the voice through the shared notify
 /// path (which, for a ducking primary, recomputes restore targets sent back to the
-/// audio thread). Returns whether the voice's count reached zero (it is now fully
-/// idle), so the caller can drop it from the streamed-voice set.
+/// audio thread).
 #[allow(clippy::too_many_arguments)]
 fn reconcile_finished_voice(
     voice: &str,
@@ -1451,7 +1447,7 @@ fn reconcile_finished_voice(
     playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
     voice_manager: &parking_lot::Mutex<voice::VoiceManager>,
     ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
-) -> bool {
+) {
     playing.remove(&id);
     voice_manager.lock().remove_sample(id);
     if let Some(count) = active_counts.get_mut(voice) {
@@ -1459,10 +1455,8 @@ fn reconcile_finished_voice(
         if *count == 0 {
             active_counts.remove(voice);
             notify_voice_activity(voice, false, ducking_engine, cmd_tx, ducking_snapshot);
-            return true;
         }
     }
-    false
 }
 
 /// Drain the sample and streamed-source graveyards and the command-return ring,
@@ -1478,7 +1472,6 @@ fn reap_finished_samples(
     cmd_tx: &mut rt_engine::CommandProducer,
     mut ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
     active_counts: &mut std::collections::HashMap<String, usize>,
-    streamed_voices: &mut std::collections::HashSet<String>,
     playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
     voice_manager: &parking_lot::Mutex<voice::VoiceManager>,
     snapshot: &std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
@@ -1498,7 +1491,7 @@ fn reap_finished_samples(
         let id = finished.id;
         // Dropping `finished` here is the off-RT free of the sample's buffers.
         drop(finished);
-        if reconcile_finished_voice(
+        reconcile_finished_voice(
             &voice,
             id,
             cmd_tx,
@@ -1507,9 +1500,7 @@ fn reap_finished_samples(
             playing,
             voice_manager,
             ducking_snapshot,
-        ) {
-            streamed_voices.remove(&voice);
-        }
+        );
         reaped += 1;
     }
 
@@ -1521,7 +1512,7 @@ fn reap_finished_samples(
         let voice = finished.voice_id.clone();
         let id = finished.id;
         drop(finished);
-        if reconcile_finished_voice(
+        reconcile_finished_voice(
             &voice,
             id,
             cmd_tx,
@@ -1530,9 +1521,7 @@ fn reap_finished_samples(
             playing,
             voice_manager,
             ducking_snapshot,
-        ) {
-            streamed_voices.remove(&voice);
-        }
+        );
         reaped += 1;
     }
 
@@ -1722,9 +1711,6 @@ struct CommandCtx<'a> {
     cmd_tx: &'a mut rt_engine::CommandProducer,
     ducking_engine: &'a mut Option<audio::ducking::DuckingEngine>,
     active_counts: &'a mut std::collections::HashMap<String, usize>,
-    /// Voices that currently have a windowed/streamed source, so the seek/speed gate
-    /// can warn that those commands do not apply to them.
-    streamed_voices: &'a mut std::collections::HashSet<String>,
     playing: &'a mut std::collections::HashMap<u64, http::SampleStatus>,
     snapshot: &'a std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
     ducking_snapshot: &'a std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
@@ -1910,7 +1896,6 @@ async fn finish_streamed_play(
     }
     *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
     ctx.playing.insert(status.internal_id, status);
-    ctx.streamed_voices.insert(voice_id.clone());
 
     // First-mix latency probe (Sprint 11, D50), mirroring the full-load path.
     let enqueued_at = std::time::Instant::now();
@@ -1925,21 +1910,6 @@ async fn finish_streamed_play(
         voice_id,
         ctx.playing.len()
     );
-}
-
-/// Whether a selector targets a voice that currently has a windowed/streamed source.
-/// Streamed voices are forward-only, so seek/speed/pitch do not apply. Best-effort:
-/// it matches on the selector's voice (the common case) and is used only to warn — a
-/// stray seek/speed would be a structural no-op on streamed sources anyway, since they
-/// live in a separate voice list the sample-targeted commands never touch.
-fn selector_targets_streamed_voice(
-    selector: &mqtt::commands::SampleSelector,
-    streamed_voices: &std::collections::HashSet<String>,
-) -> bool {
-    selector
-        .voice
-        .as_deref()
-        .is_some_and(|v| streamed_voices.contains(v))
 }
 
 /// Apply a single parsed command to the shared audio state.
@@ -1973,6 +1943,51 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             tracing::warn!("No sample matches the selector {:?}", selector);
             ctx.fail(CommandErrorKind::NotFound, "No sample matches the selector");
             return;
+        }
+        // A windowed sound plays forward at normal speed only: seek and speed
+        // apply to the fully loaded sounds the selector matches, and are refused
+        // when it matches only windowed ones.
+        if matches!(
+            cmd,
+            ParsedCommand::Seek { .. } | ParsedCommand::Speed { .. }
+        ) {
+            let action = if matches!(cmd, ParsedCommand::Seek { .. }) {
+                "Seek"
+            } else {
+                "Speed"
+            };
+            let (full, windowed) = ctx
+                .playing
+                .values()
+                .filter(|sample| sample_status_matches(selector, sample))
+                .fold((0, 0), |(full, windowed), sample| {
+                    if sample.windowed {
+                        (full, windowed + 1)
+                    } else {
+                        (full + 1, windowed)
+                    }
+                });
+            if full == 0 {
+                tracing::warn!(
+                    "{} does not apply to windowed (streamed) sounds; the selector {:?} matches \
+                     only windowed sounds",
+                    action,
+                    selector
+                );
+                ctx.fail(
+                    CommandErrorKind::Unsupported,
+                    format!("{action} does not apply to windowed (streamed) sounds"),
+                );
+                return;
+            }
+            if windowed > 0 {
+                tracing::warn!(
+                    "{} skips {} windowed (streamed) sound(s) matching {:?}",
+                    action,
+                    windowed,
+                    selector
+                );
+            }
         }
     }
 
@@ -2687,11 +2702,6 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         } => {
             if selector.is_empty() {
                 tracing::warn!("Seek command with empty selector - no samples targeted");
-            } else if selector_targets_streamed_voice(&selector, ctx.streamed_voices) {
-                tracing::warn!(
-                    "Seek is not supported for windowed/streamed voices; ignoring (a streamed \
-                     source plays forward only)"
-                );
             } else {
                 // The audio thread matches the selector against the live samples
                 // and converts ms to frames per sample's rate.
@@ -2719,11 +2729,6 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 ctx.fail(
                     CommandErrorKind::InvalidRequest,
                     "Negative speed is not supported with pitch correction",
-                );
-            } else if selector_targets_streamed_voice(&selector, ctx.streamed_voices) {
-                tracing::warn!(
-                    "Speed/pitch is not supported for windowed/streamed voices; ignoring (a \
-                     streamed source plays forward only)"
                 );
             } else {
                 let mode = if pitch_correction {
@@ -2925,7 +2930,6 @@ mod tests {
         mixer: MixerState,
         ducking_engine: Option<DuckingEngine>,
         active_counts: HashMap<String, usize>,
-        streamed_voices: std::collections::HashSet<String>,
         playing: HashMap<u64, http::SampleStatus>,
         snapshot: Arc<RwLock<http::StatusSnapshot>>,
         ducking_snapshot: Arc<RwLock<HashMap<String, f32>>>,
@@ -2979,7 +2983,6 @@ mod tests {
                 mixer,
                 ducking_engine,
                 active_counts: HashMap::new(),
-                streamed_voices: std::collections::HashSet::new(),
                 playing: HashMap::new(),
                 snapshot: Arc::new(RwLock::new(http::StatusSnapshot {
                     active_samples: 0,
@@ -3033,7 +3036,6 @@ mod tests {
                 cmd_tx: &mut self.cmd_tx,
                 ducking_engine: &mut self.ducking_engine,
                 active_counts: &mut self.active_counts,
-                streamed_voices: &mut self.streamed_voices,
                 playing: &mut self.playing,
                 snapshot: &self.snapshot,
                 ducking_snapshot: &self.ducking_snapshot,
@@ -3078,7 +3080,6 @@ mod tests {
                 &mut self.cmd_tx,
                 self.ducking_engine.as_mut(),
                 &mut self.active_counts,
-                &mut self.streamed_voices,
                 &mut self.playing,
                 &self.voice_manager,
                 &self.snapshot,
@@ -3215,7 +3216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_play_emits_add_streamed_source_and_tracks_the_voice() {
+    async fn stream_play_emits_add_streamed_source_marked_windowed() {
         let mut fixture = Fixture::new(vec![]);
         fixture.run(play_stream(Some("bed"))).await;
         fixture.drain();
@@ -3224,8 +3225,7 @@ mod tests {
         assert_eq!(fixture.mixer.streamed_sources.len(), 1);
         assert!(fixture.mixer.active_samples.is_empty());
         assert_eq!(fixture.mixer.streamed_sources[0].voice_id, "bed");
-        // The voice is tracked so the seek/speed gate can warn for it.
-        assert!(fixture.streamed_voices.contains("bed"));
+        assert!(fixture.playing.values().any(|status| status.windowed));
     }
 
     #[tokio::test]
@@ -3257,30 +3257,91 @@ mod tests {
         assert_eq!(source.channel_route_gain(1), 1.0);
     }
 
+    fn speed_voice(voice: &str, speed: f32) -> AudioCommand {
+        AudioCommand::Speed {
+            selector: mqtt::commands::SampleSelector {
+                internal_id: None,
+                id: None,
+                file: None,
+                voice: Some(voice.to_string()),
+            },
+            speed,
+            pitch_correction: false,
+        }
+    }
+
     #[tokio::test]
-    async fn seek_on_a_streamed_voice_is_gated_and_pushes_nothing() {
+    async fn seek_and_speed_on_only_windowed_sounds_are_refused() {
+        // A windowed sound plays forward at normal speed only, so a command whose
+        // sounds are all windowed is refused rather than reported as done.
         let mut fixture = Fixture::new(vec![]);
         fixture.run(play_stream(Some("bed"))).await;
         fixture.drain(); // consume the AddStreamedSource; the ring is now empty
 
-        // A seek targeting the streamed voice is skipped (the gate warns instead of
-        // pushing a SeekMatching that would be a no-op on a forward-only ring).
-        fixture.run(seek_voice("bed", 1000)).await;
+        let error = fixture.run(seek_voice("bed", 1000)).await.unwrap();
+        assert_eq!(
+            error.kind,
+            mqtt::commands::CommandErrorKind::Unsupported,
+            "{}",
+            error.message
+        );
+        let error = fixture.run(speed_voice("bed", 0.5)).await.unwrap();
+        assert_eq!(
+            error.kind,
+            mqtt::commands::CommandErrorKind::Unsupported,
+            "{}",
+            error.message
+        );
         assert!(
             fixture.cmd_rx.pop().is_none(),
-            "seek on a streamed voice must push no command"
+            "a refused command must push nothing"
         );
+    }
 
-        // A seek on a playing normal voice still pushes (positive control).
-        fixture.run(play(Some("other"), 1.0)).await;
+    #[tokio::test]
+    async fn seek_by_id_on_a_windowed_sound_is_refused() {
+        let mut fixture = Fixture::new(vec![]);
+        let mut windowed = play_stream(Some("bed"));
+        if let AudioCommand::Play { id, .. } = &mut windowed {
+            *id = Some("rain".to_string());
+        }
+        fixture.run(windowed).await;
         fixture.drain();
-        fixture.run(seek_voice("other", 1000)).await;
+        let seek = AudioCommand::Seek {
+            selector: mqtt::commands::SampleSelector {
+                internal_id: None,
+                id: Some("rain".to_string()),
+                file: None,
+                voice: None,
+            },
+            position_ms: 1000,
+        };
+        let error = fixture.run(seek).await.unwrap();
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn seek_and_speed_reach_the_full_sounds_of_a_voice_that_also_has_windowed_ones() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_stream(Some("bed"))).await;
+        fixture.run(play(Some("bed"), 1.0)).await;
+        fixture.drain();
+
+        assert!(fixture.run(seek_voice("bed", 1000)).await.is_none());
         assert!(
             matches!(
                 fixture.cmd_rx.pop(),
                 Some(rt_engine::AudioCommand::SeekMatching { .. })
             ),
-            "seek on a normal voice must still push SeekMatching"
+            "the fully loaded sound must be seeked"
+        );
+        assert!(fixture.run(speed_voice("bed", 0.5)).await.is_none());
+        assert!(
+            matches!(
+                fixture.cmd_rx.pop(),
+                Some(rt_engine::AudioCommand::SetSpeedWithCorrector { .. })
+            ),
+            "the fully loaded sound must change speed"
         );
     }
 
@@ -3299,7 +3360,6 @@ mod tests {
             "an over-threshold asset must auto-window"
         );
         assert!(fixture.mixer.active_samples.is_empty());
-        assert!(fixture.streamed_voices.contains("bed"));
     }
 
     #[tokio::test]

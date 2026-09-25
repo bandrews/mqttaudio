@@ -104,7 +104,7 @@ queued to start) and reports the outcome:
 | `400` | The command is malformed: bad JSON, unknown command, a missing or invalid parameter, no selector, an unknown channel name, `speed: 0` |
 | `403` | Not allowed: a path outside `security.allowed_directories`, a talkback request that is refused or has a value out of range, unmuting an input held by talkback |
 | `404` | Nothing to act on: a file that is missing or cannot be decoded, a URL that fails, a selector that matches no sound, an empty voice, an input that did not open, no open talkback microphone |
-| `409` | A pending play or cache command was cancelled by `stopall` or `fadeall` |
+| `409` | A pending play or cache command was cancelled by `stopall` or `fadeall`, or a `seek` or `speed` matched only windowed sounds |
 | `500` | The daemon is overloaded (32 loads already in flight, or its audio queue is full) or failed internally |
 | `504` | No result within 30 seconds of being queued. The daemon then drops the command: a play whose load finishes later never starts, though `precache` and the cache commands still take effect |
 

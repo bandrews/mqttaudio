@@ -808,6 +808,39 @@ async fn test_seek_endpoint() {
 }
 
 #[tokio::test]
+async fn a_seek_the_target_cannot_take_answers_conflict() {
+    // The control loop refuses seek/speed on windowed sounds; HTTP reports it as 409.
+    let (mut state, _rx) = create_test_state();
+    let (cmd_tx, mut request_rx) = mpsc::channel::<CommandRequest>(10);
+    tokio::spawn(async move {
+        while let Some(request) = request_rx.recv().await {
+            if let Some(reply) = request.reply {
+                let _ = reply.send(Err(mqttaudio::mqtt::commands::CommandError::new(
+                    mqttaudio::mqtt::commands::CommandErrorKind::Unsupported,
+                    "Seek does not apply to windowed (streamed) sounds",
+                )));
+            }
+        }
+    });
+    state.cmd_tx = cmd_tx;
+    let app = create_router(state, false, false);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/seek")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"voice": "bed", "position_ms": 5000}"#))
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["success"], false);
+    assert!(json["error"].as_str().unwrap().contains("windowed"));
+}
+
+#[tokio::test]
 async fn test_speed_endpoint() {
     let (state, mut rx) = create_test_state();
     let app = create_router(state, false, false);

@@ -114,7 +114,7 @@ small however long the file is, but it:
 - always starts at the beginning (`start_position_ms` is ignored, with a warning);
 - loops a local file without a crossfade (`crossfade_ms` is ignored, with a warning), and plays a URL
   only once (`loop` is ignored, with a warning);
-- ignores `seek` and `speed`.
+- cannot `seek` or change `speed`.
 
 `"auto"`, or leaving `mode` out, uses `cache.load_mode` (default `auto`). In `auto` a file plays in
 full unless it is larger than `cache.full_load_max_bytes` decoded, longer than
@@ -207,9 +207,8 @@ own volume; `voice_volume` sets a separate voice level, and the two multiply.
 | `internal_id`, `id`, `file`, `voice` | string | | [Selector](#sounds-and-voices) |
 | `position_ms` | integer | *required* | New position, clamped to the end of the file |
 
-Applies to full plays only. Windowed sounds ignore it. When the selector names a `voice` in which a
-windowed sound has played since the voice was last silent, the whole command is ignored with a
-warning.
+Applies to the full plays the selector matches; windowed sounds it also matches are skipped, with a
+warning. When it matches only windowed sounds, the command fails (HTTP `409`).
 
 ### speed
 
@@ -232,7 +231,7 @@ warning.
 - A sound still being decoded for its first play changes speed at once without pitch correction, and a
   warning says correction is deferred. Correction starts once the decoded file is kept in the memory
   cache, and never if it is not kept; see [Caching](features/caching.md#full-and-windowed-plays).
-- Applies to full plays only, with the same windowed-voice rule as `seek`.
+- Applies to full plays only, with the same rule for windowed sounds as `seek`.
 
 ## Voices
 

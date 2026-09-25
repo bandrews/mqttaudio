@@ -29,8 +29,9 @@ are the things most likely to silently break a UI.
   or an error status with `{"success":false,"error":"…"}`: `400` malformed/invalid, `403` forbidden (path
   outside `allowed_directories`, a refused or out-of-range talkback request, unmuting a talkback-held
   input), `404` nothing to act on (missing/undecodable file, failed URL, unmatched selector, empty voice,
-  unavailable input, no open talkback microphone), `409` cancelled by a later `stopall`/`fadeall`, `500`
-  overloaded (32 loads in flight, full audio queue) or internal, `504` no result within 30 s of queuing.
+  unavailable input, no open talkback microphone), `409` cancelled by a later `stopall`/`fadeall` or a
+  `seek`/`speed` matching only windowed sounds, `500` overloaded (32 loads in flight, full audio queue) or
+  internal, `504` no result within 30 s of queuing.
   After a `504` the daemon drops the command: a play whose load finishes later never starts (cache
   commands still take effect).
 - **A non-JSON `/command` body returns 400 with the same JSON shape** (D61). The typed endpoints instead
@@ -50,7 +51,7 @@ parser/handler defaults.
 | `stopall` (`soundStopAll`) | — | — | Stops everything (10 ms fade); cancels loads in flight. |
 | `fadeall` (`soundFadeAll`,`fadeout`,`soundFadeOut`) | — | `time`(1000; alias `fade_out_ms`) | Fades everything out; cancels loads in flight. |
 | `volume` | `volume` + a selector | `internal_id`,`id`,`file`,`voice` | Clamped `0..4`; applies to full and windowed plays. |
-| `seek` | `position_ms` + a selector | `internal_id`,`id`,`file`,`voice` | Full plays only; windowed plays ignore it (still `200`). |
+| `seek` | `position_ms` + a selector | `internal_id`,`id`,`file`,`voice` | Full plays only: matched windowed sounds are skipped, and `409` when only windowed sounds match. |
 | `speed` | `speed` + a selector | `internal_id`,`id`,`file`,`voice`, `pitch_correction`(false) | No pitch → −100..100 (negative = reverse, `|speed|<0.01` → ±0.01); with pitch → 0.05..8.0, negative → `400`. Every speed command sets pitch correction on or off. Full plays only. |
 | `voice_volume` | `voice`, `volume` | — | Clamped `0..4`; also reaches a live input with that `voice_id`. `404` if neither exists. |
 | `voice_fade_out` | `voice`, **`time`** | — | **Wire key is `time` (ms).** Typed REST body uses `time_ms` (§5). |
@@ -79,8 +80,8 @@ specified criterion matches.
 - `voice`: exact `voice_id` — targets *all* samples in the voice.
 - **Empty selector (all four absent) is a `400`**, and a selector that matches no playing sample is a `404`
   (`handle_command`'s pre-check). The UI should still warn before sending.
-- `seek`/`speed` selecting by `voice` are skipped entirely (still `200`) when a windowed sound has played in
-  that voice since it was last idle.
+- `seek`/`speed` apply to the matched full plays and skip matched windowed sounds; a selector matching only
+  windowed sounds is a `409`.
 
 ## 4. `channel_map` (play only)
 

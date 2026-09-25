@@ -109,6 +109,5 @@ at all); the `play` options it cannot honor are logged as warnings. `"mode": "fu
 asks for a full load when the file fits in memory. `GET /status/samples` shows `"windowed": true` for
 windowed sounds.
 
-When a `seek` or `speed` selects by `voice`, and a windowed sound has played in that voice since the
-voice was last silent, the whole command is ignored, including for the voice's fully loaded sounds.
-Select those by `id` instead.
+A `seek` or `speed` applies to the fully loaded sounds it matches and skips windowed ones with a
+warning; when it matches only windowed sounds it fails (HTTP `409`).

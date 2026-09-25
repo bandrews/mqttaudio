@@ -40,7 +40,7 @@ fn status_for(kind: CommandErrorKind) -> StatusCode {
         CommandErrorKind::InvalidRequest => StatusCode::BAD_REQUEST,
         CommandErrorKind::NotFound => StatusCode::NOT_FOUND,
         CommandErrorKind::Forbidden => StatusCode::FORBIDDEN,
-        CommandErrorKind::Cancelled => StatusCode::CONFLICT,
+        CommandErrorKind::Cancelled | CommandErrorKind::Unsupported => StatusCode::CONFLICT,
         CommandErrorKind::Internal => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
