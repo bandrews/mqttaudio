@@ -29,7 +29,7 @@ export function useCommandRunner() {
       const res = await fn(client);
       setState({
         status: res.success ? 'ok' : 'error',
-        message: res.error ?? res.message ?? (res.success ? 'Command accepted (enqueued).' : 'Failed.'),
+        message: res.error ?? res.message ?? (res.success ? 'Command completed.' : 'Failed.'),
       });
     } catch (err) {
       setState({ status: 'error', message: err instanceof Error ? err.message : String(err) });

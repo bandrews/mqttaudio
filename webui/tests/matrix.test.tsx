@@ -61,7 +61,7 @@ function statusClient() {
         xruns: 0,
         cache: { memory: { entries: 0, size_bytes: 0 }, disk: { entries: 0, size_bytes: 0 } },
       }) as Awaited<ReturnType<DaemonClient['status']>>,
-    rawCommand: vi.fn().mockResolvedValue({ success: true, message: 'ok' }),
+    rawCommand: vi.fn().mockResolvedValue({ success: true, message: 'Command completed' }),
   } as Partial<DaemonClient>);
 }
 
@@ -92,6 +92,7 @@ describe('MatrixMixer (F1-F5)', () => {
       { src: 0, dest: 0 },
       { src: 1, dest: 0 },
     ]);
+    expect(await screen.findByText('Command completed')).toBeInTheDocument();
   });
 
   it('disables Play with no routes selected', async () => {

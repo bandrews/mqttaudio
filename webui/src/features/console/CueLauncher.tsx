@@ -136,7 +136,7 @@ export function CueLauncher() {
           <Button variant="contained" disabled={!file.trim() || state.status === 'sending'} onClick={() => run((c) => c.rawCommand({ command: 'play', message: params }))}>
             Play
           </Button>
-          {state.status === 'ok' && <Alert severity="success" sx={{ py: 0 }}>Accepted (enqueued — confirm on the dashboard).</Alert>}
+          {state.status === 'ok' && <Alert severity="success" sx={{ py: 0 }}>{state.message}</Alert>}
           {state.status === 'error' && <Alert severity="error" sx={{ py: 0 }}>{state.message}</Alert>}
         </Stack>
       </Stack>

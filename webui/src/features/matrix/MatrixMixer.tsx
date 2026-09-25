@@ -142,7 +142,7 @@ export function MatrixMixer() {
             Play routed
           </Button>
           {channelMap.length === 0 && <Typography variant="caption" color="text.secondary">Select at least one route.</Typography>}
-          {state.status === 'ok' && <Alert severity="success" sx={{ py: 0 }}>Accepted (enqueued).</Alert>}
+          {state.status === 'ok' && <Alert severity="success" sx={{ py: 0 }}>{state.message}</Alert>}
           {state.status === 'error' && <Alert severity="error" sx={{ py: 0 }}>{state.message}</Alert>}
         </Stack>
       </Stack>

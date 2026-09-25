@@ -72,7 +72,7 @@ export function RawCommandEditor() {
           Send
         </Button>
         {jsonError && <Alert severity="error" sx={{ py: 0 }} aria-label="json error">{jsonError}</Alert>}
-        {state.status === 'ok' && <Alert severity="success" sx={{ py: 0 }}>Accepted (enqueued).</Alert>}
+        {state.status === 'ok' && <Alert severity="success" sx={{ py: 0 }}>{state.message}</Alert>}
         {state.status === 'error' && !jsonError && <Alert severity="error" sx={{ py: 0 }}>{state.message}</Alert>}
       </Stack>
     </Paper>

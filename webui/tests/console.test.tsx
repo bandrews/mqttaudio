@@ -18,7 +18,7 @@ function spyClient() {
     'inputVolume', 'inputMute', 'precache', 'cacheInvalidate', 'cacheReload', 'cacheClear', 'stopAll',
   ] as const;
   const client: Record<string, ReturnType<typeof vi.fn>> = {};
-  for (const m of methods) client[m] = vi.fn().mockResolvedValue({ success: true, message: 'Command accepted' });
+  for (const m of methods) client[m] = vi.fn().mockResolvedValue({ success: true, message: 'Command completed' });
   return client as unknown as DaemonClient & Record<string, ReturnType<typeof vi.fn>>;
 }
 
@@ -64,6 +64,7 @@ describe('CueLauncher (F4)', () => {
       command: 'play',
       message: { file: '/s.wav', volume: 0.4 },
     });
+    expect(await screen.findByText('Command completed')).toBeInTheDocument();
   });
 });
 
@@ -81,6 +82,7 @@ describe('RawCommandEditor (F3)', () => {
     };
     expect(sent.command).toBe('play');
     expect(sent.message.channel_map).toBeDefined();
+    expect(await screen.findByText('Command completed')).toBeInTheDocument();
 
     // Replace with invalid JSON -> error, no second send.
     fireEvent.change(screen.getByLabelText('raw command JSON'), { target: { value: '{ not json' } });
@@ -103,6 +105,16 @@ describe('Command forms', () => {
     await user.type(screen.getByLabelText('voice'), 'music');
     await user.click(screen.getByRole('button', { name: 'Fade out' }));
     expect(client.voiceFadeOut).toHaveBeenCalledWith({ voice: 'music', time_ms: 2000 });
+  });
+
+  it('reports a completed command when the daemon sends no message', async () => {
+    const user = userEvent.setup();
+    const client = spyClient();
+    (client.voiceStop as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({ success: true });
+    renderWithClient(<VoiceControl />, client);
+    await user.type(screen.getByLabelText('voice'), 'music');
+    await user.click(screen.getByRole('button', { name: 'Stop' }));
+    expect(await screen.findByText('Command completed.')).toBeInTheDocument();
   });
 
   it('stop sends the selector once a criterion is set', async () => {
