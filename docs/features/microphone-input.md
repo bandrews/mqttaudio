@@ -173,31 +173,55 @@ logged as `Input '...' capture counters moved: ...` and counted in `/metrics` un
 ## Talkback
 
 Talkback gives one client at a time a short, renewable lease on a microphone, for a push-to-talk
-button in a control panel. The daemon, not the client, mutes the microphone again when the lease is
+button in a control panel. The daemon, not the client, closes the microphone again when the lease is
 released, expires or is hard-muted, so a crashed panel cannot leave a microphone open.
 
+Name the microphone and the destinations a lease may choose in the
+[`talkback`](../configuration.md#talkback) section. Each destination lists output channels, and the
+microphone needs a route to every one of them:
+
 ```json
-{"command": "talkback_acquire", "client_id": "panel-1", "destination": "GUEST_ALL", "gain": 0.0, "lease_ms": 1000}
+"inputs": [
+  {
+    "voice_id": "gm_mic",
+    "routes": [
+      {"source_channel": 0, "dest_channel": 4},
+      {"source_channel": 0, "dest_channel": 5},
+      {"source_channel": 0, "dest_channel": 6},
+      {"source_channel": 0, "dest_channel": 7}
+    ]
+  }
+],
+"talkback": {
+  "input": "gm_mic",
+  "destinations": [
+    {"name": "GUEST_ALL", "channels": [4, 5, 6, 7]},
+    {"name": "ROOM_1", "channels": [4, 5]}
+  ]
+}
 ```
 
-The panel repeats the acquire before `lease_ms` runs out for as long as the button is held, then
-releases with the `lease_id` it reads from `GET /status/talkback`. Another client is refused until
-then. Parameters are in [Commands](../commands.md#talkback).
+A panel then holds the button with:
 
-The talkback microphone is the input whose `voice_id` is `GM_MIC`, or else the one whose `voice_id` is
-`mic` (the default voice id of any input).
+```json
+{"command": "talkback_acquire", "client_id": "panel-1", "destination": "ROOM_1", "gain": 0.0, "lease_ms": 1000}
+```
 
-Current limitations:
+It repeats the acquire before `lease_ms` runs out for as long as the button is held, which renews the
+lease and may change its destination and gain, then sends `talkback_release` with its `client_id`.
+Another client is refused until the lease ends. Parameters are in
+[Commands](../commands.md#talkback).
 
-- **The microphone is not muted at startup.** It is live from the moment it opens until the first
-  lease ends, although `/status/talkback` reports `muted`. Send `input_mute` for it at startup to
-  close it.
-- **`destination` and `gain` are checked but not applied.** The microphone plays through its
-  configured routes at its configured volume. The allowed destinations are a fixed list.
-- **Only a lease blocks ordinary commands, and only partly.** Without an active lease, `input_mute`
-  can unmute the microphone. With one, only `input_mute` naming it by `voice_id` is refused; selecting
-  it by position, or raising it with `input_volume`, still unmutes it.
-- The acquire reply does not include the `lease_id`; read it from `GET /status/talkback`.
+How the microphone behaves:
+
+- It is muted from startup and opens only during a lease, with the 20 ms default fade. `input_mute`
+  and `input_volume` cannot open it without a lease (HTTP `403`); muting it is always allowed.
+- During a lease it plays only on the routes to the destination's channels, at the lease's `gain`
+  on top of the input's `volume`.
+- When the lease ends, the daemon queues the mute at once. If the audio command queue is full, it
+  tries again every 20 ms, and `/status/talkback` reports `applied_live: true` until the mute is
+  queued.
+- A muted input never triggers ducking, so the microphone ducks other voices only during a lease.
 
 ## Troubleshooting
 

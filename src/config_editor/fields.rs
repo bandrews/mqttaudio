@@ -314,12 +314,13 @@ pub enum Section {
     Ducking,
     BassManagement,
     Inputs,
+    Talkback,
     Advanced,
     Macros,
 }
 
 impl Section {
-    pub const ALL: [Section; 11] = [
+    pub const ALL: [Section; 12] = [
         Section::Mqtt,
         Section::Audio,
         Section::Cache,
@@ -329,6 +330,7 @@ impl Section {
         Section::Ducking,
         Section::BassManagement,
         Section::Inputs,
+        Section::Talkback,
         Section::Advanced,
         Section::Macros,
     ];
@@ -344,6 +346,7 @@ impl Section {
             Section::Ducking => "Ducking Rules",
             Section::BassManagement => "Bass Management",
             Section::Inputs => "Inputs",
+            Section::Talkback => "Talkback",
             Section::Advanced => "Advanced",
             Section::Macros => "Macros",
         }
@@ -395,6 +398,11 @@ impl Section {
                 "Live inputs (microphones, line-in) mixed into the output in real time, \
                  with channel routing and a voice name so ducking rules can react to \
                  them. The device picker shows a live level meter."
+            }
+            Section::Talkback => {
+                "Talkback lets one control panel at a time open a microphone for a short, \
+                 renewable lease (push to talk). Name the input it opens and the \
+                 destinations a lease may choose; the microphone stays muted outside a lease."
             }
             Section::Advanced => {
                 "Settings that rarely need changing: resampling quality and the config \
@@ -551,6 +559,57 @@ fn summarize_route(value: &Value) -> String {
 fn route_skeleton() -> Value {
     serde_json::json!({ "source_channel": 0, "dest_channel": 0 })
 }
+
+/// Fields of one talkback destination.
+pub static TALKBACK_DESTINATION_FIELDS: [SubFieldSpec; 2] = [
+    SubFieldSpec {
+        key: "name",
+        label: "name",
+        kind: FieldKind::Text,
+        help: "The name a talkback_acquire command gives as its destination, such as ROOM_1.",
+    },
+    SubFieldSpec {
+        key: "channels",
+        label: "channels",
+        kind: FieldKind::ChannelRefList,
+        help: "The output channels the microphone plays on during a lease to this \
+               destination (numbers or aliases). Each must be one the talkback input routes \
+               to in its inputs entry.",
+    },
+];
+
+/// One-line summary of a talkback destination for the list view.
+fn summarize_talkback_destination(value: &Value) -> String {
+    let name = value.get("name").and_then(Value::as_str).unwrap_or("?");
+    let channels = value
+        .get("channels")
+        .and_then(Value::as_array)
+        .map(|channels| {
+            channels
+                .iter()
+                .map(|channel| match channel {
+                    Value::String(alias) => alias.clone(),
+                    other => other.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    format!("{} → {}", name, channels)
+}
+
+fn talkback_destination_skeleton() -> Value {
+    serde_json::json!({ "name": "ROOM_1", "channels": [0] })
+}
+
+/// Talkback-destination list metadata.
+pub static TALKBACK_DESTINATION_META: StructListMeta = StructListMeta {
+    specs: &TALKBACK_DESTINATION_FIELDS,
+    item_noun: "destination",
+    summarize: summarize_talkback_destination,
+    skeleton: talkback_destination_skeleton,
+    item_defaults: no_item_defaults,
+};
 
 /// Input-route list metadata.
 pub static INPUT_ROUTE_META: StructListMeta = StructListMeta {
@@ -770,7 +829,7 @@ pub fn macro_param_spec(key: &str) -> Option<&'static SubFieldSpec> {
 /// Every config field the editor can set, in display order. The coverage test
 /// in tests/config_editor_test.rs asserts this stays complete as the config
 /// schema grows.
-pub static REGISTRY: [FieldSpec; 57] = [
+pub static REGISTRY: [FieldSpec; 59] = [
     // --- MQTT ---
     FieldSpec {
         section: Section::Mqtt,
@@ -1189,6 +1248,21 @@ pub static REGISTRY: [FieldSpec; 57] = [
         path: &["inputs"],
         kind: FieldKind::StructList(&INPUT_META),
         help: "Live inputs (microphone, line-in) mixed into the output in real time. Each input picks a capture device, routes its channels to output channels, and plays under a voice name that ducking rules can react to.",
+    },
+    // --- Talkback ---
+    FieldSpec {
+        section: Section::Talkback,
+        label: "input",
+        path: &["talkback", "input"],
+        kind: FieldKind::OptionalText,
+        help: "The talkback microphone: an input's voice_id, or its position in inputs (\"0\" is the first). It starts muted and opens only during a talkback lease. Unset = talkback off.",
+    },
+    FieldSpec {
+        section: Section::Talkback,
+        label: "destinations",
+        path: &["talkback", "destinations"],
+        kind: FieldKind::StructList(&TALKBACK_DESTINATION_META),
+        help: "The destinations a talkback lease may choose, each with the output channels the microphone plays on during the lease.",
     },
     // --- Advanced ---
     FieldSpec {

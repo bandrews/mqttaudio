@@ -423,6 +423,10 @@ fn registry_covers_every_config_field() {
               "channels": 2, "sample_rate": 48000, "activity_threshold": 0.05, "activity_hold_ms": 500,
               "routes": [ { "source_channel": 0, "dest_channel": "lfe" } ] }
         ],
+        "talkback": {
+            "input": "mic",
+            "destinations": [ { "name": "ROOM_1", "channels": [0, "lfe"] } ]
+        },
         "macros": { "boom": { "volume": 1.0 } }
     });
     // Sanity check: the populated fixture must itself deserialize, so the test

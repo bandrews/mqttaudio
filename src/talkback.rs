@@ -19,7 +19,6 @@ struct Lease {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseError {
     InvalidClient,
-    InvalidSource,
     InvalidDestination,
     InvalidDuration,
     InvalidGain,
@@ -32,8 +31,9 @@ impl std::fmt::Display for LeaseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidClient => write!(f, "client_id is required"),
-            Self::InvalidSource => write!(f, "source_id must be GM_MIC"),
-            Self::InvalidDestination => write!(f, "destination is not allowlisted"),
+            Self::InvalidDestination => {
+                write!(f, "destination is not one of talkback.destinations")
+            }
             Self::InvalidDuration => write!(f, "lease_ms must be between 250 and 2000"),
             Self::InvalidGain => write!(f, "gain must be between -60 and 12 dB"),
             Self::AlreadyOwned { owner_client_id } => {
@@ -82,13 +82,48 @@ pub enum LeaseTransition {
 
 #[derive(Default)]
 pub struct TalkbackLease {
+    /// Destination names a lease may choose (`talkback.destinations`)
+    destinations: Vec<String>,
     active: Option<Lease>,
+    /// Whether the microphone is open: from the queued unmute of an acquire until
+    /// the queued mute after the lease ends. It outlives the lease while that mute
+    /// waits for room in the audio command queue.
+    input_open: bool,
     counter: u64,
     last_transition: Option<String>,
     last_error: Option<String>,
 }
 
 impl TalkbackLease {
+    /// A lease state machine accepting these destination names.
+    pub fn new(destinations: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            destinations: destinations.into_iter().collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Whether a lease is held.
+    pub fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    /// The microphone's unmute has been queued.
+    pub fn input_opened(&mut self) {
+        self.input_open = true;
+    }
+
+    /// The microphone's mute has been queued.
+    pub fn input_closed(&mut self) {
+        self.input_open = false;
+    }
+
+    /// Whether the microphone is open without a lease, so its mute still has to be
+    /// queued.
+    pub fn needs_close(&self) -> bool {
+        self.input_open && self.active.is_none()
+    }
+
     pub fn acquire(
         &mut self,
         client_id: &str,
@@ -101,10 +136,7 @@ impl TalkbackLease {
         if client_id.trim().is_empty() {
             return Err(self.fail(LeaseError::InvalidClient));
         }
-        if source_id != "GM_MIC" {
-            return Err(self.fail(LeaseError::InvalidSource));
-        }
-        if !allowed_destination(destination) {
+        if !self.destinations.iter().any(|name| name == destination) {
             return Err(self.fail(LeaseError::InvalidDestination));
         }
         if !(MIN_LEASE_MS..=MAX_LEASE_MS).contains(&lease_ms) {
@@ -158,16 +190,18 @@ impl TalkbackLease {
         ))
     }
 
+    /// End the lease held by `client_id`. A `lease_id`, when given, must be the
+    /// current lease's, so a stale release cannot end a newer lease.
     pub fn release(
         &mut self,
         client_id: &str,
-        lease_id: &str,
+        lease_id: Option<&str>,
         now_ms: u64,
     ) -> Result<(LeaseTransition, TalkbackStatus), LeaseError> {
         let Some(active) = &self.active else {
             return Err(self.fail(LeaseError::LeaseNotFound));
         };
-        if active.owner_client_id != client_id || active.id != lease_id {
+        if active.owner_client_id != client_id || lease_id.is_some_and(|id| id != active.id) {
             return Err(self.fail(LeaseError::NotOwner));
         }
         let id = active.id.clone();
@@ -202,22 +236,16 @@ impl TalkbackLease {
         ))
     }
 
-    pub fn active_for(&self, source_id: &str) -> bool {
-        self.active
-            .as_ref()
-            .map(|lease| lease.source_id == source_id)
-            .unwrap_or(false)
-    }
-
-    pub fn active_source(&self) -> Option<&str> {
-        self.active.as_ref().map(|lease| lease.source_id.as_str())
+    /// The current lease's id.
+    pub fn lease_id(&self) -> Option<&str> {
+        self.active.as_ref().map(|lease| lease.id.as_str())
     }
 
     pub fn status(&self, _now_ms: u64) -> TalkbackStatus {
         match &self.active {
             Some(active) => TalkbackStatus {
                 state: "live".to_string(),
-                applied_live: true,
+                applied_live: self.input_open,
                 lease_id: Some(active.id.clone()),
                 owner_client_id: Some(active.owner_client_id.clone()),
                 source_id: Some(active.source_id.clone()),
@@ -229,7 +257,7 @@ impl TalkbackLease {
             },
             None => TalkbackStatus {
                 state: "muted".to_string(),
-                applied_live: false,
+                applied_live: self.input_open,
                 lease_id: None,
                 owner_client_id: None,
                 source_id: None,
@@ -248,21 +276,18 @@ impl TalkbackLease {
     }
 }
 
-fn allowed_destination(destination: &str) -> bool {
-    matches!(
-        destination,
-        "GUEST_ALL" | "ROOM_1" | "ROOM_2A" | "ROOM_2B" | "ROOM_3" | "ROOM_4"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn lease() -> TalkbackLease {
+        TalkbackLease::new(["GUEST_ALL".to_string(), "ROOM_1".to_string()])
+    }
+
     #[test]
     fn lease_is_exclusive_and_renews_for_same_owner() {
-        let mut lease = TalkbackLease::default();
-        let (first, status) = lease
+        let mut lease = lease();
+        let (first, _) = lease
             .acquire("gm-a", "GM_MIC", "GUEST_ALL", 0.0, 500, 0)
             .unwrap();
         assert_eq!(
@@ -272,7 +297,6 @@ mod tests {
                 expires_at_ms: 500
             }
         );
-        assert!(status.applied_live);
         let (renewed, _) = lease
             .acquire("gm-a", "GM_MIC", "ROOM_1", -3.0, 500, 250)
             .unwrap();
@@ -290,8 +314,8 @@ mod tests {
     }
 
     #[test]
-    fn lease_expires_and_hard_mute_fail_closed() {
-        let mut lease = TalkbackLease::default();
+    fn lease_expires_and_hard_mute_end_it() {
+        let mut lease = lease();
         lease
             .acquire("gm-a", "GM_MIC", "GUEST_ALL", 0.0, 500, 0)
             .unwrap();
@@ -303,29 +327,35 @@ mod tests {
                 lease_id: "lease-0001".to_string()
             }
         );
-        assert!(!status.applied_live);
+        assert_eq!(status.state, "muted");
         lease
             .acquire("gm-a", "GM_MIC", "GUEST_ALL", 0.0, 500, 500)
             .unwrap();
         let (muted, status) = lease.hard_mute(510);
         assert_eq!(muted, LeaseTransition::HardMuted);
-        assert!(!status.applied_live);
+        assert_eq!(status.state, "muted");
     }
 
     #[test]
-    fn lease_rejects_invalid_source_destination_duration_and_owner() {
-        let mut lease = TalkbackLease::default();
+    fn destinations_come_from_the_configuration() {
+        let mut lease = TalkbackLease::new(["LOBBY".to_string()]);
         assert_eq!(
             lease
-                .acquire("gm", "mic", "GUEST_ALL", 0.0, 500, 0)
-                .unwrap_err(),
-            LeaseError::InvalidSource
-        );
-        assert_eq!(
-            lease
-                .acquire("gm", "GM_MIC", "UNKNOWN", 0.0, 500, 0)
+                .acquire("gm", "GM_MIC", "GUEST_ALL", 0.0, 500, 0)
                 .unwrap_err(),
             LeaseError::InvalidDestination
+        );
+        assert!(lease.acquire("gm", "GM_MIC", "LOBBY", 0.0, 500, 0).is_ok());
+    }
+
+    #[test]
+    fn lease_rejects_invalid_values_and_other_owners() {
+        let mut lease = lease();
+        assert_eq!(
+            lease
+                .acquire(" ", "GM_MIC", "GUEST_ALL", 0.0, 500, 0)
+                .unwrap_err(),
+            LeaseError::InvalidClient
         );
         assert_eq!(
             lease
@@ -333,21 +363,59 @@ mod tests {
                 .unwrap_err(),
             LeaseError::InvalidDuration
         );
+        let error = lease
+            .acquire("gm", "GM_MIC", "GUEST_ALL", 20.0, 500, 0)
+            .unwrap_err();
+        assert_eq!(error, LeaseError::InvalidGain);
+        assert!(error.to_string().contains("gain"), "got {error}");
         lease
             .acquire("gm", "GM_MIC", "GUEST_ALL", 0.0, 500, 0)
             .unwrap();
         assert_eq!(
-            lease.release("other", "lease-0001", 0).unwrap_err(),
+            lease.release("other", Some("lease-0001"), 0).unwrap_err(),
+            LeaseError::NotOwner
+        );
+        assert_eq!(
+            lease.release("gm", Some("lease-0009"), 0).unwrap_err(),
             LeaseError::NotOwner
         );
     }
 
     #[test]
-    fn out_of_range_gain_is_reported_as_a_gain_error() {
-        let mut lease = TalkbackLease::default();
-        let error = lease
-            .acquire("gm", "GM_MIC", "GUEST_ALL", 20.0, 500, 0)
-            .unwrap_err();
-        assert!(error.to_string().contains("gain"), "got {error}");
+    fn the_holder_can_release_without_the_lease_id() {
+        let mut lease = lease();
+        assert_eq!(
+            lease.release("gm", None, 0).unwrap_err(),
+            LeaseError::LeaseNotFound
+        );
+        lease
+            .acquire("gm", "GM_MIC", "GUEST_ALL", 0.0, 500, 0)
+            .unwrap();
+        assert!(lease.release("gm", None, 10).is_ok());
+        assert!(!lease.is_active());
+    }
+
+    #[test]
+    fn applied_live_follows_the_microphone_not_the_lease() {
+        let mut lease = lease();
+        lease
+            .acquire("gm", "GM_MIC", "GUEST_ALL", 0.0, 500, 0)
+            .unwrap();
+        assert!(
+            !lease.status(0).applied_live,
+            "not open until the unmute is queued"
+        );
+        lease.input_opened();
+        assert!(lease.status(0).applied_live);
+
+        lease.release("gm", None, 10).unwrap();
+        assert!(
+            lease.needs_close(),
+            "the lease ended but the microphone is still open"
+        );
+        assert!(lease.status(10).applied_live);
+        lease.input_closed();
+        assert!(!lease.needs_close());
+        assert!(!lease.status(10).applied_live);
     }
 }

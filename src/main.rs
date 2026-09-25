@@ -562,7 +562,12 @@ async fn main() {
         Vec::new();
     let mut activity_watchers: Vec<InputWatcher> = Vec::new();
     let mut cmd_tx = cmd_tx;
-    let mut talkback_lease = talkback::TalkbackLease::default();
+    let talkback_config = config.resolved_talkback();
+    let mut talkback_lease = talkback::TalkbackLease::new(
+        talkback_config
+            .iter()
+            .flat_map(|talkback| talkback.destination_names().map(str::to_string)),
+    );
     let talkback_status = std::sync::Arc::new(std::sync::RwLock::new(talkback_lease.status(0)));
     struct SharedCapture {
         active: audio::input::ActiveInput,
@@ -707,13 +712,28 @@ async fn main() {
                         applied_muted.clone(),
                         applied_unmuted_volume.clone(),
                     );
+                    // The talkback microphone stays closed until a lease opens it.
+                    let talkback_mic = talkback_config
+                        .as_ref()
+                        .is_some_and(|talkback| talkback.input_index == idx);
+                    if talkback_mic {
+                        live_input.set_muted(true, 0);
+                        tracing::info!(
+                            "Input '{}' is the talkback microphone; it opens only during a talkback lease",
+                            input_config.voice_id
+                        );
+                    }
 
                     input_statuses.push(http::InputStatus {
                         index: idx,
                         voice_id: input_config.voice_id.clone(),
-                        volume: input_config.volume,
+                        volume: if talkback_mic {
+                            0.0
+                        } else {
+                            input_config.volume
+                        },
                         channels,
-                        muted: false,
+                        muted: talkback_mic,
                         unmuted_volume: input_config.volume,
                         applied_volume: Some(applied_volume),
                         applied_muted: Some(applied_muted.clone()),
@@ -1097,11 +1117,13 @@ async fn main() {
                             streaming_upgrades: &mut streaming_upgrades,
                             max_block_frames,
                             error: None,
+                            reply_fields: serde_json::Map::new(),
                             prepared,
                         };
                         handle_command(cmd, &mut ctx).await;
                         if let Some(reply) = reply {
-                            let outcome = ctx.error.take().map_or_else(|| Ok("Command completed".to_string()), Err);
+                            let fields = std::mem::take(&mut ctx.reply_fields);
+                            let outcome = ctx.error.take().map_or_else(|| Ok(mqtt::commands::CommandReply { message: "Command completed".to_string(), fields }), Err);
                             let _ = reply.send(outcome);
                         }
                         ctx.refresh_talkback(start_time.elapsed().as_millis() as u64);
@@ -1121,25 +1143,9 @@ async fn main() {
                     &ducking_snapshot,
                 );
                 let now_ms = start_time.elapsed().as_millis() as u64;
-                if let Some(source_id) = talkback_lease.active_source().map(str::to_string) {
-                    if let Some((_transition, status)) = talkback_lease.expire(now_ms) {
-                        if let Some(input) = resolve_talkback_input(&input_statuses, &source_id) {
-                            if cmd_tx
-                                .push(rt_engine::AudioCommand::SetInputMute {
-                                    input,
-                                    mute: true,
-                                    fade_frames: fade_frames(
-                                        mqtt::commands::DEFAULT_INPUT_FADE_MS,
-                                        output_sample_rate,
-                                    ),
-                                })
-                                .is_err()
-                            {
-                                tracing::error!("Audio command ring full while expiring talkback lease");
-                            }
-                        }
-                        *talkback_status.write().unwrap() = status;
-                    }
+                if talkback_lease.is_active() || talkback_lease.needs_close() {
+                    talkback_tick(&mut talkback_lease, &config, &input_statuses, &mut cmd_tx, now_ms, output_sample_rate);
+                    *talkback_status.write().unwrap() = talkback_lease.status(now_ms);
                 }
                 reap_finished_samples(
                     &mut grave_rx,
@@ -1256,23 +1262,95 @@ fn find_input_status_mut<'a>(
     inputs.iter_mut().find(|input| input.voice_id == selector)
 }
 
-fn resolve_talkback_input(inputs: &[http::InputStatus], source_id: &str) -> Option<String> {
-    if inputs
-        .iter()
-        .any(|input| input.ready && input.voice_id == source_id)
-    {
-        return Some(source_id.to_string());
+/// The talkback microphone's input selector (its position in `inputs`), when
+/// talkback is configured and that input opened.
+fn talkback_input(config: &config::Config, inputs: &[http::InputStatus]) -> Option<String> {
+    let talkback = config.resolved_talkback()?;
+    inputs
+        .get(talkback.input_index)
+        .filter(|input| input.ready)
+        .map(|_| talkback.input_index.to_string())
+}
+
+/// Whether an input selector names the talkback microphone.
+fn is_talkback_input(
+    config: &config::Config,
+    inputs: &[http::InputStatus],
+    selector: &str,
+) -> bool {
+    let Some(talkback) = config.resolved_talkback() else {
+        return false;
+    };
+    match selector.parse::<usize>() {
+        Ok(index) => index == talkback.input_index,
+        Err(_) => {
+            inputs.iter().position(|input| input.voice_id == selector) == Some(talkback.input_index)
+        }
     }
-    // The venue profile uses the semantic GM_MIC name while the checked-in
-    // daemon config historically calls the same first strip `mic`.
-    if source_id == "GM_MIC"
-        && inputs
-            .iter()
-            .any(|input| input.ready && input.voice_id == "mic")
-    {
-        return Some("mic".to_string());
+}
+
+/// Close the talkback microphone when no lease holds it: queue its mute with the
+/// default short fade. Until the mute is queued, the microphone counts as open
+/// (`/status/talkback` reports `applied_live`) and the next tick tries again, so a
+/// full audio command queue cannot leave it open for good.
+fn close_talkback_input(
+    lease: &mut talkback::TalkbackLease,
+    config: &config::Config,
+    inputs: &[http::InputStatus],
+    cmd_tx: &mut rt_engine::CommandProducer,
+    sample_rate: u32,
+) {
+    if !lease.needs_close() {
+        return;
     }
-    None
+    let Some(input) = talkback_input(config, inputs) else {
+        lease.input_closed();
+        return;
+    };
+    let mute = rt_engine::AudioCommand::SetInputMute {
+        input,
+        mute: true,
+        fade_frames: fade_frames(mqtt::commands::DEFAULT_INPUT_FADE_MS, sample_rate),
+    };
+    if cmd_tx.push(mute).is_ok() {
+        lease.input_closed();
+    } else {
+        tracing::error!(
+            "Audio command ring full; the talkback microphone stays open until its mute can be \
+             queued"
+        );
+    }
+}
+
+/// The talkback work of each reaper tick: end a lease that has run out, and close
+/// the microphone if no lease holds it.
+fn talkback_tick(
+    lease: &mut talkback::TalkbackLease,
+    config: &config::Config,
+    inputs: &[http::InputStatus],
+    cmd_tx: &mut rt_engine::CommandProducer,
+    now_ms: u64,
+    sample_rate: u32,
+) {
+    if let Some((talkback::LeaseTransition::Expired { lease_id }, _)) = lease.expire(now_ms) {
+        tracing::info!("Talkback lease {} expired", lease_id);
+    }
+    close_talkback_input(lease, config, inputs, cmd_tx, sample_rate);
+}
+
+/// The HTTP status of a talkback refusal: a bad value is an invalid request,
+/// another client's lease forbids, and a missing lease is not found.
+fn talkback_error_kind(error: &talkback::LeaseError) -> mqtt::commands::CommandErrorKind {
+    use mqtt::commands::CommandErrorKind;
+    use talkback::LeaseError;
+    match error {
+        LeaseError::InvalidClient
+        | LeaseError::InvalidDestination
+        | LeaseError::InvalidDuration
+        | LeaseError::InvalidGain => CommandErrorKind::InvalidRequest,
+        LeaseError::AlreadyOwned { .. } | LeaseError::NotOwner => CommandErrorKind::Forbidden,
+        LeaseError::LeaseNotFound => CommandErrorKind::NotFound,
+    }
 }
 
 /// Per-route gains for a Play `channel_map`, parallel to its routes (D29). A route
@@ -1715,6 +1793,8 @@ struct CommandCtx<'a> {
     /// pitch scratch (D56/D58).
     max_block_frames: usize,
     error: Option<mqtt::commands::CommandError>,
+    /// Fields a successful command reports to an HTTP caller
+    reply_fields: serde_json::Map<String, serde_json::Value>,
     prepared: Option<PreparedPlayback>,
 }
 
@@ -2585,6 +2665,18 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 );
                 return;
             }
+            if is_talkback_input(config, ctx.inputs, &input) && !ctx.talkback.is_active() {
+                ctx.fail(
+                    mqtt::commands::CommandErrorKind::Forbidden,
+                    "The talkback microphone opens only through a talkback lease",
+                );
+                tracing::warn!(
+                    "Input '{}' is the talkback microphone; input_volume, which unmutes, refused \
+                     without a lease",
+                    input
+                );
+                return;
+            }
             let volume = new_volume.clamp(0.0, config::MAX_GAIN);
             let queued = ctx.send(rt_engine::AudioCommand::SetInputVolume {
                 input: input.clone(),
@@ -2627,16 +2719,13 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 );
                 return;
             }
-            if !mute
-                && (ctx.talkback.active_for(&input)
-                    || (input == "mic" && ctx.talkback.active_for("GM_MIC")))
-            {
+            if !mute && is_talkback_input(config, ctx.inputs, &input) && !ctx.talkback.is_active() {
                 ctx.fail(
                     mqtt::commands::CommandErrorKind::Forbidden,
-                    "Input is owned by an active talkback lease",
+                    "The talkback microphone opens only through a talkback lease",
                 );
                 tracing::warn!(
-                    "Input '{}' is owned by an active talkback lease; ordinary unmute was rejected",
+                    "Input '{}' is the talkback microphone; unmute refused without a lease",
                     input
                 );
                 return;
@@ -2663,96 +2752,149 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             }
         }
         mqtt::commands::AudioCommand::TalkbackAcquire(request) => {
-            let Some(input) = resolve_talkback_input(ctx.inputs, &request.source_id) else {
-                tracing::warn!(
-                    "Talkback source '{}' is unavailable; lease was not acquired",
-                    request.source_id
-                );
+            let Some(talkback) = config.resolved_talkback() else {
+                tracing::warn!("Talkback acquire refused: talkback is not configured");
                 ctx.fail(
-                    mqtt::commands::CommandErrorKind::NotFound,
-                    "Talkback source unavailable",
+                    CommandErrorKind::NotFound,
+                    "Talkback is not configured (set talkback.input and talkback.destinations)",
                 );
-                ctx.refresh_talkback(ctx.now_ms);
                 return;
             };
-            match ctx.talkback.acquire(
+            if let Some(source) = request.source_id.as_deref() {
+                if Some(source) != config.talkback.input.as_deref() && source != talkback.voice_id {
+                    tracing::warn!("Talkback acquire refused: unknown source '{}'", source);
+                    ctx.fail(
+                        CommandErrorKind::NotFound,
+                        format!("Unknown talkback source '{}'", source),
+                    );
+                    return;
+                }
+            }
+            let Some(input) = talkback_input(config, ctx.inputs) else {
+                tracing::warn!("Talkback acquire refused: the talkback microphone did not open");
+                ctx.fail(
+                    CommandErrorKind::NotFound,
+                    "The talkback microphone did not open",
+                );
+                return;
+            };
+            // A lease that has run out ends here, so it never refuses the next client.
+            talkback_tick(
+                ctx.talkback,
+                config,
+                ctx.inputs,
+                ctx.cmd_tx,
+                ctx.now_ms,
+                output_sample_rate,
+            );
+            let transition = match ctx.talkback.acquire(
                 &request.client_id,
-                &request.source_id,
+                &talkback.voice_id,
                 &request.destination,
                 request.gain,
                 request.lease_ms,
                 ctx.now_ms,
             ) {
-                Ok((_transition, _status)) => {
-                    if !ctx.send(rt_engine::AudioCommand::SetInputMute {
-                        input: input.clone(),
-                        mute: false,
-                        fade_frames: fade_frames(
-                            mqtt::commands::DEFAULT_INPUT_FADE_MS,
-                            output_sample_rate,
-                        ),
-                    }) {
-                        ctx.talkback.hard_mute(ctx.now_ms);
-                    }
-                    ctx.refresh_talkback(ctx.now_ms);
-                }
+                Ok((transition, _)) => transition,
                 Err(error) => {
-                    ctx.fail(
-                        mqtt::commands::CommandErrorKind::Forbidden,
-                        error.to_string(),
-                    );
-                    tracing::warn!("Talkback acquire rejected: {}", error);
-                    ctx.refresh_talkback(ctx.now_ms);
+                    tracing::warn!("Talkback acquire refused: {}", error);
+                    ctx.fail(talkback_error_kind(&error), error.to_string());
+                    return;
                 }
+            };
+            let mask = talkback
+                .destination_mask(&request.destination)
+                .unwrap_or(u64::MAX);
+            let routed = ctx.send(rt_engine::AudioCommand::SetInputRouting {
+                input: input.clone(),
+                mask,
+                gain: audio::mixer::db_to_linear(request.gain),
+            });
+            let (lease_id, opened) = match transition {
+                talkback::LeaseTransition::Acquired { lease_id, .. } => {
+                    let opened = routed
+                        && ctx.send(rt_engine::AudioCommand::SetInputMute {
+                            input,
+                            mute: false,
+                            fade_frames: fade_frames(
+                                mqtt::commands::DEFAULT_INPUT_FADE_MS,
+                                output_sample_rate,
+                            ),
+                        });
+                    if opened {
+                        ctx.talkback.input_opened();
+                        tracing::info!(
+                            "Talkback lease {} for {} to {}",
+                            lease_id,
+                            request.client_id,
+                            request.destination
+                        );
+                    }
+                    (lease_id, opened)
+                }
+                talkback::LeaseTransition::Renewed { lease_id, .. } => (lease_id, routed),
+                _ => unreachable!("acquire either acquires or renews"),
+            };
+            if !opened {
+                // Fail closed: a lease whose microphone could not be set up ends.
+                ctx.talkback.hard_mute(ctx.now_ms);
+                close_talkback_input(
+                    ctx.talkback,
+                    config,
+                    ctx.inputs,
+                    ctx.cmd_tx,
+                    output_sample_rate,
+                );
+                return;
             }
+            ctx.reply_fields
+                .insert("lease_id".to_string(), serde_json::Value::String(lease_id));
         }
         mqtt::commands::AudioCommand::TalkbackRelease(request) => {
-            let source = ctx.talkback.active_source().map(str::to_string);
+            if config.resolved_talkback().is_none() {
+                ctx.fail(
+                    CommandErrorKind::NotFound,
+                    "Talkback is not configured (set talkback.input and talkback.destinations)",
+                );
+                return;
+            }
             match ctx
                 .talkback
-                .release(&request.client_id, &request.lease_id, ctx.now_ms)
+                .release(&request.client_id, request.lease_id.as_deref(), ctx.now_ms)
             {
-                Ok((_transition, _status)) => {
-                    if let Some(source_id) = source {
-                        if let Some(input) = resolve_talkback_input(ctx.inputs, &source_id) {
-                            let _ = ctx.send(rt_engine::AudioCommand::SetInputMute {
-                                input,
-                                mute: true,
-                                fade_frames: fade_frames(
-                                    mqtt::commands::DEFAULT_INPUT_FADE_MS,
-                                    output_sample_rate,
-                                ),
-                            });
-                        }
-                    }
-                    ctx.refresh_talkback(ctx.now_ms);
+                Ok(_) => {
+                    tracing::info!("Talkback lease released by {}", request.client_id);
+                    close_talkback_input(
+                        ctx.talkback,
+                        config,
+                        ctx.inputs,
+                        ctx.cmd_tx,
+                        output_sample_rate,
+                    );
                 }
                 Err(error) => {
-                    ctx.fail(
-                        mqtt::commands::CommandErrorKind::Forbidden,
-                        error.to_string(),
-                    );
-                    tracing::warn!("Talkback release rejected: {}", error);
-                    ctx.refresh_talkback(ctx.now_ms);
+                    tracing::warn!("Talkback release refused: {}", error);
+                    ctx.fail(talkback_error_kind(&error), error.to_string());
                 }
             }
         }
         mqtt::commands::AudioCommand::TalkbackHardMute => {
-            let source = ctx.talkback.active_source().map(str::to_string);
-            let _ = ctx.talkback.hard_mute(ctx.now_ms);
-            if let Some(source_id) = source {
-                if let Some(input) = resolve_talkback_input(ctx.inputs, &source_id) {
-                    let _ = ctx.send(rt_engine::AudioCommand::SetInputMute {
-                        input,
-                        mute: true,
-                        fade_frames: fade_frames(
-                            mqtt::commands::DEFAULT_INPUT_FADE_MS,
-                            output_sample_rate,
-                        ),
-                    });
-                }
+            if config.resolved_talkback().is_none() {
+                ctx.fail(
+                    CommandErrorKind::NotFound,
+                    "Talkback is not configured (set talkback.input and talkback.destinations)",
+                );
+                return;
             }
-            ctx.refresh_talkback(ctx.now_ms);
+            ctx.talkback.hard_mute(ctx.now_ms);
+            tracing::info!("Talkback hard-muted");
+            close_talkback_input(
+                ctx.talkback,
+                config,
+                ctx.inputs,
+                ctx.cmd_tx,
+                output_sample_rate,
+            );
         }
         mqtt::commands::AudioCommand::Seek {
             selector,
@@ -2998,6 +3140,8 @@ mod tests {
         latency_stats: Arc<http::PlayLatencyStats>,
         latency: http::LatencyTracker,
         streaming_upgrades: Vec<StreamingUpgrade>,
+        now_ms: u64,
+        last_reply: serde_json::Map<String, serde_json::Value>,
         _cache_dir: tempfile::TempDir,
     }
 
@@ -3058,6 +3202,8 @@ mod tests {
                 latency_stats: latency_stats.clone(),
                 latency: http::LatencyTracker::new(latency_stats),
                 streaming_upgrades: Vec::new(),
+                now_ms: 0,
+                last_reply: serde_json::Map::new(),
                 _cache_dir: cache_dir,
             }
         }
@@ -3100,7 +3246,7 @@ mod tests {
                 inputs: &mut self.inputs,
                 talkback: &mut self.talkback,
                 talkback_status: &self.talkback_status,
-                now_ms: 0,
+                now_ms: self.now_ms,
                 output_channels: 2,
                 output_sample_rate: SR,
                 config: &self.config,
@@ -3108,10 +3254,13 @@ mod tests {
                 streaming_upgrades: &mut self.streaming_upgrades,
                 max_block_frames: 512,
                 error: None,
+                reply_fields: serde_json::Map::new(),
                 prepared,
             };
             handle_command(cmd, &mut ctx).await;
-            ctx.error
+            let error = ctx.error.take();
+            self.last_reply = std::mem::take(&mut ctx.reply_fields);
+            error
         }
 
         /// Apply every queued audio command to the mixer, as the audio callback
@@ -4629,52 +4778,256 @@ mod tests {
         assert!(!fixture.inputs[0].muted);
     }
 
-    #[tokio::test]
-    async fn talkback_lease_acquire_release_and_expiry_mute_the_input() {
+    /// A fixture with a talkback microphone (voice `GM_MIC`, routed to outputs 0
+    /// and 1, muted as at startup) and the destinations `ALL` (0 and 1) and `LEFT`
+    /// (0).
+    fn talkback_fixture() -> Fixture {
+        use ringbuf::HeapRb;
         let mut fixture = Fixture::new(vec![]);
-        push_live_input(&mut fixture, "mic", 0.7);
+        fixture.config = serde_json::from_value(serde_json::json!({
+            "mqtt": {"topic": "t"},
+            "inputs": [{"voice_id": "GM_MIC", "volume": 0.7, "routes": [
+                {"source_channel": 0, "dest_channel": 0},
+                {"source_channel": 0, "dest_channel": 1}
+            ]}],
+            "talkback": {"input": "GM_MIC", "destinations": [
+                {"name": "ALL", "channels": [0, 1]},
+                {"name": "LEFT", "channels": [0]}
+            ]}
+        }))
+        .unwrap();
+        fixture.talkback = talkback::TalkbackLease::new(["ALL".to_string(), "LEFT".to_string()]);
+        let mut input = audio::mixer::LiveInput::new(
+            0,
+            "GM_MIC".to_string(),
+            HeapRb::<f32>::new(16).split().1,
+            1,
+            0.7,
+            vec![(0, 0), (0, 1)],
+            8,
+        );
+        input.set_muted(true, 0);
+        fixture.mixer.live_inputs.push(input);
+        fixture.inputs.push(http::InputStatus {
+            index: 0,
+            voice_id: "GM_MIC".to_string(),
+            volume: 0.0,
+            channels: 1,
+            muted: true,
+            unmuted_volume: 0.7,
+            applied_volume: None,
+            applied_muted: None,
+            applied_unmuted_volume: None,
+            health: None,
+            ready: true,
+            last_error: None,
+        });
         fixture
-            .run(AudioCommand::TalkbackAcquire(
-                mqtt::commands::TalkbackAcquireMessage {
-                    client_id: "gm-1".to_string(),
-                    source_id: "GM_MIC".to_string(),
-                    destination: "GUEST_ALL".to_string(),
-                    gain: 0.0,
-                    lease_ms: 500,
-                },
-            ))
-            .await;
+    }
+
+    fn acquire(client: &str, destination: &str, gain: f32, lease_ms: u64) -> AudioCommand {
+        AudioCommand::TalkbackAcquire(mqtt::commands::TalkbackAcquireMessage {
+            client_id: client.to_string(),
+            source_id: None,
+            destination: destination.to_string(),
+            gain,
+            lease_ms,
+        })
+    }
+
+    fn release(client: &str, lease_id: Option<&str>) -> AudioCommand {
+        AudioCommand::TalkbackRelease(mqtt::commands::TalkbackReleaseMessage {
+            client_id: client.to_string(),
+            lease_id: lease_id.map(str::to_string),
+        })
+    }
+
+    #[tokio::test]
+    async fn talkback_needs_its_configuration() {
+        let mut fixture = Fixture::new(vec![]);
+        push_live_input(&mut fixture, "GM_MIC", 1.0);
+        let error = fixture.run(acquire("gm", "ALL", 0.0, 500)).await.unwrap();
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::NotFound);
+        assert!(error.message.contains("talkback"), "{}", error.message);
+    }
+
+    #[tokio::test]
+    async fn a_lease_opens_the_microphone_on_its_destination_at_its_gain() {
+        let mut fixture = talkback_fixture();
+        assert!(fixture
+            .run(acquire("gm", "LEFT", -6.0, 500))
+            .await
+            .is_none());
+        assert_eq!(
+            fixture.last_reply.get("lease_id").and_then(|v| v.as_str()),
+            Some("lease-0001"),
+            "the reply carries the lease id"
+        );
         fixture.drain();
+        let mic = &fixture.mixer.live_inputs[0];
+        assert!(!mic.is_muted());
+        assert_eq!(mic.target_volume, 0.7);
         assert!(fixture.talkback.status(0).applied_live);
-        assert_eq!(fixture.mixer.live_inputs[0].volume, 0.7);
 
-        fixture
-            .run(AudioCommand::TalkbackRelease(
-                mqtt::commands::TalkbackReleaseMessage {
-                    client_id: "gm-1".to_string(),
-                    lease_id: "lease-0001".to_string(),
-                },
-            ))
-            .await;
+        // The holder releases by client id alone; the microphone closes.
+        assert!(fixture.run(release("gm", None)).await.is_none());
         fixture.drain();
-        assert!(!fixture.talkback.status(0).applied_live);
         assert!(fixture.mixer.live_inputs[0].is_muted());
-        assert_eq!(fixture.mixer.live_inputs[0].target_volume, 0.0);
+        assert!(!fixture.talkback.status(0).applied_live);
+    }
 
-        fixture
-            .run(AudioCommand::TalkbackAcquire(
-                mqtt::commands::TalkbackAcquireMessage {
-                    client_id: "gm-1".to_string(),
-                    source_id: "GM_MIC".to_string(),
-                    destination: "GUEST_ALL".to_string(),
-                    gain: 0.0,
-                    lease_ms: 500,
-                },
-            ))
-            .await;
+    #[tokio::test]
+    async fn a_lease_plays_only_on_its_destination() {
+        use ringbuf::HeapRb;
+        let mut fixture = talkback_fixture();
+        let (mut producer, consumer) = HeapRb::<f32>::new(64).split();
+        producer.push_slice(&[0.5; 8]);
+        fixture.mixer.live_inputs[0].consumer = consumer;
+        fixture.mixer.live_inputs[0].max_backlog_frames = 64;
+        fixture.run(acquire("gm", "LEFT", -6.0, 500)).await;
         fixture.drain();
-        let _ = fixture.talkback.expire(500);
-        assert!(!fixture.talkback.status(500).applied_live);
+        let mic = &mut fixture.mixer.live_inputs[0];
+        mic.set_volume(0.7, 0); // skip the fade-in for a steady level
+        let mut output = vec![0.0f32; 4];
+        audio::mixer::mix_audio(&mut output, &mut fixture.mixer);
+        let expected = 0.5 * 0.7 * audio::mixer::db_to_linear(-6.0);
+        assert!(
+            (output[0] - expected).abs() < 1e-3,
+            "left, got {}",
+            output[0]
+        );
+        assert_eq!(output[1], 0.0, "right is outside the destination");
+    }
+
+    #[tokio::test]
+    async fn talkback_refusals_have_their_own_status_codes() {
+        use mqtt::commands::CommandErrorKind::*;
+        let mut fixture = talkback_fixture();
+        let kind = |error: Option<mqtt::commands::CommandError>| error.map(|e| e.kind);
+        assert_eq!(
+            kind(fixture.run(acquire("gm", "ALL", 0.0, 100)).await),
+            Some(InvalidRequest)
+        );
+        assert_eq!(
+            kind(fixture.run(acquire("gm", "ALL", 30.0, 500)).await),
+            Some(InvalidRequest)
+        );
+        assert_eq!(
+            kind(fixture.run(acquire("gm", "NOWHERE", 0.0, 500)).await),
+            Some(InvalidRequest)
+        );
+        let mut wrong_source = acquire("gm", "ALL", 0.0, 500);
+        if let AudioCommand::TalkbackAcquire(request) = &mut wrong_source {
+            request.source_id = Some("OTHER_MIC".to_string());
+        }
+        assert_eq!(kind(fixture.run(wrong_source).await), Some(NotFound));
+        assert_eq!(kind(fixture.run(release("gm", None)).await), Some(NotFound));
+        assert_eq!(
+            kind(fixture.run(acquire("gm", "ALL", 0.0, 500)).await),
+            None
+        );
+        assert_eq!(
+            kind(fixture.run(acquire("other", "ALL", 0.0, 500)).await),
+            Some(Forbidden)
+        );
+        assert_eq!(
+            kind(fixture.run(release("gm", Some("lease-0009"))).await),
+            Some(Forbidden)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_lease_does_not_refuse_the_next_client() {
+        let mut fixture = talkback_fixture();
+        assert!(fixture
+            .run(acquire("gm-a", "ALL", 0.0, 250))
+            .await
+            .is_none());
+        fixture.now_ms = 300; // past the lease, before any tick has expired it
+        assert!(fixture
+            .run(acquire("gm-b", "ALL", 0.0, 250))
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn ordinary_commands_cannot_open_the_talkback_microphone() {
+        use mqtt::commands::CommandErrorKind::Forbidden;
+        let mut fixture = talkback_fixture();
+        for input in ["GM_MIC", "0"] {
+            let unmute = AudioCommand::InputMute {
+                input: input.to_string(),
+                mute: false,
+                fade_ms: 0,
+            };
+            assert_eq!(
+                fixture.run(unmute).await.map(|e| e.kind),
+                Some(Forbidden),
+                "{input}"
+            );
+            let raise = AudioCommand::InputVolume {
+                input: input.to_string(),
+                volume: 1.0,
+                fade_ms: 0,
+            };
+            assert_eq!(
+                fixture.run(raise).await.map(|e| e.kind),
+                Some(Forbidden),
+                "{input}"
+            );
+        }
+        let mute = AudioCommand::InputMute {
+            input: "GM_MIC".to_string(),
+            mute: true,
+            fade_ms: 0,
+        };
+        assert!(
+            fixture.run(mute).await.is_none(),
+            "muting is always allowed"
+        );
+
+        // During a lease the level can be set.
+        fixture.run(acquire("gm", "ALL", 0.0, 500)).await;
+        let level = AudioCommand::InputVolume {
+            input: "GM_MIC".to_string(),
+            volume: 0.9,
+            fade_ms: 0,
+        };
+        assert!(fixture.run(level).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_mute_that_cannot_be_queued_is_retried_until_it_is() {
+        let mut fixture = talkback_fixture();
+        fixture.run(acquire("gm", "ALL", 0.0, 500)).await;
+        fixture.drain();
+        // Fill the audio command queue, as when the audio thread is not draining.
+        while fixture
+            .cmd_tx
+            .push(rt_engine::AudioCommand::SetVoiceVolume {
+                voice: "x".to_string(),
+                volume: 1.0,
+            })
+            .is_ok()
+        {}
+        fixture.run(release("gm", None)).await;
+        assert!(
+            fixture.talkback.status(0).applied_live,
+            "the microphone still counts as open while its mute waits"
+        );
+
+        fixture.drain();
+        talkback_tick(
+            &mut fixture.talkback,
+            &fixture.config,
+            &fixture.inputs,
+            &mut fixture.cmd_tx,
+            0,
+            SR,
+        );
+        assert!(!fixture.talkback.status(0).applied_live);
+        fixture.drain();
+        assert!(fixture.mixer.live_inputs[0].is_muted());
     }
 
     #[tokio::test]
@@ -5175,6 +5528,7 @@ mod tests {
             rt_engine::AudioCommand::SetVoiceVolume { .. } => "SetVoiceVolume",
             rt_engine::AudioCommand::SetInputVolume { .. } => "SetInputVolume",
             rt_engine::AudioCommand::SetInputMute { .. } => "SetInputMute",
+            rt_engine::AudioCommand::SetInputRouting { .. } => "SetInputRouting",
             rt_engine::AudioCommand::SeekMatching { .. } => "SeekMatching",
             rt_engine::AudioCommand::SetSpeedMatching { .. } => "SetSpeedMatching",
             rt_engine::AudioCommand::SetVolumeMatching { .. } => "SetVolumeMatching",

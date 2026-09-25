@@ -48,7 +48,25 @@ impl std::fmt::Display for CommandError {
 }
 
 /// What actually happened when a command was processed
-pub type CommandOutcome = Result<String, CommandError>;
+pub type CommandOutcome = Result<CommandReply, CommandError>;
+
+/// A successful command's answer: a message, and any fields the command reports
+/// (such as a talkback acquire's `lease_id`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandReply {
+    pub message: String,
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl CommandReply {
+    /// A reply with only a message.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            fields: serde_json::Map::new(),
+        }
+    }
+}
 
 /// A command traveling to the processing loop, with an optional reply slot.
 /// MQTT publishes send no reply; HTTP requests wait on one so clients learn
@@ -297,21 +315,20 @@ pub struct InputMuteMessage {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TalkbackAcquireMessage {
     pub client_id: String,
-    #[serde(default = "default_talkback_source")]
-    pub source_id: String,
+    /// The talkback source; when given it must name `talkback.input`
+    #[serde(default)]
+    pub source_id: Option<String>,
     pub destination: String,
     pub gain: f32,
     pub lease_ms: u64,
 }
 
-fn default_talkback_source() -> String {
-    "GM_MIC".to_string()
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TalkbackReleaseMessage {
     pub client_id: String,
-    pub lease_id: String,
+    /// The lease to end; the holder's `client_id` alone ends its current lease
+    #[serde(default)]
+    pub lease_id: Option<String>,
 }
 
 /// Seek command parameters
@@ -1808,13 +1825,19 @@ mod tests {
         match acquire {
             AudioCommand::TalkbackAcquire(request) => {
                 assert_eq!(request.client_id, "gm-1");
-                assert_eq!(request.source_id, "GM_MIC");
+                assert_eq!(request.source_id, None);
                 assert_eq!(request.lease_ms, 500);
             }
             _ => panic!("Expected TalkbackAcquire command"),
         }
         let release = parse_command(r#"{"command":"talkback_release","message":{"client_id":"gm-1","lease_id":"lease-0001"}}"#).unwrap();
         assert!(matches!(release, AudioCommand::TalkbackRelease(_)));
+        let release =
+            parse_command(r#"{"command":"talkback_release","client_id":"gm-1"}"#).unwrap();
+        assert!(
+            matches!(release, AudioCommand::TalkbackRelease(ref r) if r.lease_id.is_none()),
+            "the holder releases by client_id alone"
+        );
         assert!(matches!(
             parse_command(r#"{"command":"talkback_hard_mute"}"#).unwrap(),
             AudioCommand::TalkbackHardMute

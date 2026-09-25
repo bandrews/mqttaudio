@@ -68,7 +68,7 @@ All take `POST` with a JSON body (`Content-Type: application/json`).
 | `/cache/clear` | `cache_clear` | none |
 | `/cache/invalidate` | `cache_invalidate` | `file` |
 | `/cache/reload` | `cache_reload` | `file` |
-| `/talkback/acquire` | `talkback_acquire` | `client_id`, `source_id`, `destination`, `gain`, `lease_ms` |
+| `/talkback/acquire` | `talkback_acquire` | `client_id`, `destination`, `gain`, `lease_ms` and `source_id` |
 | `/talkback/release` | `talkback_release` | `client_id` and `lease_id` |
 | `/talkback/hard-mute` | `talkback_hard_mute` | none |
 | `/telemetry` | | `{"enabled": true}` or `false`; see [Telemetry](#telemetry) |
@@ -98,12 +98,14 @@ queued to start) and reports the outcome:
 {"success": false, "error": "No sample matches the selector"}
 ```
 
+A talkback acquire's reply also carries the lease's id, `"lease_id": "lease-0001"`.
+
 | Status | Meaning |
 |--------|---------|
 | `200` | Done |
-| `400` | The command is malformed: bad JSON, unknown command, a missing or invalid parameter, no selector, an unknown channel name, `speed: 0` |
-| `403` | Not allowed: a path outside `security.allowed_directories`, a talkback request that is refused or has a value out of range, unmuting an input held by talkback |
-| `404` | Nothing to act on: a file that is missing or cannot be decoded, a URL that fails, a selector that matches no sound, an empty voice, an input that did not open, no open talkback microphone |
+| `400` | The command is malformed: bad JSON, unknown command, a missing or invalid parameter, no selector, an unknown channel name, `speed: 0`, a talkback value out of range or an unknown destination |
+| `403` | Not allowed: a path outside `security.allowed_directories`, a talkback lease held by another client, opening the talkback microphone without a lease |
+| `404` | Nothing to act on: a file that is missing or cannot be decoded, a URL that fails, a selector that matches no sound, an empty voice, an input that did not open, talkback not configured or its microphone not open, no lease to release |
 | `409` | A pending play or cache command was cancelled by `stopall` or `fadeall`, or a `seek` or `speed` matched only windowed sounds |
 | `500` | The daemon is overloaded (32 loads already in flight, a sound limit reached, or its audio queue is full) or failed internally |
 | `504` | No result within 30 seconds of being queued. The daemon then drops the command: a play whose load finishes later never starts, though `precache` and the cache commands still take effect |
@@ -274,7 +276,7 @@ what rising values mean.
     "applied_live": true,
     "lease_id": "lease-0003",
     "owner_client_id": "panel-1",
-    "source_id": "GM_MIC",
+    "source_id": "gm_mic",
     "destination": "GUEST_ALL",
     "gain": 0.0,
     "lease_expires_at_ms": 52000,
@@ -284,12 +286,13 @@ what rising values mean.
 }
 ```
 
-`state` is `live` while a lease is held and `muted` otherwise. It follows the lease, not the input:
-at startup the microphone is open while `state` reads `muted`, and `destination` and `gain` are
-recorded but not applied (see [Microphone Input](features/microphone-input.md#talkback)). `now_ms`
-and `lease_expires_at_ms` are milliseconds since the daemon started, so their difference is the time
-left. `last_transition` is `acquired`, `renewed`, `released`, `expired` or `hard-muted`;
-`last_error` is the last refused request's reason. The lease holder needs `lease_id` to release it.
+`state` is `live` while a lease is held and `muted` otherwise. `applied_live` is whether the
+microphone is open: it turns on once a lease's unmute is queued and off once the mute that follows
+is queued, so it stays `true` after a lease ends while that mute waits for room in the audio command
+queue (see [Microphone Input](features/microphone-input.md#talkback)). `source_id` is the talkback
+input's `voice_id`. `now_ms` and `lease_expires_at_ms` are milliseconds since the daemon started, so
+their difference is the time left. `last_transition` is `acquired`, `renewed`, `released`, `expired`
+or `hard-muted`; `last_error` is the last refused request's reason.
 
 ### /metrics
 

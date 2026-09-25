@@ -201,7 +201,7 @@ impl CacheManager {
         })
     }
 
-    /// Record the current mtime + size of a local file after decoding it, so a later
+    /// Record the current mtime + size of a local file before decoding it, so a later
     /// load can cheaply detect an edit. Best-effort: a stat failure records nothing.
     fn record_local_stat(&mut self, path: &str) {
         if let Ok(meta) = std::fs::metadata(path) {
@@ -555,6 +555,9 @@ impl CacheManager {
         target_sample_rate: u32,
     ) -> Result<SampleBuffer, Box<dyn std::error::Error + Send + Sync>> {
         let quality = self.resampler_quality;
+        // Captured before the open, so a file replaced while it is being opened
+        // reads as changed at promotion rather than vouching for the old content.
+        let generation = LoadGeneration::capture(&source_path);
         let open_path = source_path.clone();
         let decoder = tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&open_path)
@@ -581,7 +584,7 @@ impl CacheManager {
             ActiveLoad {
                 buffer: Arc::clone(&streaming_buffer),
                 path: key.to_string(),
-                generation: LoadGeneration::capture(&source_path),
+                generation,
                 pending_disk_write: None,
             },
         );
@@ -1618,6 +1621,55 @@ mod tests {
             }
             _ => panic!("expected Complete buffers"),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_replaced_while_its_load_opens_it_is_not_promoted() {
+        // The load opens a FIFO, which holds the open until a writer arrives; the
+        // writer replaces the path with a different file before sending the old
+        // content, as a freshness check's rename can land during a load's open.
+        if !wavs_present() {
+            eprintln!("skipping: test WAVs not found");
+            return;
+        }
+        let work = TempDir::new().unwrap();
+        let asset = work.path().join("asset.wav");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&asset)
+            .status()
+            .unwrap();
+        assert!(made.success(), "mkfifo failed");
+        let asset_str = asset.to_string_lossy().into_owned();
+        let replacement = work.path().join("replacement.wav");
+        std::fs::copy(LONG_WAV, &replacement).unwrap();
+        let writer_path = asset.clone();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut fifo = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .unwrap();
+            std::fs::rename(&replacement, &writer_path).unwrap();
+            fifo.write_all(&std::fs::read(SHORT_WAV).unwrap()).unwrap();
+        });
+
+        let cache_dir = TempDir::new().unwrap();
+        let mut cm =
+            CacheManager::with_quality(cache_dir.path().to_path_buf(), ResamplerQuality::Fast)
+                .unwrap();
+        let buffer = cm
+            .get_or_load_streaming_with_freshness(&asset_str, 48000, FreshnessMode::Pinned)
+            .await
+            .unwrap();
+        wait_complete(&buffer).await;
+        writer.join().unwrap();
+        cm.cleanup_completed_loads();
+
+        assert!(
+            !cm.is_in_memory_cache(&asset_str),
+            "the decode of the replaced file must not be published"
+        );
     }
 
     #[tokio::test]

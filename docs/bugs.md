@@ -7,27 +7,6 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 
 ## Open
 
-### Talkback
-
-- **The talkback microphone is live at startup.** Inputs open unmuted, and nothing mutes the talkback
-  source (`GM_MIC`, or `mic`) until the first lease is released, expires or is hard-muted, while
-  `/status/talkback` reports `muted` the whole time. Workaround: send `input_mute` for it at startup.
-  Muting it at startup would also mute any input left at the default `voice_id` of `mic`, so this
-  needs a decision about how talkback inputs are marked.
-- **`destination` and `gain` are validated but never applied.** The microphone plays through its
-  configured routes at its configured volume. The destination allowlist (`GUEST_ALL`, `ROOM_1`,
-  `ROOM_2A`, `ROOM_2B`, `ROOM_3`, `ROOM_4`) is hard-coded in `src/talkback.rs`.
-- **Ordinary commands can reopen the microphone.** Without an active lease, `input_mute` unmutes it.
-  With a lease, the unmute guard compares the `input` string with the source's voice id, so selecting
-  the input by number (`"0"`) bypasses it, and `input_volume`, which also unmutes, has no guard at all.
-- **A lease can fail open.** If the audio command queue is full when a lease expires, is released
-  or is hard-muted, the mute is dropped (logged at `error`; release and hard-mute answer `500`) while
-  the lease is already cleared, so `/status/talkback` reports `muted` and the microphone stays live.
-- **Rough edges:** the acquire reply does not carry the `lease_id` (read `/status/talkback`), so an
-  MQTT-only client cannot release; refusals from the lease rules, including an out-of-range
-  `lease_ms`, answer `403` rather than `400`; an expired lease keeps refusing other clients for up to
-  one 20 ms tick.
-
 ### Playback and commands
 
 - **Pitch correction never engages on a cold play whose file is not kept in memory.** The stretcher

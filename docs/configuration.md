@@ -281,6 +281,32 @@ Inputs that share a device and settings share one capture stream. An input that 
 reported by `GET /ready` and `/status/inputs`, and the daemon keeps running without it.
 [Microphone Input](features/microphone-input.md) covers setup and tuning.
 
+### talkback
+
+Names the microphone that [talkback](features/microphone-input.md#talkback) leases open, and the
+destinations a lease may send it to:
+
+```json
+"talkback": {
+  "input": "gm_mic",
+  "destinations": [
+    {"name": "GUEST_ALL", "channels": [4, 5, 6, 7]},
+    {"name": "ROOM_1", "channels": [4, 5]}
+  ]
+}
+```
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `input` | none: talkback is off | The talkback microphone: an input's `voice_id`, or its position in `inputs` as a string (`"0"`) |
+| `destinations` | `[]` | What a lease may choose; at least one when `input` is set |
+| `destinations[].name` | *required* | The name clients send as `destination`. Must be unique and not empty |
+| `destinations[].channels` | *required* | Output channels (numbers or aliases, below 64) the microphone plays on during a lease to this destination. Each must be the `dest_channel` of one of the input's `routes` |
+
+The talkback microphone is muted from startup and opens only during a lease; `input_mute` and
+`input_volume` cannot open it without one. While talkback is off, the talkback commands answer
+`404`.
+
 ### ducking_rules
 
 ```json

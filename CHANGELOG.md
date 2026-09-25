@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`input_volume` and `input_mute` fade.** Both take an optional `fade_ms` (default 20, up to 60000;
   `0` is instant), so a microphone is muted, unmuted or turned up without a click. They changed the
   level instantly before.
+- **A `talkback` configuration section** names the talkback microphone (`talkback.input`) and the
+  destinations a lease may choose, each with its output channels (`talkback.destinations`). A lease
+  now plays the microphone only on its destination's channels, at its `gain`; both were checked but
+  not applied before, and the destinations were a fixed list.
 - **`--check-ready`** asks the daemon described by the configuration (file, command line and
   `MQTTAUDIO_HTTP_*` variables) for `GET /ready` and exits `0` when it is ready or the HTTP server is
   off, `1` otherwise. The container image's health check uses it.
@@ -31,8 +35,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `curl`.
 - **`Cargo.toml` declares `rust-version = "1.88"`**, the version the dependencies need, and no longer
   lists the unused `dasp` crate.
+- **Talkback needs the `talkback` section.** The talkback microphone was the input whose `voice_id`
+  was `GM_MIC`, or else `mic`. To upgrade, set `talkback.input` to that input and list the
+  destinations your clients use in `talkback.destinations`; without the section the talkback commands
+  answer `404`. A client that sends `source_id` must send the value of `talkback.input` or the input's
+  `voice_id`.
+- **Talkback answers use their own status codes and carry the lease id.** An out-of-range value or an
+  unknown destination is `400` (it was `403`), and releasing when no lease is held is `404`. The
+  acquire reply includes `lease_id`, and `talkback_release` no longer needs it: the holder's
+  `client_id` ends its lease, so an MQTT-only client can release. `/status/talkback`'s `applied_live`
+  reports whether the microphone is open rather than whether a lease is held.
 
 ### Fixed
+
+- **The talkback microphone is closed until a lease opens it.** It opened unmuted at startup and stayed
+  live until the first lease ended, while `/status/talkback` reported `muted`. Without a lease,
+  `input_mute` could unmute it; with one, only an unmute naming it by `voice_id` was refused, so
+  selecting it by position or raising it with `input_volume` reopened it. Both commands now refuse to
+  open it without a lease (`403`), however it is named.
+- **A talkback lease can no longer end with the microphone open.** When the audio command queue was
+  full as a lease expired, was released or was hard-muted, the mute was dropped while the lease was
+  cleared. The mute is now retried every 20 ms until it is queued, and `/status/talkback` reports
+  `applied_live: true` until then.
+- **An expired talkback lease no longer refuses the next client** for up to 20 ms before the expiry
+  pass ran.
 
 - **Plays never wait on a server to check a cached file (decision D46).** A play of a URL cached only
   on disk asked the server whether it changed before playing, in every freshness mode: up to 5 seconds

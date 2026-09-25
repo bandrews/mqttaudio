@@ -293,9 +293,9 @@ Sets the input's volume (`0.0`–`4.0`) and unmutes it.
 {"command": "input_mute", "input": "gm_mic", "mute": true}
 ```
 
-Muting silences the input and remembers its volume; unmuting restores that volume. While a
-[talkback](#talkback) lease holds the input, unmuting it by its `voice_id` is refused (HTTP `403`);
-selecting it by position, or raising it with `input_volume`, is not checked.
+Muting silences the input and remembers its volume; unmuting restores that volume. The
+[talkback](#talkback) microphone opens only through a lease: without one, unmuting it or setting its
+volume is refused (HTTP `403`).
 
 Both commands take an optional `fade_ms` (default `20`, up to `60000`): the change fades over that
 many milliseconds, and `0` makes it instant. A muted input does not trigger ducking.
@@ -343,32 +343,34 @@ current file without waiting for it to load. Use it after replacing a file in pl
 
 ## Talkback
 
-Talkback lets one client at a time open a microphone for a short, renewable lease, for example a
-push-to-talk button in a control panel. When the lease runs out, is released or is hard-muted, the
-microphone is muted again. See [Microphone Input](features/microphone-input.md#talkback) for setup
-and current limitations.
+Talkback lets one client at a time open the talkback microphone for a short, renewable lease, for
+example a push-to-talk button in a control panel. When the lease runs out, is released or is
+hard-muted, the microphone is muted again. It needs the [`talkback`](configuration.md#talkback)
+section; see [Microphone Input](features/microphone-input.md#talkback) for setup.
 
 ```json
-{"command": "talkback_acquire", "client_id": "panel-1", "destination": "GUEST_ALL", "gain": 0.0, "lease_ms": 1000}
-{"command": "talkback_release", "client_id": "panel-1", "lease_id": "lease-0001"}
+{"command": "talkback_acquire", "client_id": "panel-1", "destination": "ROOM_1", "gain": 0.0, "lease_ms": 1000}
+{"command": "talkback_release", "client_id": "panel-1"}
 {"command": "talkback_hard_mute"}
 ```
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `client_id` | string | *required* | Who holds the lease |
-| `source_id` | string | `"GM_MIC"` | Must be `GM_MIC`. It opens the input whose `voice_id` is `GM_MIC`, or else `mic` |
-| `destination` | string | *required* | One of `GUEST_ALL`, `ROOM_1`, `ROOM_2A`, `ROOM_2B`, `ROOM_3`, `ROOM_4` |
-| `gain` | number | *required* | `-60` to `12` (dB) |
-| `lease_ms` | integer | *required* | Lease length, `250`–`2000` ms |
-| `lease_id` | string | *required* (release) | The lease's id, from `GET /status/talkback` |
+| `destination` | string | *required* (acquire) | One of the names in `talkback.destinations` |
+| `gain` | number | *required* (acquire) | `-60` to `12` (dB), on top of the input's volume |
+| `lease_ms` | integer | *required* (acquire) | Lease length, `250`–`2000` ms |
+| `source_id` | string | the talkback microphone | Acquire only. When given, it must name `talkback.input`, as configured or by `voice_id` |
+| `lease_id` | string | the current lease | Release only. When given, it must be the current lease's id, so a late release cannot end a newer lease |
 
-- Acquiring unmutes the input and starts a lease. The holder renews it by acquiring again before it
-  expires; another client is refused (HTTP `403`) until then.
-- Acquiring fails with HTTP `404` when no input with the `voice_id` `GM_MIC` (or `mic`) is open, and
-  with `403` for a value outside its range or list.
-- Releasing needs the holder's `client_id` and the current `lease_id`.
-- `talkback_hard_mute` ends the current lease, whoever holds it, and mutes its input.
+- Acquiring opens the microphone on the destination's channels and starts a lease. Over HTTP the
+  reply carries the lease's id: `{"success": true, "message": "Command completed", "lease_id":
+  "lease-0001"}`. The holder renews the lease by acquiring again before it expires, and may change
+  `destination` and `gain` when it does; another client is refused with `403` until then.
+- A value outside its range or list is refused with `400`. `404` means talkback is not configured,
+  `source_id` names another input, the microphone did not open, or there is no lease to release.
+- Releasing needs the holder's `client_id`; another client gets `403`.
+- `talkback_hard_mute` ends the current lease, whoever holds it, and mutes the microphone.
 
 ## Macros
 

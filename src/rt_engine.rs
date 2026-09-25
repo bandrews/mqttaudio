@@ -67,6 +67,10 @@ pub enum AudioCommand {
         mute: bool,
         fade_frames: u32,
     },
+    /// Play a live input only on the output channels whose bit is set in `mask`,
+    /// at `gain` (talkback's destination and gain); `u64::MAX` and `1.0` restore
+    /// every route at unity.
+    SetInputRouting { input: String, mask: u64, gain: f32 },
     /// Seek the samples matching `selector` to `position_ms`.
     SeekMatching {
         selector: SampleSelector,
@@ -271,6 +275,9 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
             fade_frames,
         } => {
             with_live_input(state, input, |live| live.set_muted(*mute, *fade_frames));
+        }
+        AudioCommand::SetInputRouting { input, mask, gain } => {
+            with_live_input(state, input, |live| live.set_routing(*mask, *gain));
         }
         AudioCommand::SeekMatching {
             selector,

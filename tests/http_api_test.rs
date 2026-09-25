@@ -46,7 +46,7 @@ fn create_test_state() -> (AppState, mpsc::Receiver<String>) {
         while let Some(request) = request_rx.recv().await {
             let _ = payload_tx.send(request.payload.clone()).await;
             if let Some(reply) = request.reply {
-                let _ = reply.send(Ok("accepted".to_string()));
+                let _ = reply.send(Ok(mqttaudio::mqtt::commands::CommandReply::new("accepted")));
             }
         }
     });
@@ -1597,10 +1597,11 @@ async fn test_talkback_status_and_command_endpoints() {
     let (state, mut rx) = create_test_state();
     {
         let mut status = state.talkback.write().unwrap();
-        let mut lease = TalkbackLease::default();
+        let mut lease = TalkbackLease::new(["GUEST_ALL".to_string()]);
         let _ = lease
             .acquire("gm", "GM_MIC", "GUEST_ALL", 0.0, 500, 0)
             .unwrap();
+        lease.input_opened();
         *status = lease.status(0);
     }
     let app = create_router(state, false, false);

@@ -944,6 +944,10 @@ pub struct LiveInput {
     /// Channel routing: vec![(src_channel, dest_channel), ...]
     pub channel_map: Vec<(usize, usize)>,
 
+    /// Gain of each route in `channel_map`, sized with it at construction so
+    /// [`LiveInput::set_routing`] changes it in place on the audio thread
+    route_gains: Vec<f32>,
+
     /// Optional control-side observers. They are allocated during setup and
     /// updated with relaxed atomics by the audio callback, so status queries
     /// can report applied values without locking the mixer.
@@ -983,6 +987,7 @@ impl LiveInput {
             pre_mute_volume: volume,
             voice_volume: 1.0,
             target_voice_volume: 1.0,
+            route_gains: vec![1.0; channel_map.len()],
             channel_map,
             applied_volume: None,
             applied_muted: None,
@@ -1094,6 +1099,16 @@ impl LiveInput {
         } else if self.muted {
             self.muted = false;
             self.fade_volume_to(self.pre_mute_volume, fade_frames);
+        }
+    }
+
+    /// Play only the routes whose output channel has its bit set in `mask`, each at
+    /// `gain` (talkback's destination and gain); `u64::MAX` and `1.0` restore every
+    /// route at unity. Channels from 64 up are never masked out.
+    pub fn set_routing(&mut self, mask: u64, gain: f32) {
+        for (route_gain, &(_, dest)) in self.route_gains.iter_mut().zip(&self.channel_map) {
+            let routed = dest >= 64 || mask & (1 << dest) != 0;
+            *route_gain = if routed { gain } else { 0.0 };
         }
     }
 
@@ -2283,7 +2298,7 @@ fn mix_live_input_into_output(
             &mut input.consumer,
             input.input_channels,
             &input.channel_map,
-            &[],
+            &input.route_gains,
             output,
             frame_idx,
             output_channels,
@@ -2490,6 +2505,44 @@ mod tests {
         input.set_muted(true, 0);
         input.set_muted(false, 0);
         assert_eq!(input.target_volume, 2.0, "a boosted mic comes back boosted");
+    }
+
+    #[test]
+    fn input_routing_limits_the_input_to_some_outputs_at_a_gain() {
+        let consumer = create_test_ring_buffer_with_data(&[0.5f32; 4]);
+        let mut input = test_live_input(
+            "GM_MIC".to_string(),
+            consumer,
+            1,
+            1.0,
+            vec![(0, 0), (0, 1), (0, 2)],
+        );
+        input.set_routing(0b101, 0.5);
+        let mut state = MixerState::new(3);
+        state.live_inputs.push(input);
+
+        let mut output = vec![0.0f32; 6]; // 2 frames of 3 channels
+        mix_audio(&mut output, &mut state);
+        assert!(
+            (output[0] - 0.25).abs() < 1e-3,
+            "channel 0 at half gain, got {}",
+            output[0]
+        );
+        assert_eq!(output[1], 0.0, "channel 1 is outside the destination");
+        assert!(
+            (output[2] - 0.25).abs() < 1e-3,
+            "channel 2 at half gain, got {}",
+            output[2]
+        );
+
+        state.live_inputs[0].set_routing(u64::MAX, 1.0);
+        let mut output = vec![0.0f32; 6];
+        mix_audio(&mut output, &mut state);
+        assert!(
+            (output[1] - 0.5).abs() < 1e-3,
+            "every route again, got {}",
+            output[1]
+        );
     }
 
     #[test]

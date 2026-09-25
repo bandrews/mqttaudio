@@ -15,14 +15,18 @@ struct CommandResponse {
     message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Fields the command reports, such as a talkback acquire's `lease_id`
+    #[serde(flatten)]
+    fields: serde_json::Map<String, Value>,
 }
 
 impl CommandResponse {
-    fn success(message: String) -> Self {
+    fn success(reply: crate::mqtt::commands::CommandReply) -> Self {
         Self {
             success: true,
-            message: Some(message),
+            message: Some(reply.message),
             error: None,
+            fields: reply.fields,
         }
     }
 
@@ -31,6 +35,7 @@ impl CommandResponse {
             success: false,
             message: None,
             error: Some(msg.to_string()),
+            fields: serde_json::Map::new(),
         }
     }
 }
@@ -59,7 +64,7 @@ async fn send_command(state: &AppState, command_json: &str) -> (StatusCode, Json
     }
 
     match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
-        Ok(Ok(Ok(message))) => (StatusCode::OK, Json(CommandResponse::success(message))),
+        Ok(Ok(Ok(reply))) => (StatusCode::OK, Json(CommandResponse::success(reply))),
         Ok(Ok(Err(err))) => (
             status_for(err.kind),
             Json(CommandResponse::error(&err.message)),

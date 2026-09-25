@@ -26,10 +26,12 @@ are the things most likely to silently break a UI.
 - **Unknown params are ignored**, so a misspelled key is silently dropped rather than rejected.
 - **Every command route reports the real outcome**, `/command` included: it waits (up to 30 s) until the
   control loop has carried the command out and answers `200 {"success":true,"message":"Command completed"}`
-  or an error status with `{"success":false,"error":"…"}`: `400` malformed/invalid, `403` forbidden (path
-  outside `allowed_directories`, a refused or out-of-range talkback request, unmuting a talkback-held
-  input), `404` nothing to act on (missing/undecodable file, failed URL, unmatched selector, empty voice,
-  unavailable input, no open talkback microphone), `409` cancelled by a later `stopall`/`fadeall` or a
+  or an error status with `{"success":false,"error":"…"}`: `400` malformed/invalid (including an
+  out-of-range talkback value or unknown destination), `403` forbidden (path outside
+  `allowed_directories`, a talkback lease held by another client, opening the talkback microphone
+  without a lease), `404` nothing to act on (missing/undecodable file, failed URL, unmatched selector,
+  empty voice, unavailable input, talkback not configured or its microphone not open, no lease to
+  release), `409` cancelled by a later `stopall`/`fadeall` or a
   `seek`/`speed` matching only windowed sounds, `500` overloaded (32 loads in flight, a sound limit reached, full audio queue) or
   internal, `504` no result within 30 s of queuing.
   After a `504` the daemon drops the command: a play whose load finishes later never starts (cache
@@ -56,15 +58,15 @@ parser/handler defaults.
 | `voice_volume` | `voice`, `volume` | — | Clamped `0..4`; also reaches a live input with that `voice_id`. `404` if neither exists. |
 | `voice_fade_out` | `voice`, **`time`** | — | **Wire key is `time` (ms).** Typed REST body uses `time_ms` (§5). |
 | `voice_stop` | `voice` | — | 10 ms fade. `404` if the voice has no sounds. |
-| `input_volume` | `input`, `volume` | `fade_ms`(20; 0..60000, 0 = instant) | `input` is a **string** — index `"0"` or a `voice_id`. A bare number is a `400` on `/command`/MQTT, `422` on the typed route. Clears mute. |
-| `input_mute` | `input`, **`mute`** | `fade_ms`(20; 0..60000, 0 = instant) | `mute` required on every path. A muted input never triggers ducking. Unmuting by `voice_id` is `403` while a talkback lease holds the input (not checked by index, nor for `input_volume`). |
+| `input_volume` | `input`, `volume` | `fade_ms`(20; 0..60000, 0 = instant) | `input` is a **string** — index `"0"` or a `voice_id`. A bare number is a `400` on `/command`/MQTT, `422` on the typed route. Clears mute. `403` on the talkback microphone without a lease. |
+| `input_mute` | `input`, **`mute`** | `fade_ms`(20; 0..60000, 0 = instant) | `mute` required on every path. A muted input never triggers ducking. Unmuting the talkback microphone without a lease is `403`, by index or `voice_id`. |
 | `precache` (`soundPrecache`) | `file` | — | Loads as an `auto` play would: decodes files within the limits, downloads over-limit URLs to disk only. Completes when loading has started. |
 | `cache_clear` | — | — | Clears memory + disk. |
 | `cache_invalidate` | `file` | — | Exact key/file string. |
 | `cache_reload` | `file` | — | Invalidate + re-precache; completes when loading has started. |
-| `talkback_acquire` | `client_id`, `destination`, `gain`, `lease_ms` | `source_id`(`GM_MIC`) | Lease 250..2000 ms, gain −60..12 dB, fixed destination allowlist; refusals and out-of-range values are `403`, and `404` when no `GM_MIC`/`mic` input is open. `gain`/`destination` are validated and echoed in `/status/talkback` but not applied. Renew by re-acquiring. |
-| `talkback_release` | `client_id`, `lease_id` | — | `lease_id` from `/status/talkback`. |
-| `talkback_hard_mute` | — | — | Ends the current lease and mutes its input. |
+| `talkback_acquire` | `client_id`, `destination`, `gain`, `lease_ms` | `source_id` (must name `talkback.input`) | Needs the config's `talkback` section (else `404`). Lease 250..2000 ms, gain −60..12 dB on top of the input volume, `destination` one of `talkback.destinations`; out-of-range values are `400`, another client's lease `403`, an unopened microphone `404`. The mic plays only on the destination's channels. Reply adds `lease_id`. Renew (and change destination/gain) by re-acquiring. |
+| `talkback_release` | `client_id` | `lease_id` (must be current) | The holder's `client_id` ends its lease; another client is `403`, no lease `404`. |
+| `talkback_hard_mute` | — | — | Ends the current lease, whoever holds it, and mutes the microphone. `404` when talkback is not configured. |
 
 ## 3. Selector model (`stop`/`volume`/`seek`/`speed`)
 
@@ -131,7 +133,7 @@ open): `/health`, `/ready`, `/version`, `/metrics`, `/status`, `/status/samples`
 | `/telemetry` | `{enabled}` (Sprint W6). `GET` reads the opt-in flag; `POST {"enabled":bool}` sets it (token-gated). Off by default. |
 | `/status/voices` | per-voice `id,sample_count,volume,ducking_multiplier`, for voices with sounds (a voice used only by a live input is absent; `/metrics` `ducking` lists every ducked voice). `ducking_multiplier` is the target the voice is at or fading to (1.0 = not ducked). Poll 1–2 s. |
 | `/status/inputs` | per-input `index,voice_id,volume,channels,muted,unmuted_volume,ready,last_error,backlog_frames,max_backlog_frames,dropped_frames,trimmed_frames,underrun_frames`; `volume`/`muted`/`unmuted_volume` are the audio thread's applied state. Poll 1–2 s. |
-| `/status/talkback` | `{now_ms,talkback{state,applied_live,lease_id,owner_client_id,source_id,destination,gain,lease_expires_at_ms,last_transition,last_error}}` (monotonic ms). `state` follows the lease, not the input: the microphone is live at startup while `state` reads `muted`. |
+| `/status/talkback` | `{now_ms,talkback{state,applied_live,lease_id,owner_client_id,source_id,destination,gain,lease_expires_at_ms,last_transition,last_error}}` (monotonic ms). `state` follows the lease; `applied_live` is whether the microphone is open (it stays `true` after a lease ends until the mute is queued). |
 | `/status/meters` | `{output:[peak…]}` per output channel, post-limiter, linear; zeros when telemetry is off. |
 | `/status/cache` | memory/disk `{entries,size_bytes,size_mb}`. Poll 2–5 s. |
 | `/metrics` | `uptime_seconds`, `clips`, `xruns`, active counts, `output_channels`, `cache{memory_bytes,memory_entries,memory_headroom_bytes,memory_cap_bytes,disk_bytes}` (`null` cap = unlimited), `ducking` map, `latency{play_to_first_mix_ns{last,max},plays_measured}`, `input_capture{<voice>{…}}`, `pitch_scratch_regrows`. Poll 1 s. Richest read surface. |

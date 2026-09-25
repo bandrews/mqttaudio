@@ -367,6 +367,56 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Talkback: the microphone a talkback lease opens, and the destinations a lease
+/// may send it to.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct TalkbackConfig {
+    /// The talkback microphone: an input's `voice_id`, or its position in `inputs`
+    /// as a string. Talkback is off while unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// The destinations a lease may choose, each with the output channels the
+    /// microphone plays on during the lease.
+    pub destinations: Vec<TalkbackDestination>,
+}
+
+/// A talkback destination: a name clients use, and the output channels it covers.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TalkbackDestination {
+    pub name: String,
+    pub channels: Vec<ChannelRef>,
+}
+
+/// Talkback with its input and destination channels resolved.
+#[derive(Debug, Clone)]
+pub struct ResolvedTalkback {
+    /// Position of the talkback input in `inputs`
+    pub input_index: usize,
+    /// The talkback input's `voice_id`
+    pub voice_id: String,
+    /// Each destination's name and output channels, one bit per channel
+    destinations: Vec<(String, u64)>,
+}
+
+impl ResolvedTalkback {
+    /// The output channels of destination `name`, one bit per channel.
+    pub fn destination_mask(&self, name: &str) -> Option<u64> {
+        self.destinations
+            .iter()
+            .find(|(destination, _)| destination == name)
+            .map(|(_, mask)| *mask)
+    }
+
+    /// The destination names clients may ask for.
+    pub fn destination_names(&self) -> impl Iterator<Item = &str> {
+        self.destinations.iter().map(|(name, _)| name.as_str())
+    }
+}
+
+/// Output channels a talkback destination can address (one bit each).
+pub const MAX_TALKBACK_CHANNELS: usize = 64;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BassManagementConfig {
@@ -732,6 +782,8 @@ pub struct Config {
     #[serde(default)]
     pub inputs: Vec<InputConfig>,
     #[serde(default)]
+    pub talkback: TalkbackConfig,
+    #[serde(default)]
     pub advanced: AdvancedConfig,
     /// Command macros for parameter presets.
     /// Each macro name maps to an object of default parameters that will be merged
@@ -897,6 +949,99 @@ impl Config {
             self.http.require_auth = true;
             self.http.enabled = true;
         }
+    }
+
+    /// The talkback section resolved against `inputs` and the channel aliases, or
+    /// `None` while talkback is off or does not resolve (validation says why).
+    pub fn resolved_talkback(&self) -> Option<ResolvedTalkback> {
+        self.resolve_talkback().ok().flatten()
+    }
+
+    fn resolve_talkback(&self) -> Result<Option<ResolvedTalkback>, Vec<String>> {
+        let talkback = &self.talkback;
+        let Some(input) = &talkback.input else {
+            if talkback.destinations.is_empty() {
+                return Ok(None);
+            }
+            return Err(vec![
+                "talkback.destinations needs talkback.input, the microphone talkback opens"
+                    .to_string(),
+            ]);
+        };
+        let input_index = match input.parse::<usize>() {
+            Ok(index) if index < self.inputs.len() => Some(index),
+            Ok(_) => None,
+            Err(_) => self
+                .inputs
+                .iter()
+                .position(|config| &config.voice_id == input),
+        };
+        let Some(input_index) = input_index else {
+            return Err(vec![format!(
+                "talkback.input '{}' names no configured input (use an input's voice_id or its \
+                 position in inputs)",
+                input
+            )]);
+        };
+        let routed: Vec<usize> = self.inputs[input_index]
+            .routes
+            .iter()
+            .filter_map(|route| self.resolve_channel(&route.dest_channel).ok())
+            .collect();
+        let mut errors = Vec::new();
+        if talkback.destinations.is_empty() {
+            errors.push("talkback.destinations must list at least one destination".to_string());
+        }
+        let mut destinations: Vec<(String, u64)> = Vec::new();
+        for (i, destination) in talkback.destinations.iter().enumerate() {
+            let name = &destination.name;
+            if name.trim().is_empty() {
+                errors.push(format!(
+                    "talkback.destinations[{}].name must not be empty",
+                    i
+                ));
+                continue;
+            }
+            if destinations.iter().any(|(listed, _)| listed == name) {
+                errors.push(format!(
+                    "talkback destination '{}' is listed more than once",
+                    name
+                ));
+                continue;
+            }
+            if destination.channels.is_empty() {
+                errors.push(format!(
+                    "talkback destination '{}' needs at least one output in channels",
+                    name
+                ));
+            }
+            let mut mask = 0u64;
+            for channel in &destination.channels {
+                match self.resolve_channel(channel) {
+                    Err(e) => errors.push(format!("talkback destination '{}': {}", name, e)),
+                    Ok(index) if index >= MAX_TALKBACK_CHANNELS => errors.push(format!(
+                        "talkback destination '{}': channel {} is beyond the {} channels talkback \
+                         can address",
+                        name, index, MAX_TALKBACK_CHANNELS
+                    )),
+                    Ok(index) if !routed.contains(&index) => errors.push(format!(
+                        "talkback destination '{}': channel {} is not routed from the talkback \
+                         input; add a route to it in inputs",
+                        name, index
+                    )),
+                    Ok(index) => mask |= 1 << index,
+                }
+            }
+            destinations.push((name.clone(), mask));
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        Ok(Some(ResolvedTalkback {
+            input_index,
+            voice_id: self.inputs[input_index].voice_id.clone(),
+            destinations,
+        }))
     }
 
     /// Merge CLI arguments into this config (CLI args override config file)
@@ -1212,6 +1357,10 @@ impl Config {
                 "audio.max_streamed_sounds must be between 1 and {}",
                 MAX_STREAMED_SOUNDS_LIMIT
             ));
+        }
+
+        if let Err(talkback_errors) = self.resolve_talkback() {
+            errors.extend(talkback_errors);
         }
 
         // Ducking target volumes must be finite and within [0.0, 1.0]
@@ -1942,6 +2091,101 @@ mod tests {
         config.audio.master_gain = 100.0;
         let errors = config.validate().unwrap_err();
         assert!(errors.iter().any(|e| e.contains("master_gain")));
+    }
+
+    fn talkback_config(talkback: serde_json::Value) -> Config {
+        serde_json::from_value(serde_json::json!({
+            "mqtt": {"topic": "t"},
+            "audio": {"channel_aliases": {"room1_left": 2, "room1_right": 3}},
+            "inputs": [
+                {"voice_id": "house", "routes": [{"source_channel": 0, "dest_channel": 0}]},
+                {"voice_id": "GM_MIC", "routes": [
+                    {"source_channel": 0, "dest_channel": 0},
+                    {"source_channel": 0, "dest_channel": 1},
+                    {"source_channel": 0, "dest_channel": 2},
+                    {"source_channel": 0, "dest_channel": 3}
+                ]}
+            ],
+            "talkback": talkback
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn talkback_is_off_until_it_names_an_input() {
+        let config = Config::default();
+        assert!(config.talkback.input.is_none());
+        assert!(config.talkback.destinations.is_empty());
+        assert!(config.resolved_talkback().is_none());
+    }
+
+    #[test]
+    fn talkback_resolves_its_input_and_destination_channels() {
+        let config = talkback_config(serde_json::json!({
+            "input": "GM_MIC",
+            "destinations": [
+                {"name": "GUEST_ALL", "channels": [0, 1, 2, 3]},
+                {"name": "ROOM_1", "channels": ["room1_left", "room1_right"]}
+            ]
+        }));
+        assert!(config.validate().is_ok(), "{:?}", config.validate());
+        let talkback = config.resolved_talkback().unwrap();
+        assert_eq!(talkback.input_index, 1);
+        assert_eq!(talkback.destination_mask("GUEST_ALL"), Some(0b1111));
+        assert_eq!(talkback.destination_mask("ROOM_1"), Some(0b1100));
+        assert_eq!(talkback.destination_mask("ROOM_9"), None);
+
+        let by_position = talkback_config(serde_json::json!({
+            "input": "1",
+            "destinations": [{"name": "ALL", "channels": [0]}]
+        }));
+        assert_eq!(by_position.resolved_talkback().unwrap().input_index, 1);
+    }
+
+    #[test]
+    fn talkback_configuration_mistakes_are_reported() {
+        let cases = [
+            (
+                serde_json::json!({"input": "nobody", "destinations": [{"name": "A", "channels": [0]}]}),
+                "talkback.input",
+            ),
+            (
+                serde_json::json!({"input": "GM_MIC", "destinations": []}),
+                "talkback.destinations",
+            ),
+            (
+                serde_json::json!({"destinations": [{"name": "A", "channels": [0]}]}),
+                "talkback.input",
+            ),
+            (
+                serde_json::json!({"input": "GM_MIC", "destinations": [{"name": "", "channels": [0]}]}),
+                "name",
+            ),
+            (
+                serde_json::json!({"input": "GM_MIC", "destinations": [{"name": "A", "channels": [0]}, {"name": "A", "channels": [1]}]}),
+                "more than once",
+            ),
+            (
+                serde_json::json!({"input": "GM_MIC", "destinations": [{"name": "A", "channels": []}]}),
+                "channels",
+            ),
+            (
+                serde_json::json!({"input": "GM_MIC", "destinations": [{"name": "A", "channels": ["nowhere"]}]}),
+                "nowhere",
+            ),
+            (
+                serde_json::json!({"input": "GM_MIC", "destinations": [{"name": "A", "channels": [5]}]}),
+                "not routed",
+            ),
+        ];
+        for (talkback, expected) in cases {
+            let config = talkback_config(talkback.clone());
+            let errors = config.validate().unwrap_err();
+            assert!(
+                errors.iter().any(|e| e.contains(expected)),
+                "{talkback}: expected an error mentioning {expected:?}, got {errors:?}"
+            );
+        }
     }
 
     #[test]
