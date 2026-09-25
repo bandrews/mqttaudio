@@ -1,5 +1,5 @@
 // ABOUTME: HTTP route definitions for mqttaudio REST API.
-// ABOUTME: Sets up all endpoints with optional auth middleware and CORS.
+// ABOUTME: Sets up all endpoints with optional auth, the cross-site check and CORS.
 
 use super::handlers;
 use super::websocket;
@@ -9,11 +9,11 @@ use axum::{
     extract::State,
     http::{header, Request, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, Any, CorsLayer};
 
 /// Constant-time string equality (avoids leaking the token via compare timing).
 /// The length is allowed to differ-fast; token length is not the secret.
@@ -108,6 +108,33 @@ async fn auth_middleware(
     Err(StatusCode::UNAUTHORIZED)
 }
 
+/// Refuse a request a browser sends from a page on another site (`Sec-Fetch-Site:
+/// cross-site`). Without CORS such a page cannot read the answers or send JSON,
+/// but it can still send the body-less commands and open the WebSockets. Clients
+/// that are not browsers send no such header and are served.
+async fn refuse_cross_site(request: Request<Body>, next: Next) -> Response {
+    let cross_site = request
+        .headers()
+        .get("sec-fetch-site")
+        .is_some_and(|site| site.as_bytes().eq_ignore_ascii_case(b"cross-site"));
+    if cross_site {
+        tracing::debug!(
+            "Refused a request for {} from a page on another site",
+            request.uri().path()
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Requests from pages on other sites are refused; set \
+                          http.cors_permissive to allow them",
+            })),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 /// Create the main router with all endpoints.
 pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: bool) -> Router {
     // Build command routes
@@ -175,7 +202,7 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
     // /health and /ready are always open (liveness and readiness probes). Status
     // routes are open unless require_auth is set; the WebSockets carry the auth
     // middleware either way, so they need the token whenever one is set.
-    let mut app = Router::new().merge(health_route);
+    let mut app = Router::new();
 
     if state.require_auth {
         let protected_status = status_routes.layer(middleware::from_fn_with_state(
@@ -208,13 +235,19 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         }
     }
 
-    // Add CORS layer if permissive mode is enabled
+    // Pages on other sites are served only with CORS on, which then answers them
+    // for any origin. The allowed headers mirror the preflight's request, since
+    // browsers do not count `Authorization` as covered by a `*`.
     if cors_permissive {
         let cors = CorsLayer::new()
             .allow_origin(Any)
             .allow_methods(Any)
-            .allow_headers(Any);
-        app = app.layer(cors);
+            .allow_headers(AllowHeaders::mirror_request());
+        app = app.merge(health_route).layer(cors);
+    } else {
+        app = app
+            .layer(middleware::from_fn(refuse_cross_site))
+            .merge(health_route);
     }
 
     app.with_state(state)

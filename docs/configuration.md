@@ -240,7 +240,7 @@ Logs go to standard output. Records published to `mqtt_topic` look like this:
 | `auth_token` | none | Bearer token, at least 8 characters, required for commands and WebSockets |
 | `require_auth` | `false` | Also require the token for status routes. Needs a token |
 | `websocket_enabled` | `true` | Serve `/ws` and `/ws/state` |
-| `cors_permissive` | `false` | Allow browser pages from any origin to call the API |
+| `cors_permissive` | `false` | Allow browser pages from any origin to call the API. Off, requests from pages on other sites are refused ([HTTP API: Security levels](http-api.md#security-levels)) |
 
 A warning is logged when the server listens on a non-loopback address without a token.
 

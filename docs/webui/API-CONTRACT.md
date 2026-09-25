@@ -152,7 +152,10 @@ unrecoverable errors rebuild the stream. Label it "stream errors".
   about every 66 ms, **only while telemetry is on** (and a client is connected); no welcome frame.
 
 Both need the token whenever `http.auth_token` is set. Behind the proxy (DW1) the browser connects
-same-origin and the proxy injects it; bypassing the proxy forces `?token=` in the WS URL (DW9).
+same-origin and the proxy injects it; bypassing the proxy forces `?token=` in the WS URL (DW9). A page on another
+site than the daemon (`Sec-Fetch-Site: cross-site`) gets `403` on every route but `/health` and `/ready` unless
+`http.cors_permissive` is on; with it on, CORS allows any origin and mirrors the requested headers, so
+`Authorization` works.
 
 ## 7. Program additions — landed and deferred
 

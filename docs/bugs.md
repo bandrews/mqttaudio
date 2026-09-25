@@ -61,13 +61,10 @@ quality review with its deferred backlog is in [docs/quality-review-2026-08/](qu
 
 ### HTTP API
 
-- **CORS does not cover the `Authorization` header.** `cors_permissive` sends
-  `Access-Control-Allow-Headers: *`, which browsers do not apply to `Authorization`, so cross-origin
-  pages must use `?token=`. Mirroring the requested headers would fix it.
-- **Cross-site requests in open mode.** With no `auth_token`, any web page the operator opens can
-  send the body-less `POST /stopall`, `/cache/clear` and `/talkback/hard-mute` to a daemon on
-  `localhost`, and read the log stream on `/ws` (no `Origin` check). With `cors_permissive` on, every
-  JSON command route is reachable cross-site too. Setting a token closes this.
+- **Without a token, only browsers that mark their requests are kept from other sites.** The
+  cross-site check reads `Sec-Fetch-Site`, which current Chrome, Edge, Firefox and Safari (16.4 and
+  later) send; an older browser is not checked, and a page that resolves its own domain name to the
+  daemon's address (DNS rebinding) counts as the same site. Setting a token closes both.
 - **The 30-second command timeout starts after queuing**, so a request can wait longer while the
   command queue is full.
 

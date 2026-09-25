@@ -67,7 +67,9 @@ dev proxy does not add a token: if the daemon has an `auth_token`, enter it on t
 
 On the connect screen, the **Daemon URL** defaults to `/api` (same-origin, behind the sidecar/dev proxy). If
 the daemon requires auth, a Bearer-token field appears after the first attempt; behind the sidecar the token is
-injected server-side and never appears in a URL.
+injected server-side and never appears in a URL. A daemon URL on another site needs `http.cors_permissive` on
+the daemon, which otherwise refuses requests from pages on other sites (another port on the same host is the
+same site).
 
 ## Develop / test
 

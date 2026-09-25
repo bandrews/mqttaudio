@@ -95,7 +95,7 @@ mqttaudio runs open by default so it is easy to try on a trusted network. Each o
 |------|---------|
 | Any local file the daemon can read is playable | `security.allowed_directories`: only paths inside these directories play (symlinks and `..` are resolved first). HTTP(S) URLs are not restricted; limit outbound traffic with a firewall if that matters |
 | MQTT traffic and credentials in cleartext | `mqtt.tls` (with `ca_path` for a private CA); a warning is logged when credentials go to a non-loopback broker without TLS |
-| Anyone who can reach the HTTP port can send commands | `http.auth_token` protects the command endpoints and the WebSockets; `http.require_auth` extends it to the status routes, `/metrics`, `/version` and `/config` (`/health` and `/ready` stay open). Keep `http.bind_address` on loopback unless it must be remote; a warning is logged for a non-loopback bind without authentication |
+| Anyone who can reach the HTTP port can send commands | `http.auth_token` protects the command endpoints and the WebSockets; `http.require_auth` extends it to the status routes, `/metrics`, `/version` and `/config` (`/health` and `/ready` stay open). Keep `http.bind_address` on loopback unless it must be remote; a warning is logged for a non-loopback bind without authentication. Pages on other sites are refused unless `http.cors_permissive` is on ([HTTP API: Security levels](http-api.md#security-levels)) |
 
 The HTTP server speaks plain HTTP. Put a reverse proxy in front of it for TLS
 ([HTTP API: HTTPS](http-api.md#https)).

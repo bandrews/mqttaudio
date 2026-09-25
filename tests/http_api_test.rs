@@ -1979,3 +1979,108 @@ async fn test_voices_endpoint_reports_per_voice_ducking_state() {
         "an unducked voice reports 1.0, got {narration_duck}"
     );
 }
+
+/// A body-less request as a browser sends it from a page whose relation to the
+/// daemon is `site` (the `Sec-Fetch-Site` value).
+fn from_browser(method: Method, uri: &str, site: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("sec-fetch-site", site)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_page_on_another_site_cannot_reach_the_daemon() {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, true);
+    for (method, uri) in [
+        (Method::POST, "/stopall"),
+        (Method::POST, "/talkback/hard-mute"),
+        (Method::GET, "/status"),
+        (Method::GET, "/ws"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(from_browser(method, uri, "cross-site"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{uri}");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["error"].as_str().unwrap().contains("cors_permissive"),
+            "{uri}: the refusal names the setting that allows it, got {json}"
+        );
+    }
+    assert!(rx.try_recv().is_err(), "no command reached the daemon");
+
+    let health = app
+        .oneshot(from_browser(Method::GET, "/health", "cross-site"))
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK, "probes stay open");
+}
+
+#[tokio::test]
+async fn pages_on_the_same_site_and_other_clients_are_served() {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+    for site in ["same-origin", "same-site", "none"] {
+        let response = app
+            .clone()
+            .oneshot(from_browser(Method::POST, "/stopall", site))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{site}");
+    }
+    let script = Request::builder()
+        .method(Method::POST)
+        .uri("/stopall")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(script).await.unwrap().status(), StatusCode::OK);
+    for _ in 0..4 {
+        assert!(rx.recv().await.unwrap().contains("stopall"));
+    }
+}
+
+#[tokio::test]
+async fn cors_permissive_serves_other_sites_and_their_authorization_header() {
+    let (state, _rx) = create_test_state_with_auth("secret_token_123");
+    let app = create_router(state, true, false);
+    let preflight = Request::builder()
+        .method(Method::OPTIONS)
+        .uri("/play")
+        .header(header::ORIGIN, "https://panel.example.com")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .header(
+            header::ACCESS_CONTROL_REQUEST_HEADERS,
+            "authorization,content-type",
+        )
+        .body(Body::empty())
+        .unwrap();
+    let response = app.clone().oneshot(preflight).await.unwrap();
+    let allowed = response
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+        .map(|value| value.to_str().unwrap().to_ascii_lowercase())
+        .unwrap_or_default();
+    assert!(
+        allowed.contains("authorization"),
+        "a preflight asking for Authorization must be allowed it, got {allowed:?}"
+    );
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/stopall")
+        .header(header::ORIGIN, "https://panel.example.com")
+        .header("sec-fetch-site", "cross-site")
+        .header(header::AUTHORIZATION, "Bearer secret_token_123")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(request).await.unwrap().status(), StatusCode::OK);
+}

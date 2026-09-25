@@ -45,6 +45,38 @@ curl -X POST "http://localhost:8080/stopall?token=a-long-random-token"
 Browsers cannot set headers on a WebSocket, so use the query parameter there. Tokens shorter than 8
 characters are rejected at startup, and `require_auth` without a token is a startup error.
 
+## Security levels
+
+Choose how much to lock down:
+
+| Level | Settings | Who can control the daemon |
+|-------|----------|----------------------------|
+| Wide open | no `auth_token`, `cors_permissive: true` | Anyone who can reach the port, including any web page open in a browser that can reach it |
+| Default | no `auth_token`, `cors_permissive: false` | Anyone who can reach the port with a script, `curl` or a page on the same site; web pages on other sites are refused (see below) |
+| Secured | `auth_token` (and `require_auth` to hide status too), TLS through a [reverse proxy](#https) | Only clients holding the token |
+
+The server listens on `127.0.0.1` by default, so without a token "anyone who can reach the port"
+means programs on the same machine; binding it to a network address without a token logs a
+warning.
+
+A token is the real protection: a page on another site never has it. Without one, the default level
+still keeps out pages on other sites, but not everything: a page that resolves its own domain name to
+the daemon's address (DNS rebinding) counts as the same site. Set a token if untrusted pages may be
+opened on a machine that can reach the daemon.
+
+## Cross-origin requests
+
+Browsers mark each request with the site of the page that sent it (`Sec-Fetch-Site`). Unless
+`http.cors_permissive` is on, a request marked `cross-site` gets `403` on every route except
+`/health` and `/ready`: without it, a page on another site could still send the commands that take
+no body (`/stopall`, `/cache/clear`, `/talkback/hard-mute`) and open the WebSockets.
+Pages on the same site (`same-origin` or `same-site`, which includes another port on the same host),
+and clients that are not browsers, are not affected.
+
+`http.cors_permissive: true` lets web pages from any origin call the API, including with an
+`Authorization` header. A page served from the same origin (for example through the
+[web UI's proxy](webui/README.md)) needs neither.
+
 ## Command routes
 
 All take `POST` with a JSON body (`Content-Type: application/json`).
@@ -104,7 +136,7 @@ A talkback acquire's reply also carries the lease's id, `"lease_id": "lease-0001
 |--------|---------|
 | `200` | Done |
 | `400` | The command is malformed: bad JSON, unknown command, a missing or invalid parameter, no selector, an unknown channel name, `speed: 0`, a talkback value out of range or an unknown destination |
-| `403` | Not allowed: a path outside `security.allowed_directories`, a talkback lease held by another client, opening the talkback microphone without a lease |
+| `403` | Not allowed: a path outside `security.allowed_directories`, a talkback lease held by another client, opening the talkback microphone without a lease, a request from a page on another site ([Cross-origin requests](#cross-origin-requests)) |
 | `404` | Nothing to act on: a file that is missing or cannot be decoded, a URL that fails, a selector that matches no sound, an empty voice, an input that did not open, talkback not configured or its microphone not open, no lease to release |
 | `409` | A pending play or cache command was cancelled by `stopall` or `fadeall`, or a `seek` or `speed` matched only windowed sounds |
 | `500` | The daemon is overloaded (32 loads already in flight, a sound limit reached, or its audio queue is full) or failed internally |
@@ -383,13 +415,6 @@ While telemetry is on, sends about 15 messages per second:
 ```
 
 Nothing is sent while telemetry is off.
-
-## Cross-origin requests
-
-`http.cors_permissive: true` lets web pages from any origin call the API. Browsers do not treat the
-`Authorization` header as covered by that permission, so a cross-origin page should pass the token as
-the `token` query parameter. A page served from the same origin (for example through the
-[web UI's proxy](webui/README.md)) needs neither.
 
 ## HTTPS
 

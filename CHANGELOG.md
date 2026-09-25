@@ -42,6 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channels it plays on: a soundtrack on every main is not multiplied, an effect on one main keeps its
   level, and different sounds add up. Content that played on every source channel sounds the same as
   before.
+- **Pages on other sites are refused unless `http.cors_permissive` is on.** A request a browser marks
+  `Sec-Fetch-Site: cross-site` gets `403` on every route but `/health` and `/ready`. Without a token,
+  any web page open on the daemon's machine could send `/stopall`, `/cache/clear` and
+  `/talkback/hard-mute` (they take no body, so need no CORS) and read the log stream on `/ws`. Pages on
+  the same site, including another port on the same host and the web UI behind its proxy, and clients
+  that are not browsers are not affected. The HTTP API guide describes the three security levels.
 - **Talkback needs the `talkback` section.** The talkback microphone was the input whose `voice_id`
   was `GM_MIC`, or else `mic`. To upgrade, set `talkback.input` to that input and list the
   destinations your clients use in `talkback.destinations`; without the section the talkback commands
@@ -55,6 +61,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cors_permissive` lets cross-origin pages send the `Authorization` header.** It answered preflights
+  with `Access-Control-Allow-Headers: *`, which browsers do not apply to `Authorization`, so such pages
+  had to put the token in the URL. It now allows the headers the preflight asks for.
 - **The talkback microphone is closed until a lease opens it.** It opened unmuted at startup and stayed
   live until the first lease ended, while `/status/talkback` reported `muted`. Without a lease,
   `input_mute` could unmute it; with one, only an unmute naming it by `voice_id` was refused, so
