@@ -1144,6 +1144,7 @@ async fn main() {
                     &mut grave_rx,
                     &mut streamed_grave_rx,
                     &mut cmd_return_rx,
+                    &voice_manager,
                     &mut cmd_tx,
                     ducking_engine.as_mut(),
                     &mut active_counts,
@@ -1389,14 +1390,17 @@ fn detect_available_memory() -> Option<u64> {
 }
 
 /// Reconcile control-side bookkeeping for one finished voice-bearing entry (a sample
-/// or a streamed source): drop it from the live `playing` map and decrement its
+/// or a streamed source): drop it from the live `playing` map and from its voice in
+/// the voice manager (which removes the voice once it is empty) and decrement its
 /// voice's active count; when that count reaches zero, restore the voice through the
 /// shared notify path (which, for a ducking primary, recomputes restore targets sent
 /// back to the audio thread). Returns whether the voice's count reached zero (it is
 /// now fully idle), so the caller can drop it from the streamed-voice set.
+#[allow(clippy::too_many_arguments)]
 fn reconcile_finished_voice(
     voice: &str,
     id: u64,
+    voice_manager: &parking_lot::Mutex<voice::VoiceManager>,
     cmd_tx: &mut rt_engine::CommandProducer,
     ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
     active_counts: &mut std::collections::HashMap<String, usize>,
@@ -1404,6 +1408,7 @@ fn reconcile_finished_voice(
     ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
 ) -> bool {
     playing.remove(&id);
+    voice_manager.lock().remove_sample(id);
     if let Some(count) = active_counts.get_mut(voice) {
         *count -= 1;
         if *count == 0 {
@@ -1425,6 +1430,7 @@ fn reap_finished_samples(
     grave_rx: &mut rt_engine::GraveyardConsumer,
     streamed_grave_rx: &mut rt_engine::StreamedGraveyardConsumer,
     cmd_return_rx: &mut rt_engine::CommandReturnConsumer,
+    voice_manager: &parking_lot::Mutex<voice::VoiceManager>,
     cmd_tx: &mut rt_engine::CommandProducer,
     mut ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
     active_counts: &mut std::collections::HashMap<String, usize>,
@@ -1450,6 +1456,7 @@ fn reap_finished_samples(
         if reconcile_finished_voice(
             &voice,
             id,
+            voice_manager,
             cmd_tx,
             ducking_engine.as_deref_mut(),
             active_counts,
@@ -1472,6 +1479,7 @@ fn reap_finished_samples(
         if reconcile_finished_voice(
             &voice,
             id,
+            voice_manager,
             cmd_tx,
             ducking_engine.as_deref_mut(),
             active_counts,
@@ -2968,6 +2976,7 @@ mod tests {
                 &mut self.grave_rx,
                 &mut self.streamed_grave_rx,
                 &mut self.cmd_return_rx,
+                &self.voice_manager,
                 &mut self.cmd_tx,
                 self.ducking_engine.as_mut(),
                 &mut self.active_counts,
@@ -4492,6 +4501,142 @@ mod tests {
             "no restore should be emitted while the voice still has samples"
         );
         assert_eq!(fixture.playing.len(), 2, "one narration + music remain");
+    }
+
+    #[tokio::test]
+    async fn reaper_prunes_finished_samples_from_their_voice() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("fx"), 1.0)).await;
+        fixture.run(play(Some("fx"), 1.0)).await;
+        fixture.drain();
+        assert_eq!(
+            fixture
+                .voice_manager
+                .lock()
+                .get_voice_sample_ids("fx")
+                .len(),
+            2
+        );
+
+        // One sample finishes: only the one still playing stays in the voice.
+        finish_voice_sample(&mut fixture, "fx");
+        fixture.reap();
+        let remaining = fixture.voice_manager.lock().get_voice_sample_ids("fx");
+        assert_eq!(remaining.len(), 1, "the finished sample leaves its voice");
+        assert!(
+            fixture.playing.contains_key(&remaining[0]),
+            "the sample left in the voice is the one still playing"
+        );
+
+        // The last sample finishes: the voice itself goes away.
+        finish_voice_sample(&mut fixture, "fx");
+        fixture.reap();
+        assert_eq!(
+            fixture.voice_manager.lock().voice_count(),
+            0,
+            "a voice with nothing playing is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaper_prunes_a_finished_streamed_source_from_its_voice() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_stream(Some("bed"))).await;
+        fixture.drain();
+        assert_eq!(
+            fixture
+                .voice_manager
+                .lock()
+                .get_voice_sample_ids("bed")
+                .len(),
+            1
+        );
+
+        // The RT thread retires the real streamed source into its graveyard.
+        let finished = fixture.mixer.streamed_sources.swap_remove(0);
+        fixture
+            .streamed_grave_tx
+            .push(finished)
+            .ok()
+            .expect("streamed graveyard has room");
+        fixture.reap();
+
+        assert_eq!(
+            fixture.voice_manager.lock().voice_count(),
+            0,
+            "a finished streamed source leaves its voice, and the empty voice goes away"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_commands_on_a_voice_whose_sounds_finished_report_not_found() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("fx"), 1.0)).await;
+        fixture.drain();
+        finish_voice_sample(&mut fixture, "fx");
+        fixture.reap();
+        while fixture.cmd_rx.pop().is_some() {}
+
+        let stop = run_capturing_warnings(
+            &mut fixture,
+            AudioCommand::VoiceStop {
+                voice: "fx".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(stop, vec!["Voice 'fx' not found or already empty"]);
+
+        let fade = run_capturing_warnings(
+            &mut fixture,
+            AudioCommand::VoiceFadeOut {
+                voice: "fx".to_string(),
+                time_ms: 500,
+            },
+        )
+        .await;
+        assert_eq!(fade, vec!["Voice 'fx' not found or already empty"]);
+
+        let volume = run_capturing_warnings(
+            &mut fixture,
+            AudioCommand::VoiceVolume {
+                voice: "fx".to_string(),
+                volume: 0.5,
+            },
+        )
+        .await;
+        assert_eq!(volume, vec!["Voice 'fx' not found"]);
+
+        assert!(
+            fixture.cmd_rx.pop().is_none(),
+            "nothing is sent to the audio thread for a voice that no longer exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_voice_played_again_after_it_finished_starts_at_full_volume() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("fx"), 1.0)).await;
+        fixture
+            .run(AudioCommand::VoiceVolume {
+                voice: "fx".to_string(),
+                volume: 0.3,
+            })
+            .await;
+        fixture.drain();
+        finish_voice_sample(&mut fixture, "fx");
+        fixture.reap();
+
+        // The voice ended with its last sound, so a new play creates it afresh.
+        fixture.run(play(Some("fx"), 1.0)).await;
+        fixture.drain();
+        let sample = fixture
+            .mixer
+            .active_samples
+            .iter()
+            .find(|s| s.voice_id == "fx")
+            .expect("the new fx sample");
+        assert_eq!(sample.voice_volume, 1.0);
     }
 
     #[tokio::test]

@@ -1,2 +1,45 @@
-(no work in progress - committed through "Merge v2.1 so the command-ordering
-fix is built on the release line")
+Remove finished sounds from their voice so voices end with their sounds
+
+main's af4dc22 taught the daemon to prune the voice manager: a periodic
+task removed each finished sample from its voice and dropped empty
+voices. v2.1's restructured command loop lost that when main was merged
+in, and nothing in v2.1 calls VoiceManager::remove_sample or
+cleanup_empty_voices. Every play therefore left a permanent entry (each
+play without a voice added a whole new auto voice), /status/voices
+listed voices whose sounds had ended, voice_stop and voice_fade_out on
+such a voice reported success for sample ids that no longer existed,
+and a later play into a reused voice name silently inherited the old
+voice_volume.
+
+The reaper already reconciles every finished sample and streamed source
+through reconcile_finished_voice, so that is where the voice manager is
+now pruned: the finished id leaves its voice, and VoiceManager's
+remove_sample drops the voice once it is empty. Voice commands on a
+voice whose sounds have all finished now report "not found", as they do
+on main, and a voice played again starts at full volume.
+
+Tests (written first, each failing for the reason above): a finished
+sample leaves its voice while its sibling stays, and the voice goes with
+its last sample; a finished streamed source leaves its voice;
+voice_stop, voice_fade_out and voice_volume on an ended voice warn "not
+found" and send nothing to the audio thread; a voice played again after
+it ended starts at volume 1.0.
+
+Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
+and a warning-free release build (RUSTFLAGS=-D warnings); fuzz suite 7
+passed; broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA
+set) 945 passed, 0 failed, 7 device-gated ignored.
+
+Prompts that led to this work:
+
+- "Let's go with the per-voice hold fix. Make sure to think through all
+  the possible implications, like conflicting sequences of multiple
+  commands affecting the same voice(s), or commands affecting multiple
+  groups/voices/etc in a complex way, before designing our approach.
+  We'll need a lot of tests in this area before implementation as well.
+  Consider spawning adversarial review agents both before starting the
+  fix and after implementing it."
+- "You can fix the other regression too." (the voice manager pruning
+  lost on v2.1, found while analysing voice semantics for the hold)
+
+This commit was authored by Claude (AI assistant) working with Ben Andrews.
