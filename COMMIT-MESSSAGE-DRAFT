@@ -1,2 +1,2 @@
-(no work in progress - committed through "Record that commands sent right
-after a play can overtake it")
+(no work in progress - committed through "Merge v2.1 so the command-ordering
+fix is built on the release line")

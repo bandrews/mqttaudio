@@ -36,7 +36,7 @@ Add inputs to your config file:
 | `volume` | Input volume (0.0 to 4.0, unity is 1.0) |
 | `voice_id` | Voice name for ducking integration |
 | `routes` | Channel routing (source → destination) |
-| `latency_ms` | Buffer latency (5-500ms) |
+| `latency_ms` | Buffer latency (5-500ms). Raised with a warning when the ring cannot hold one resampler chunk (11 ms at 48 kHz) |
 | `channels` | Capture channels to open. Omit to let the routes decide |
 | `sample_rate` | Capture rate to request. Omit to match the output rate |
 
@@ -55,13 +55,29 @@ fixed layout regardless of routing.
 `volume` is a gain: 1.0 passes the microphone through untouched, below that
 attenuates and above that boosts, up to 4.0 (+12 dB). Boosting is how you lift
 a quiet lavalier or a preamp that will not go loud enough; the mixer saturates
-its output, so too much gain clips rather than wrapping.
+its output at the configured ceiling, so additional gain engages the limiter.
 
 ### Sample rate
 
 `sample_rate` is normally left out. The capture stream is opened at the output
-rate whenever the device supports it, which keeps the resampler out of the
-signal path entirely.
+rate whenever the device supports it. Capture still uses asynchronous sample-rate
+conversion to compensate for clock drift between independently clocked devices.
+The configured output buffer size is also requested for capture, with a fallback
+to the device default if it is rejected.
+
+### Shared devices and activity detection
+
+Input entries with the same device, latency, channel-count setting, and sample-rate
+setting share one physical capture stream. Each receives its own ring buffer and
+routing, so several microphones on one multichannel interface do not compete to
+open the same ALSA device.
+
+Set `activity_threshold` (greater than 0 and at most 1) and `activity_hold_ms` on an
+input to trigger its ducking rules only while its routed microphone channels are
+active. Without a threshold, the configured input voice stays active while open.
+`/status/inputs` reports applied mute/volume state, readiness, capture drops,
+backlog, trimmed frames, and underruns. Talkback lease status is available at
+`/status/talkback`; an expired or released lease mutes its microphone.
 
 ## Finding Input Devices
 
@@ -90,10 +106,9 @@ On Linux, prefer the `plughw:` alias of a card over `hw:`:
 "device": "plughw:CARD=UMC1820,DEV=0"
 ```
 
-Capture is read as 32-bit float. `plughw:` converts from the card's native
-format; a bare `hw:` device that only offers integer formats is rejected at
-startup with the format it does offer. `hw:` works where the card exposes a
-float format natively.
+Capture supports native f32, i16, u16, and i32 formats and converts them to the
+mixer's floating-point format. `plughw:` supplies ALSA conversion when a card
+needs it; `hw:` can be used when the negotiated format is supported directly.
 
 Names are matched exactly first, then as a `--list-inputs` index, then by ALSA
 card, so `"hw:CARD=UMC1820, DEV=0"`, `"hw:1,0"`, and `"0"` (the index from the
@@ -136,57 +151,11 @@ Route a microphone to all player earpiece channels:
 ]
 ```
 
-### Several Microphones on One Interface
+A `source_channel` must exist on the device (channels are 0-based, so a 2-channel device has channels `0` and `1`). The device's channel count is only known once the input stream opens, so a route reading a non-existent source channel is logged as a warning at startup and that route is dropped:
 
-A multichannel interface exposes each of its microphone preamps as a source
-channel, so one `inputs` entry can carry several microphones at once. Routing
-two source channels to the same destination sums them:
-
-```json
-{
-  "device": "plughw:CARD=UMC1820,DEV=0",
-  "voice_id": "room_mics",
-  "routes": [
-    {"source_channel": 0, "dest_channel": 4},
-    {"source_channel": 1, "dest_channel": 4},
-    {"source_channel": 2, "dest_channel": 5}
-  ]
-}
 ```
-
-Microphones 1 and 2 are mixed together onto output 4; microphone 3 goes to
-output 5 on its own. There is no limit on how many source channels an interface
-can contribute.
-
-### Several Microphones with Independent Control
-
-Everything in one `inputs` entry shares a volume, a `voice_id` and therefore
-one ducking behaviour. For per-microphone control, give each microphone its own
-entry:
-
-```json
-"inputs": [
-  {
-    "device": "Gamemaster Headset",
-    "voice_id": "gm_mic",
-    "volume": 0.9,
-    "routes": [{"source_channel": 0, "dest_channel": 4}]
-  },
-  {
-    "device": "Handheld Mic",
-    "voice_id": "handheld",
-    "volume": 0.7,
-    "routes": [{"source_channel": 0, "dest_channel": 4}]
-  }
-]
+WARN Input 0 routes read source channel(s) [2] but the device has only 2 channel(s) (0..1); those routes will be silently dropped — fix the input's routes config
 ```
-
-Both feed output 4 and are summed there, but each can be levelled, muted and
-ducked on its own.
-
-Separate entries need separate devices. Two entries naming the same ALSA `hw:`
-device will not both open it; route the extra microphones as extra source
-channels of a single entry instead.
 
 ## MQTT Commands
 
@@ -200,7 +169,7 @@ channels of a single entry instead.
 }
 ```
 
-The `input` field can be the `voice_id` or the input index (0, 1, 2...).
+The `input` field can be the `voice_id` or the input index (0, 1, 2...). Setting an explicit volume also takes the input out of any muted state.
 
 ### Mute/Unmute
 
@@ -211,6 +180,22 @@ The `input` field can be the `voice_id` or the input index (0, 1, 2...).
   "mute": true
 }
 ```
+
+Muting stores the input's current volume and silences it; unmuting **restores that stored volume** (for example, a calibrated `0.5`), not a fixed `1.0`. So a mute/unmute round-trip leaves the calibrated level intact.
+
+### Voice Volume
+
+An input's `voice_id` is a first-class voice: a `voice_volume` command targeting it ramps the input's level, even when no sample is playing on that voice.
+
+```json
+{
+  "command": "voice_volume",
+  "voice": "presenter_mic",
+  "volume": 0.4
+}
+```
+
+This is separate from `input_volume` (a per-input gain): `voice_volume` is the shared voice-level gain that also scales any samples playing on the same voice.
 
 ## Ducking Integration
 
@@ -264,9 +249,7 @@ pauses):
 }
 ```
 
-Now when the gamemaster speaks, ambient audio and music duck automatically.
-Without an `activity_threshold`, an input never triggers rules (it can
-still be ducked by them).
+Ambient audio and music duck while the gamemaster microphone's input stream is open. Activation is not yet gated on the microphone's signal level, so the duck holds while the input is running rather than only while the gamemaster is actually speaking; signal-level gating is planned.
 
 ## Example: Escape Room
 
@@ -309,7 +292,7 @@ Complete configuration for an escape room with gamemaster microphone:
 This:
 - Captures from the gamemaster's headset microphone
 - Routes to player earpiece channels (4-7)
-- Automatically ducks ambient audio when gamemaster speaks
+- Ducks ambient audio while the gamemaster microphone is active (its input stream is open)
 - Uses low latency (25ms) for natural conversation feel
 
 ## Latency
@@ -325,15 +308,38 @@ The `latency_ms` setting controls the input buffer size:
 
 For live microphones, use the lowest stable setting (typically 20-30ms).
 
-## Sample Rate Handling
+Capture runs through a resampler that publishes audio in 1024-frame chunks, so
+the ring must hold at least two chunks. A `latency_ms` below that minimum (11 ms
+at a 48 kHz output, 12 ms at 44.1 kHz) is raised to it when the input opens, with
+a warning naming the value used.
 
-If the input device sample rate differs from the output, mqttaudio automatically resamples. You'll see a warning in the logs:
+## Sample Rate and Clock-Drift Handling
+
+An input device and the output device are clocked by independent oscillators. Even when their nominal sample
+rates match (e.g. both `48000 Hz`), those clocks tick at very slightly different real-world rates, so over a
+long session the input's ring buffer slowly fills or drains until it overflows (a click) or starves (a
+dropout). To stay glitch-free over the long-running sessions this daemon is built for, **every input runs
+through an asynchronous sample-rate converter**, not just inputs whose rate differs from the output.
+
+The converter's resampling ratio is gently steered from the measured ring-buffer fill toward a target: the
+middle of the span that still leaves room for one resampler chunk to land on top. If the ring is trending
+full the input is producing slightly faster than the output consumes, so the converter emits marginally
+fewer frames, and vice versa. The correction authority is 2% — far more than enough to track real
+oscillator drift (tens of parts per million) yet small enough to be inaudible as pitch. The result is a
+ring-buffer fill that stays bounded indefinitely instead of drifting to a boundary.
+
+The mixer's trim ceiling (`max_backlog_frames`) sits above the highest fill the steering can park at plus
+one chunk, so trimming only starts once the clock mismatch exceeds what the steering can absorb.
+
+If the input device's nominal rate differs from the output you'll also see a warning that the rate conversion
+adds latency:
 
 ```
 WARN Input device 'USB Microphone' sample rate (44100 Hz) differs from output (48000 Hz) - resampling will add latency
 ```
 
-For lowest latency, use an input device that matches your output sample rate.
+For lowest latency, use an input device whose nominal rate matches your output rate; the drift-control
+conversion still runs, but with no nominal rate change it only has to correct the small clock difference.
 
 ## Monitoring Input Health
 
@@ -430,10 +436,12 @@ A handful of `underrun_frames` at startup is normal while the buffer primes.
 - Check CPU usage - a stalled audio callback shows up here first
 
 **Trims (`trimmed_frames` climbing steadily):**
-- Input and output clocks are drifting apart, which happens when the microphone
-  and the speakers are on different devices. Trimming keeps latency bounded, at
-  the cost of an occasional discontinuity. Putting capture and playback on the
-  same interface removes the drift
+- Input and output clocks differ by more than the 2% the drift control can
+  absorb. Ordinary drift between two devices is far smaller than that, so steady
+  trimming usually means capture opened at a rate the card is not actually
+  running at (see the choppy-audio entry above). Trimming keeps latency bounded,
+  at the cost of an occasional discontinuity. Putting capture and playback on the
+  same interface removes the drift entirely
 
 **Audio is delayed:**
 - Reduce `latency_ms`
@@ -444,3 +452,7 @@ A handful of `underrun_frames` at startup is normal while the buffer primes.
 - Increase `latency_ms`
 - Check CPU usage
 - Reduce number of simultaneous sources
+
+Periodic dropouts caused by clock drift between two independent devices are handled by the always-on
+drift-control converter (see *Sample Rate and Clock-Drift Handling*), so recurring glitches every few minutes
+on a two-device setup should not occur. Glitches that remain are typically CPU- or latency-related.

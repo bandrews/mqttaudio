@@ -1,0 +1,51 @@
+# Lane A (CI / headless) for the web app: typecheck, lint (warnings-as-errors),
+# build, unit/component tests, and the Playwright headless smoke.
+name: webui-ci
+
+on:
+  push:
+    paths:
+      - 'webui/**'
+      - '.github/workflows/webui-ci.yml'
+  pull_request:
+    paths:
+      - 'webui/**'
+      - '.github/workflows/webui-ci.yml'
+
+defaults:
+  run:
+    working-directory: webui
+
+jobs:
+  lane-a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Lint (warnings are errors)
+        run: pnpm lint
+
+      - name: Build
+        run: pnpm build
+
+      - name: Unit & component tests
+        run: pnpm test
+
+      - name: Install Playwright browser
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: E2E (headless)
+        run: pnpm test:e2e

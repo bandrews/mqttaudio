@@ -36,13 +36,11 @@ impl PitchCorrector {
     }
 
     /// Get the input latency in frames.
-    #[allow(dead_code)]
     pub fn input_latency(&self) -> usize {
         self.stretcher.input_latency()
     }
 
     /// Get the output latency in frames.
-    #[allow(dead_code)]
     pub fn output_latency(&self) -> usize {
         self.stretcher.output_latency()
     }
@@ -61,6 +59,29 @@ impl PitchCorrector {
         debug_assert_eq!(output.len() % self.channels, 0);
 
         self.stretcher.process(input, output);
+    }
+
+    /// Pre-roll the stretcher with the samples leading up to the current playback
+    /// position, without producing any output. This primes the internal analysis
+    /// buffers so the first `process` after enabling correction emits real signal
+    /// instead of ~`input_latency` frames of warm-up silence.
+    ///
+    /// `pre_samples` is interleaved with the configured channel count; it is the
+    /// audio immediately *before* the playback position. `playback_rate` is the
+    /// stretch ratio in effect (input frames consumed per output frame), matching
+    /// the rate `process` is driven at.
+    pub fn preroll(&mut self, pre_samples: &[f32], playback_rate: f64) {
+        debug_assert_eq!(pre_samples.len() % self.channels, 0);
+        self.stretcher.seek(pre_samples, playback_rate);
+    }
+
+    /// Drain buffered output from the stretcher into `output` without supplying new
+    /// input, emitting the tail that `process` has not yet produced (used at EOF so
+    /// the final ~`output_latency` frames are not truncated). `output` is
+    /// interleaved with the configured channel count.
+    pub fn flush(&mut self, output: &mut [f32]) {
+        debug_assert_eq!(output.len() % self.channels, 0);
+        self.stretcher.flush(output);
     }
 
     /// Reset the stretcher state (for seek operations).
@@ -191,5 +212,58 @@ mod tests {
         let mut output = vec![0.0f32; 600];
 
         pc.process(&input, &mut output);
+    }
+
+    #[test]
+    fn test_pitch_corrector_preroll_primes_output() {
+        // Pre-rolling with a window of signal before the first process should let
+        // the first process block emit real signal instead of warm-up silence. The
+        // stretcher needs roughly its full input+output pipeline primed, so the
+        // pre-roll window is two input-latencies of leading audio.
+        let mut primed = PitchCorrector::new(2, 48000);
+        let pre_frames = 2 * primed.input_latency();
+        let pre = vec![0.5f32; pre_frames * 2]; // pre_frames frames, stereo
+        primed.preroll(&pre, 1.0);
+
+        let input = vec![0.5f32; 1024];
+        let mut primed_out = vec![0.0f32; 1024];
+        primed.process(&input, &mut primed_out);
+
+        // A fresh stretcher with no pre-roll emits near-silence for the first block.
+        let mut cold = PitchCorrector::new(2, 48000);
+        let mut cold_out = vec![0.0f32; 1024];
+        cold.process(&input, &mut cold_out);
+
+        let energy = |b: &[f32]| b.iter().map(|s| s * s).sum::<f32>();
+        let primed_energy = energy(&primed_out);
+        let cold_energy = energy(&cold_out);
+        // The cold first block is warm-up silence (≈0); the primed block carries
+        // real signal (substantially non-zero). Require a clear, order-of-magnitude
+        // separation rather than an absolute floor.
+        assert!(
+            primed_energy > 0.1 && primed_energy > cold_energy * 100.0 + 0.05,
+            "pre-roll should fill the first block (primed {primed_energy} vs cold {cold_energy})"
+        );
+    }
+
+    #[test]
+    fn test_pitch_corrector_flush_emits_tail() {
+        // After feeding signal, flush should drain buffered output (the tail) rather
+        // than leaving it stuck inside the stretcher.
+        let mut pc = PitchCorrector::new(2, 48000);
+        let input = vec![0.5f32; 4096];
+        let mut output = vec![0.0f32; 4096];
+        pc.process(&input, &mut output);
+
+        // Drain the tail; output_latency frames captures all buffered output.
+        let tail_frames = pc.output_latency();
+        let mut tail = vec![0.0f32; tail_frames * 2];
+        pc.flush(&mut tail);
+
+        let tail_energy: f32 = tail.iter().map(|s| s * s).sum();
+        assert!(
+            tail_energy > 1.0,
+            "flush should emit the buffered tail, got energy {tail_energy}"
+        );
     }
 }

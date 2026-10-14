@@ -1,8 +1,8 @@
 // ABOUTME: Performance benchmarks for audio mixer operations.
 // ABOUTME: Validates that critical audio callback code meets timing requirements.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use mqttaudio::audio::mixer::{ActiveSample, FadeState, MixerState, mix_audio};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use mqttaudio::audio::mixer::{mix_audio, ActiveSample, FadeState, MixerState};
 use mqttaudio::audio::types::DecodedBuffer;
 use std::sync::Arc;
 
@@ -26,13 +26,7 @@ fn create_test_buffer(channels: usize, frames: usize) -> Arc<DecodedBuffer> {
 
 /// Create a mixer state with N active samples
 fn create_mixer_state(num_samples: usize, output_channels: usize) -> MixerState {
-    let mut state = MixerState {
-        active_samples: Vec::new(),
-        live_inputs: Vec::new(),
-        output_channels,
-        ducking_engine: None,
-        bass_management: None,
-    };
+    let mut state = MixerState::new(output_channels);
 
     let buffer = create_test_buffer(2, 48000); // 1 second of stereo audio
 
@@ -58,13 +52,7 @@ fn create_mixer_state_with_routing(
     dest_channels: usize,
     channel_map: Vec<(usize, usize)>,
 ) -> MixerState {
-    let mut state = MixerState {
-        active_samples: Vec::new(),
-        live_inputs: Vec::new(),
-        output_channels: dest_channels,
-        ducking_engine: None,
-        bass_management: None,
-    };
+    let mut state = MixerState::new(dest_channels);
 
     let buffer = create_test_buffer(src_channels, 48000);
 
@@ -78,6 +66,8 @@ fn create_mixer_state_with_routing(
             channel_map.clone(),
             format!("bench_file_{}.wav", i),
             None,
+            false,
+            0,
         );
         state.active_samples.push(sample);
     }
@@ -130,7 +120,7 @@ fn bench_channel_mapping(c: &mut Criterion) {
 
     // Test stereo to mono (downmix)
     let mut state = create_mixer_state_with_routing(1, 2, 1, vec![(0, 0), (1, 0)]);
-    let mut output = vec![0.0f32; 512 * 1];
+    let mut output = vec![0.0f32; 512];
     group.bench_function("stereo_to_mono", |b| {
         b.iter(|| {
             state.active_samples[0].position = 0;
@@ -154,12 +144,7 @@ fn bench_channel_mapping(c: &mut Criterion) {
     });
 
     // Test quad to 8-channel (complex routing)
-    let mut state = create_mixer_state_with_routing(
-        1,
-        4,
-        8,
-        vec![(0, 0), (1, 1), (2, 6), (3, 7)],
-    );
+    let mut state = create_mixer_state_with_routing(1, 4, 8, vec![(0, 0), (1, 1), (2, 6), (3, 7)]);
     let mut output = vec![0.0f32; 512 * 8];
     group.bench_function("quad_to_8ch", |b| {
         b.iter(|| {
