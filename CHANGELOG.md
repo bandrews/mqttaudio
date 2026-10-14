@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`play` takes `speed` and `pitch_correction`.** A sound can start at a speed, with or without pitch
+  correction, instead of needing a `speed` command right after the play. Both fields mean exactly what
+  they mean on the `speed` command, with the same ranges and defaults (1.0, no correction); `speed: 0`
+  and a negative speed with `pitch_correction` reject the play. A windowed play cannot change speed, so
+  it starts at normal speed and logs a warning. The typed `POST /play` endpoint accepts both fields.
+
 ### Fixed
 
 - **Finished sounds leave their voice again.** The voice manager never dropped a finished sample or an

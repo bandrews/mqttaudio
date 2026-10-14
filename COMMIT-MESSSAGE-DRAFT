@@ -1,45 +1,68 @@
-Remove finished sounds from their voice so voices end with their sounds
+Let play start at a speed, exactly as the speed command sets it
 
-main's af4dc22 taught the daemon to prune the voice manager: a periodic
-task removed each finished sample from its voice and dropped empty
-voices. v2.1's restructured command loop lost that when main was merged
-in, and nothing in v2.1 calls VoiceManager::remove_sample or
-cleanup_empty_voices. Every play therefore left a permanent entry (each
-play without a voice added a whole new auto voice), /status/voices
-listed voices whose sounds had ended, voice_stop and voice_fade_out on
-such a voice reported success for sample ids that no longer existed,
-and a later play into a reused voice name silently inherited the old
-voice_volume.
+A customer starting a sound and setting its speed had to send a play and
+then a speed command, and the speed command raced the play's background
+load and was silently dropped. Starting the sound at its speed removes
+the need for the second command in that case. (The ordering race itself
+is fixed separately.)
 
-The reaper already reconciles every finished sample and streamed source
-through reconcile_finished_voice, so that is where the voice manager is
-now pruned: the finished id leaves its voice, and VoiceManager's
-remove_sample drops the voice once it is empty. Voice commands on a
-voice whose sounds have all finished now report "not found", as they do
-on main, and a voice played again starts at full volume.
+play now takes speed and pitch_correction with the speed command's
+meaning, ranges and defaults (1.0, no correction), in the flattened and
+nested message forms and on the typed POST /play endpoint:
 
-Tests (written first, each failing for the reason above): a finished
-sample leaves its voice while its sibling stays, and the voice goes with
-its last sample; a finished streamed source leaves its voice;
-voice_stop, voice_fade_out and voice_volume on an ended voice warn "not
-found" and send nothing to the audio thread; a voice played again after
-it ended starts at volume 1.0.
+- A full-load play sets the speed on the sample before it is handed to
+  the audio thread, through the same set_speed_with_mode a speed command
+  ends up in, so the corrector is built off the audio thread and the
+  status snapshot reports the starting speed.
+- Pitch correction on a cold play whose progressive load is still
+  filling stays dormant until the D51 upgrade, as it does for a speed
+  command, and logs the same "deferred" warning; the warning now lives
+  in one helper both paths call.
+- A windowed play plays forward only, so it starts at normal speed and
+  logs a warning, matching what a speed command on a streamed voice
+  does.
+- speed 0, and a negative speed with pitch_correction, reject the play
+  at parse time (HTTP 400). The speed-0 rejection is shared with the
+  speed command instead of repeating its message.
+
+Audited the other per-sample controls the audio engine accepts for any
+that play could not already set: seek has start_position_ms, volume has
+volume, fades have fade_in and routing gains have channel_map;
+voice_volume changes state shared by every sound in the voice rather
+than the new sound, so it stays a command. Speed and pitch were the only
+gap.
+
+Docs: the play table in commands.md, a "Start Speed" section in the
+playback-control guide, the typed-endpoint notes in http-api.md and the
+web UI API contract (both also claimed channel_map was not accepted by
+typed /play, which stopped being true when main's channel_map-over-HTTP
+change was merged), and the changelog.
+
+Tests (written first, each failing before the change): parse of speed
+and pitch_correction in flattened and legacy nested soundPlay forms, the
+1.0/false defaults, reverse speed accepted without correction, speed 0
+and reverse-with-correction rejected; dispatch starts the sample at the
+speed and reports it in status; a warm play with pitch correction starts
+with a corrector; a still-loading play with pitch correction warns that
+it is deferred; a windowed play with a speed warns and plays at normal
+speed while an explicit 1.0 does not warn; a reverse play starts at its
+start position running backwards; typed POST /play forwards both fields
+in a form parse_command accepts.
 
 Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
 and a warning-free release build (RUSTFLAGS=-D warnings); fuzz suite 7
 passed; broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA
-set) 945 passed, 0 failed, 7 device-gated ignored.
+set) 958 passed, 0 failed, 7 device-gated ignored.
 
 Prompts that led to this work:
 
-- "Let's go with the per-voice hold fix. Make sure to think through all
-  the possible implications, like conflicting sequences of multiple
-  commands affecting the same voice(s), or commands affecting multiple
-  groups/voices/etc in a complex way, before designing our approach.
-  We'll need a lot of tests in this area before implementation as well.
-  Consider spawning adversarial review agents both before starting the
-  fix and after implementing it."
-- "You can fix the other regression too." (the voice manager pruning
-  lost on v2.1, found while analysing voice semantics for the hold)
+- "While you're working on this, can we also add a speed parameter to
+  the play command so we don't need to issue multiple commands in
+  sequence to begin with?"
+- "I want this exactly parallel to the speed command. And if there are
+  other similar modifications that make sense to be able to set at the
+  time we start playing, let's expose those too." (with: a windowed play
+  warns and plays at 1x; invalid combinations reject the play; typed
+  POST /play accepts the new fields)
 
 This commit was authored by Claude (AI assistant) working with Ben Andrews.

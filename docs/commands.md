@@ -47,6 +47,8 @@ Play an audio file.
 | `crossfade_ms` | integer | 0 | Crossfade duration at loop boundaries (0 = disabled) |
 | `fade_in` | integer | 0 | Fade-in duration (milliseconds) |
 | `start_position_ms` | integer | 0 | Start position (milliseconds) |
+| `speed` | float | 1.0 | Start speed, as the [`speed`](#speed) command sets it. `0` is rejected; a negative speed plays backwards from `start_position_ms` |
+| `pitch_correction` | boolean | false | Start with pitch correction, as the [`speed`](#speed) command sets it. Rejected with a negative `speed` |
 | `channel_map` | array | auto | Channel routing (see below) |
 | `mode` | string | `auto` | Load strategy: `auto` (decide by size/duration + memory budget), `full` (always in-memory), or `stream` (window a big/long file). Applies to local files and `http(s)://` URLs. A windowed voice plays forward only |
 | `window_ms` | integer | config | Windowed-source ring depth override (streamed plays) |
@@ -57,6 +59,10 @@ Play an audio file.
 Volumes are gains: 1.0 is unity, below that attenuates and above that boosts, up
 to 4.0 (+12 dB). The mixer saturates its output, so a boost loud enough to
 exceed full scale clips rather than wrapping around.
+
+A windowed play (`mode: "stream"`, or a file long or large enough for `auto` to
+window) plays forward only, so it ignores `speed` and `pitch_correction`, starts
+at normal speed, and logs a warning.
 
 **Channel Mapping:**
 

@@ -100,9 +100,10 @@ commands (an emergency `stopall` also cancels any loads still in flight).
 
 > **Typed endpoints vs `/command`.** The convenience endpoints above deserialize a fixed set of fields. In
 > particular, `POST /play` accepts only `file`, `id`, `volume`, `voice`, `fade_in`, `start_position_ms`,
-> `loop` (also `loop_mode`), and `crossfade_ms`. It does **not** accept `channel_map`, `mode`, `window_ms`,
-> `prebuffer_ms`, `freshness`, or `cacheable` — to use those, POST the full command JSON to `/command`
-> (which accepts the same payload as MQTT). Unknown fields sent to a typed endpoint are silently ignored.
+> `loop` (also `loop_mode`), `crossfade_ms`, `speed`, `pitch_correction`, and `channel_map`. It does **not**
+> accept `mode`, `window_ms`, `prebuffer_ms`, `freshness`, or `cacheable` — to use those, POST the full
+> command JSON to `/command` (which accepts the same payload as MQTT). Unknown fields sent to a typed
+> endpoint are silently ignored.
 > Note also that `POST /voice/fade_out` takes `time_ms`, whereas the raw command / MQTT key is `time`.
 
 ## Authentication

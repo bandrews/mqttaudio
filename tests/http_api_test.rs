@@ -285,6 +285,37 @@ async fn test_play_endpoint() {
 }
 
 #[tokio::test]
+async fn test_play_endpoint_forwards_speed_and_pitch_correction() {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/play")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"file": "/path/to/test.wav", "speed": 1.08, "pitch_correction": true}"#,
+        ))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = rx.try_recv().unwrap();
+    match mqttaudio::mqtt::commands::parse_command(&received).unwrap() {
+        mqttaudio::mqtt::commands::AudioCommand::Play {
+            speed,
+            pitch_correction,
+            ..
+        } => {
+            assert_eq!(speed, 1.08);
+            assert!(pitch_correction);
+        }
+        other => panic!("Expected Play, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn test_stopall_endpoint() {
     let (state, mut rx) = create_test_state();
     let app = create_router(state, false, false);

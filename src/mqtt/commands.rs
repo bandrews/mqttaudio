@@ -224,6 +224,12 @@ pub struct PlayMessage {
     pub freshness: Option<FreshnessMode>, // Freshness override: trusting|dev|pinned
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cacheable: Option<bool>, // HTTP windowed plays: persist to disk (true, default) or treat as live (false)
+    /// Start speed multiplier, as the speed command sets it (1.0 = normal)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f32>,
+    /// Start with pitch correction, as the speed command sets it
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pitch_correction: Option<bool>,
 }
 
 /// Voice stop command parameters
@@ -403,6 +409,8 @@ pub enum AudioCommand {
         prebuffer_ms: Option<u32>,        // Windowed-source prebuffer override
         freshness: Option<FreshnessMode>, // Freshness override (None => config default)
         cacheable: Option<bool>, // HTTP windowed: persist to disk (None/true) or treat as live (false)
+        speed: f32,              // Start speed, as the speed command sets it (1.0 = normal)
+        pitch_correction: bool,  // Start with pitch correction, as the speed command sets it
     },
     StopAll,
     FadeAll {
@@ -580,6 +588,17 @@ pub fn expand_macros(
 ///
 /// Reject a non-numeric internal_id at parse time: the system-assigned ids
 /// are numeric, so a non-numeric value could only ever silently match nothing.
+/// Reject a speed of zero, which would otherwise be coerced to an
+/// unintelligible 0.01x drone; someone sending 0 almost certainly wanted stop.
+fn reject_zero_speed(speed: f32) -> Result<(), ParseError> {
+    if speed == 0.0 {
+        return Err(ParseError::InvalidParameter(
+            "speed 0 is not supported - use stop to end playback, or a small value like 0.05 to crawl".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_internal_id(internal_id: &Option<String>) -> Result<(), ParseError> {
     if let Some(iid) = internal_id {
         if iid.parse::<u64>().is_err() {
@@ -602,6 +621,15 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 return Err(ParseError::MissingMessage);
             }
             let play_msg: PlayMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            let speed = play_msg.speed.unwrap_or(1.0);
+            let pitch_correction = play_msg.pitch_correction.unwrap_or(false);
+            reject_zero_speed(speed)?;
+            if speed < 0.0 && pitch_correction {
+                return Err(ParseError::InvalidParameter(format!(
+                    "negative speed ({}) plays in reverse, which pitch_correction does not support",
+                    speed
+                )));
+            }
 
             Ok(AudioCommand::Play {
                 file: play_msg.file,
@@ -621,6 +649,8 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 prebuffer_ms: play_msg.prebuffer_ms,
                 freshness: play_msg.freshness,
                 cacheable: play_msg.cacheable,
+                speed,
+                pitch_correction,
             })
         }
         "stopall" | "soundStopAll" => Ok(AudioCommand::StopAll),
@@ -760,11 +790,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             let speed_msg: SpeedMessage = serde_json::from_value(mqtt_cmd.get_params())?;
             validate_internal_id(&speed_msg.internal_id)?;
 
-            if speed_msg.speed == 0.0 {
-                return Err(ParseError::InvalidParameter(
-                    "speed 0 is not supported - use stop to end playback, or a small value like 0.05 to crawl".to_string(),
-                ));
-            }
+            reject_zero_speed(speed_msg.speed)?;
 
             Ok(AudioCommand::Speed {
                 selector: SampleSelector {
@@ -1104,6 +1130,89 @@ mod tests {
         assert!(
             err.to_string().contains("speed"),
             "the error should explain the speed problem, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_play_without_speed_plays_at_normal_speed() {
+        let json = r#"{"command": "play", "file": "test.wav"}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play {
+                speed,
+                pitch_correction,
+                ..
+            } => {
+                assert_eq!(speed, 1.0);
+                assert!(!pitch_correction);
+            }
+            other => panic!("Expected Play command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_carries_speed_and_pitch_correction() {
+        let json =
+            r#"{"command": "play", "file": "test.wav", "speed": 1.08, "pitch_correction": true}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play {
+                speed,
+                pitch_correction,
+                ..
+            } => {
+                assert_eq!(speed, 1.08);
+                assert!(pitch_correction);
+            }
+            other => panic!("Expected Play command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_nested_play_carries_speed_and_pitch_correction() {
+        let json = r#"{"command": "soundPlay", "message": {"file": "test.wav", "speed": 0.5, "pitch_correction": false}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play {
+                speed,
+                pitch_correction,
+                ..
+            } => {
+                assert_eq!(speed, 0.5);
+                assert!(!pitch_correction);
+            }
+            other => panic!("Expected Play command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_accepts_reverse_speed_without_pitch_correction() {
+        let json =
+            r#"{"command": "play", "file": "test.wav", "speed": -1.0, "start_position_ms": 1500}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play { speed, .. } => assert_eq!(speed, -1.0),
+            other => panic!("Expected Play command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_speed_zero_is_rejected() {
+        let json = r#"{"command": "play", "file": "test.wav", "speed": 0}"#;
+        let err = parse_command(json).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidParameter(ref message) if message.contains("speed 0")),
+            "a play at speed 0 must be rejected like the speed command, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_play_reverse_speed_with_pitch_correction_is_rejected() {
+        let json =
+            r#"{"command": "play", "file": "test.wav", "speed": -1.0, "pitch_correction": true}"#;
+        let err = parse_command(json).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidParameter(ref message)
+                if message.contains("negative") && message.contains("pitch_correction")),
+            "reverse playback cannot be pitch-corrected, got: {}",
             err
         );
     }

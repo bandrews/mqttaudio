@@ -1872,6 +1872,17 @@ async fn finish_streamed_play(
     );
 }
 
+/// Pitch correction stays dormant while a cold play's progressive load is still
+/// filling (the mixer needs slice access) and engages when the D51 upgrade lands.
+/// Tell the operator instead of silently doing nothing in the meantime.
+fn warn_pitch_correction_deferred(file: &str) {
+    tracing::warn!(
+        "Pitch correction for {} is deferred: its cold play is still loading; it engages when \
+         the load completes",
+        file
+    );
+}
+
 /// Whether a selector targets a voice that currently has a windowed/streamed source.
 /// Streamed voices are forward-only, so seek/speed/pitch do not apply. Best-effort:
 /// it matches on the selector's voice (the common case) and is used only to warn — a
@@ -1949,6 +1960,8 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             prebuffer_ms: _,
             freshness: _,
             cacheable: _,
+            speed,
+            pitch_correction,
         } => {
             // Stage clock for this play's latency event (Sprint 11, D50).
             let mut stages = PlayStages::begin();
@@ -1957,6 +1970,13 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 Some(PreparedPlayback::Stream(handles)) => {
                     let handles = handles.into_handles();
                     stages.decision();
+                    if speed != 1.0 || pitch_correction {
+                        tracing::warn!(
+                            "Speed/pitch is not supported for windowed/streamed plays; playing \
+                             {} at normal speed (a streamed source plays forward only)",
+                            file
+                        );
+                    }
                     finish_streamed_play(
                         handles,
                         file.clone(),
@@ -2156,6 +2176,16 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             output_sample_rate,
                         ));
                         tracing::debug!("Applied {}ms fade in to voice '{}'", fade_ms, voice_id);
+                    }
+
+                    // Start at the requested speed, exactly as a speed command sent
+                    // right after the play would set it. The sample is not on the
+                    // audio thread yet, so building its corrector here is off-RT.
+                    if speed != 1.0 || pitch_correction {
+                        sample.set_speed_with_mode(speed, pitch_correction);
+                        if pitch_correction && !buffer.is_complete() {
+                            warn_pitch_correction_deferred(&file);
+                        }
                     }
 
                     // Live-position publisher (Sprint W6, DW12): one atomic, shared
@@ -2684,11 +2714,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             .map(|s| sample_status_matches(&selector, s))
                             .unwrap_or(false);
                         if matches && !upgrade.buffer.is_complete() {
-                            tracing::warn!(
-                                "Pitch correction for {} is deferred: its cold play is \
-                                 still loading; it engages when the load completes",
-                                upgrade.file
-                            );
+                            warn_pitch_correction_deferred(&upgrade.file);
                         }
                     }
                 }
@@ -3019,6 +3045,8 @@ mod tests {
             prebuffer_ms: None,
             freshness: None,
             cacheable: None,
+            speed: 1.0,
+            pitch_correction: false,
         }
     }
 
@@ -3039,6 +3067,8 @@ mod tests {
             prebuffer_ms: Some(20),
             freshness: None,
             cacheable: None,
+            speed: 1.0,
+            pitch_correction: false,
         }
     }
 
@@ -3257,6 +3287,8 @@ mod tests {
             prebuffer_ms: None,
             freshness: None,
             cacheable: None,
+            speed: 1.0,
+            pitch_correction: false,
         }
     }
 
@@ -3307,6 +3339,16 @@ mod tests {
     /// Run `cmd` through `handle_command` under a WARN-capturing subscriber and
     /// return every captured warning message.
     async fn run_capturing_warnings(fixture: &mut Fixture, cmd: AudioCommand) -> Vec<String> {
+        run_prepared_capturing_warnings(fixture, cmd, None).await
+    }
+
+    /// Run `cmd` with an already-prepared load through `handle_command` under a
+    /// WARN-capturing subscriber and return every captured warning message.
+    async fn run_prepared_capturing_warnings(
+        fixture: &mut Fixture,
+        cmd: AudioCommand,
+        prepared: Option<PreparedPlayback>,
+    ) -> Vec<String> {
         use tracing_subscriber::layer::SubscriberExt;
         let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(CaptureLayer {
@@ -3316,7 +3358,7 @@ mod tests {
         // dispatcher guard that stays in scope across the await.
         let dispatch = tracing::Dispatch::new(subscriber);
         let _guard = tracing::dispatcher::set_default(&dispatch);
-        fixture.run(cmd).await;
+        fixture.run_prepared(cmd, prepared).await;
         let captured = warnings.lock().unwrap().clone();
         captured
     }
@@ -3774,6 +3816,141 @@ mod tests {
             fixture.mixer.active_samples[0].speed, 1.0,
             "the sample's speed must be untouched"
         );
+    }
+
+    /// `command` (a Play) with its start speed and pitch mode set.
+    fn at_speed(mut command: AudioCommand, start_speed: f32, pitch: bool) -> AudioCommand {
+        if let AudioCommand::Play {
+            speed,
+            pitch_correction,
+            ..
+        } = &mut command
+        {
+            *speed = start_speed;
+            *pitch_correction = pitch;
+        }
+        command
+    }
+
+    #[tokio::test]
+    async fn play_with_speed_starts_the_sample_at_that_speed() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture
+            .run(at_speed(play(Some("crank"), 1.0), 1.08, false))
+            .await;
+        fixture.drain();
+
+        let sample = &fixture.mixer.active_samples[0];
+        assert_eq!(sample.speed, 1.08);
+        assert!(!sample.has_pitch_correction());
+        let status = fixture.playing.values().next().expect("the play's status");
+        assert_eq!(
+            status.speed, 1.08,
+            "the status snapshot reports the speed the play started at"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_with_pitch_correction_starts_with_a_corrector() {
+        let mut fixture = Fixture::new(vec![]);
+        // A warm cache hands the play a complete buffer, so the corrector is live
+        // from the first block rather than waiting for a progressive load.
+        fixture
+            .cache_manager
+            .lock()
+            .await
+            .get_or_load(TEST_WAV, SR)
+            .await
+            .unwrap();
+        fixture
+            .run(at_speed(play(Some("crank"), 1.0), 1.5, true))
+            .await;
+        fixture.drain();
+
+        let sample = &fixture.mixer.active_samples[0];
+        assert!(sample.buffer.is_complete());
+        assert!(sample.has_pitch_correction());
+        assert_eq!(sample.speed, 1.5);
+    }
+
+    #[tokio::test]
+    async fn play_with_pitch_correction_on_a_still_loading_cold_play_warns_like_speed() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let still_loading = audio::streaming::SampleBuffer::Streaming(Arc::new(RwLock::new(
+            audio::streaming::StreamingBuffer::new(2, SR, None),
+        )));
+
+        let warnings = run_prepared_capturing_warnings(
+            &mut fixture,
+            at_speed(play(Some("crank"), 1.0), 1.2, true),
+            Some(PreparedPlayback::Full(still_loading)),
+        )
+        .await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("deferred") && w.contains("still loading")),
+            "pitch correction on a still-loading play must warn as the speed command does, got {warnings:?}"
+        );
+        fixture.drain();
+        let sample = &fixture.mixer.active_samples[0];
+        assert!(sample.has_pitch_correction());
+        assert_eq!(sample.speed, 1.2);
+    }
+
+    #[tokio::test]
+    async fn windowed_play_with_speed_warns_and_plays_at_normal_speed() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let warnings =
+            run_capturing_warnings(&mut fixture, at_speed(play_stream(Some("bed")), 1.5, false))
+                .await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("windowed") && w.contains("normal speed")),
+            "a windowed play cannot change speed and must say so, got {warnings:?}"
+        );
+        fixture.drain();
+        assert_eq!(
+            fixture.mixer.streamed_sources.len(),
+            1,
+            "the play still starts"
+        );
+        let status = fixture.playing.values().next().expect("the play's status");
+        assert_eq!(status.speed, 1.0);
+    }
+
+    #[tokio::test]
+    async fn windowed_play_at_normal_speed_does_not_warn_about_speed() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let warnings =
+            run_capturing_warnings(&mut fixture, at_speed(play_stream(Some("bed")), 1.0, false))
+                .await;
+        assert!(
+            !warnings.iter().any(|w| w.contains("speed")),
+            "an explicit normal speed is not a speed change, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reverse_play_runs_backwards_from_its_start_position() {
+        let mut fixture = Fixture::new(vec![]);
+        let mut command = at_speed(play(Some("crank"), 1.0), -1.0, false);
+        if let AudioCommand::Play {
+            start_position_ms, ..
+        } = &mut command
+        {
+            *start_position_ms = Some(1000);
+        }
+        fixture.run(command).await;
+        fixture.drain();
+
+        let sample = &fixture.mixer.active_samples[0];
+        assert_eq!(sample.speed, -1.0);
+        assert_eq!(sample.position, SR as usize, "1000 ms into a 48 kHz buffer");
     }
 
     #[tokio::test]
