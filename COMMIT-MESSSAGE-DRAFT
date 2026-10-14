@@ -1,68 +1,36 @@
-Let play start at a speed, exactly as the speed command sets it
+Propose per-voice command ordering and record issues found on the way
 
-A customer starting a sound and setting its speed had to send a play and
-then a speed command, and the speed command raced the play's background
-load and was silently dropped. Starting the sound at its speed removes
-the need for the second command in that case. (The ordering race itself
-is fixed separately.)
+docs/command-ordering.md is the design for fixing the play-then-command
+race (a speed, stop or voice_stop sent right after a play runs before
+the play's background load finishes, matches nothing, and is dropped).
+It defines the guarantee (commands touching the same voice take effect
+in arrival order; a slow load only delays commands for the voices it
+touches; stopall/fadeall stay immediate), what each command touches,
+when a command waits, failure and cancellation handling, what is not
+ordered and why, and the implementation and test plan. It is marked as
+a proposal: it is under adversarial review and nothing implements it
+yet.
 
-play now takes speed and pitch_correction with the speed command's
-meaning, ranges and defaults (1.0, no correction), in the flattened and
-nested message forms and on the typed POST /play endpoint:
+docs/bugs.md gains the out-of-scope issues found while analysing v2.1's
+command semantics for the design: cache commands are not ordered
+against plays and are aborted by stopall; pitch correction engages
+unprimed when a cold play's load completes; voice_volume on a live
+input's voice misreports that input in status; the docs call an empty
+selector a silent no-op while the daemon rejects it; a play dropped by
+a full audio command ring stays in its voice.
 
-- A full-load play sets the speed on the sample before it is handed to
-  the audio thread, through the same set_speed_with_mode a speed command
-  ends up in, so the corrector is built off the audio thread and the
-  status snapshot reports the starting speed.
-- Pitch correction on a cold play whose progressive load is still
-  filling stays dormant until the D51 upgrade, as it does for a speed
-  command, and logs the same "deferred" warning; the warning now lives
-  in one helper both paths call.
-- A windowed play plays forward only, so it starts at normal speed and
-  logs a warning, matching what a speed command on a streamed voice
-  does.
-- speed 0, and a negative speed with pitch_correction, reject the play
-  at parse time (HTTP 400). The speed-0 rejection is shared with the
-  speed command instead of repeating its message.
-
-Audited the other per-sample controls the audio engine accepts for any
-that play could not already set: seek has start_position_ms, volume has
-volume, fades have fade_in and routing gains have channel_map;
-voice_volume changes state shared by every sound in the voice rather
-than the new sound, so it stays a command. Speed and pitch were the only
-gap.
-
-Docs: the play table in commands.md, a "Start Speed" section in the
-playback-control guide, the typed-endpoint notes in http-api.md and the
-web UI API contract (both also claimed channel_map was not accepted by
-typed /play, which stopped being true when main's channel_map-over-HTTP
-change was merged), and the changelog.
-
-Tests (written first, each failing before the change): parse of speed
-and pitch_correction in flattened and legacy nested soundPlay forms, the
-1.0/false defaults, reverse speed accepted without correction, speed 0
-and reverse-with-correction rejected; dispatch starts the sample at the
-speed and reports it in status; a warm play with pitch correction starts
-with a corrector; a still-loading play with pitch correction warns that
-it is deferred; a windowed play with a speed warns and plays at normal
-speed while an explicit 1.0 does not warn; a reverse play starts at its
-start position running backwards; typed POST /play forwards both fields
-in a form parse_command accepts.
-
-Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
-and a warning-free release build (RUSTFLAGS=-D warnings); fuzz suite 7
-passed; broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA
-set) 958 passed, 0 failed, 7 device-gated ignored.
+No code changes.
 
 Prompts that led to this work:
 
-- "While you're working on this, can we also add a speed parameter to
-  the play command so we don't need to issue multiple commands in
-  sequence to begin with?"
-- "I want this exactly parallel to the speed command. And if there are
-  other similar modifications that make sense to be able to set at the
-  time we start playing, let's expose those too." (with: a windowed play
-  warns and plays at 1x; invalid combinations reject the play; typed
-  POST /play accepts the new fields)
+- "Let's go with the per-voice hold fix. Make sure to think through all
+  the possible implications, like conflicting sequences of multiple
+  commands affecting the same voice(s), or commands affecting multiple
+  groups/voices/etc in a complex way, before designing our approach.
+  We'll need a lot of tests in this area before implementation as well.
+  Consider spawning adversarial review agents both before starting the
+  fix and after implementing it."
+- Stop hook: "There are uncommitted changes in the repository. Please
+  commit and push these changes to the remote branch."
 
 This commit was authored by Claude (AI assistant) working with Ben Andrews.

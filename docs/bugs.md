@@ -567,3 +567,53 @@ Left alone because the fix is a decision about ordering semantics, not a local
 change. One option is to hold a command whose selector or voice names a play
 that is still loading until that play dispatches. Another is to dispatch
 prepared plays and everything behind them strictly in arrival order.
+
+## Cache commands are not ordered against plays
+
+`precache`, `cache_clear`, `cache_invalidate` and `cache_reload` run as
+background tasks next to play loads, with nothing ordering them. A
+`cache_invalidate` or `cache_reload` of a file followed at once by a `play` of
+it can race the play's load, so the play may still start from the stale entry.
+`stopall` and `fadeall` also abort these tasks along with play loads, so a
+`cache_reload` cut off by a stop can leave the entry invalidated but not
+reloaded. Left alone because ordering them needs a play's load (not its start)
+to wait for earlier cache work on the same file, which is a different mechanism
+from the per-voice command ordering in `docs/command-ordering.md`.
+
+## Pitch correction engages unprimed when a cold play's load completes
+
+A `speed` with `pitch_correction` (or a `play` with both) aimed at a cold play
+whose progressive load is still filling installs the corrector while the buffer
+cannot be pre-rolled. The mixer plays the speed without correction until the
+D51 upgrade swaps in the complete buffer, then switches straight to the
+corrector's output. There is no pre-roll and no direct-to-stretched crossfade,
+which `apply_shipped_speed` uses when correction is enabled on a complete
+buffer. Expect an audible switch from pitch-shifted to corrected audio, possibly
+with a short gap while the stretcher warms up. A dispatch warning says the
+correction is deferred. Left alone because the fix belongs in the upgrade path
+(prime and crossfade on `UpgradeSampleBuffer`) and needs its own render test.
+
+## `voice_volume` on a live input's voice misreports the input in status
+
+When a voice id belongs to a live input, `voice_volume` writes the target into
+that input's `volume` and `unmuted_volume` in the status snapshot and marks it
+unmuted. On the audio thread it only sets the input's voice multiplier, which is
+separate from the input volume and does not unmute it. `/status/inputs` then
+reports a volume and mute state the input does not have. Left alone as a
+status-reporting fix outside the command-ordering work.
+
+## Empty selectors are rejected, not ignored
+
+`docs/commands.md` says a `stop`/`seek`/`speed`/`volume` with an empty selector
+"is silently a no-op". The daemon rejects it with "Command has no sample
+selector" (HTTP 400). Over MQTT that looks silent only because MQTT command
+failures are not logged on v2.1.
+
+## A play dropped by a full audio command ring stays in its voice
+
+A play registers its sample with the voice manager before pushing it onto the
+1024-entry audio command ring. If the ring is full, the push fails (logged as
+"Audio command ring full") and the sample never reaches the mixer, so it never
+reaches the graveyard and the reaper never removes it from its voice. Narrow,
+since the ring only fills when the audio thread stalls. Left alone because the
+fix is to register after a successful push, which touches both play paths.
