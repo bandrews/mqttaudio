@@ -15,13 +15,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a negative speed with `pitch_correction` reject the play. A windowed play cannot change speed, so
   it starts at normal speed and logs a warning. The typed `POST /play` endpoint accepts both fields.
 
+### Changed
+
+- **A stop cancels a matching play that has not started.** `stop`, `voice_stop` and `voice_fade_out`
+  cancel the matching plays whose files are still loading, as `stopall` and `fadeall` already did for
+  every play. A cancelled play is never heard, its HTTP client gets 409, and the log says `Cancelled play
+  of <file>: <reason>`. A voice now exists from the moment a play naming it arrives, so `/status/voices`
+  lists it while the play loads and `voice_volume` sets it.
+
 ### Fixed
 
+- **Commands sent right after a `play` reach it.** A `speed`, `seek`, `volume`, `stop`, `voice_stop`,
+  `voice_fade_out` or `voice_volume` that arrived while the play's file was still loading ran first,
+  matched nothing (`No sample matches the selector`) and was lost: the sound started at normal speed, and a
+  looping play followed by a `voice_stop` kept playing. With messages under about 300 µs apart this
+  happened most of the time, and for longer with cold files and URLs. A command now reaches a play that is
+  still loading as if the play had already started: `speed`, `volume` and `seek` carry over and the sound
+  starts with them, and stops cancel the play. Nothing waits for a load, so plays still start in the order
+  their loads finish. See `docs/command-ordering.md`.
 - **Failed MQTT commands are logged again.** An MQTT sender gets no reply, and several failures left no
-  trace at all: a selector that matched nothing (such as a `speed` for a sound that had not started), an
-  empty selector, the concurrent-load limit, and a play superseded by `stopall`. Each failed command with
-  no client waiting is now logged once as `Command failed: <reason>`, unless its own handler already
-  logged it. HTTP clients still get the failure in their response.
+  trace at all: a selector that matched nothing (such as a `speed` for a sound that had already ended), an
+  empty selector, and the concurrent-load limit. Each failed command with no client waiting is now logged
+  once as `Command failed: <reason>`, unless its own handler already logged it. HTTP clients still get the
+  failure in their response.
+- **A play whose load task panicked is answered with 500.** It got the 409 of a play cancelled by a stop.
+  It now gets `Load of <file> stopped unexpectedly`, and the panic is logged as an error.
 - **A load cancelled before it began is answered with 409.** When `stopall`, `fadeall` or shutdown
   cancelled a play or cache command whose background load had not started running yet, its HTTP request
   got a 500 "Command was dropped before completion" instead of the 409 every other cancelled load gets.

@@ -93,10 +93,14 @@ Command endpoints wait for the command to be processed and report the
 real outcome: `{"success": true, "message": ...}` on success, or an error
 with a matching status code - 400 for malformed requests, 404 when a
 file fails to load or a selector matches nothing, 403 when a path is
-outside `security.allowed_directories`, 409 when a pending play was
-cancelled by a stop, 504 if the result takes longer than 30 seconds.
-Loads run in the background, so a slow download never delays other
-commands (an emergency `stopall` also cancels any loads still in flight).
+outside `security.allowed_directories`, 409 when a play still loading was
+cancelled (by `stopall`, `fadeall`, or a `stop`, `voice_stop` or
+`voice_fade_out` that matched it), 504 if the result takes longer than 30
+seconds. Loads run in the background, so a slow download never delays other
+commands (an emergency `stopall` also cancels any loads still in flight). A
+`play` is answered once its sound has started; a command sent before that
+still reaches it (see [commands sent while a play is
+loading](commands.md#commands-sent-while-a-play-is-loading)).
 
 > **Typed endpoints vs `/command`.** The convenience endpoints above deserialize a fixed set of fields. In
 > particular, `POST /play` accepts only `file`, `id`, `volume`, `voice`, `fade_in`, `start_position_ms`,
@@ -218,7 +222,9 @@ Operational telemetry for monitoring. Every field is real — no placeholders.
 
 ### `/status/voices` Response
 
-Each voice carries its resolved ducking multiplier (`1.0` when not ducked):
+Each voice carries its resolved ducking multiplier (`1.0` when not ducked). A
+voice is listed while it has a sound playing or a play naming it is still
+loading, so a voice can appear with `sample_count: 0` until its play starts:
 
 ```json
 {

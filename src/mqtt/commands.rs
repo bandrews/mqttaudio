@@ -159,6 +159,19 @@ impl SampleSelector {
             }
         }
 
+        self.matches_unstarted(sample_id, file_path, Some(voice_id))
+    }
+
+    /// Check if a sound that has not started yet matches this selector. It
+    /// matches as a started sound would, except that `internal_id` never does
+    /// (internal ids are assigned when a sound starts) and a sound without a
+    /// voice yet cannot match by voice.
+    pub fn matches_unstarted(
+        &self,
+        sample_id: Option<&str>,
+        file_path: &str,
+        voice_id: Option<&str>,
+    ) -> bool {
         // Check if selector specifies id and if it matches
         if let Some(ref id) = self.id {
             if sample_id == Some(id.as_str()) {
@@ -175,7 +188,7 @@ impl SampleSelector {
 
         // Check if selector specifies voice and if it matches
         if let Some(ref voice) = self.voice {
-            if voice_id == voice {
+            if voice_id == Some(voice.as_str()) {
                 return true;
             }
         }

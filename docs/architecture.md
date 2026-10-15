@@ -195,6 +195,13 @@ struct Voice {
 
 ## Key Components
 
+### Command Scheduler (`src/main.rs`, `src/pending_plays.rs`)
+
+Takes commands from MQTT and HTTP. A play's file loads in the background while
+the scheduler keeps the play; commands that arrive meanwhile carry their
+settings onto it or cancel it, and the play starts when its load finishes. See
+[Command ordering](command-ordering.md).
+
 ### Mixer (`src/audio/mixer.rs`)
 
 The real-time mixing core. Called from cpal audio callback.

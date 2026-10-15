@@ -2,9 +2,6 @@
 
 How commands reach a sound whose play is still loading.
 
-**Status:** approved design, not yet implemented; until it is, the race
-described below is live (see `docs/bugs.md`).
-
 ## The problem
 
 A `play` prepares its audio (open, probe, decode, download) outside the command
@@ -43,9 +40,9 @@ play creates:
   rule as `SampleSelector::matches` over `voice`, `id` and `file`. A selector's
   `internal_id` never matches an unstarted play. Internal ids are assigned
   when a sound starts, so no client can know one before then.
-- `voice_stop`, `voice_fade_out` and `voice_volume` match plays that name their
-  voice. A play without a `voice` gets its automatic voice when it starts, so a
-  voice command cannot name it before then.
+- `voice_stop` and `voice_fade_out` match plays that name their voice. A play
+  without a `voice` gets its automatic voice when it starts, so a voice command
+  cannot name it before then.
 
 ## What carries over
 
@@ -54,7 +51,6 @@ play creates:
 | `speed` | The play starts at that speed and pitch mode |
 | `volume` | The play starts at that volume |
 | `seek` | The play starts at that position |
-| `voice_volume` | Applied to the voice as the play starts |
 | `stop`, `voice_stop`, `voice_fade_out` | The play is cancelled |
 
 When several commands of one kind reach the same play, the last one wins. A
@@ -63,9 +59,24 @@ would leave. Settings of different kinds do not affect each other, so their
 relative order does not matter. A carried setting replaces the play's own
 `speed`, `pitch_correction`, `volume` or `start_position_ms`.
 
+A `speed` or `seek` that the daemon ignores for a playing sound carries onto
+nothing either: a negative `speed` with `pitch_correction`, and a `speed` or
+`seek` whose `voice` is playing a windowed source. It logs the same warning
+whether it reached a playing sound or only a play still loading.
+
 A command reports success when it reached a playing sound or an unstarted play,
-and "not found" only when it reached neither. A command that only reached
-unstarted plays logs that it was carried onto them.
+and "not found" only when it reached neither. The log says what a command did
+to unstarted plays: `Carried <command> onto <n> play(s) still loading`, and
+`Cancelled play of <file>: <reason>` for each play a stop cancelled.
+
+## Voices that are still loading
+
+A voice exists while a sound in it is playing or a play naming it is still
+loading. `voice_volume` therefore needs no carrying: it sets the volume of a voice
+whose only play is still loading, and the play starts at that volume. A voice
+whose last playing sound stops keeps its volume while a play into it is loading.
+`voice_stop` and `voice_fade_out` cancel the loading plays, so the voice ends
+with them.
 
 ## Differences from one-at-a-time processing
 
@@ -75,9 +86,10 @@ unstarted plays logs that it was carried onto them.
 - **Stops cancel instead of interrupting.** A stop or fade that reaches an
   unstarted play cancels it, instead of starting it and then stopping or fading
   it.
-- **`voice_volume` and plays into a voice that does not exist yet.** The
-  command reaches the voice when a matching play starts. A different play into
-  that voice that starts first plays at the voice's previous level until then.
+- **A play that fails to load still held its voice open while it loaded.** A
+  `voice_volume` sent meanwhile set the voice's volume, which stays if another
+  play into that voice starts. Processing one at a time, the failed play would
+  never have existed, and the `voice_volume` would have found no voice to set.
 - **HTTP play whose client gave up** (timeout or disconnect): the loaded play
   is discarded instead of started, as before.
 - **Windowed plays** play forward only. A carried `speed` or `seek` is ignored
@@ -101,22 +113,25 @@ unstarted plays logs that it was carried onto them.
 - `src/pending_plays.rs` (library, pure logic): `PendingPlays` records the
   unstarted plays, answers which of them a command matches, and holds their
   carried settings. It has no I/O, so it is covered by unit and property tests.
+- `src/voice.rs`: the voice manager keeps a voice while a play naming it is
+  loading, as well as while it has sounds.
 - `src/main.rs`: a `CommandScheduler` owns the pending plays and the load tasks.
   It takes each request, starts loads, routes commands to playing sounds and
   pending plays, cancels on stops, and starts plays as their loads finish. The
   command loop and the test fixture both drive it, so the tests run the code
   the daemon runs. `handle_command` stays the one place a command takes effect.
   A play's parsed command and HTTP reply stay in the scheduler; the load task
-  returns only the prepared audio. A stop replaces the load task set, which
-  aborts every load and drops any finished but unstarted result.
+  returns only the prepared audio. A stop that cancels a play aborts its load.
+  `stopall` and `fadeall` replace the load task set, which aborts every load
+  and drops any finished but unstarted result.
 
 ## Testing
 
 - `PendingPlays` unit tests, and a property test that runs random command
   streams with random load completion orders and failures. It checks the final
   state of every sound (and each voice's volume) against processing the same
-  commands one at a time in arrival order, using a model independent of the
-  matching code.
+  commands one at a time in arrival order, with a failed play counted as a
+  sound until its load fails.
 - Command-loop tests through `CommandScheduler`, with real WAV files, the real
   cache and a real in-test HTTP server whose response headers are held until
   the test releases them. That keeps a play deterministically unstarted without

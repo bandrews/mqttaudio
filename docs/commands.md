@@ -160,7 +160,9 @@ a microphone.
 
 ## Sample Targeting Commands
 
-These commands control specific playing samples by ID, filename, or voice.
+These commands control specific playing samples by ID, filename, or voice. They
+also reach a play whose file is still loading; see
+[Commands sent while a play is loading](#commands-sent-while-a-play-is-loading).
 
 ### stop
 
@@ -306,6 +308,33 @@ Adjust volume for all samples in a voice.
 |-----------|------|---------|-------------|
 | `voice` | string | *required* | Voice name |
 | `volume` | float | *required* | New volume (0.0 to 4.0, unity is 1.0) |
+
+---
+
+## Commands sent while a play is loading
+
+A `play` loads its file before the sound starts, which takes a while for a cold
+file or a URL. Commands that arrive in the meantime still reach the new sound,
+as if they had arrived just after it started:
+
+- `speed`, `volume` and `seek` change the sounds already playing at once, and the
+  play starts with the new setting. When several of one kind arrive, the last
+  one wins.
+- `stop`, `voice_stop` and `voice_fade_out` cancel a matching play before it
+  starts, so it is never heard. An HTTP client waiting on the `play` gets 409.
+- `voice_volume` sets the voice's volume. A voice exists from the moment a play
+  naming it arrives, so the play starts at that volume, and `/status/voices`
+  lists the voice while its play loads.
+- `internal_id` cannot reach a play that has not started, because the id is
+  assigned when it starts. A play without a `voice` can be reached only by `id`
+  or `file` until then.
+- A command that reaches only plays still loading reports success.
+- A windowed play plays forward only, so it starts at normal speed from the
+  beginning whatever `speed` or `seek` reached it, and logs a warning.
+
+Nothing waits: a play starts when its own load finishes, so plays do not always
+start in the order they were sent. See [command ordering](command-ordering.md)
+for the full rules.
 
 ---
 

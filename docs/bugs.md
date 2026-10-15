@@ -524,23 +524,22 @@ raises a `latency_ms` whose ring cannot hold two bursts, with a warning. Covered
 blocks, ±1.5% inside the authority, 4% beyond it) and
 `minimum_latency_holds_the_target_plus_one_burst`.
 
-## Commands sent right after a `play` can run before it
+## Commands sent right after a `play` can run before it (resolved in 2.1)
 
 A `play` loads its file outside the command loop, so `stopall` is never queued
-behind a slow load. Nothing orders the commands that arrive while that load is
-in flight: a `speed`, `seek`, `volume`, `stop`, `voice_stop`, `voice_fade_out`
-or `voice_volume` aimed at the new sample runs immediately, matches nothing,
-and the play starts afterwards with none of it applied. A `voice_stop` sent
-right after a looping `play` leaves the loop running indefinitely. Two plays can
-also start in the opposite order to how they were sent. Only `stopall` and
-`fadeall` are covered, by the generation counter that discards loads they
-overtake.
+behind a slow load. Nothing ordered the commands that arrived while that load
+was in flight: a `speed`, `seek`, `volume`, `stop`, `voice_stop`,
+`voice_fade_out` or `voice_volume` aimed at the new sample ran immediately,
+matched nothing, and the play started afterwards with none of it applied. A
+`voice_stop` sent right after a looping `play` left the loop running
+indefinitely. Only `stopall` and `fadeall` were covered, by a generation counter
+that discarded the loads they overtook.
 
-Both `main` (the Play arm hands the load to `tokio::spawn`) and `v2.1` (the play
-waits in the `loads` JoinSet and re-enters the loop once prepared) have this.
-It shows up in the log as `Command failed: Speed command matched no active
-samples` on `main` and `Command failed: No sample matches the selector` on
-v2.1.
+Both `main` (the Play arm hands the load to `tokio::spawn`) and 2.1.0-rc.1 (the
+play waits in the `loads` JoinSet and re-enters the loop once prepared) have
+this. It shows up in the log as `Command failed: Speed command matched no
+active samples` on `main` and `Command failed: No sample matches the selector`
+on rc.1.
 
 Measured with a local broker and a null ALSA sink, sending `play` then `speed`
 for the same voice on one connection, 20 pairs per gap, counting `Set speed`
@@ -557,15 +556,21 @@ log lines:
 | 20 ms, first play of a 30 s WAV | 6/20 | 0/20 |
 
 The window is the load time, so it grows with cold files, HTTP URLs, and
-contention for the cache lock. A delay between messages narrows the window
-but does not close it. HTTP clients that wait for the `play` response before
-sending the next command are ordered correctly, because the response is only
+contention for the cache lock. A delay between messages narrowed the window
+but did not close it. HTTP clients that wait for the `play` response before
+sending the next command were ordered correctly, because the response is only
 sent once the play has been dispatched.
 
-Left alone because the fix is a decision about ordering semantics, not a local
-change. One option is to hold a command whose selector or voice names a play
-that is still loading until that play dispatches. Another is to dispatch
-prepared plays and everything behind them strictly in arrival order.
+The command loop now keeps each play until it starts. A command that reaches
+one carries its setting onto it (`speed`, `volume`, `seek`) or cancels it
+(`stop`, `voice_stop`, `voice_fade_out`), and a voice exists while a play naming
+it loads, so `voice_volume` reaches it directly. `docs/command-ordering.md` has
+the rules and the remaining differences from one-at-a-time processing; plays
+still start in the order their loads finish. The same sweep against the fixed
+build, checking each sound's speed in `/status/samples` instead of counting log
+lines: 20/20 at 1.08x for every gap above (warm 0, 100, 300, 1000 and 5000 µs;
+cold 0, 1, 5 and 20 ms), with no `Command failed` lines. `voice_stop` sent 0,
+100 µs or 1 ms after a looping `play` left 0 of 50 loops running.
 
 ## Cache commands are not ordered against plays
 
@@ -577,7 +582,7 @@ it can race the play's load, so the play may still start from the stale entry.
 `cache_reload` cut off by a stop can leave the entry invalidated but not
 reloaded. Left alone because ordering them needs a play's load (not its start)
 to wait for earlier cache work on the same file, which is a different mechanism
-from the per-voice command ordering in `docs/command-ordering.md`.
+from the carry-over in `docs/command-ordering.md`.
 
 ## Pitch correction engages unprimed when a cold play's load completes
 
@@ -615,7 +620,8 @@ fix is to register after a successful push, which touches both play paths.
 A play that windows (`mode: "stream"`, or a file long or large enough for `auto`
 to window) always starts from the beginning: neither the local nor the HTTP
 windowed path passes `start_position_ms` to the streamed source, and nothing
-warns. The docs only say a windowed voice "plays forward only". Left alone
+warns about the play's own `start_position_ms`. A `seek` carried onto a
+windowed play while it loads does warn. The docs only say a windowed voice "plays forward only". Left alone
 because starting a windowed decode at an offset is a feature of the streamed
 source, not a dispatch fix.
 
@@ -625,7 +631,9 @@ The audio thread applies `SetVolumeMatching` and `SeekMatching` to
 `active_samples` only, so a `volume` or `seek` aimed at a windowed play changes
 nothing audible. `volume` still updates the status snapshot, so
 `/status/samples` reports a volume the stream is not playing at. `speed` and
-`seek` warn for streamed voices; `volume` does not. Left alone as a separate
+`seek` warn for streamed voices; `volume` does not. A `volume` that reaches a
+windowed play while it is still loading does apply, because it becomes the
+play's start volume. Left alone as a separate
 mixer change.
 
 ## A shutdown signal can be missed while a command is being handled
