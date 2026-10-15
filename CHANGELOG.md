@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A load cancelled before it began is answered with 409.** When `stopall`, `fadeall` or shutdown
+  cancelled a play or cache command whose background load had not started running yet, its HTTP request
+  got a 500 "Command was dropped before completion" instead of the 409 every other cancelled load gets.
 - **Finished sounds leave their voice again.** The voice manager never dropped a finished sample or an
   empty voice, so it grew with every play (each play without a `voice` added a new one), `/status/voices`
   listed voices whose sounds had ended, `voice_stop` and `voice_fade_out` on such a voice reported success

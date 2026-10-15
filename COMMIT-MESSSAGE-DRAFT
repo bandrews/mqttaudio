@@ -1,42 +1,33 @@
-Replace the command hold design with carry-over
+Answer a load cancelled before its task ran with 409, not a dropped reply
 
-Three adversarial reviews of the proposed per-voice hold found that
-holding commands behind loads is the wrong mechanism:
+The scheduler spawns a play's or cache command's background load with
+the HTTP reply inside the task, wrapped in PendingReply, whose drop
+answers "Load cancelled before playback" (409). The wrapping happened
+in the task's body, so it only took effect once the runtime first
+polled the task. A stopall, fadeall or shutdown that aborted the task
+before that dropped the bare reply sender instead, and the HTTP client
+got a 500 "Command was dropped before completion".
 
-- a load can hang (an uncached HTTP play opens with no connect or
-  response timeout), and a held voice_stop or fader move would then
-  wait forever, while the sound already playing kept going;
-- holding per voice made unrelated commands wait in chains, a global
-  waiting cap turned one stuck voice into failures everywhere, and a
-  release burst could overflow the audio command ring and drop the
-  stopall that triggered it;
-- ordering plays within a voice bought nothing and cost latency.
+PendingReply is now built before the task is spawned and moved into
+it, so dropping a never-polled task answers 409 like any other
+cancelled load.
 
-docs/command-ordering.md now describes the approved replacement: a
-command applies at once to the sounds already playing and carries its
-setting (speed, volume, seek, voice_volume) onto every matching play
-that is still loading, which starts with it; stop, voice_stop and
-voice_fade_out cancel matching unstarted plays, as stopall and fadeall
-already cancel every one; nothing waits. It lists where the result still
-differs from one-at-a-time processing (timing, stops cancelling instead
-of interrupting, voice_volume onto a voice that does not exist yet, HTTP
-plays whose client gave up, windowed plays, crossfades across voices).
+Found while writing the scheduler's characterization tests, which
+aborted loads straight after submitting them.
 
-docs/bugs.md gains the pre-existing issues the reviews surfaced and that
-were checked against the code: windowed plays ignore start_position_ms;
-volume and seek do not reach streamed sources; a shutdown signal can be
-missed while a command is handled (tokio drops a signal broadcast that
-finds no listener, and the loop recreates its listeners each iteration);
-a huge start_position_ms or seek overflows in debug builds.
+Tests (failing before the fix with the reply dropped unanswered): a
+stopall sent before a play's load task has run answers the play 409; a
+shutdown abort before a precache's task has run answers it 409.
 
-No code changes.
+Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
+and a warning-free release build (RUSTFLAGS=-D warnings); fuzz suite 7
+passed; broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA
+set) 975 passed, 0 failed, 7 device-gated ignored.
 
 Prompts that led to this work:
 
-- "Let's go with the per-voice hold fix. Make sure to think through all
-  the possible implications ... Consider spawning adversarial review
-  agents both before starting the fix and after implementing it."
-- Decisions after the reviews: carry settings over instead of holding
-  commands; stops and fades cancel matching unstarted plays.
+- "Let's go with the per-voice hold fix. ... We'll need a lot of tests
+  in this area before implementation as well." (characterization tests
+  for the command loop exposed this)
 
 This commit was authored by Claude (AI assistant) working with Ben Andrews.

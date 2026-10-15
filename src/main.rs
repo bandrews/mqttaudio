@@ -1783,8 +1783,10 @@ impl CommandScheduler {
                     let cache = ctx.cache_manager.clone();
                     let permit = self.load_permit.clone();
                     let output_sample_rate = ctx.output_sample_rate;
+                    // Built before the task so a load cancelled before it first runs
+                    // still answers its client.
+                    let mut reply = loading::PendingReply(reply);
                     self.loads.spawn(async move {
-                        let mut reply = loading::PendingReply(reply);
                         let _permit = permit
                             .acquire_owned()
                             .await
@@ -5353,6 +5355,36 @@ mod tests {
             "the cancelled load ends without a result"
         );
         assert!(fixture.playing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduler_answers_a_play_cancelled_before_its_load_task_ran() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        // The stop arrives before the runtime has polled the new load task once.
+        let play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        let _stop = submit(&mut fixture, &mut scheduler, STOPALL).await;
+
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_answers_a_cache_command_cancelled_before_its_task_ran() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let json = serde_json::json!({"command": "precache", "file": TEST_WAV}).to_string();
+
+        let precache = submit(&mut fixture, &mut scheduler, &json).await;
+        scheduler.abort_loads();
+
+        assert_eq!(
+            awaited_outcome(precache).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
     }
 
     #[tokio::test]
