@@ -3279,7 +3279,7 @@ mod tests {
     use audio::mixer::{FadeState, MixerState};
     use mqtt::commands::{AudioCommand, SampleSelector};
     use parking_lot::Mutex;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, RwLock};
     use voice::VoiceManager;
 
@@ -6718,5 +6718,595 @@ mod tests {
             fixture.mixer.streamed_sources[0].volume, 0.4,
             "a carried volume does"
         );
+    }
+
+    // ---- Command scheduler against one-at-a-time processing ---------------------
+
+    const SCRIPT_VOICES: [&str; 3] = ["A", "B", "C"];
+    const SCRIPT_IDS: [&str; 2] = ["x", "y"];
+    const SCRIPT_FILES: [&str; 2] = ["f.wav", "g.wav"];
+
+    /// Which sounds a selector command names, over the small alphabets above.
+    #[derive(Clone, Debug)]
+    struct Pick {
+        voice: Option<usize>,
+        id: Option<usize>,
+        file: Option<usize>,
+    }
+
+    /// One step of a generated script.
+    #[derive(Clone, Debug)]
+    enum Step {
+        /// A play of a shared file that loads, or of its own file whose load fails.
+        Play {
+            voice: Option<usize>,
+            id: Option<usize>,
+            file: usize,
+            fails: bool,
+            speed: Option<f32>,
+            volume: Option<f32>,
+            position: Option<u64>,
+        },
+        Speed {
+            pick: Pick,
+            speed: f32,
+            pitch: bool,
+        },
+        Volume {
+            pick: Pick,
+            volume: f32,
+        },
+        Seek {
+            pick: Pick,
+            position: u64,
+        },
+        Stop {
+            pick: Pick,
+        },
+        VoiceStop {
+            voice: usize,
+        },
+        VoiceFadeOut {
+            voice: usize,
+        },
+        VoiceVolume {
+            voice: usize,
+            volume: f32,
+        },
+        StopAll,
+        /// The load of the `which`-th play still loading (modulo how many there
+        /// are) ends.
+        Finish {
+            which: usize,
+        },
+    }
+
+    fn arb_pick() -> impl proptest::strategy::Strategy<Value = Pick> {
+        use proptest::prelude::*;
+        (
+            proptest::option::weighted(0.6, 0..SCRIPT_VOICES.len()),
+            proptest::option::weighted(0.35, 0..SCRIPT_IDS.len()),
+            proptest::option::weighted(0.3, 0..SCRIPT_FILES.len()),
+        )
+            .prop_map(|(voice, id, file)| Pick { voice, id, file })
+    }
+
+    fn arb_step() -> impl proptest::strategy::Strategy<Value = Step> {
+        use proptest::prelude::*;
+        let speed = prop_oneof![Just(-1.0f32), Just(0.5), Just(1.5)];
+        let volume = prop_oneof![Just(0.0f32), Just(0.3), Just(1.5)];
+        let position = prop_oneof![Just(0u64), Just(250), Just(1500)];
+        prop_oneof![
+            4 => (
+                proptest::option::weighted(0.8, 0..SCRIPT_VOICES.len()),
+                proptest::option::weighted(0.5, 0..SCRIPT_IDS.len()),
+                0..SCRIPT_FILES.len(),
+                proptest::bool::weighted(0.2),
+                proptest::option::weighted(0.2, speed.clone()),
+                proptest::option::weighted(0.2, volume.clone()),
+                proptest::option::weighted(0.2, position.clone()),
+            )
+                .prop_map(|(voice, id, file, fails, speed, volume, position)| Step::Play {
+                    voice,
+                    id,
+                    file,
+                    fails,
+                    speed,
+                    volume,
+                    position,
+                }),
+            2 => (arb_pick(), speed, any::<bool>())
+                .prop_map(|(pick, speed, pitch)| Step::Speed { pick, speed, pitch }),
+            2 => (arb_pick(), volume.clone()).prop_map(|(pick, volume)| Step::Volume { pick, volume }),
+            1 => (arb_pick(), position).prop_map(|(pick, position)| Step::Seek { pick, position }),
+            1 => arb_pick().prop_map(|pick| Step::Stop { pick }),
+            1 => (0..SCRIPT_VOICES.len()).prop_map(|voice| Step::VoiceStop { voice }),
+            1 => (0..SCRIPT_VOICES.len()).prop_map(|voice| Step::VoiceFadeOut { voice }),
+            2 => (0..SCRIPT_VOICES.len(), volume)
+                .prop_map(|(voice, volume)| Step::VoiceVolume { voice, volume }),
+            1 => Just(Step::StopAll),
+            4 => (0..8usize).prop_map(|which| Step::Finish { which }),
+        ]
+    }
+
+    /// The file a failing play loads: its own, so only its load is answered 404.
+    fn failing_file(step: usize) -> String {
+        format!("fail{step}.wav")
+    }
+
+    /// The JSON a step sends, or `None` for a load ending.
+    fn step_json(step: &Step, index: usize, server: &AudioServer) -> Option<String> {
+        let pick_json = |command: &str, pick: &Pick| {
+            let mut json = serde_json::json!({ "command": command });
+            if let Some(voice) = pick.voice {
+                json["voice"] = serde_json::json!(SCRIPT_VOICES[voice]);
+            }
+            if let Some(id) = pick.id {
+                json["id"] = serde_json::json!(SCRIPT_IDS[id]);
+            }
+            if let Some(file) = pick.file {
+                json["file"] = serde_json::json!(server.url(SCRIPT_FILES[file]));
+            }
+            json
+        };
+        let json = match step {
+            Step::Play {
+                voice,
+                id,
+                file,
+                fails,
+                speed,
+                volume,
+                position,
+            } => {
+                let file = if *fails {
+                    server.url(&failing_file(index))
+                } else {
+                    server.url(SCRIPT_FILES[*file])
+                };
+                let mut json =
+                    serde_json::json!({ "command": "play", "file": file, "mode": "full" });
+                if let Some(voice) = voice {
+                    json["voice"] = serde_json::json!(SCRIPT_VOICES[*voice]);
+                }
+                if let Some(id) = id {
+                    json["id"] = serde_json::json!(SCRIPT_IDS[*id]);
+                }
+                if let Some(speed) = speed {
+                    json["speed"] = serde_json::json!(speed);
+                }
+                if let Some(volume) = volume {
+                    json["volume"] = serde_json::json!(volume);
+                }
+                if let Some(position) = position {
+                    json["start_position_ms"] = serde_json::json!(position);
+                }
+                json
+            }
+            Step::Speed { pick, speed, pitch } => {
+                let mut json = pick_json("speed", pick);
+                json["speed"] = serde_json::json!(speed);
+                json["pitch_correction"] = serde_json::json!(pitch);
+                json
+            }
+            Step::Volume { pick, volume } => {
+                let mut json = pick_json("volume", pick);
+                json["volume"] = serde_json::json!(volume);
+                json
+            }
+            Step::Seek { pick, position } => {
+                let mut json = pick_json("seek", pick);
+                json["position_ms"] = serde_json::json!(position);
+                json
+            }
+            Step::Stop { pick } => pick_json("stop", pick),
+            Step::VoiceStop { voice } => {
+                serde_json::json!({ "command": "voice_stop", "voice": SCRIPT_VOICES[*voice] })
+            }
+            Step::VoiceFadeOut { voice } => serde_json::json!({
+                "command": "voice_fade_out", "voice": SCRIPT_VOICES[*voice], "time": 500
+            }),
+            Step::VoiceVolume { voice, volume } => serde_json::json!({
+                "command": "voice_volume", "voice": SCRIPT_VOICES[*voice], "volume": volume
+            }),
+            Step::StopAll => serde_json::json!({ "command": "stopall" }),
+            Step::Finish { .. } => return None,
+        };
+        Some(json.to_string())
+    }
+
+    fn stops(step: &Step) -> bool {
+        matches!(
+            step,
+            Step::Stop { .. } | Step::VoiceStop { .. } | Step::VoiceFadeOut { .. } | Step::StopAll
+        )
+    }
+
+    /// Finish every fade-out at once, as if its time had passed, and reap the faded
+    /// sounds, so a stopped sound is gone in both runs alike.
+    fn end_fades(fixture: &mut Fixture) {
+        fixture.drain();
+        let (faded, playing): (Vec<_>, Vec<_>) = std::mem::take(&mut fixture.mixer.active_samples)
+            .into_iter()
+            .partition(|sample| matches!(sample.fade_state, FadeState::Out { .. }));
+        fixture.mixer.active_samples = playing;
+        for sample in faded {
+            fixture
+                .grave_tx
+                .push(sample)
+                .ok()
+                .expect("graveyard has room");
+        }
+        fixture.reap();
+    }
+
+    /// Remove a sound at once, as a failed load removes the play standing for it.
+    fn end_sound(fixture: &mut Fixture, internal_id: u64) {
+        fixture.drain();
+        if let Some(index) = fixture
+            .mixer
+            .active_samples
+            .iter()
+            .position(|sample| sample.id == internal_id)
+        {
+            let sample = fixture.mixer.active_samples.swap_remove(index);
+            fixture
+                .grave_tx
+                .push(sample)
+                .ok()
+                .expect("graveyard has room");
+        }
+        fixture.reap();
+    }
+
+    /// What a run leaves: the speed, volume, voice volume and position of each
+    /// sound still playing, by the step of the play that started it; the volume of
+    /// each named voice; and the outcome of every command that is not a play.
+    #[derive(Debug, PartialEq)]
+    struct Leftover {
+        sounds: BTreeMap<usize, (f32, f32, f32, usize)>,
+        voices: Vec<Option<f32>>,
+        outcomes: BTreeMap<usize, Result<(), mqtt::commands::CommandErrorKind>>,
+    }
+
+    fn leftover(
+        fixture: &mut Fixture,
+        started: &BTreeMap<usize, u64>,
+        outcomes: BTreeMap<usize, Result<(), mqtt::commands::CommandErrorKind>>,
+    ) -> Leftover {
+        fixture.drain();
+        let sounds = started
+            .iter()
+            .filter_map(|(step, internal_id)| {
+                fixture
+                    .mixer
+                    .active_samples
+                    .iter()
+                    .find(|sample| {
+                        sample.id == *internal_id
+                            && !matches!(sample.fade_state, FadeState::Out { .. })
+                    })
+                    .map(|sample| {
+                        (
+                            *step,
+                            (
+                                sample.speed,
+                                sample.target_volume,
+                                sample.target_voice_volume,
+                                sample.position,
+                            ),
+                        )
+                    })
+            })
+            .collect();
+        let voices = SCRIPT_VOICES
+            .iter()
+            .map(|voice| fixture.voice_manager.lock().get_voice_volume(voice))
+            .collect();
+        Leftover {
+            sounds,
+            voices,
+            outcomes,
+        }
+    }
+
+    /// The internal id of the sound `work` started, if it started one.
+    async fn started_by(
+        fixture: &mut Fixture,
+        work: impl AsyncFnOnce(&mut Fixture),
+    ) -> Option<u64> {
+        let before: std::collections::HashSet<u64> = fixture.playing.keys().copied().collect();
+        work(fixture).await;
+        fixture
+            .playing
+            .keys()
+            .copied()
+            .find(|internal_id| !before.contains(internal_id))
+    }
+
+    /// How often the generated scripts reached each path, so the property cannot
+    /// pass vacuously.
+    #[derive(Default)]
+    struct ScriptCoverage {
+        reached_only_loading: std::cell::Cell<usize>,
+        voice_volume_on_loading_voice: std::cell::Cell<usize>,
+        cancelled: std::cell::Cell<usize>,
+        failed: std::cell::Cell<usize>,
+        started_after_commands: std::cell::Cell<usize>,
+    }
+
+    fn bump(counter: &std::cell::Cell<usize>) {
+        counter.set(counter.get() + 1);
+    }
+
+    /// Whether a command other than a play arrived after step `play` and before
+    /// step `end`.
+    fn commands_between(steps: &[Step], play: usize, end: usize) -> bool {
+        steps[play + 1..end]
+            .iter()
+            .any(|step| !matches!(step, Step::Play { .. } | Step::Finish { .. }))
+    }
+
+    /// Run `steps` through the scheduler, ending each load where the script says.
+    /// Returns what is left and, for each `Finish` in order (then each load left at
+    /// the end), the step of the play whose load ended, if any was loading.
+    async fn run_scheduled(
+        steps: &[Step],
+        server: &AudioServer,
+        coverage: &ScriptCoverage,
+    ) -> (Leftover, Vec<Option<usize>>) {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.config.cache.stream_prebuffer_deadline_ms = 10_000;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        // Plays not yet finished, in arrival order, with their load task.
+        let mut loading: Vec<(usize, tokio::task::Id)> = Vec::new();
+        let mut ended_early: HashMap<tokio::task::Id, SchedulerInput> = HashMap::new();
+        let mut plays = Vec::new();
+        let mut finishes = Vec::new();
+        let mut started = BTreeMap::new();
+        let mut outcomes = BTreeMap::new();
+
+        let finish = async |fixture: &mut Fixture,
+                            scheduler: &mut CommandScheduler,
+                            ended_early: &mut HashMap<tokio::task::Id, SchedulerInput>,
+                            task: tokio::task::Id| {
+            let input = match ended_early.remove(&task) {
+                Some(input) => input,
+                None => loop {
+                    let input = next_load(scheduler).await;
+                    let ended = match &input {
+                        SchedulerInput::Loaded(Ok((ended, _))) => *ended,
+                        SchedulerInput::Loaded(Err(error)) => error.id(),
+                        SchedulerInput::Request(_) => unreachable!("a load ends with a load"),
+                    };
+                    if ended == task {
+                        break input;
+                    }
+                    ended_early.insert(ended, input);
+                },
+            };
+            started_by(fixture, async |fixture| {
+                fixture.take(scheduler, input).await
+            })
+            .await
+        };
+
+        for (index, step) in steps.iter().enumerate() {
+            match step {
+                Step::Play { fails, .. } => {
+                    if *fails {
+                        server.hold(&failing_file(index)).fail();
+                    }
+                    let json = step_json(step, index, server).unwrap();
+                    let mut play = submit(&mut fixture, &mut scheduler, &json).await;
+                    assert!(is_waiting(&mut play), "{json} is loading");
+                    let (task, _) = scheduler
+                        .play_loads
+                        .iter()
+                        .max_by_key(|(_, key)| **key)
+                        .expect("the play's load");
+                    loading.push((index, *task));
+                    plays.push((index, play));
+                }
+                Step::Finish { which } => {
+                    loading.retain(|(_, task)| scheduler.play_loads.contains_key(task));
+                    if loading.is_empty() {
+                        finishes.push(None);
+                        continue;
+                    }
+                    let (play, task) = loading.remove(which % loading.len());
+                    if let Some(internal_id) =
+                        finish(&mut fixture, &mut scheduler, &mut ended_early, task).await
+                    {
+                        started.insert(play, internal_id);
+                        if commands_between(steps, play, index) {
+                            bump(&coverage.started_after_commands);
+                        }
+                    }
+                    finishes.push(Some(play));
+                }
+                command => {
+                    let json = step_json(command, index, server).unwrap();
+                    let reached_playing = match mqtt::commands::parse_command(&json) {
+                        Ok(command) => reaches_playing(&command, &fixture.ctx(None)),
+                        Err(_) => false,
+                    };
+                    let held_open_by_loading = match command {
+                        Step::VoiceVolume { voice, .. } => {
+                            let voices = fixture.voice_manager.lock();
+                            voices.get_voice(SCRIPT_VOICES[*voice]).is_some()
+                                && voices
+                                    .get_voice_sample_ids(SCRIPT_VOICES[*voice])
+                                    .is_empty()
+                        }
+                        _ => false,
+                    };
+                    let mut outcome = submit(&mut fixture, &mut scheduler, &json).await;
+                    let outcome = outcome_of(&mut outcome).map(|_| ()).map_err(|e| e.kind);
+                    if outcome.is_ok() && !reached_playing {
+                        bump(&coverage.reached_only_loading);
+                    }
+                    if outcome.is_ok() && held_open_by_loading {
+                        bump(&coverage.voice_volume_on_loading_voice);
+                    }
+                    outcomes.insert(index, outcome);
+                    if stops(command) {
+                        end_fades(&mut fixture);
+                    }
+                }
+            }
+            fixture.drain();
+        }
+        loading.retain(|(_, task)| scheduler.play_loads.contains_key(task));
+        for (play, task) in loading {
+            if let Some(internal_id) =
+                finish(&mut fixture, &mut scheduler, &mut ended_early, task).await
+            {
+                started.insert(play, internal_id);
+                if commands_between(steps, play, steps.len()) {
+                    bump(&coverage.started_after_commands);
+                }
+            }
+            finishes.push(Some(play));
+        }
+        // The loads of cancelled plays end too, and start nothing.
+        let mut cancelled_loads: Vec<SchedulerInput> = ended_early.into_values().collect();
+        while !scheduler.loads.is_empty() {
+            cancelled_loads.push(next_load(&mut scheduler).await);
+        }
+        for input in cancelled_loads {
+            let internal_id = started_by(&mut fixture, async |fixture| {
+                fixture.take(&mut scheduler, input).await
+            })
+            .await;
+            assert!(internal_id.is_none(), "a cancelled play never starts");
+        }
+        assert!(scheduler.pending.is_empty());
+        for (_, mut play) in plays {
+            match outcome_of(&mut play) {
+                Err(error) if error.kind == mqtt::commands::CommandErrorKind::Cancelled => {
+                    bump(&coverage.cancelled)
+                }
+                Err(error) if error.kind == mqtt::commands::CommandErrorKind::NotFound => {
+                    bump(&coverage.failed)
+                }
+                _ => {}
+            }
+        }
+        (leftover(&mut fixture, &started, outcomes), finishes)
+    }
+
+    /// Run `steps` one at a time in arrival order through `handle_command`. A play
+    /// starts at once; a play whose load fails in the scheduled run plays until
+    /// the point its load ended there.
+    async fn run_one_at_a_time(
+        steps: &[Step],
+        finishes: &[Option<usize>],
+        server: &AudioServer,
+    ) -> Leftover {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.config.cache.stream_prebuffer_deadline_ms = 10_000;
+        let mut started = BTreeMap::new();
+        let mut outcomes = BTreeMap::new();
+        let mut finishes = finishes.iter();
+        let end_failed_load =
+            |fixture: &mut Fixture, started: &BTreeMap<usize, u64>, play: usize| {
+                if matches!(steps[play], Step::Play { fails: true, .. }) {
+                    end_sound(fixture, started[&play]);
+                }
+            };
+        for (index, step) in steps.iter().enumerate() {
+            match step {
+                Step::Finish { .. } => {
+                    if let Some(Some(play)) = finishes.next() {
+                        end_failed_load(&mut fixture, &started, *play);
+                    }
+                }
+                step => {
+                    let json = step_json(step, index, server).unwrap();
+                    let command = mqtt::commands::parse_command(&json);
+                    let mut outcome = Ok(());
+                    let internal_id = started_by(&mut fixture, async |fixture| {
+                        outcome = match command {
+                            Ok(command) => {
+                                let mut ctx = fixture.ctx(None);
+                                handle_command(command, &mut ctx).await;
+                                ctx.error.take().map_or(Ok(()), |error| Err(error.kind))
+                            }
+                            Err(_) => Err(mqtt::commands::CommandErrorKind::InvalidRequest),
+                        };
+                    })
+                    .await;
+                    if let Step::Play { .. } = step {
+                        assert_eq!(outcome, Ok(()), "{json} starts");
+                        started.insert(index, internal_id.expect("the play starts"));
+                    } else {
+                        outcomes.insert(index, outcome);
+                    }
+                    if stops(step) {
+                        end_fades(&mut fixture);
+                    }
+                }
+            }
+            fixture.drain();
+        }
+        for play in finishes.flatten() {
+            end_failed_load(&mut fixture, &started, *play);
+        }
+        leftover(&mut fixture, &started, outcomes)
+    }
+
+    #[test]
+    fn the_scheduler_leaves_every_sound_as_one_at_a_time_processing_would() {
+        use proptest::test_runner::{Config as RunnerConfig, TestRunner};
+        let coverage = ScriptCoverage::default();
+        let cases = std::env::var("SCHEDULER_SCRIPT_CASES")
+            .ok()
+            .and_then(|cases| cases.parse().ok())
+            .unwrap_or(64);
+        let mut runner = TestRunner::new(RunnerConfig {
+            cases,
+            ..RunnerConfig::default()
+        });
+        let result = runner.run(&proptest::collection::vec(arb_step(), 1..24), |steps| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (scheduled, one_at_a_time) = runtime.block_on(async {
+                let server = AudioServer::start().await;
+                let (scheduled, finishes) = run_scheduled(&steps, &server, &coverage).await;
+                // A failing play cancelled before its request left its gate unused.
+                server.gates.lock().unwrap().clear();
+                let one_at_a_time = run_one_at_a_time(&steps, &finishes, &server).await;
+                (scheduled, one_at_a_time)
+            });
+            proptest::prop_assert_eq!(scheduled, one_at_a_time, "steps: {:?}", steps);
+            Ok(())
+        });
+        if let Err(failure) = result {
+            panic!("{failure}");
+        }
+        for (path, count) in [
+            (
+                "answered a command that reached only loading plays",
+                coverage.reached_only_loading.get(),
+            ),
+            (
+                "set the volume of a voice held open by a loading play",
+                coverage.voice_volume_on_loading_voice.get(),
+            ),
+            ("cancelled a play", coverage.cancelled.get()),
+            ("failed a load", coverage.failed.get()),
+            (
+                "started a play that commands arrived during the load of",
+                coverage.started_after_commands.get(),
+            ),
+        ] {
+            assert!(
+                count > 0,
+                "no generated script {path}; the property is vacuous"
+            );
+        }
     }
 }

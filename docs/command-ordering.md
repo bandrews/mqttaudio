@@ -136,6 +136,11 @@ with them.
   cache and a real in-test HTTP server whose response headers are held until
   the test releases them. That keeps a play deterministically unstarted without
   mocking the load path.
+- A generated-script test through `CommandScheduler` with real loads, ending
+  each load where the script says. It compares every sound, every named voice's
+  volume and every command's outcome with sending the same commands one at a
+  time through `handle_command`, a failed play again counted as a sound until
+  its load fails.
 - Characterization tests of the existing loop behaviour, written before the
   loop is restructured.
 - The MQTT reproduction from `docs/bugs.md`, re-run against the built daemon.
