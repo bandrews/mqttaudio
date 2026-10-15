@@ -1,17 +1,16 @@
 # Command ordering
 
-How the daemon keeps commands in order while plays load in the background.
+How commands reach a sound whose play is still loading.
 
-**Status:** proposed design, under adversarial review. The daemon does not
-implement it yet; until it does, the race described below is live (see
-`docs/bugs.md`).
+**Status:** approved design, not yet implemented; until it is, the race
+described below is live (see `docs/bugs.md`).
 
 ## The problem
 
 A `play` prepares its audio (open, probe, decode, download) outside the command
-loop, so a slow load never delays `stopall` or commands for other sounds. Before
-this design, nothing ordered the commands that arrived while a load was in
-flight. A `speed` sent right after the `play` it was meant for ran first, matched
+loop, so a slow load never delays `stopall` or commands for other sounds.
+Nothing tied the commands that arrived during a load to the sound being loaded.
+A `speed` sent right after the `play` it was meant for ran first, matched
 nothing, and the play started afterwards at normal speed. A `voice_stop` sent
 right after a looping `play` left the loop running indefinitely. With messages
 under ~300 µs apart, this happened most of the time (see `docs/bugs.md` for the
@@ -19,147 +18,109 @@ measurements).
 
 ## The guarantee
 
-1. Commands that touch the same voice take effect in the order they arrived.
-2. A command that touches a play which has not started yet waits for that play
-   to start (or fail), then takes effect.
-3. A play never starts before an earlier command that would have touched it,
-   had the play been sent first.
-4. A command that touches nothing that is still waiting takes effect
-   immediately. A slow load only delays commands for the voices it touches.
-5. `stopall` and `fadeall` take effect immediately. They cancel every play that
-   has not started. Commands that were waiting run first, in arrival order,
-   then the stop.
+1. A command takes effect at once on the sounds already playing. Its setting
+   also carries onto every matching play that is still loading, which starts
+   with it. Each sound ends up as if the commands had been processed one at a
+   time in arrival order.
+2. Nothing waits. Commands never wait for loads, and plays never wait for each
+   other. A slow or stuck load only delays its own sound.
+3. `stop`, `voice_stop` and `voice_fade_out` cancel matching plays that have not
+   started. The cancelled play is never heard, and an HTTP client waiting on it
+   gets 409. `stopall` and `fadeall` cancel every play that has not started, as
+   they always have.
 
-The outcome is the same as processing commands one at a time in arrival order,
-except that unrelated commands do not wait for slow loads.
+## Plays that have not started
 
-"Arrival" means the order in which the command loop receives commands: MQTT
-messages in broker delivery order and HTTP requests in the order their handlers
-submit them, interleaved through one channel.
+A play is unstarted from the moment the command loop receives it until it
+starts, fails or is cancelled. Its load begins immediately. While it is
+unstarted, the loop keeps a record of its voice (if the play names one), its
+`id`, its `file`, and the settings carried onto it.
 
-## What a command touches
+A command matches an unstarted play the same way it would match the sound the
+play creates:
 
-Every command that can affect a sound is described by three sets, computed when
-it arrives.
+- `seek`, `speed`, `stop` and `volume` use their selector, with the same OR
+  rule as `SampleSelector::matches` over `voice`, `id` and `file`. A selector's
+  `internal_id` never matches an unstarted play. Internal ids are assigned
+  when a sound starts, so no client can know one before then.
+- `voice_stop`, `voice_fade_out` and `voice_volume` match plays that name their
+  voice. A play without a `voice` gets its automatic voice when it starts, so a
+  voice command cannot name it before then.
 
-- **Voices**: the voices whose sounds it can affect.
-- **Criteria**: for commands that select sounds, the `voice:`, `id:` and `file:`
-  values of their selector. A sound matches when any one of them is equal, the
-  same OR rule `SampleSelector::matches` uses.
-- **Identity**: for plays, the `voice:`, `id:` and `file:` of the sound the play
-  will create.
+## What carries over
 
-| Command | Voices | Criteria | Identity |
-|---|---|---|---|
-| `play` | its voice | - | its voice, id, file |
-| `voice_stop`, `voice_fade_out`, `voice_volume` | the named voice | the named voice | - |
-| `seek`, `speed`, `stop`, `volume` | voices of started sounds the selector matches, plus voices of unstarted plays it matches | selector `voice`, `id`, `file` | - |
+| Command | Effect on a matching unstarted play |
+|---|---|
+| `speed` | The play starts at that speed and pitch mode |
+| `volume` | The play starts at that volume |
+| `seek` | The play starts at that position |
+| `voice_volume` | Applied to the voice as the play starts |
+| `stop`, `voice_stop`, `voice_fade_out` | The play is cancelled |
 
-A play without a `voice` gets its automatic voice name when it arrives rather
-than when it starts. The sound then has the same voice before and after it
-starts, so commands that reach it by `id` or `file` order against each other
-through that voice.
+When several commands of one kind reach the same play, the last one wins. A
+later `speed` replaces an earlier one, which is what processing them in order
+would leave. Settings of different kinds do not affect each other, so their
+relative order does not matter. A carried setting replaces the play's own
+`speed`, `pitch_correction`, `volume` or `start_position_ms`.
 
-`internal_id` only names sounds that have already started. Internal ids are
-assigned when a sound starts, so no client can name an unstarted play by one.
-A selector's `internal_id` therefore contributes the voice of the started sound
-it matches and nothing else.
+A command reports success when it reached a playing sound or an unstarted play,
+and "not found" only when it reached neither. A command that only reached
+unstarted plays logs that it was carried onto them.
 
-## When a command waits
+## Differences from one-at-a-time processing
 
-A later command L waits for an earlier unfinished entry E when either holds:
+- **Timing.** A command reaches the playing sounds before earlier plays start,
+  and plays start in the order their loads finish. A cached play can start
+  before an earlier slow one, in any voice.
+- **Stops cancel instead of interrupting.** A stop or fade that reaches an
+  unstarted play cancels it, instead of starting it and then stopping or fading
+  it.
+- **`voice_volume` and plays into a voice that does not exist yet.** The
+  command reaches the voice when a matching play starts. A different play into
+  that voice that starts first plays at the voice's previous level until then.
+- **HTTP play whose client gave up** (timeout or disconnect): the loaded play
+  is discarded instead of started, as before.
+- **Windowed plays** play forward only. A carried `speed` or `seek` is ignored
+  with a warning, as the commands are for a streamed voice. A carried `volume`
+  applies.
+- **Crossfades across voices are not linked.** A fade of voice A and a play into
+  voice B are independent. A cold play into B starts when it has loaded, so
+  `precache` the file first if the crossfade must not leave a gap.
 
-- **Shared voice**: E and L touch a common voice.
-- **E would reach L**: L is a play and E's criteria match L's identity. Without
-  this rule, a waiting `stop {file: F}` could be overtaken by a play of `F` in an
-  unrelated voice, and would then stop a sound that was sent after it.
+## Not affected
 
-An entry is unfinished while it is a play that has not started (still loading,
-or loaded and waiting its turn), or a command waiting its turn.
-
-When an entry finishes, the waiting entries are re-examined in arrival order,
-and each one with no remaining blocker runs. A play's load starts on arrival
-regardless; only its start waits.
-
-Examples:
-
-- `play V` (loading), then `speed {voice V}`: the speed waits and applies to
-  the new sound once it starts.
-- `play V` (loading), then `volume {voice W}`: different voices, so the volume
-  runs at once.
-- `play V` (loading), `voice_stop V`, `play V` (cached): the second play waits
-  for the stop, which waits for the first play. The first sound starts and is
-  stopped, and the second keeps playing.
-- Existing sound in voice W with file F, then `play F` into V (loading), then
-  `stop {file: F}`: the stop touches W (started sound) and V (unstarted play).
-  It waits for the play and then stops both.
-- `stop {file: F}` waiting behind a load in V, then `play F` into W: the play
-  waits for the stop (E would reach L), so it is not stopped by a command sent
-  before it.
-
-## Plays in the same voice
-
-Two plays into the same voice start in arrival order. A cached play sent right
-after a slow play into the same voice waits for the slow one, so sounds sent
-together into one voice start in the order sent, as close together as the slower
-load allows, at the cost of the later one's latency. Plays in different voices
-never wait for each other, even for the same file or id.
-
-## Failures and cancellation
-
-- **Load fails** (missing file, HTTP error, decode error): the play finishes as
-  failed, its error is reported, and the commands waiting on it run against
-  whatever is playing.
-- **Load task panics**: treated as a failed load. The task id maps back to the
-  play, so nothing waits forever.
-- **HTTP client gives up on a play** (timeout or disconnect): the loaded play is
-  discarded instead of started, as before, and its waiting commands run.
-- **HTTP client gives up on a waiting command**: the command still runs when its
-  turn comes. A stop that timed out on the client side still stops the sound.
-- **`stopall` / `fadeall`**: in-flight loads are aborted as before, every
-  unstarted play is cancelled (HTTP 409), waiting commands run in arrival order,
-  and then the stop runs. A waiting command whose only target was a cancelled
-  play matches nothing and reports that.
-- **Too many waiting**: at most 256 entries may be waiting, meaning they had an
-  earlier blocker when they arrived (a play with no blocker only loads, and loads
-  are already capped at 32). A command or play that would have to wait while 256
-  are waiting is rejected with "Too many commands are waiting for earlier
-  plays". Commands that need not wait are unaffected. The bound keeps a burst of
-  released commands inside the 1024-entry audio command ring.
-- **Shutdown**: waiting commands are dropped.
-
-## Not ordered
-
-- **`precache`, `cache_clear`, `cache_invalidate`, `cache_reload`** run as
-  background tasks and do not take part. Ordering them against plays would
-  need to order the start of a load, not the start of a sound, so it is a
-  separate problem (see `docs/bugs.md`).
-- **`input_volume`, `input_mute` and the talkback commands** act on live inputs.
-  On the audio thread they set an input's own volume and mute, which are
-  independent of the voice volume `voice_volume` sets, so the result does not
-  depend on their order.
-- **Malformed commands** (parse errors, empty selectors) fail at once.
+- **`precache`, `cache_clear`, `cache_invalidate` and `cache_reload`** run as
+  background tasks next to play loads and are not ordered against them (see
+  `docs/bugs.md`).
+- **`input_volume`, `input_mute` and the talkback commands** act on live inputs
+  and never on sample plays.
+- **Malformed commands** (parse errors, empty selectors) fail at once, as before.
 
 ## Implementation
 
-- `src/sequencing.rs` (library, pure logic): `Sequencer<T>` keeps the unfinished
-  entries in arrival order with their voices, criteria and identity, decides
-  whether an arriving entry must wait, and yields entries as they become
-  runnable. It has no I/O, so it is covered by unit and property tests.
-- `src/main.rs`: a `CommandScheduler` owns the sequencer and the load tasks
-  (`JoinSet`, mapping task ids to entries). The command loop and the test
-  fixture both drive it, so the tests exercise the code the daemon runs. It
-  computes each command's voices from the live sound map (`playing`) and the
-  sequencer's unstarted plays.
-- `handle_command` stays the single place a command takes effect.
+- `src/pending_plays.rs` (library, pure logic): `PendingPlays` records the
+  unstarted plays, answers which of them a command matches, and holds their
+  carried settings. It has no I/O, so it is covered by unit and property tests.
+- `src/main.rs`: a `CommandScheduler` owns the pending plays and the load tasks.
+  It takes each request, starts loads, routes commands to playing sounds and
+  pending plays, cancels on stops, and starts plays as their loads finish. The
+  command loop and the test fixture both drive it, so the tests run the code
+  the daemon runs. `handle_command` stays the one place a command takes effect.
+  A play's parsed command and HTTP reply stay in the scheduler; the load task
+  returns only the prepared audio. A stop replaces the load task set, which
+  aborts every load and drops any finished but unstarted result.
 
 ## Testing
 
-- Sequencer unit tests for each rule, and a property test over random command
-  streams and random load completion orders. It checks that conflicting
-  entries take effect in arrival order, that nothing waits forever, and that
-  an entry with nothing to wait for runs at once.
-- Command-loop tests through `CommandScheduler`, using real WAV files and a real
-  in-test HTTP server whose responses are held until the test releases them.
-  That makes "still loading" deterministic without mocking the load path.
-- The MQTT reproduction from `docs/bugs.md` re-run against the built daemon.
+- `PendingPlays` unit tests, and a property test that runs random command
+  streams with random load completion orders and failures. It checks the final
+  state of every sound (and each voice's volume) against processing the same
+  commands one at a time in arrival order, using a model independent of the
+  matching code.
+- Command-loop tests through `CommandScheduler`, with real WAV files, the real
+  cache and a real in-test HTTP server whose response headers are held until
+  the test releases them. That keeps a play deterministically unstarted without
+  mocking the load path.
+- Characterization tests of the existing loop behaviour, written before the
+  loop is restructured.
+- The MQTT reproduction from `docs/bugs.md`, re-run against the built daemon.

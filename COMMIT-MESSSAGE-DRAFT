@@ -1,55 +1,42 @@
-Move the command loop's request handling into a CommandScheduler
+Replace the command hold design with carry-over
 
-The command-ordering fix needs the loop's request handling under test,
-and that code lived inline in main()'s select loop, where no test could
-reach it (only an ignored, device-gated daemon test touched it). This
-moves it, unchanged, into CommandScheduler:
+Three adversarial reviews of the proposed per-voice hold found that
+holding commands behind loads is the wrong mechanism:
 
-- take() is the old branch body: the closed-reply skip, the stopall /
-  fadeall generation bump and abort, macro expansion and parsing, the
-  32-load limit (now the named MAX_CONCURRENT_LOADS), spawning loads
-  that take a permit, and handing ready commands to handle_command with
-  the post-command talkback refresh.
-- next_load() is the old join branch, pending while no load runs.
-- The load semaphore is a constructor argument, so a test can hold a
-  load in flight by giving out no permits.
-- CommandCtx carries the daemon's start_time so the scheduler can take
-  the talkback refresh's timestamp after the command, as the loop did.
+- a load can hang (an uncached HTTP play opens with no connect or
+  response timeout), and a held voice_stop or fader move would then
+  wait forever, while the sound already playing kept going;
+- holding per voice made unrelated commands wait in chains, a global
+  waiting cap turned one stuck voice into failures everywhere, and a
+  release burst could overflow the audio command ring and drop the
+  stopall that triggered it;
+- ordering plays within a voice bought nothing and cost latency.
 
-The loop builds one CommandCtx per input and calls take(); the test
-fixture builds its context through one shared helper and drives the
-same scheduler.
+docs/command-ordering.md now describes the approved replacement: a
+command applies at once to the sounds already playing and carries its
+setting (speed, volume, seek, voice_volume) onto every matching play
+that is still loading, which starts with it; stop, voice_stop and
+voice_fade_out cancel matching unstarted plays, as stopall and fadeall
+already cancel every one; nothing waits. It lists where the result still
+differs from one-at-a-time processing (timing, stops cancelling instead
+of interrupting, voice_volume onto a voice that does not exist yet, HTTP
+plays whose client gave up, windowed plays, crossfades across voices).
 
-Characterization tests pin the existing behaviour before it changes: a
-play is answered only once its sample is queued; a missing file is
-NotFound, a path outside allowed_directories Forbidden, an unknown
-channel InvalidRequest (each logged as "Load failed"); malformed JSON
-and unknown commands are InvalidRequest and logged; the 33rd concurrent
-load is rejected; stopall cancels a load in flight and one that finished
-but was not yet taken (409), and plays sent after a stop start normally;
-a request whose client has gone starts nothing, and a loaded play whose
-client has gone is discarded; cache commands run as background loads
-and stopall cancels them; the scheduler keeps going after a load task
-panics; shutdown cancels loads in flight.
+docs/bugs.md gains the pre-existing issues the reviews surfaced and that
+were checked against the code: windowed plays ignore start_position_ms;
+volume and seek do not reach streamed sources; a shutdown signal can be
+missed while a command is handled (tokio drops a signal broadcast that
+finds no listener, and the loop recreates its listeners each iteration);
+a huge start_position_ms or seek overflows in debug builds.
 
-Writing them exposed a bug that is fixed separately: a load aborted
-before its task first runs drops its HTTP reply instead of answering
-409. The tests here yield once so the task is running when the stop
-arrives, which is the behaviour they pin.
-
-Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
-and a warning-free release build (RUSTFLAGS=-D warnings); fuzz suite 7
-passed; broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA
-set) 973 passed, 0 failed, 7 device-gated ignored.
+No code changes.
 
 Prompts that led to this work:
 
 - "Let's go with the per-voice hold fix. Make sure to think through all
-  the possible implications ... We'll need a lot of tests in this area
-  before implementation as well. Consider spawning adversarial review
+  the possible implications ... Consider spawning adversarial review
   agents both before starting the fix and after implementing it."
-- Design decisions after the adversarial review: carry settings over
-  to unstarted plays instead of holding commands; stops cancel unstarted
-  plays; restore MQTT failure logging; bound HTTP waits.
+- Decisions after the reviews: carry settings over instead of holding
+  commands; stops and fades cancel matching unstarted plays.
 
 This commit was authored by Claude (AI assistant) working with Ben Andrews.

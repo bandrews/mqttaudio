@@ -617,3 +617,41 @@ A play registers its sample with the voice manager before pushing it onto the
 reaches the graveyard and the reaper never removes it from its voice. Narrow,
 since the ring only fills when the audio thread stalls. Left alone because the
 fix is to register after a successful push, which touches both play paths.
+
+## Windowed plays ignore `start_position_ms`
+
+A play that windows (`mode: "stream"`, or a file long or large enough for `auto`
+to window) always starts from the beginning: neither the local nor the HTTP
+windowed path passes `start_position_ms` to the streamed source, and nothing
+warns. The docs only say a windowed voice "plays forward only". Left alone
+because starting a windowed decode at an offset is a feature of the streamed
+source, not a dispatch fix.
+
+## `volume` and `seek` do not reach streamed sources
+
+The audio thread applies `SetVolumeMatching` and `SeekMatching` to
+`active_samples` only, so a `volume` or `seek` aimed at a windowed play changes
+nothing audible. `volume` still updates the status snapshot, so
+`/status/samples` reports a volume the stream is not playing at. `speed` and
+`seek` warn for streamed voices; `volume` does not. Left alone as a separate
+mixer change.
+
+## A shutdown signal can be missed while a command is being handled
+
+`shutdown_signal()` creates fresh Ctrl-C and SIGTERM listeners every time the
+command loop's `select!` runs, and drops them whenever another branch wins.
+Tokio delivers a signal only to listeners that exist when its driver
+broadcasts it, and a broadcast that finds none is discarded. A SIGTERM that
+arrives while a handler is awaiting can therefore be lost, leaving the daemon
+running until a second signal. The fix is to create the shutdown future once,
+outside the loop, and pin it.
+
+## A huge `start_position_ms` or `seek` overflows in debug builds
+
+`start_ms * sample_rate` (dispatch, and the prebuffer gate in `loading.rs`) and
+the audio thread's seek conversion multiply a client-supplied millisecond
+count without overflow checks. A debug build panics once the product overflows
+(above about 3.8 × 10¹⁴ ms at 48 kHz), which stops the daemon when it happens
+on the audio thread or in the command loop. A release build wraps and then
+clamps to the end of the clip. Left alone because release
+builds are what run, but the multiplications should saturate.
