@@ -185,6 +185,10 @@ impl VoiceManager {
     /// cancelled. The voice is dropped if nothing else keeps it.
     pub fn remove_loading_play(&mut self, voice_id: &str) {
         if let Some(voice) = self.voices.get_mut(voice_id) {
+            debug_assert!(
+                voice.loading_plays > 0,
+                "voice '{voice_id}' let go of a loading play it was not holding"
+            );
             voice.loading_plays = voice.loading_plays.saturating_sub(1);
             if voice.is_empty() {
                 self.voices.remove(voice_id);
@@ -456,6 +460,17 @@ mod tests {
 
         manager.remove_loading_play("amb");
         assert_eq!(manager.voice_count(), 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "let go of a loading play it was not holding")]
+    fn letting_go_of_a_loading_play_twice_is_caught() {
+        let mut manager = VoiceManager::new();
+        manager.add_sample_to_voice("amb");
+        manager.add_loading_play("amb");
+        manager.remove_loading_play("amb");
+        manager.remove_loading_play("amb");
     }
 
     #[test]

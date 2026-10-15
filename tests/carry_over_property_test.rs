@@ -172,9 +172,6 @@ impl World {
 
     /// Apply a command to the sounds that are playing.
     fn apply(&mut self, command: &AudioCommand) {
-        let matches = |selector: &SampleSelector, play: usize, sound: &Sound| {
-            selector.matches(play as u64, sound.id.as_deref(), &sound.file, &sound.voice)
-        };
         match command {
             AudioCommand::Speed {
                 selector,
@@ -182,14 +179,14 @@ impl World {
                 pitch_correction,
             } => {
                 for (play, sound) in self.sounds.iter_mut() {
-                    if matches(selector, *play, sound) {
+                    if names(selector, *play, sound) {
                         sound.speed = (*speed, *pitch_correction);
                     }
                 }
             }
             AudioCommand::Volume { selector, volume } => {
                 for (play, sound) in self.sounds.iter_mut() {
-                    if matches(selector, *play, sound) {
+                    if names(selector, *play, sound) {
                         sound.volume = *volume;
                     }
                 }
@@ -199,14 +196,14 @@ impl World {
                 position_ms,
             } => {
                 for (play, sound) in self.sounds.iter_mut() {
-                    if matches(selector, *play, sound) {
+                    if names(selector, *play, sound) {
                         sound.position = Some(*position_ms);
                     }
                 }
             }
             AudioCommand::Stop { selector, .. } => {
                 self.sounds
-                    .retain(|play, sound| !matches(selector, *play, sound));
+                    .retain(|play, sound| !names(selector, *play, sound));
             }
             AudioCommand::VoiceStop { voice } | AudioCommand::VoiceFadeOut { voice, .. } => {
                 self.sounds.retain(|_, sound| &sound.voice != voice);
@@ -264,6 +261,17 @@ impl World {
     fn is_playing(&self, play: usize) -> bool {
         self.sounds.contains_key(&play)
     }
+}
+
+/// Whether `selector` names the sound of play `play`: by internal id, id, file or
+/// voice, any one of them being enough. Written out here rather than taken from
+/// `SampleSelector::matches`, so the reference does not share the matching it
+/// checks.
+fn names(selector: &SampleSelector, play: usize, sound: &Sound) -> bool {
+    selector.internal_id.as_deref() == Some(play.to_string().as_str())
+        || (selector.id.is_some() && selector.id == sound.id)
+        || selector.file.as_deref() == Some(sound.file.as_str())
+        || selector.voice.as_deref() == Some(sound.voice.as_str())
 }
 
 fn play_command(op: &Op) -> AudioCommand {

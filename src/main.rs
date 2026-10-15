@@ -6060,7 +6060,7 @@ mod tests {
 
     #[tokio::test]
     async fn scheduler_stopall_cancels_a_load_in_flight() {
-        let (mut scheduler, permits) = scheduler_with(0);
+        let (mut scheduler, _permits) = scheduler_with(0);
         let mut fixture = Fixture::new(vec![]);
 
         let play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
@@ -6073,13 +6073,22 @@ mod tests {
             mqtt::commands::CommandErrorKind::Cancelled
         );
 
-        permits.add_permits(4);
-        assert!(
-            scheduler.loads.is_empty(),
-            "the cancelled load is no longer running"
-        );
+        assert!(scheduler.loads.is_empty());
         assert!(scheduler.pending.is_empty());
         assert!(fixture.playing.is_empty());
+        // An aborted load drops what it holds once the runtime polls it; one left
+        // running would still be waiting for a slot, holding the cache.
+        for _ in 0..10 {
+            if Arc::strong_count(&fixture.cache_manager) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            Arc::strong_count(&fixture.cache_manager),
+            1,
+            "the cancelled load was aborted"
+        );
     }
 
     #[tokio::test]
@@ -6583,12 +6592,10 @@ mod tests {
         let _serial = MAIN_TEST_LOCK.lock().await;
         let (mut fixture, mut scheduler, server) = http_fixture().await;
         let gate = server.hold("crank2.wav");
-        let _play = submit(
-            &mut fixture,
-            &mut scheduler,
-            &play_from(&server.url("crank2.wav"), Some("Crank2"), None),
-        )
-        .await;
+        let play = serde_json::json!({
+            "command": "play", "file": server.url("crank2.wav"), "voice": "Crank2", "speed": 0.5
+        });
+        let _play = submit(&mut fixture, &mut scheduler, &play.to_string()).await;
 
         let (mut speed, warnings) = capturing_warnings(submit(
             &mut fixture,
@@ -6608,10 +6615,11 @@ mod tests {
 
         gate.release();
         finish_next_load(&mut fixture, &mut scheduler).await;
-        assert_eq!(
-            sound_in(&mut fixture, "Crank2").speed,
-            1.0,
-            "the ignored speed does not carry"
+        let sound = sound_in(&mut fixture, "Crank2");
+        assert_eq!(sound.speed, 0.5, "the play keeps its own speed");
+        assert!(
+            !sound.has_pitch_correction(),
+            "the ignored speed does not turn pitch correction on"
         );
     }
 
@@ -6652,7 +6660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stop_cancels_loading_plays_and_stops_playing_sounds_together() {
+    async fn voice_fade_out_cancels_loading_plays_and_fades_playing_sounds_together() {
         let (mut fixture, mut scheduler, server) = http_fixture().await;
         let _first = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "V")).await;
         finish_next_load(&mut fixture, &mut scheduler).await;
@@ -6969,6 +6977,214 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_voice_ends_with_the_last_sound_of_a_play_that_loaded() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let mut play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "amb")).await;
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(outcome_of(&mut play).unwrap(), "Command completed");
+
+        fixture.drain();
+        finish_voice_sample(&mut fixture, "amb");
+        fixture.reap();
+        assert!(
+            fixture.voice_manager.lock().get_voice("amb").is_none(),
+            "the voice ends with its last sound"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_voice_stays_open_while_a_second_play_into_it_loads() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let gate = server.hold("second.wav");
+        let _second = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("second.wav"), Some("amb"), None),
+        )
+        .await;
+        let _first = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "amb")).await;
+        finish_loads_until_playing(&mut fixture, &mut scheduler, "amb").await;
+
+        fixture.drain();
+        finish_voice_sample(&mut fixture, "amb");
+        fixture.reap();
+        assert!(
+            fixture.voice_manager.lock().get_voice("amb").is_some(),
+            "the second play still holds the voice open"
+        );
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_cancels_a_play_aborts_its_load() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gate = server.hold("loop.wav");
+        let _play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("loop.wav"), Some("V"), None),
+        )
+        .await;
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "stop", "voice": "V"}"#,
+        )
+        .await;
+
+        let ended = next_load(&mut scheduler).await;
+        assert!(
+            matches!(&ended, SchedulerInput::Loaded(Err(error)) if error.is_cancelled()),
+            "the cancelled play's load is aborted, not left running"
+        );
+    }
+
+    #[tokio::test]
+    async fn fadeall_cancels_a_play_still_loading() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gate = server.hold("a.wav");
+        let play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("a.wav"), Some("A"), None),
+        )
+        .await;
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "fadeall", "time": 500}"#,
+        )
+        .await;
+
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+        assert_eq!(fixture.voice_manager.lock().voice_count(), 0);
+        assert!(scheduler.loads.is_empty(), "fadeall ends every load");
+    }
+
+    #[tokio::test]
+    async fn voice_fade_out_reaching_only_a_loading_play_succeeds() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gate = server.hold("a.wav");
+        let play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("a.wav"), Some("V"), None),
+        )
+        .await;
+        let mut fade = submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_fade_out", "voice": "V", "time": 500}"#,
+        )
+        .await;
+        assert_eq!(outcome_of(&mut fade).unwrap(), "Command completed");
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn a_play_rejected_by_the_load_limit_holds_no_voice() {
+        let (mut scheduler, _permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+        for i in 0..MAX_CONCURRENT_LOADS {
+            submit(
+                &mut fixture,
+                &mut scheduler,
+                &play_json(TEST_WAV, &format!("v{i}")),
+            )
+            .await;
+        }
+        let mut over = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "over")).await;
+        assert_eq!(
+            outcome_of(&mut over).unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Internal
+        );
+        assert!(
+            fixture.voice_manager.lock().get_voice("over").is_none(),
+            "a rejected play never held its voice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_speed_for_a_streamed_voice_does_not_carry_onto_a_play_into_it() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let windowed = serde_json::json!({
+            "command": "play", "file": server.url("bed.wav"), "voice": "bed",
+            "mode": "stream", "window_ms": 200, "prebuffer_ms": 20
+        });
+        let mut bed = submit(&mut fixture, &mut scheduler, &windowed.to_string()).await;
+        let ((), started) =
+            capturing_warnings(finish_next_load(&mut fixture, &mut scheduler)).await;
+        assert!(started.is_empty(), "got {started:?}");
+        assert_eq!(outcome_of(&mut bed).unwrap(), "Command completed");
+        assert!(fixture.streamed_voices.contains("bed"));
+
+        let gate = server.hold("next.wav");
+        let full = serde_json::json!({
+            "command": "play", "file": server.url("next.wav"), "voice": "bed", "mode": "full"
+        });
+        let _next = submit(&mut fixture, &mut scheduler, &full.to_string()).await;
+        let (_speed, warnings) = capturing_warnings(submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "speed", "voice": "bed", "speed": 1.5}"#,
+        ))
+        .await;
+        assert_eq!(
+            warnings,
+            vec![
+                "Speed/pitch is not supported for windowed/streamed voices; ignoring (a streamed \
+                 source plays forward only)"
+            ]
+        );
+
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(
+            sound_in(&mut fixture, "bed").speed,
+            1.0,
+            "one at a time, the speed reaches a streamed voice and is ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_cancelling_an_mqtt_play_logs_why() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gate = server.hold("a.wav");
+        let url = server.url("a.wav");
+        submit_unreplied(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&url, Some("V"), None),
+        )
+        .await;
+        let ((), logs) = capturing_logs(
+            tracing::Level::INFO,
+            submit_unreplied(
+                &mut fixture,
+                &mut scheduler,
+                r#"{"command": "voice_stop", "voice": "V"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(
+            logs,
+            vec![format!(
+                "Cancelled play of {url}: Cancelled by a stop before it started"
+            )]
+        );
+    }
+
     // ---- Command scheduler against one-at-a-time processing ---------------------
 
     const SCRIPT_VOICES: [&str; 3] = ["A", "B", "C"];
@@ -7023,6 +7239,7 @@ mod tests {
             volume: f32,
         },
         StopAll,
+        FadeAll,
         /// The load of the `which`-th play still loading (modulo how many there
         /// are) ends.
         Finish {
@@ -7074,6 +7291,7 @@ mod tests {
             2 => (0..SCRIPT_VOICES.len(), volume)
                 .prop_map(|(voice, volume)| Step::VoiceVolume { voice, volume }),
             1 => Just(Step::StopAll),
+            1 => Just(Step::FadeAll),
             4 => (0..8usize).prop_map(|which| Step::Finish { which }),
         ]
     }
@@ -7159,6 +7377,7 @@ mod tests {
                 "command": "voice_volume", "voice": SCRIPT_VOICES[*voice], "volume": volume
             }),
             Step::StopAll => serde_json::json!({ "command": "stopall" }),
+            Step::FadeAll => serde_json::json!({ "command": "fadeall", "time": 500 }),
             Step::Finish { .. } => return None,
         };
         Some(json.to_string())
@@ -7167,7 +7386,11 @@ mod tests {
     fn stops(step: &Step) -> bool {
         matches!(
             step,
-            Step::Stop { .. } | Step::VoiceStop { .. } | Step::VoiceFadeOut { .. } | Step::StopAll
+            Step::Stop { .. }
+                | Step::VoiceStop { .. }
+                | Step::VoiceFadeOut { .. }
+                | Step::StopAll
+                | Step::FadeAll
         )
     }
 

@@ -1,43 +1,50 @@
-Count live loads against the load limit, and report the speed that plays
+Cover what the review found untested in the carry-over scheduler
 
-Two findings from the post-implementation review of the carry-over
-scheduler.
+A post-implementation reviewer ran 45 mutations against 89c927a; 10
+survived the whole suite, 6 of them also the differential test at its
+default 64 cases. Each gap now has a test, checked again on the current
+code to fail under the mutation it targets:
 
-The load limit counted every task in the JoinSet. A stop that cancels a
-loading play aborts its task, but an aborted task stays in the set until
-the command loop takes its end, so right after a voice_stop cancelled
-many loading plays, a play arriving before the loop got to them was
-refused with "Too many concurrent loads" while nothing was loading. The
-scheduler now counts the work still running for a command: the plays
-still pending (play_loads) and the cache commands in flight, tracked by
-task id in cache_loads and dropped when they end, panic, or are cleared
-by stopall/fadeall.
+- a_voice_ends_with_the_last_sound_of_a_play_that_loaded: no release of
+  the voice hold after a successful start (every voice would live
+  forever, undoing "finished sounds leave their voice").
+- a_voice_stays_open_while_a_second_play_into_it_loads: a hold released
+  twice. remove_loading_play also debug-asserts it is releasing a hold
+  it has (letting_go_of_a_loading_play_twice_is_caught), so a double
+  release fails loudly in every debug test.
+- a_stop_that_cancels_a_play_aborts_its_load: no abort on cancel (the
+  load would keep a slot until it finished or timed out).
+- fadeall_cancels_a_play_still_loading: fadeall not cancelling. fadeall
+  is also added to the differential test's generator.
+- voice_fade_out_reaching_only_a_loading_play_succeeds,
+  a_play_rejected_by_the_load_limit_holds_no_voice,
+  a_speed_for_a_streamed_voice_does_not_carry_onto_a_play_into_it, and
+  a_stop_cancelling_an_mqtt_play_logs_why (the reason troubleshooting.md
+  quotes).
 
-The speed arm recorded the requested speed in /status/samples while the
-mixer clamps it (-100 to 100, never nearer zero than 0.01; 0.05 to 8
-with pitch correction). A play that starts at a speed records the
-clamped one, so a speed of 150 showed 100 when it was carried onto a
-loading play and 150 when it reached a playing sound. The clamp is now
-one function, audio::mixer::playable_speed, used by
-ActiveSample::set_speed and by the speed arm for the status. CHANGELOG
-has a Fixed entry.
+Tests made stronger:
+- a_speed_ignored_with_a_warning_reaches_a_loading_play_without_changing_
+  it: the play now has its own speed 0.5. Carrying the ignored (-1,
+  pitch) used to leave the 1.0 the test expected, because the mixer
+  rejects a negative pitch-corrected speed; now the test sees the
+  play's speed and pitch mode change.
+- scheduler_stopall_cancels_a_load_in_flight: checks the cancelled load
+  let go of the cache (it was aborted) instead of only that the task set
+  is empty; it fails when no abort happens.
+- tests/carry_over_property_test.rs: the one-at-a-time reference used
+  the production SampleSelector::matches, the code the scheduler side
+  also relies on. It now has its own OR matcher, and disabling file
+  matching in SampleSelector fails the property.
 
-Tests (each failed first):
-- plays_a_stop_cancelled_leave_their_load_slots_to_later_plays: 32
-  plays loading into V, a voice_stop, then a play into W was answered
-  "Too many concurrent loads"; now it loads and starts.
-- scheduler_counts_cache_commands_against_the_load_limit_until_they_end:
-  32 precaches in flight refuse a play, and a finished one frees its
-  slot. Removing either the insert or the removal of the cache task id
-  fails it.
-- the_status_reports_the_speed_a_sound_plays_at: 150, 0.001 and -150
-  recorded as 100, 0.01 and -100, matching the mixer.
+Renamed a_stop_cancels_loading_plays_and_stops_playing_sounds_together
+to voice_fade_out_cancels_loading_plays_and_fades_playing_sounds_
+together, which is what it does.
 
 Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
-and a warning-free release build (RUSTFLAGS=-D warnings); fuzz suite 7
-passed; broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA
-set) 1033 passed, 0 failed, 7 device-gated ignored. The scheduler
-differential test also passed at 2000 cases.
+and a warning-free release build (RUSTFLAGS=-D warnings);
+broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA set) 1042
+passed, 0 failed, 7 device-gated ignored. The differential test passed
+200 cases with fadeall in the generator.
 
 Prompts that led to this work:
 
