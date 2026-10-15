@@ -1,43 +1,67 @@
-Check the command scheduler against one-at-a-time processing
+Build pitch correctors from the metadata a play read, not a racing read
 
-tests/carry_over_property_test.rs checks PendingPlays and the voice rule
-against a sequential model, but its executor re-implements the
-scheduler's routing, so a wiring mistake in src/main.rs (a voice hold
-not released, a cancelled play started, a wrong reply) would get past
-it. This test drives the real CommandScheduler instead.
+A run of the new scheduler differential test killed the test process
+with SIGFPE. The cause is a race that can kill the daemon:
 
-Each generated script mixes plays (voices A to C or none, ids x and y
-or none, two shared files over a real in-test HTTP server, about a
-fifth of them answered 404, some with their own speed, volume or start
-position), speed (including a negative speed with pitch correction),
-volume, seek, stop, voice_stop, voice_fade_out, voice_volume, stopall,
-and points where a chosen loading play's load ends. The scheduled run
-submits the JSON to CommandScheduler with real loads and takes each
-load's result where the script says, so loads end in any order. The
-reference run sends the same commands one at a time through
-handle_command: each play starts at once, and a play whose load fails
-in the scheduled run plays until the point its load ended there. Both
-runs finish fade-outs at once after a stop, so a stopped sound is gone
-in both.
+- A buffer still decoding answers SampleBuffer::channels() and
+  sample_rate() with a non-blocking try_read, and returns 0 for both
+  whenever its decoder holds the write lock to append a chunk.
+- Signalsmith's presetDefault configures its STFT with
+  blockSamples = 0.12 x rate; for rate 0 that is 0, and
+  DynamicSTFT::moveOutput then computes `% 0` (stft.h:212), a hardware
+  divide fault rather than a Rust panic.
 
-The runs must agree on every sound left playing (speed, volume, voice
-volume, position), every named voice's volume, and every command's
-outcome (success, 404, 400). Every play must be answered, and the load
-of a cancelled play must start nothing. Coverage counters make the run
-fail if no script answered a command that reached only loading plays,
-set the volume of a voice held open by a loading play, cancelled a
-play, failed a load, or started a play that commands arrived during
-the load of.
+Two routes reached it:
 
-64 cases by default, about 20 s in a debug build;
-SCHEDULER_SCRIPT_CASES raises it. Each of these mutations fails it with
-a shrunk script: speed not carried; voice_stop not cancelling; a failed
-load keeping its voice; a command that reached only loading plays
-answered "not found".
+- A play starting with pitch correction (its own pitch_correction from
+  0bf9fe5, or a pitch-corrected speed carried onto it while it loaded)
+  went through set_speed_with_mode -> enable_pitch_correction ->
+  PitchCorrector::new(channels(), sample_rate()). gdb on the new test:
+  PitchCorrector::new(channels=0, sample_rate=0) <- enable_pitch_
+  correction (mixer.rs:470) <- set_speed_with_mode <- handle_command.
+- The Play arm recorded /status/samples sample_rate and channels with
+  the same reads, and a later speed with pitch correction builds its
+  bundle from that status. This route is on 2.1.0-rc.1: a cold play
+  recorded rate 0 in 2-5% of plays under a decoder in these tests.
 
-Validation: cargo fmt --check and cargo clippy --all-targets -D
-warnings clean; the binary's tests 98 passed; the new test also passed
-at 300 and 1000 cases.
+A play now records the channels and rate it read with
+metadata_blocking() (already checked non-zero) in its status, and a
+play starting with pitch correction gets its corrector the way a speed
+command does: PitchBundle::for_voice from those values, installed with
+apply_shipped_speed. That also gives it the scratch sized for a whole
+block, so its first mixed block no longer grows pitch_scratch on the
+audio thread.
+
+enable_pitch_correction (still reached by the library-only
+SetSpeedMatching) now refuses when the buffer cannot report its channels
+or rate, and set_speed_with_mode then rejects the speed instead of
+applying it without correction; the rest of the function uses the
+values it checked.
+
+docs/bugs.md records the same non-blocking rate read in SeekMatching,
+which can send a seek on a still-decoding sound to frame 0. CHANGELOG
+has a Fixed entry.
+
+Tests (each failed first):
+- a_play_with_pitch_correction_starts_while_its_decoder_writes_the_
+  buffer: 100 pitch-corrected plays against a buffer whose stand-in
+  decoder takes the write lock for 5 us out of every 25 us; SIGFPE 3 of
+  3 runs before the change.
+- a_play_records_its_rate_and_channels_while_its_decoder_writes_the_
+  buffer: 300 plays; 6 to 15 statuses recorded (0, 0) per run before.
+- a_play_with_pitch_correction_mixes_its_first_block_without_growing_
+  scratch: 1 regrow before, 0 after.
+- pitch_correction_is_refused_while_a_decoding_buffer_cannot_report_its_
+  rate (mixer): SIGFPE before; now refused while the buffer is held and
+  accepted once it is released.
+
+Two adversarial reviewers found the same crash independently; their
+traces match the one above.
+
+Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
+and a warning-free release build (RUSTFLAGS=-D warnings); fuzz suite 7
+passed; broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA
+set) 1027 passed, 0 failed, 7 device-gated ignored.
 
 Prompts that led to this work:
 
@@ -48,6 +72,9 @@ Prompts that led to this work:
   We'll need a lot of tests in this area before implementation as well.
   Consider spawning adversarial review agents both before starting the
   fix and after implementing it."
+- "While you're working on this, can we also add a speed parameter to
+  the play command so we don't need to issue multiple commands in
+  sequence to begin with?"
 
 This commit was authored by Claude (AI assistant) working with Ben Andrews.
 

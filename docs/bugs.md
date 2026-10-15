@@ -655,3 +655,12 @@ count without overflow checks. A debug build panics once the product overflows
 on the audio thread or in the command loop. A release build wraps and then
 clamps to the end of the clip. Left alone because release
 builds are what run, but the multiplications should saturate.
+
+## A seek on a still-decoding sound can land at its start
+
+The audio thread converts a `seek`'s milliseconds to frames with the buffer's
+sample rate (`SeekMatching` in `rt_engine.rs`), read without blocking. A buffer
+still decoding reports a rate of 0 while its decoder holds it, so the seek goes
+to frame 0 instead of the requested position. Left alone because the audio
+thread must not block; the fix is to keep the sample rate on the sample when it
+starts.

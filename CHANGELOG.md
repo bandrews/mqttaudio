@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A `speed` with `pitch_correction` no longer kills the daemon.** A sound whose file was still
+  decoding could record a sample rate of 0, read while the decoder held its buffer, and a `speed` with
+  `pitch_correction` then built the pitch stretcher for that rate, which ends the process with SIGFPE (a
+  division by zero in the native library). A sound now records the rate and channel count it read before it
+  started, and a play that starts with pitch correction builds its stretcher from them too.
 - **Commands sent right after a `play` reach it.** A `speed`, `seek`, `volume`, `stop`, `voice_stop`,
   `voice_fade_out` or `voice_volume` that arrived while the play's file was still loading ran first,
   matched nothing (`No sample matches the selector`) and was lost: the sound started at normal speed, and a

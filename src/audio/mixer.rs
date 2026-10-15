@@ -463,11 +463,19 @@ impl ActiveSample {
     /// (F10), priming its analysis buffers so the first mixed block already carries
     /// signal. The pre-roll reads a borrowed slice of the already-decoded buffer and
     /// produces no output, so it allocates nothing on the audio thread.
-    pub fn enable_pitch_correction(&mut self) {
+    ///
+    /// Returns whether correction is enabled. A buffer still decoding cannot report
+    /// its channels or rate while its decoder holds it, and the stretcher cannot be
+    /// built without them, so correction is not enabled then.
+    pub fn enable_pitch_correction(&mut self) -> bool {
         if self.pitch_corrector.is_some() {
-            return;
+            return true;
         }
-        let mut pc = PitchCorrector::new(self.buffer.channels(), self.buffer.sample_rate());
+        let (channels, sample_rate) = (self.buffer.channels(), self.buffer.sample_rate());
+        if channels == 0 || sample_rate == 0 {
+            return false;
+        }
+        let mut pc = PitchCorrector::new(channels, sample_rate);
         pc.set_speed(self.speed);
         self.preroll_corrector(&mut pc);
         // A fresh stretcher starts with no pending input fraction and no tail.
@@ -478,7 +486,7 @@ impl ActiveSample {
         // the per-block drain at EOF never allocates on the audio thread. This sits
         // alongside the (already heap-allocating) stretcher construction, off the
         // per-block mix path.
-        let tail_samples = pc.output_latency() * self.buffer.channels();
+        let tail_samples = pc.output_latency() * channels;
         if self.pitch_tail_buffer.len() < tail_samples {
             self.pitch_tail_buffer.resize(tail_samples, 0.0);
         }
@@ -487,7 +495,7 @@ impl ActiveSample {
         // mid-playback (there is prior audio to be continuous with); a first enable
         // at the very start has nothing to cross-fade from.
         if self.position > 0 {
-            let xfade = (self.buffer.sample_rate() as usize / 200).max(1); // ~5 ms
+            let xfade = (sample_rate as usize / 200).max(1); // ~5 ms
             self.pitch_crossfade_remaining = xfade;
             self.pitch_crossfade_total = xfade;
             self.pitch_crossfade_direct_pos = self.precise_position();
@@ -495,9 +503,9 @@ impl ActiveSample {
             self.pitch_crossfade_remaining = 0;
             self.pitch_crossfade_total = 0;
         }
-        self.pitch_input_scratch
-            .resize(8192 * 8 * self.buffer.channels().max(1), 0.0);
+        self.pitch_input_scratch.resize(8192 * 8 * channels, 0.0);
         self.pitch_corrector = Some(pc);
+        true
     }
 
     /// Feed `pc` the audio leading up to `self.position` so it is primed and emits
@@ -528,11 +536,14 @@ impl ActiveSample {
     /// must be changed before setting speed (negative speeds are rejected
     /// while pitch correction is enabled).
     ///
-    /// Returns true if the speed was set, false if rejected.
+    /// Returns true if the speed was set, false if rejected, including when the
+    /// requested correction cannot be enabled yet.
     pub fn set_speed_with_mode(&mut self, speed: f32, pitch_correction: bool) -> bool {
         // Change pitch correction mode FIRST
         if pitch_correction {
-            self.enable_pitch_correction();
+            if !self.enable_pitch_correction() {
+                return false;
+            }
         } else {
             self.disable_pitch_correction();
         }
@@ -5081,6 +5092,37 @@ mod tests {
         // Mix reverse 10 frames
         mix_audio(&mut output, &mut state);
         assert_eq!(state.active_samples[0].position, 50);
+    }
+
+    #[test]
+    fn pitch_correction_is_refused_while_a_decoding_buffer_cannot_report_its_rate() {
+        use std::sync::RwLock;
+        let streaming = Arc::new(RwLock::new(crate::audio::streaming::StreamingBuffer::new(
+            2, 48000, None,
+        )));
+        let mut sample = ActiveSample::new(
+            1,
+            "voice".into(),
+            SampleBuffer::Streaming(streaming.clone()),
+            1.0,
+            1.0,
+            "file.wav".into(),
+        );
+
+        // The decoder holds the buffer while it appends a chunk.
+        let appending = streaming.write().unwrap();
+        let accepted = sample.set_speed_with_mode(1.2, true);
+        drop(appending);
+        assert!(
+            !accepted,
+            "the speed is refused rather than applied without its correction"
+        );
+        assert_eq!(sample.speed, 1.0);
+        assert!(!sample.has_pitch_correction());
+
+        assert!(sample.set_speed_with_mode(1.2, true));
+        assert!(sample.has_pitch_correction());
+        assert_eq!(sample.speed, 1.2);
     }
 
     // === set_speed_with_mode Tests ===

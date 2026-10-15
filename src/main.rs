@@ -2642,9 +2642,24 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
 
                     // Start at the requested speed, exactly as a speed command sent
                     // right after the play would set it. The sample is not on the
-                    // audio thread yet, so building its corrector here is off-RT.
+                    // audio thread yet, so building its corrector here is off-RT. The
+                    // corrector takes the channels and rate read above: a buffer
+                    // still decoding can be locked by its decoder at this moment.
                     if speed != 1.0 || pitch_correction {
-                        sample.set_speed_with_mode(speed, pitch_correction);
+                        let mut corrector = pitch_correction.then(|| {
+                            Box::new(audio::mixer::PitchBundle::for_voice(
+                                channels,
+                                sample_rate,
+                                speed,
+                                ctx.max_block_frames,
+                            ))
+                        });
+                        sample.apply_shipped_speed(
+                            speed,
+                            pitch_correction,
+                            &mut corrector,
+                            &mut None,
+                        );
                         if pitch_correction && !buffer.is_complete() {
                             warn_pitch_correction_deferred(&file);
                         }
@@ -2672,8 +2687,8 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             .buffer
                             .total_frames_or_estimate()
                             .unwrap_or_else(|| sample.buffer.frames()),
-                        sample_rate: sample.buffer.sample_rate(),
-                        channels: sample.buffer.channels(),
+                        sample_rate,
+                        channels,
                         volume: sample.volume,
                         voice_volume: sample.voice_volume,
                         speed: sample.speed,
@@ -4353,6 +4368,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_play_with_pitch_correction_mixes_its_first_block_without_growing_scratch() {
+        let mut fixture = Fixture::new(vec![]);
+        // A warm cache hands the play a complete buffer, so the corrector runs from
+        // the first block.
+        fixture
+            .cache_manager
+            .lock()
+            .await
+            .get_or_load(TEST_WAV, SR)
+            .await
+            .unwrap();
+        fixture
+            .run(at_speed(play(Some("crank"), 1.0), 1.5, true))
+            .await;
+        fixture.drain();
+        let regrows =
+            audio::mixer::PITCH_SCRATCH_REGROWS.load(std::sync::atomic::Ordering::Relaxed);
+
+        mix_one_block(&mut fixture);
+
+        assert_eq!(
+            audio::mixer::PITCH_SCRATCH_REGROWS.load(std::sync::atomic::Ordering::Relaxed),
+            regrows,
+            "the corrector arrives with scratch for a whole block, so the audio thread allocates nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn play_with_pitch_correction_on_a_still_loading_cold_play_warns_like_speed() {
         let _serial = MAIN_TEST_LOCK.lock().await;
         let mut fixture = Fixture::new(vec![]);
@@ -4376,6 +4419,118 @@ mod tests {
         let sample = &fixture.mixer.active_samples[0];
         assert!(sample.has_pitch_correction());
         assert_eq!(sample.speed, 1.2);
+    }
+
+    /// Stands for a cold play's decoder: it takes the buffer's write lock briefly
+    /// for each chunk it appends and decodes the next chunk between, so a play can
+    /// start while the lock is held.
+    struct DecoderHoldingTheLock {
+        running: Arc<std::sync::atomic::AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl DecoderHoldingTheLock {
+        fn start(buffer: Arc<RwLock<audio::streaming::StreamingBuffer>>) -> Self {
+            fn spin_for(duration: std::time::Duration) {
+                let until = std::time::Instant::now() + duration;
+                while std::time::Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            }
+            let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let appended = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let thread = std::thread::spawn({
+                let running = running.clone();
+                let appended = appended.clone();
+                move || {
+                    while running.load(std::sync::atomic::Ordering::Relaxed) {
+                        let appending = buffer.write().unwrap();
+                        spin_for(std::time::Duration::from_micros(5));
+                        drop(appending);
+                        appended.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        spin_for(std::time::Duration::from_micros(20));
+                    }
+                }
+            });
+            while appended.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                std::thread::yield_now();
+            }
+            Self { running, thread }
+        }
+
+        fn stop(self) {
+            self.running
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.thread.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_play_with_pitch_correction_starts_while_its_decoder_writes_the_buffer() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let decoding = Arc::new(RwLock::new(audio::streaming::StreamingBuffer::new(
+            2, SR, None,
+        )));
+        let decoder = DecoderHoldingTheLock::start(decoding.clone());
+
+        let ((), warnings) = capturing_warnings(async {
+            for _ in 0..100 {
+                fixture
+                    .run_prepared(
+                        at_speed(play(Some("crank"), 1.0), 1.2, true),
+                        Some(PreparedPlayback::Full(
+                            audio::streaming::SampleBuffer::Streaming(decoding.clone()),
+                        )),
+                    )
+                    .await;
+            }
+        })
+        .await;
+        decoder.stop();
+
+        assert_eq!(warnings.len(), 100, "got {warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.contains("deferred")),
+            "each cold play says its pitch correction is deferred, got {warnings:?}"
+        );
+        fixture.drain();
+        assert_eq!(fixture.mixer.active_samples.len(), 100);
+        assert!(fixture
+            .mixer
+            .active_samples
+            .iter()
+            .all(|sample| sample.has_pitch_correction() && sample.speed == 1.2));
+    }
+
+    #[tokio::test]
+    async fn a_play_records_its_rate_and_channels_while_its_decoder_writes_the_buffer() {
+        let mut fixture = Fixture::new(vec![]);
+        let decoding = Arc::new(RwLock::new(audio::streaming::StreamingBuffer::new(
+            2, SR, None,
+        )));
+        let decoder = DecoderHoldingTheLock::start(decoding.clone());
+
+        for _ in 0..300 {
+            fixture
+                .run_prepared(
+                    play(Some("crank"), 1.0),
+                    Some(PreparedPlayback::Full(
+                        audio::streaming::SampleBuffer::Streaming(decoding.clone()),
+                    )),
+                )
+                .await;
+        }
+        decoder.stop();
+
+        assert_eq!(fixture.playing.len(), 300);
+        for status in fixture.playing.values() {
+            assert_eq!(
+                (status.sample_rate, status.channels),
+                (SR, 2),
+                "a speed with pitch correction builds its stretcher from these"
+            );
+        }
     }
 
     #[tokio::test]
