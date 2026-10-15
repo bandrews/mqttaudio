@@ -19,8 +19,10 @@ measurements).
    also carries onto every matching play that is still loading, which starts
    with it. Each sound ends up as if the commands had been processed one at a
    time in arrival order.
-2. Nothing waits. Commands never wait for loads, and plays never wait for each
-   other. A slow or stuck load only delays its own sound.
+2. Commands never wait for loads, and a play never waits for an earlier play to
+   start: it starts when its own load finishes. Loads do share four load slots,
+   so several slow downloads at once can hold up other loads until they finish
+   or give up (30 seconds for a server to answer, 60 seconds without data).
 3. `stop`, `voice_stop` and `voice_fade_out` cancel matching plays that have not
    started. The cancelled play is never heard, and an HTTP client waiting on it
    gets 409. `stopall` and `fadeall` cancel every play that has not started, as

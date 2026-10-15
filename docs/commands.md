@@ -332,9 +332,9 @@ as if they had arrived just after it started:
 - A windowed play plays forward only, so it starts at normal speed from the
   beginning whatever `speed` or `seek` reached it, and logs a warning.
 
-Nothing waits: a play starts when its own load finishes, so plays do not always
-start in the order they were sent. See [command ordering](command-ordering.md)
-for the full rules.
+Commands do not wait for loads, and a play starts when its own load finishes,
+so plays do not always start in the order they were sent. See
+[command ordering](command-ordering.md) for the full rules.
 
 ---
 

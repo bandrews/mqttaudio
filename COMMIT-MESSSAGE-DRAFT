@@ -1,80 +1,78 @@
-Build pitch correctors from the metadata a play read, not a racing read
+Give up on HTTP servers that stop answering
 
-A run of the new scheduler differential test killed the test process
-with SIGFPE. The cause is a race that can kill the daemon:
+Three HTTP waits had no bound:
 
-- A buffer still decoding answers SampleBuffer::channels() and
-  sample_rate() with a non-blocking try_read, and returns 0 for both
-  whenever its decoder holds the write lock to append a chunk.
-- Signalsmith's presetDefault configures its STFT with
-  blockSamples = 0.12 x rate; for rate 0 that is 0, and
-  DynamicSTFT::moveOutput then computes `% 0` (stft.h:212), a hardware
-  divide fault rather than a Rust panic.
+- open_http_stream, which a windowed (streaming) HTTP play opens first,
+  used bare reqwest::get: no connect timeout and no limit on the wait
+  for response headers.
+- The bounded reader feeding a windowed play's decoder awaited the next
+  body chunk with no stall timeout.
+- DiskCache::revalidate_if_due built a fresh reqwest::Client with no
+  timeout and awaited the conditional GET while the cache was locked.
 
-Two routes reached it:
+A server that accepts the connection and then sends nothing therefore
+hung the load forever. Each such load also held one of the four load
+slots, so four of them stopped every later play from loading, and a
+stuck revalidation held the cache lock, stopping every load at once.
+With carry-over a stuck load no longer blocks its voice's commands, but
+it still held its slot and its voice until a stop.
 
-- A play starting with pitch correction (its own pitch_correction from
-  0bf9fe5, or a pitch-corrected speed carried onto it while it loaded)
-  went through set_speed_with_mode -> enable_pitch_correction ->
-  PitchCorrector::new(channels(), sample_rate()). gdb on the new test:
-  PitchCorrector::new(channels=0, sample_rate=0) <- enable_pitch_
-  correction (mixer.rs:470) <- set_speed_with_mode <- handle_command.
-- The Play arm recorded /status/samples sample_rate and channels with
-  the same reads, and a later speed with pitch correction builds its
-  bundle from that status. This route is on 2.1.0-rc.1: a cold play
-  recorded rate 0 in 2-5% of plays under a decoder in these tests.
+The full-load paths were already bounded (connect 10 s, response 30 s,
+60 s without body data). The windowed open now uses the same shared
+client and response limit; the bounded reader fails the download with
+"Download stalled: no data for 60 seconds" when a chunk does not arrive
+in time (back-pressure from the decoder is not a stall); and
+revalidate_if_due uses the shared client and gives up after 5 seconds,
+the bound DiskCache::revalidate already had, logging "Revalidation
+failed for <url>: no response within 5 seconds; keeping cached copy".
+The 5 s bound is now one constant used by both.
 
-A play now records the channels and rate it read with
-metadata_blocking() (already checked non-zero) in its status, and a
-play starting with pitch correction gets its corrector the way a speed
-command does: PitchBundle::for_voice from those values, installed with
-apply_shipped_speed. That also gives it the scratch sized for a whole
-block, so its first mixed block no longer grows pitch_scratch on the
-audio thread.
+To test these without waiting tens of seconds, each wait takes its limit
+from a private function (open_http_stream_with_response_limit,
+into_bounded_reader_with_stall_limit,
+revalidate_if_due_with_response_limit) that the public function calls
+with the existing constant. src/test_support.rs (unit tests only) adds a
+local server that answers fixed bytes and then holds the connection
+open, and a capture of the warnings code logs. The paused tokio clock
+was not used: with real sockets it can jump past the connect timeout
+before a loopback connect is seen.
 
-enable_pitch_correction (still reached by the library-only
-SetSpeedMatching) now refuses when the buffer cannot report its channels
-or rate, and set_speed_with_mode then rejects the speed instead of
-applying it without correction; the rest of the function uses the
-values it checked.
+Still open, recorded in docs/bugs.md: revalidate_if_due holds the cache
+lock across its request and does not record a failed attempt, so a
+server that never answers costs up to 5 seconds per cached URL on every
+freshness tick, with loads queued behind it. docs/features/caching.md
+no longer promises "once per interval" for that case.
 
-docs/bugs.md records the same non-blocking rate read in SeekMatching,
-which can send a seek on a still-decoding sound to frame 0. CHANGELOG
-has a Fixed entry.
+The design doc's guarantee that plays never wait for each other is
+reworded: a play never waits for an earlier play to start, but loads
+share four slots, so slow downloads can hold up other loads until they
+finish or hit these bounds. commands.md and the CHANGELOG no longer say
+"nothing waits".
 
-Tests (each failed first):
-- a_play_with_pitch_correction_starts_while_its_decoder_writes_the_
-  buffer: 100 pitch-corrected plays against a buffer whose stand-in
-  decoder takes the write lock for 5 us out of every 25 us; SIGFPE 3 of
-  3 runs before the change.
-- a_play_records_its_rate_and_channels_while_its_decoder_writes_the_
-  buffer: 300 plays; 6 to 15 statuses recorded (0, 0) per run before.
-- a_play_with_pitch_correction_mixes_its_first_block_without_growing_
-  scratch: 1 regrow before, 0 after.
-- pitch_correction_is_refused_while_a_decoding_buffer_cannot_report_its_
-  rate (mixer): SIGFPE before; now refused while the buffer is held and
-  accepted once it is released.
-
-Two adversarial reviewers found the same crash independently; their
-traces match the one above.
+Tests (each first seen hanging past a 10 s guard with the limits
+unused):
+- opening_a_stream_gives_up_when_the_server_sends_no_response: "No
+  response from server within 0.2 seconds".
+- a_bounded_download_reports_a_stall_at_its_limit: the first bytes
+  arrive, then "Download stalled: no data for 0.2 seconds".
+- revalidation_keeps_the_cached_copy_when_the_server_sends_no_response:
+  returns unchanged, keeps the cached copy, and logs the one warning.
 
 Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
 and a warning-free release build (RUSTFLAGS=-D warnings); fuzz suite 7
 passed; broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA
-set) 1027 passed, 0 failed, 7 device-gated ignored.
+set) 1030 passed, 0 failed, 7 device-gated ignored.
 
 Prompts that led to this work:
 
-- "Let's go with the per-voice hold fix. Make sure to think through all
-  the possible implications, like conflicting sequences of multiple
-  commands affecting the same voice(s), or commands affecting multiple
-  groups/voices/etc in a complex way, before designing our approach.
-  We'll need a lot of tests in this area before implementation as well.
-  Consider spawning adversarial review agents both before starting the
-  fix and after implementing it."
-- "While you're working on this, can we also add a speed parameter to
-  the play command so we don't need to issue multiple commands in
-  sequence to begin with?"
+- Decision after the design review, asked as "Uncached HTTP plays open
+  with no connect, response or stall timeout, and cache revalidation
+  runs with no timeout while holding the cache lock, so one dead server
+  can wedge loads indefinitely. Fix that here too?" -- "Yes, separate
+  commit (Recommended)": use the existing connect, response and stall
+  limits for these paths, with tests. Revalidation takes the existing
+  5 s revalidation bound rather than the 30 s response limit, because it
+  runs with the cache locked.
 
 This commit was authored by Claude (AI assistant) working with Ben Andrews.
 

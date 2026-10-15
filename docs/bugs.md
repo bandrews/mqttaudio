@@ -636,6 +636,19 @@ windowed play while it is still loading does apply, because it becomes the
 play's start volume. Left alone as a separate
 mixer change.
 
+## Revalidation holds the cache lock across its request
+
+`revalidate_if_due` runs with the cache locked: when a play finds its URL on
+disk but not in memory, and for every URL resident in memory on each 30 s
+freshness tick (`revalidate_stale_http` holds the lock for its whole loop).
+Every load waits behind it. The request gives up after 5 seconds, but a failed
+check is not recorded, so a server that accepts connections and never answers
+costs 5 seconds per cached URL on every tick, and plays queue behind the tick
+for that long. `maybe_revalidate` (the `get_or_load` path) records each attempt
+and retries once per interval; `revalidate_if_due` does not. Left alone because
+the fix is to send the request without holding the lock and to record failed
+attempts, which reshapes both revalidation paths.
+
 ## A shutdown signal can be missed while a command is being handled
 
 `shutdown_signal()` creates fresh Ctrl-C and SIGTERM listeners every time the

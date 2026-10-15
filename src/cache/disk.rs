@@ -385,6 +385,22 @@ impl DiskCache {
         url: &str,
         revalidate_after: std::time::Duration,
     ) -> Result<bool, CacheError> {
+        self.revalidate_if_due_with_response_limit(
+            url,
+            revalidate_after,
+            REVALIDATION_RESPONSE_LIMIT,
+        )
+        .await
+    }
+
+    /// [`Self::revalidate_if_due`], keeping the cached copy when the server does
+    /// not respond within `response_limit`.
+    async fn revalidate_if_due_with_response_limit(
+        &mut self,
+        url: &str,
+        revalidate_after: std::time::Duration,
+        response_limit: std::time::Duration,
+    ) -> Result<bool, CacheError> {
         let entry = match self.get_entry(url) {
             Some(e) => e.clone(),
             None => return Ok(false),
@@ -400,8 +416,7 @@ impl DiskCache {
             }
         }
 
-        let client = reqwest::Client::new();
-        let mut req = client.get(url);
+        let mut req = super::http_stream::http_client().get(url);
         if let Some(etag) = &entry.etag {
             req = req.header(reqwest::header::IF_NONE_MATCH, etag);
         }
@@ -409,8 +424,16 @@ impl DiskCache {
             req = req.header(reqwest::header::IF_MODIFIED_SINCE, lm);
         }
 
-        let changed = match req.send().await {
-            Ok(resp) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
+        let changed = match tokio::time::timeout(response_limit, req.send()).await {
+            Err(_) => {
+                tracing::warn!(
+                    "Revalidation failed for {}: no response within {} seconds; keeping cached copy",
+                    url,
+                    response_limit.as_secs_f64()
+                );
+                false
+            }
+            Ok(Ok(resp)) if resp.status() == reqwest::StatusCode::NOT_MODIFIED => {
                 if let Some(e) = self.metadata.entries.get_mut(url) {
                     e.last_validated = chrono::Utc::now().to_rfc3339();
                 }
@@ -418,12 +441,12 @@ impl DiskCache {
                 tracing::debug!("Cache revalidated (304 Not Modified): {}", url);
                 false
             }
-            Ok(resp) if resp.status().is_success() => {
+            Ok(Ok(resp)) if resp.status().is_success() => {
                 self.download_and_cache(url).await?;
                 tracing::info!("Cache refreshed (content changed): {}", url);
                 true
             }
-            Ok(resp) => {
+            Ok(Ok(resp)) => {
                 tracing::warn!(
                     "Revalidation got HTTP {} for {}; keeping cached copy",
                     resp.status(),
@@ -431,7 +454,7 @@ impl DiskCache {
                 );
                 false
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(
                     "Revalidation failed for {}: {}; keeping cached copy",
                     url,
@@ -476,18 +499,18 @@ impl DiskCache {
 
         // A freshness check runs in the play path, so it gets a short bound:
         // a slow server costs at most this once per revalidation interval
-        let response =
-            match tokio::time::timeout(std::time::Duration::from_secs(5), request.send()).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
-                    tracing::debug!("Revalidation request for {} failed: {}", url, e);
-                    return Freshness::Unknown;
-                }
-                Err(_) => {
-                    tracing::debug!("Revalidation request for {} timed out", url);
-                    return Freshness::Unknown;
-                }
-            };
+        let response = match tokio::time::timeout(REVALIDATION_RESPONSE_LIMIT, request.send()).await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                tracing::debug!("Revalidation request for {} failed: {}", url, e);
+                return Freshness::Unknown;
+            }
+            Err(_) => {
+                tracing::debug!("Revalidation request for {} timed out", url);
+                return Freshness::Unknown;
+            }
+        };
 
         if response.status() == reqwest::StatusCode::NOT_MODIFIED {
             if let Some(entry) = self.metadata.entries.get_mut(url) {
@@ -559,6 +582,10 @@ impl DiskCache {
     }
 }
 
+/// How long a revalidation waits for the server's response. It runs in the play
+/// path with the cache locked, so the bound is short.
+const REVALIDATION_RESPONSE_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Stream a response body straight to a temp file and rename it into place,
 /// so downloads never hold whole files in memory and a crash or stall can
 /// never leave a partial file at the final path. Returns the byte count.
@@ -622,6 +649,40 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn revalidation_keeps_the_cached_copy_when_the_server_sends_no_response() {
+        let server = crate::test_support::HeldServer::start(
+            vec![b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"v1\"\r\nConnection: close\r\n\r\nhello"],
+            b"",
+        );
+        let url = server.url();
+        let dir = TempDir::new().unwrap();
+        let mut cache = DiskCache::new(dir.path().to_path_buf()).unwrap();
+        cache.download_and_cache(&url).await.unwrap();
+
+        let (changed, warnings) = crate::test_support::capturing_warnings(tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            cache.revalidate_if_due_with_response_limit(
+                &url,
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(200),
+            ),
+        ))
+        .await;
+        let changed = changed
+            .expect("revalidation gives up at its response limit")
+            .unwrap();
+
+        assert!(!changed, "an unanswered revalidation changes nothing");
+        assert!(cache.is_cached(&url), "the cached copy stays in service");
+        assert_eq!(
+            warnings,
+            vec![format!(
+                "Revalidation failed for {url}: no response within 0.2 seconds; keeping cached copy"
+            )]
+        );
+    }
 
     #[test]
     fn test_cache_filename_ignores_query_for_extension() {

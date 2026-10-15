@@ -36,13 +36,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   looping play followed by a `voice_stop` kept playing. With messages under about 300 µs apart this
   happened most of the time, and for longer with cold files and URLs. A command now reaches a play that is
   still loading as if the play had already started: `speed`, `volume` and `seek` carry over and the sound
-  starts with them, and stops cancel the play. Nothing waits for a load, so plays still start in the order
-  their loads finish. See `docs/command-ordering.md`.
+  starts with them, and stops cancel the play. Commands do not wait for loads, and plays still start in the
+  order their loads finish. See `docs/command-ordering.md`.
 - **Failed MQTT commands are logged again.** An MQTT sender gets no reply, and several failures left no
   trace at all: a selector that matched nothing (such as a `speed` for a sound that had already ended), an
   empty selector, and the concurrent-load limit. Each failed command with no client waiting is now logged
   once as `Command failed: <reason>`, unless its own handler already logged it. HTTP clients still get the
   failure in their response.
+- **HTTP plays and cache checks give up on a server that stops answering.** A windowed HTTP play (one
+  that streams instead of loading fully) waited forever for the response headers of a server that accepted
+  the connection but never answered, and its download waited forever when the server stopped sending
+  partway through. Each such load also held one of the four load slots, so four of them stopped every later
+  play from loading. A cached URL's freshness check waited forever for its answer while holding the cache,
+  which stopped every other load as well. The windowed open now fails after 30 seconds and its download
+  after 60 seconds without data, as a fully loaded play already did, and a freshness check gives up after
+  5 seconds and keeps the cached copy.
 - **A play whose load task panicked is answered with 500.** It got the 409 of a play cancelled by a stop.
   It now gets `Load of <file> stopped unexpectedly`, and the panic is logged as an error.
 - **A load cancelled before it began is answered with 409.** When `stopall`, `fadeall` or shutdown
