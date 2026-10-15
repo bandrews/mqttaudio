@@ -119,9 +119,18 @@ failure comes back in the response.
 A command sent right after a `play` reaches that play even while its file is
 still loading, so `No sample matches the selector` means the selector named no
 playing sound and no loading play: compare its `id`, `file` or `voice` with the
-`play`'s. An `internal_id` exists only once a sound has started. A play that a
-`stop`, `voice_stop` or `voice_fade_out` cancelled before it started is logged
-as `Cancelled play of <file>: Cancelled by a stop before it started`.
+`play`'s, and check whether a stop already cancelled the play. An `internal_id`
+exists only once a sound has started.
+
+A play cancelled before it started is logged at INFO, not as a failed command:
+
+```
+INFO mqttaudio: Cancelled play of /sounds/rain.wav: Cancelled by a stop before it started
+INFO mqttaudio: Cancelled play of /sounds/rain.wav: Superseded by stopall/fadeall
+```
+
+The first is a `stop`, `voice_stop` or `voice_fade_out` that matched it; the
+second is `stopall` or `fadeall`.
 
 ---
 

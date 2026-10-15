@@ -16,7 +16,8 @@ pub enum CommandErrorKind {
     NotFound,
     /// The request was valid but not permitted (e.g. path outside allowed_directories)
     Forbidden,
-    /// Superseded by a later stopall/fadeall before it could take effect
+    /// Cancelled before it could take effect: a play still loading that a stop,
+    /// stopall, fadeall or shutdown cancelled
     Cancelled,
     /// Something failed on our side
     Internal,

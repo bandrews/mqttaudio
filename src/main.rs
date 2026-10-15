@@ -1714,10 +1714,11 @@ struct UnstartedPlay {
 const MAX_CONCURRENT_LOADS: usize = 32;
 
 /// Takes command requests from HTTP and MQTT and the background loads they
-/// start. A play's load starts at once and the play starts when it finishes.
-/// Meanwhile setting commands carry over onto the play and stops cancel it, so
-/// a command reaches a sound that is still loading as if the sound had started.
-/// Every command takes effect through `handle_command`.
+/// start. A play's load is started when the play arrives (it may wait for a
+/// load slot), and the play starts when it finishes. Meanwhile setting commands
+/// carry over onto the play and stops cancel it, so a command reaches a sound
+/// that is still loading as if the sound had started. Commands act on playing
+/// sounds, and plays start, through `handle_command`.
 struct CommandScheduler {
     loads: tokio::task::JoinSet<LoadDone>,
     load_permit: std::sync::Arc<tokio::sync::Semaphore>,

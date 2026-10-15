@@ -328,7 +328,10 @@ as if they had arrived just after it started:
 - `internal_id` cannot reach a play that has not started, because the id is
   assigned when it starts. A play without a `voice` can be reached only by `id`
   or `file` until then.
-- A command that reaches only plays still loading reports success.
+- A command that reaches only plays still loading reports success. A stop
+  removes a loading play at once, so a later command that named only that play
+  is answered "not found", where a sound that had started would still be
+  fading.
 - A windowed play plays forward only, so it starts at normal speed from the
   beginning whatever `speed` or `seek` reached it, and logs a warning.
 

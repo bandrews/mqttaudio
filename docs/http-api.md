@@ -154,7 +154,7 @@ Returns a summary of playback and cache state:
 | `version` | string | Package version string |
 | `active_samples` | integer | Number of samples currently playing |
 | `active_inputs` | integer | Number of active live inputs |
-| `active_voices` | integer | Number of active voice groups |
+| `active_voices` | integer | Number of active voice groups, including one held open by a play still loading |
 | `output_channels` | integer | Output channel count |
 | `clip_count` | integer | Output samples the limiter held at the ceiling since startup |
 | `xruns` | integer | Audio stream-error callbacks (dropouts/underruns that triggered a stream rebuild) since startup |
@@ -204,7 +204,7 @@ Operational telemetry for monitoring. Every field is real — no placeholders.
 | `uptime_seconds` | float | Seconds since the daemon started |
 | `clips` | integer | Output samples the limiter held at the ceiling since startup |
 | `xruns` | integer | Audio stream-error callbacks (dropouts/underruns) since startup |
-| `active_voices` | integer | Number of active voice groups |
+| `active_voices` | integer | Number of active voice groups, including one held open by a play still loading |
 | `active_samples` | integer | Number of samples currently playing |
 | `active_inputs` | integer | Number of active live inputs |
 | `output_channels` | integer | Output channel count |

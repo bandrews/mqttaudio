@@ -545,7 +545,7 @@ Measured with a local broker and a null ALSA sink, sending `play` then `speed`
 for the same voice on one connection, 20 pairs per gap, counting `Set speed`
 log lines:
 
-| Gap between messages | `main` dropped | `v2.1` dropped |
+| Gap between messages | `main` dropped | 2.1.0-rc.1 dropped |
 |---|---|---|
 | 0 µs, cached file | 20/20 | 20/20 |
 | 100 µs, cached file | 19/20 | 20/20 |
@@ -568,9 +568,9 @@ it loads, so `voice_volume` reaches it directly. `docs/command-ordering.md` has
 the rules and the remaining differences from one-at-a-time processing; plays
 still start in the order their loads finish. The same sweep against the fixed
 build, checking each sound's speed in `/status/samples` instead of counting log
-lines: 20/20 at 1.08x for every gap above (warm 0, 100, 300, 1000 and 5000 µs;
-cold 0, 1, 5 and 20 ms), with no `Command failed` lines. `voice_stop` sent 0,
-100 µs or 1 ms after a looping `play` left 0 of 50 loops running.
+lines: 20/20 at 1.08x for every gap in the table, and for a cached file at
+5 ms and a first play at 0 µs, with no `Command failed` lines. `voice_stop` sent
+0, 100 µs or 1 ms after a looping `play` left 0 of 50 loops running.
 
 ## Cache commands are not ordered against plays
 
@@ -621,9 +621,9 @@ A play that windows (`mode: "stream"`, or a file long or large enough for `auto`
 to window) always starts from the beginning: neither the local nor the HTTP
 windowed path passes `start_position_ms` to the streamed source, and nothing
 warns about the play's own `start_position_ms`. A `seek` carried onto a
-windowed play while it loads does warn. The docs only say a windowed voice "plays forward only". Left alone
-because starting a windowed decode at an offset is a feature of the streamed
-source, not a dispatch fix.
+windowed play while it loads does warn. The docs only say a windowed voice
+"plays forward only". Left alone because starting a windowed decode at an offset
+is a feature of the streamed source, not a dispatch fix.
 
 ## `volume` and `seek` do not reach streamed sources
 
@@ -633,8 +633,7 @@ nothing audible. `volume` still updates the status snapshot, so
 `/status/samples` reports a volume the stream is not playing at. `speed` and
 `seek` warn for streamed voices; `volume` does not. A `volume` that reaches a
 windowed play while it is still loading does apply, because it becomes the
-play's start volume. Left alone as a separate
-mixer change.
+play's start volume. Left alone as a separate mixer change.
 
 ## Revalidation holds the cache lock across its request
 

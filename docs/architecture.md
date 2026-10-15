@@ -163,7 +163,7 @@ struct Voice {
     id: String,
     sample_ids: Vec<u64>,
     volume: f32,
-    fade_state: Option<FadeState>,
+    loading_plays: usize, // plays naming this voice that are still loading
 }
 ```
 
@@ -316,6 +316,7 @@ src/
 ├── http/
 │   ├── mod.rs           # HTTP REST API
 │   └── handlers.rs      # Request handlers
+├── pending_plays.rs     # Plays still loading, and the commands that reach them
 └── voice.rs             # Voice management
 ```
 

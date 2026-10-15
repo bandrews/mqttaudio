@@ -1,50 +1,57 @@
-Cover what the review found untested in the carry-over scheduler
+Correct the carry-over docs where the reviews found them wrong or silent
 
-A post-implementation reviewer ran 45 mutations against 89c927a; 10
-survived the whole suite, 6 of them also the differential test at its
-default 64 cases. Each gap now has a test, checked again on the current
-code to fail under the mutation it targets:
+All three post-implementation reviewers checked the docs against the
+code. This fixes what they found.
 
-- a_voice_ends_with_the_last_sound_of_a_play_that_loaded: no release of
-  the voice hold after a successful start (every voice would live
-  forever, undoing "finished sounds leave their voice").
-- a_voice_stays_open_while_a_second_play_into_it_loads: a hold released
-  twice. remove_loading_play also debug-asserts it is releasing a hold
-  it has (letting_go_of_a_loading_play_twice_is_caught), so a double
-  release fails loudly in every debug test.
-- a_stop_that_cancels_a_play_aborts_its_load: no abort on cancel (the
-  load would keep a slot until it finished or timed out).
-- fadeall_cancels_a_play_still_loading: fadeall not cancelling. fadeall
-  is also added to the differential test's generator.
-- voice_fade_out_reaching_only_a_loading_play_succeeds,
-  a_play_rejected_by_the_load_limit_holds_no_voice,
-  a_speed_for_a_streamed_voice_does_not_carry_onto_a_play_into_it, and
-  a_stop_cancelling_an_mqtt_play_logs_why (the reason troubleshooting.md
-  quotes).
+docs/command-ordering.md:
+- Lists the differences from one-at-a-time processing that were
+  missing: a command after a stop that cancelled the only play it named
+  gets 404 where a fading sound would have answered; voice_fade_out
+  cancelling a voice's only play ends the voice at once, so a play into
+  it during the would-be fade starts at full volume; a play whose load
+  fails could be reached while it loaded, so commands naming only it
+  succeed; a windowed play makes its voice streamed only once it starts,
+  so a speed or seek for that voice can apply to its other sounds while
+  the windowed play loads; a carried volume applies to a windowed play
+  though a volume after it starts does not.
+- Says a carried seek into an undecoded part of a cold file plays
+  silence until the decode reaches it, where a play's own
+  start_position_ms waits for it.
+- Says a play's load may wait for one of the four load slots, that a
+  voice ends with the last of its plays to fail or be cancelled, and
+  that /status/voices and active_voices include voices held open by a
+  loading play.
+- Drops claims that were false ("handle_command stays the one place a
+  command takes effect") and wording tied to history ("as before", "as
+  they always have", "written before the loop is restructured"), and
+  says the MQTT reproduction was run by hand with results in bugs.md.
 
-Tests made stronger:
-- a_speed_ignored_with_a_warning_reaches_a_loading_play_without_changing_
-  it: the play now has its own speed 0.5. Carrying the ignored (-1,
-  pitch) used to leave the 1.0 the test expected, because the mixer
-  rejects a negative pitch-corrected speed; now the test sees the
-  play's speed and pitch mode change.
-- scheduler_stopall_cancels_a_load_in_flight: checks the cancelled load
-  let go of the cache (it was aborted) instead of only that the task set
-  is empty; it fails when no abort happens.
-- tests/carry_over_property_test.rs: the one-at-a-time reference used
-  the production SampleSelector::matches, the code the scheduler side
-  also relies on. It now has its own OR matcher, and disabling file
-  matching in SampleSelector fails the property.
-
-Renamed a_stop_cancels_loading_plays_and_stops_playing_sounds_together
-to voice_fade_out_cancels_loading_plays_and_fades_playing_sounds_
-together, which is what it does.
+Elsewhere:
+- commands.md: a later command naming only a cancelled play gets "not
+  found".
+- http-api.md: active_voices in /status and /metrics counts voices held
+  open by a loading play.
+- troubleshooting.md: a cancelled play is logged at INFO, with both
+  reasons quoted, and "a stop already cancelled the play" is listed as
+  a cause of "No sample matches the selector".
+- voice-management.md: a voice also ends when the last of its plays
+  fails or is cancelled without any starting.
+- architecture.md: the Voice struct shows loading_plays (and not a
+  fade_state it does not have); the source tree lists pending_plays.rs.
+- README: the developer docs table links command-ordering.md.
+- bugs.md: the measurement table header says 2.1.0-rc.1, the re-run
+  results name the extra gaps they cover, and two paragraphs are
+  rewrapped.
+- CHANGELOG: quotes the voice commands' not-found messages exactly, and
+  the panicked-load entry says it got the 409 of a cancelled load.
+- Code comments: CommandErrorKind::Cancelled covers stops and shutdown,
+  not only stopall/fadeall; the CommandScheduler doc no longer says
+  every command goes through handle_command or that a load starts at
+  once.
 
 Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
-and a warning-free release build (RUSTFLAGS=-D warnings);
-broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA set) 1042
-passed, 0 failed, 7 device-gated ignored. The differential test passed
-200 cases with fadeall in the generator.
+and a warning-free release build (RUSTFLAGS=-D warnings); the binary's
+tests pass (112). Only comments changed in code.
 
 Prompts that led to this work:
 

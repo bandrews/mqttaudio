@@ -25,7 +25,8 @@ Multiple sounds can belong to the same voice:
 All three sounds are now in the "ambience" voice.
 
 A voice exists from the moment a play naming it arrives, while the play's file
-is still loading, until its last sound ends. Voice commands sent while a play
+is still loading, until its last sound ends, or until the last of its plays
+fails or is cancelled if none of them started. Voice commands sent while a play
 loads reach it: `voice_volume` sets the volume it starts at, and `voice_stop` or
 `voice_fade_out` cancels it before it is heard (see
 [Commands sent while a play is loading](../commands.md#commands-sent-while-a-play-is-loading)).
