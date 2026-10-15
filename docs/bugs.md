@@ -625,15 +625,13 @@ windowed play while it loads does warn. The docs only say a windowed voice
 "plays forward only". Left alone because starting a windowed decode at an offset
 is a feature of the streamed source, not a dispatch fix.
 
-## `volume` and `seek` do not reach streamed sources
+## `seek` does not reach streamed sources
 
-The audio thread applies `SetVolumeMatching` and `SeekMatching` to
-`active_samples` only, so a `volume` or `seek` aimed at a windowed play changes
-nothing audible. `volume` still updates the status snapshot, so
-`/status/samples` reports a volume the stream is not playing at. `speed` and
-`seek` warn for streamed voices; `volume` does not. A `volume` that reaches a
-windowed play while it is still loading does apply, because it becomes the
-play's start volume. Left alone as a separate mixer change.
+The audio thread applies `SeekMatching` to `active_samples` only, so a `seek`
+aimed at a windowed play changes nothing; a windowed play plays forward only.
+A `seek` naming a streamed voice warns, but one naming a windowed play by `id`
+or `file` is skipped without a warning. Left alone because seeking a windowed
+decode needs the streamed source to restart its decoder at an offset.
 
 ## Revalidation holds the cache lock across its request
 

@@ -1103,8 +1103,11 @@ pub struct StreamedSource {
     /// Number of channels the producer writes (interleaved).
     pub input_channels: usize,
 
-    /// Per-source volume (0.0 - 1.0).
+    /// Per-source volume (0.0 - 1.0) - current smoothed value.
     pub volume: f32,
+
+    /// Target per-source volume for smooth ramping (0.0 - 1.0).
+    pub target_volume: f32,
 
     /// Voice-level volume (0.0 - 1.0) - current smoothed value.
     pub voice_volume: f32,
@@ -1148,8 +1151,8 @@ pub struct StreamedSource {
 impl StreamedSource {
     /// Build a streamed source over `consumer`, the read end of the ring the producer
     /// task fills. `producer_done`/`stop_flag` are the shared handles the producer
-    /// task also holds. Voice volume starts at unity and ramps toward
-    /// `target_voice_volume`.
+    /// task also holds. The source starts at `volume` and voice volume at unity;
+    /// each then ramps toward its target.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
@@ -1171,6 +1174,7 @@ impl StreamedSource {
             consumer,
             input_channels,
             volume: volume.clamp(0.0, crate::config::MAX_GAIN),
+            target_volume: volume.clamp(0.0, crate::config::MAX_GAIN),
             voice_volume: 1.0,
             target_voice_volume: 1.0,
             channel_map,
@@ -1238,18 +1242,16 @@ impl StreamedSource {
         self.target_voice_volume = target.clamp(0.0, crate::config::MAX_GAIN);
     }
 
-    /// Advance voice volume toward target by one frame (linear ramp, matching the
-    /// other voices' ~22 ms transition at 44.1 kHz).
-    pub fn advance_voice_volume(&mut self) {
-        const RAMP_RATE: f32 = 0.001;
+    /// Set target per-source volume for smooth ramping.
+    pub fn set_target_volume(&mut self, target: f32) {
+        self.target_volume = target.clamp(0.0, crate::config::MAX_GAIN);
+    }
 
-        if (self.voice_volume - self.target_voice_volume).abs() < RAMP_RATE {
-            self.voice_volume = self.target_voice_volume;
-        } else if self.voice_volume < self.target_voice_volume {
-            self.voice_volume += RAMP_RATE;
-        } else {
-            self.voice_volume -= RAMP_RATE;
-        }
+    /// Advance the source and voice volumes toward their targets by one frame
+    /// (linear ramp, matching the samples' ~22 ms transition at 44.1 kHz).
+    pub fn advance_volumes(&mut self) {
+        ramp_toward(&mut self.voice_volume, self.target_voice_volume);
+        ramp_toward(&mut self.volume, self.target_volume);
     }
 
     /// Whether this source has finished and can be reaped off the audio thread. A
@@ -2217,9 +2219,9 @@ fn mix_streamed_source_into_output(
     let mut underrun_frames = 0usize;
 
     for frame_idx in 0..frames {
-        // Advance voice volume toward target every frame so the ramp stays
+        // Advance the volumes toward their targets every frame so the ramps stay
         // time-accurate across underruns.
-        source.advance_voice_volume();
+        source.advance_volumes();
 
         // source volume * voice volume * per-frame duck gain (D2) * fade-in/out
         // multiplier; the underrun fade gain is applied inside mix_ring_voice_frame.

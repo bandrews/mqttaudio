@@ -52,6 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which stopped every other load as well. The windowed open now fails after 30 seconds and its download
   after 60 seconds without data, as a fully loaded play already did, and a freshness check gives up after
   5 seconds and keeps the cached copy.
+- **`volume` reaches windowed plays.** A `volume` aimed at a windowed play (`mode: "stream"`, or a file
+  long or large enough for `auto` to window) changed nothing audible, though `/status/samples` reported the
+  new volume. It now ramps the stream to that volume, as it does a fully loaded sound.
 - **`/status/samples` shows the speed a sound plays at.** A `speed` outside the playable range (beyond
   ±100, beyond 8 with pitch correction, or nearer zero than 0.01) was recorded as requested while the
   sound played at the nearest playable speed.

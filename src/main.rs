@@ -3650,6 +3650,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn volume_reaches_a_windowed_play_that_has_started() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_stream(Some("bed"))).await;
+        fixture.drain();
+
+        fixture
+            .run(AudioCommand::Volume {
+                selector: SampleSelector {
+                    internal_id: None,
+                    id: None,
+                    file: None,
+                    voice: Some("bed".to_string()),
+                },
+                volume: 0.4,
+            })
+            .await;
+        fixture.drain();
+        // The change ramps over a few hundred frames, as a sample's does.
+        mix_one_block(&mut fixture);
+        mix_one_block(&mut fixture);
+
+        assert_eq!(fixture.mixer.streamed_sources[0].volume, 0.4);
+        let status = fixture
+            .playing
+            .values()
+            .next()
+            .expect("the stream's status");
+        assert_eq!(status.volume, 0.4);
+    }
+
+    #[tokio::test]
     async fn stream_play_with_channel_map_applies_per_route_gains() {
         // D29 on the windowed path: a per-route `gain` in the Play channel_map
         // reaches the StreamedSource, and a route without one reads as unity.

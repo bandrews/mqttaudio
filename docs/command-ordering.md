@@ -112,8 +112,7 @@ with them. `/status/voices` lists a voice held open this way with
   ignored when the play starts, with a warning. Processed one at a time, one
   naming the play's voice would be ignored with a similar warning, but one
   naming it by `id` or `file` would be skipped without one. A carried `volume`
-  applies, while a `volume` that reaches a windowed play after it starts
-  changes nothing (see `docs/bugs.md`).
+  applies, as a `volume` sent after the play started does.
 - **A windowed play makes its voice streamed only once it starts.** A `speed`
   or `seek` naming a voice is ignored while a windowed play is playing in it.
   While that play is still loading, the voice is not yet streamed, so the
