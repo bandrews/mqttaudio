@@ -1052,6 +1052,7 @@ async fn main() {
                     streaming_upgrades: &mut streaming_upgrades,
                     max_block_frames,
                     error: None,
+                    error_logged: false,
                     prepared: None,
                 };
                 scheduler.take(input, &mut ctx).await;
@@ -1632,19 +1633,29 @@ struct CommandCtx<'a> {
     /// pitch scratch (D56/D58).
     max_block_frames: usize,
     error: Option<mqtt::commands::CommandError>,
+    /// Whether the handler already logged `error`, so the scheduler does not log
+    /// it again for a client that gets no reply.
+    error_logged: bool,
     prepared: Option<PreparedPlayback>,
 }
 
 impl CommandCtx<'_> {
     fn fail(&mut self, kind: mqtt::commands::CommandErrorKind, message: impl Into<String>) {
         self.error = Some(mqtt::commands::CommandError::new(kind, message.into()));
+        self.error_logged = false;
+    }
+
+    /// Record a failure the caller has already logged.
+    fn fail_logged(&mut self, kind: mqtt::commands::CommandErrorKind, message: impl Into<String>) {
+        self.fail(kind, message);
+        self.error_logged = true;
     }
 
     /// Push a resolved command to the audio thread, logging if the ring is full.
     fn send(&mut self, command: rt_engine::AudioCommand) -> bool {
         if self.cmd_tx.push(command).is_err() {
             tracing::error!("Audio command ring full; command dropped");
-            self.fail(
+            self.fail_logged(
                 mqtt::commands::CommandErrorKind::Internal,
                 "Audio command queue is full",
             );
@@ -1725,20 +1736,20 @@ impl CommandScheduler {
             return;
         }
         if generation != self.load_generation {
-            if let Some(reply) = reply {
-                let _ = reply.send(Err(mqtt::commands::CommandError::new(
+            deliver(
+                reply,
+                Err(mqtt::commands::CommandError::new(
                     mqtt::commands::CommandErrorKind::Cancelled,
                     "Superseded by stopall/fadeall",
-                )));
-            }
+                )),
+                false,
+            );
             return;
         }
         let prepared = match prepared {
             Some(Err(error)) => {
                 tracing::error!("Load failed: {}", error);
-                if let Some(reply) = reply {
-                    let _ = reply.send(Err(error));
-                }
+                deliver(reply, Err(error), true);
                 return;
             }
             Some(Ok(prepared)) => Some(prepared),
@@ -1749,12 +1760,14 @@ impl CommandScheduler {
             Ok(e) => e,
             Err(e) => {
                 tracing::error!("Macro expansion error: {}", e);
-                if let Some(reply) = reply {
-                    let _ = reply.send(Err(mqtt::commands::CommandError::new(
+                deliver(
+                    reply,
+                    Err(mqtt::commands::CommandError::new(
                         mqtt::commands::CommandErrorKind::InvalidRequest,
                         e.to_string(),
-                    )));
-                }
+                    )),
+                    true,
+                );
                 return;
             }
         };
@@ -1771,12 +1784,14 @@ impl CommandScheduler {
                 }
                 if loading::needs_preparation(&cmd) && prepared.is_none() {
                     if self.loads.len() >= MAX_CONCURRENT_LOADS {
-                        if let Some(reply) = reply {
-                            let _ = reply.send(Err(mqtt::commands::CommandError::new(
+                        deliver(
+                            reply,
+                            Err(mqtt::commands::CommandError::new(
                                 mqtt::commands::CommandErrorKind::Internal,
                                 "Too many concurrent loads",
-                            )));
-                        }
+                            )),
+                            false,
+                        );
                         return;
                     }
                     let config = ctx.config.clone();
@@ -1806,23 +1821,46 @@ impl CommandScheduler {
                 }
                 ctx.prepared = prepared;
                 ctx.error = None;
+                ctx.error_logged = false;
                 handle_command(cmd, ctx).await;
-                if let Some(reply) = reply {
-                    let outcome = ctx
-                        .error
-                        .take()
-                        .map_or_else(|| Ok("Command completed".to_string()), Err);
-                    let _ = reply.send(outcome);
-                }
+                let outcome = ctx
+                    .error
+                    .take()
+                    .map_or_else(|| Ok("Command completed".to_string()), Err);
+                deliver(reply, outcome, ctx.error_logged);
                 ctx.refresh_talkback(ctx.start_time.elapsed().as_millis() as u64);
             }
             Err(e) => {
                 tracing::error!("Failed to parse command: {}", e);
-                if let Some(reply) = reply {
-                    let _ = reply.send(Err(mqtt::commands::CommandError::new(
+                deliver(
+                    reply,
+                    Err(mqtt::commands::CommandError::new(
                         mqtt::commands::CommandErrorKind::InvalidRequest,
                         e.to_string(),
-                    )));
+                    )),
+                    true,
+                );
+            }
+        }
+    }
+}
+
+/// Answer a request: send its outcome to the HTTP client waiting on it, or, with
+/// nobody waiting (an MQTT message), log a failure the handler has not already
+/// logged, so the sender can find it.
+fn deliver(
+    reply: Option<tokio::sync::oneshot::Sender<mqtt::commands::CommandOutcome>>,
+    outcome: mqtt::commands::CommandOutcome,
+    logged: bool,
+) {
+    match reply {
+        Some(reply) => {
+            let _ = reply.send(outcome);
+        }
+        None => {
+            if let Err(error) = outcome {
+                if !logged {
+                    tracing::warn!("Command failed: {}", error.message);
                 }
             }
         }
@@ -2215,7 +2253,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             Ok(m) => m,
                             Err(e) => {
                                 tracing::error!("Failed to resolve channel alias: {}", e);
-                                ctx.fail(
+                                ctx.fail_logged(
                                     mqtt::commands::CommandErrorKind::InvalidRequest,
                                     e.to_string(),
                                 );
@@ -2364,7 +2402,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 }
                 Err(e) => {
                     tracing::error!("Failed to load {}: {}", file, e);
-                    ctx.fail(
+                    ctx.fail_logged(
                         mqtt::commands::CommandErrorKind::NotFound,
                         format!("Failed to load {}: {}", file, e),
                     );
@@ -2395,7 +2433,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             drop(voice_mgr);
 
             if sample_ids.is_empty() {
-                ctx.fail(
+                ctx.fail_logged(
                     mqtt::commands::CommandErrorKind::NotFound,
                     format!("Voice '{}' not found or already empty", voice),
                 );
@@ -2420,7 +2458,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             drop(voice_mgr);
 
             if sample_ids.is_empty() {
-                ctx.fail(
+                ctx.fail_logged(
                     mqtt::commands::CommandErrorKind::NotFound,
                     format!("Voice '{}' not found or already empty", voice),
                 );
@@ -2485,7 +2523,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 ctx.refresh();
                 tracing::info!("Set voice '{}' volume to {:.2}", voice, target);
             } else {
-                ctx.fail(
+                ctx.fail_logged(
                     mqtt::commands::CommandErrorKind::NotFound,
                     format!("Voice '{}' not found", voice),
                 );
@@ -2571,7 +2609,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 .map(|status| status.ready)
                 .unwrap_or(false);
             if !input_ready {
-                ctx.fail(
+                ctx.fail_logged(
                     mqtt::commands::CommandErrorKind::NotFound,
                     format!("Input {} is unavailable", input),
                 );
@@ -2608,7 +2646,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 .map(|status| status.ready)
                 .unwrap_or(false);
             if !input_ready {
-                ctx.fail(
+                ctx.fail_logged(
                     mqtt::commands::CommandErrorKind::NotFound,
                     format!("Input {} is unavailable", input),
                 );
@@ -2622,7 +2660,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                 && (ctx.talkback.active_for(&input)
                     || (input == "mic" && ctx.talkback.active_for("GM_MIC")))
             {
-                ctx.fail(
+                ctx.fail_logged(
                     mqtt::commands::CommandErrorKind::Forbidden,
                     "Input is owned by an active talkback lease",
                 );
@@ -2658,7 +2696,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     "Talkback source '{}' is unavailable; lease was not acquired",
                     request.source_id
                 );
-                ctx.fail(
+                ctx.fail_logged(
                     mqtt::commands::CommandErrorKind::NotFound,
                     "Talkback source unavailable",
                 );
@@ -2683,7 +2721,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     ctx.refresh_talkback(ctx.now_ms);
                 }
                 Err(error) => {
-                    ctx.fail(
+                    ctx.fail_logged(
                         mqtt::commands::CommandErrorKind::Forbidden,
                         error.to_string(),
                     );
@@ -2708,7 +2746,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     ctx.refresh_talkback(ctx.now_ms);
                 }
                 Err(error) => {
-                    ctx.fail(
+                    ctx.fail_logged(
                         mqtt::commands::CommandErrorKind::Forbidden,
                         error.to_string(),
                     );
@@ -3091,6 +3129,7 @@ mod tests {
                 streaming_upgrades: &mut self.streaming_upgrades,
                 max_block_frames: 512,
                 error: None,
+                error_logged: false,
                 prepared,
             }
         }
@@ -5180,6 +5219,141 @@ mod tests {
     fn scheduler_with(permits: usize) -> (CommandScheduler, Arc<tokio::sync::Semaphore>) {
         let semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
         (CommandScheduler::new(semaphore.clone()), semaphore)
+    }
+
+    /// Submit `json` as an MQTT message does: nobody waits for its outcome.
+    async fn submit_unreplied(fixture: &mut Fixture, scheduler: &mut CommandScheduler, json: &str) {
+        let request = mqtt::commands::CommandRequest::fire_and_forget(json.to_string());
+        let generation = scheduler.load_generation;
+        fixture.take(scheduler, (request, None, generation)).await;
+    }
+
+    #[tokio::test]
+    async fn scheduler_logs_a_failed_mqtt_command() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let ((), warnings) = capturing_warnings(submit_unreplied(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "speed", "voice": "Crank2", "speed": 1.08}"#,
+        ))
+        .await;
+
+        assert_eq!(
+            warnings,
+            vec!["Command failed: No sample matches the selector"]
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_logs_a_failed_mqtt_command_once_when_its_handler_already_did() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let ((), warnings) = capturing_warnings(submit_unreplied(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_stop", "voice": "nobody"}"#,
+        ))
+        .await;
+
+        assert_eq!(warnings, vec!["Voice 'nobody' not found or already empty"]);
+    }
+
+    #[tokio::test]
+    async fn scheduler_leaves_a_failure_it_answers_over_http_to_the_reply() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let (mut outcome, warnings) = capturing_warnings(submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "speed", "voice": "Crank2", "speed": 1.08}"#,
+        ))
+        .await;
+
+        assert!(warnings.is_empty(), "got {warnings:?}");
+        assert_eq!(
+            outcome_of(&mut outcome).unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_logs_an_mqtt_load_rejected_by_the_limit() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+        for i in 0..MAX_CONCURRENT_LOADS {
+            submit_unreplied(
+                &mut fixture,
+                &mut scheduler,
+                &play_json(TEST_WAV, &format!("v{i}")),
+            )
+            .await;
+        }
+
+        let ((), warnings) = capturing_warnings(submit_unreplied(
+            &mut fixture,
+            &mut scheduler,
+            &play_json(TEST_WAV, "over"),
+        ))
+        .await;
+
+        assert_eq!(warnings, vec!["Command failed: Too many concurrent loads"]);
+    }
+
+    #[tokio::test]
+    async fn scheduler_logs_a_failed_mqtt_load_once() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let missing = fixture._cache_dir.path().join("missing.wav");
+        submit_unreplied(
+            &mut fixture,
+            &mut scheduler,
+            &play_json(missing.to_str().unwrap(), "v"),
+        )
+        .await;
+
+        let ((), warnings) =
+            capturing_warnings(finish_next_load(&mut fixture, &mut scheduler)).await;
+
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.starts_with("Load failed"))
+                .count(),
+            1,
+            "got {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("Command failed")),
+            "the load failure is not logged a second time, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_logs_an_mqtt_play_superseded_by_a_stop() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        submit_unreplied(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        let loaded = next_load(&mut scheduler)
+            .await
+            .expect("the play's load result");
+        submit_unreplied(&mut fixture, &mut scheduler, STOPALL).await;
+
+        let ((), warnings) = capturing_warnings(fixture.take(&mut scheduler, loaded)).await;
+
+        assert_eq!(
+            warnings,
+            vec!["Command failed: Superseded by stopall/fadeall"]
+        );
     }
 
     #[tokio::test]

@@ -538,10 +538,9 @@ overtake.
 
 Both `main` (the Play arm hands the load to `tokio::spawn`) and `v2.1` (the play
 waits in the `loads` JoinSet and re-enters the loop once prepared) have this.
-v2.1 also does not log the miss for MQTT senders: the selector check calls
-`ctx.fail`, and the loop only reads `ctx.error` when an HTTP reply is waiting.
-On `main` it shows up as `Command failed: Speed command matched no active
-samples`.
+It shows up in the log as `Command failed: Speed command matched no active
+samples` on `main` and `Command failed: No sample matches the selector` on
+v2.1.
 
 Measured with a local broker and a null ALSA sink, sending `play` then `speed`
 for the same voice on one connection, 20 pairs per gap, counting `Set speed`
@@ -601,13 +600,6 @@ unmuted. On the audio thread it only sets the input's voice multiplier, which is
 separate from the input volume and does not unmute it. `/status/inputs` then
 reports a volume and mute state the input does not have. Left alone as a
 status-reporting fix outside the command-ordering work.
-
-## Empty selectors are rejected, not ignored
-
-`docs/commands.md` says a `stop`/`seek`/`speed`/`volume` with an empty selector
-"is silently a no-op". The daemon rejects it with "Command has no sample
-selector" (HTTP 400). Over MQTT that looks silent only because MQTT command
-failures are not logged on v2.1.
 
 ## A play dropped by a full audio command ring stays in its voice
 

@@ -183,7 +183,7 @@ Stop specific samples.
 | `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
 | `fade_out_ms` | integer | 10 | Fade-out duration (milliseconds). The 10 ms default avoids clicks on abrupt stops |
 
-At least one of `internal_id`, `id`, `file`, or `voice` is required. Multiple selectors use OR logic (a sample matches if any one criterion matches). An empty selector matches nothing and is silently a no-op.
+At least one of `internal_id`, `id`, `file`, or `voice` is required. Multiple selectors use OR logic (a sample matches if any one criterion matches). A command with an empty selector is rejected: HTTP answers 400, and over MQTT it is logged as a failed command.
 
 ### seek
 

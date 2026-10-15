@@ -1,33 +1,45 @@
-Answer a load cancelled before its task ran with 409, not a dropped reply
+Log MQTT command failures that no client is waiting to hear about
 
-The scheduler spawns a play's or cache command's background load with
-the HTTP reply inside the task, wrapped in PendingReply, whose drop
-answers "Load cancelled before playback" (409). The wrapping happened
-in the task's body, so it only took effect once the runtime first
-polled the task. A stopall, fadeall or shutdown that aborted the task
-before that dropped the bare reply sender instead, and the HTTP client
-got a 500 "Command was dropped before completion".
+An MQTT command gets no reply, so the log is its only feedback. main
+logged every failed command as "Command failed: ..." from one deliver()
+helper; v2.1 dropped that and only reads ctx.error when an HTTP reply is
+waiting. Several failures therefore left no trace at all for MQTT
+senders: a selector that matched nothing (the customer's speed sent
+before its play had started), an empty selector, missing decoded
+metadata, the concurrent-load limit, and a play superseded by stopall.
 
-PendingReply is now built before the task is spawned and moved into
-it, so dropping a never-polled task answers 409 like any other
-cancelled load.
+The scheduler now answers every request through deliver(): an HTTP
+client gets the outcome as before; with nobody waiting, a failure is
+logged once as WARN "Command failed: <reason>". Failures whose handler
+already logs its own message (an unknown voice, an unavailable input, a
+rejected talkback lease, a load or channel-alias error, a full audio
+command ring, macro and parse errors) are recorded with
+CommandCtx::fail_logged and are not logged a second time. HTTP logging
+is unchanged.
 
-Found while writing the scheduler's characterization tests, which
-aborted loads straight after submitting them.
+docs/commands.md no longer calls an empty selector a silent no-op (it is
+rejected: 400 over HTTP, a logged failure over MQTT), so its bugs.md
+entry is gone; the troubleshooting guide says where to find a failed
+MQTT command; the command-ordering bugs entry names the v2.1 log line.
 
-Tests (failing before the fix with the reply dropped unanswered): a
-stopall sent before a play's load task has run answers the play 409; a
-shutdown abort before a precache's task has run answers it 409.
+Tests (the first, fourth and sixth failed before the change, logging
+nothing): an MQTT speed that matches nothing logs "Command failed: No
+sample matches the selector"; an MQTT voice_stop on an unknown voice
+logs only its own warning; the same failing speed over HTTP logs
+nothing and answers 404; an MQTT play over the load limit logs "Command
+failed: Too many concurrent loads"; a failed MQTT load is logged once as
+"Load failed"; an MQTT play superseded by stopall logs "Command failed:
+Superseded by stopall/fadeall".
 
 Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
 and a warning-free release build (RUSTFLAGS=-D warnings); fuzz suite 7
 passed; broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA
-set) 975 passed, 0 failed, 7 device-gated ignored.
+set) 981 passed, 0 failed, 7 device-gated ignored.
 
 Prompts that led to this work:
 
-- "Let's go with the per-voice hold fix. ... We'll need a lot of tests
-  in this area before implementation as well." (characterization tests
-  for the command loop exposed this)
+- Decision after the design review: "Restore 'Command failed: ...'
+  logging, as main has?" — "Yes (Recommended)": one ERROR/WARN line per
+  failed MQTT command, HTTP unchanged.
 
 This commit was authored by Claude (AI assistant) working with Ben Andrews.

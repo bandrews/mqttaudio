@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Failed MQTT commands are logged again.** An MQTT sender gets no reply, and several failures left no
+  trace at all: a selector that matched nothing (such as a `speed` for a sound that had not started), an
+  empty selector, the concurrent-load limit, and a play superseded by `stopall`. Each failed command with
+  no client waiting is now logged once as `Command failed: <reason>`, unless its own handler already
+  logged it. HTTP clients still get the failure in their response.
 - **A load cancelled before it began is answered with 409.** When `stopall`, `fadeall` or shutdown
   cancelled a play or cache command whose background load had not started running yet, its HTTP request
   got a 500 "Command was dropped before completion" instead of the 409 every other cancelled load gets.

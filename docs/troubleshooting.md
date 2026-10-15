@@ -103,6 +103,19 @@ Try connecting to localhost first to rule out network problems:
 ./mqttaudio --server localhost --topic audio/commands
 ```
 
+### A Command Did Nothing
+
+An MQTT sender gets no reply, so the daemon logs each command it could not carry
+out:
+
+```
+WARN mqttaudio: Command failed: No sample matches the selector
+```
+
+A failure that has its own message, such as an unknown voice or a file that
+failed to load, is logged once under that message instead. Over HTTP the same
+failure comes back in the response.
+
 ---
 
 ## Files Not Playing
