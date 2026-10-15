@@ -433,11 +433,11 @@ keeps publishing alongside whichever console format is selected.
 
 ### For Developers
 
-| Document                             | Description                       |
-| ------------------------------------ | --------------------------------- |
-| [Architecture](docs/architecture.md) | System design and internals       |
+| Document                                     | Description                            |
+| -------------------------------------------- | -------------------------------------- |
+| [Architecture](docs/architecture.md)         | System design and internals            |
 | [Command Ordering](docs/command-ordering.md) | How commands reach plays still loading |
-| [Contributing](CONTRIBUTING.md)      | Building and testing instructions |
+| [Contributing](CONTRIBUTING.md)              | Building and testing instructions      |
 
 ## Supported Formats
 
