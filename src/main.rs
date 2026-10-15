@@ -1017,104 +1017,44 @@ async fn main() {
     // cache entries out-of-band so a play never blocks on the network. Idle when
     // freshness is pinned.
     let mut freshness_tick = tokio::time::interval(std::time::Duration::from_secs(30));
-    let mut loads = tokio::task::JoinSet::new();
-    let load_permit = Arc::new(tokio::sync::Semaphore::new(4));
-    let mut load_generation: u64 = 0;
+    let mut scheduler = CommandScheduler::new(Arc::new(tokio::sync::Semaphore::new(4)));
     let mut freshness_task: Option<tokio::task::JoinHandle<()>> = None;
 
     loop {
+        let generation = scheduler.load_generation;
         tokio::select! {
-            incoming = async {
+            input = async {
                 tokio::select! {
-                    result = loads.join_next(), if !loads.is_empty() => {
-                        match result { Some(Ok(ready)) => Some(ready), _ => None }
-                    }
-                    request = text_rx.recv() => request.map(|request| (request, None, load_generation)),
+                    loaded = scheduler.next_load() => loaded,
+                    request = text_rx.recv() => request.map(|request| (request, None, generation)),
                 }
             } => {
-                let Some((request, prepared, generation)) = incoming else { continue; };
-                let mqtt::commands::CommandRequest { payload, reply } = request;
-                if reply.as_ref().is_some_and(|reply| reply.is_closed()) { continue; }
-                if generation != load_generation {
-                    if let Some(reply) = reply { let _ = reply.send(Err(mqtt::commands::CommandError::new(mqtt::commands::CommandErrorKind::Cancelled, "Superseded by stopall/fadeall"))); }
-                    continue;
-                }
-                let prepared = match prepared {
-                    Some(Err(error)) => {
-                        tracing::error!("Load failed: {}", error);
-                        if let Some(reply) = reply { let _ = reply.send(Err(error)); }
-                        continue;
-                    }
-                    Some(Ok(prepared)) => Some(prepared),
-                    None => None,
+                let Some(input) = input else { continue; };
+                let mut ctx = CommandCtx {
+                    cache_manager: &cache_manager,
+                    voice_manager: &voice_manager,
+                    cmd_tx: &mut cmd_tx,
+                    ducking_engine: &mut ducking_engine,
+                    active_counts: &mut active_counts,
+                    streamed_voices: &mut streamed_voices,
+                    playing: &mut playing,
+                    snapshot: &status_snapshot,
+                    ducking_snapshot: &ducking_snapshot,
+                    inputs: &mut input_statuses,
+                    talkback: &mut talkback_lease,
+                    talkback_status: &talkback_status,
+                    now_ms: start_time.elapsed().as_millis() as u64,
+                    start_time,
+                    output_channels,
+                    output_sample_rate,
+                    config: &config,
+                    latency: &latency_tracker,
+                    streaming_upgrades: &mut streaming_upgrades,
+                    max_block_frames,
+                    error: None,
+                    prepared: None,
                 };
-                // Expand macros before parsing
-                let expanded = match mqtt::commands::expand_macros(&payload, &config.macros) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        tracing::error!("Macro expansion error: {}", e);
-                        if let Some(reply) = reply { let _ = reply.send(Err(mqtt::commands::CommandError::new(mqtt::commands::CommandErrorKind::InvalidRequest, e.to_string()))); }
-                        continue;
-                    }
-                };
-
-                match mqtt::commands::parse_command(&expanded) {
-                    Ok(cmd) => {
-                        if matches!(cmd, mqtt::commands::AudioCommand::StopAll | mqtt::commands::AudioCommand::FadeAll { .. }) {
-                            load_generation = load_generation.wrapping_add(1);
-                            loads.abort_all();
-                        }
-                        if loading::needs_preparation(&cmd) && prepared.is_none() {
-                            if loads.len() >= 32 {
-                                if let Some(reply) = reply { let _ = reply.send(Err(mqtt::commands::CommandError::new(mqtt::commands::CommandErrorKind::Internal, "Too many concurrent loads"))); }
-                                continue;
-                            }
-                            let config = config.clone();
-                            let cache = cache_manager.clone();
-                            let permit = load_permit.clone();
-                            loads.spawn(async move {
-                                let mut reply = loading::PendingReply(reply);
-                                let _permit = permit.acquire_owned().await.expect("load semaphore stays open");
-                                let result = loading::prepare(&cmd, &config, &cache, output_sample_rate).await;
-                                (mqtt::commands::CommandRequest { payload, reply: reply.0.take() }, Some(result), generation)
-                            });
-                            continue;
-                        }
-                        let mut ctx = CommandCtx {
-                            cache_manager: &cache_manager,
-                            voice_manager: &voice_manager,
-                            cmd_tx: &mut cmd_tx,
-                            ducking_engine: &mut ducking_engine,
-                            active_counts: &mut active_counts,
-                            streamed_voices: &mut streamed_voices,
-                            playing: &mut playing,
-                            snapshot: &status_snapshot,
-                            ducking_snapshot: &ducking_snapshot,
-                            inputs: &mut input_statuses,
-                            talkback: &mut talkback_lease,
-                            talkback_status: &talkback_status,
-                            now_ms: start_time.elapsed().as_millis() as u64,
-                            output_channels,
-                            output_sample_rate,
-                            config: &config,
-                            latency: &latency_tracker,
-                            streaming_upgrades: &mut streaming_upgrades,
-                            max_block_frames,
-                            error: None,
-                            prepared,
-                        };
-                        handle_command(cmd, &mut ctx).await;
-                        if let Some(reply) = reply {
-                            let outcome = ctx.error.take().map_or_else(|| Ok("Command completed".to_string()), Err);
-                            let _ = reply.send(outcome);
-                        }
-                        ctx.refresh_talkback(start_time.elapsed().as_millis() as u64);
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to parse command: {}", e);
-                        if let Some(reply) = reply { let _ = reply.send(Err(mqtt::commands::CommandError::new(mqtt::commands::CommandErrorKind::InvalidRequest, e.to_string()))); }
-                    }
-                }
+                scheduler.take(input, &mut ctx).await;
             }
             _ = reaper_tick.tick() => {
                 let mut capture_peaks = std::collections::HashMap::new();
@@ -1189,7 +1129,7 @@ async fn main() {
             }
             _ = shutdown_signal() => {
                 tracing::info!("Shutdown signal received");
-                loads.abort_all();
+                scheduler.abort_loads();
                 if let Some(task) = freshness_task.take() { task.abort(); }
                 shutdown(&mut cmd_tx, &cache_manager).await;
                 break;
@@ -1677,6 +1617,8 @@ struct CommandCtx<'a> {
     talkback: &'a mut talkback::TalkbackLease,
     talkback_status: &'a std::sync::Arc<std::sync::RwLock<talkback::TalkbackStatus>>,
     now_ms: u64,
+    /// When the daemon started; talkback lease times are milliseconds since then.
+    start_time: std::time::Instant,
     output_channels: usize,
     output_sample_rate: u32,
     config: &'a config::Config,
@@ -1725,6 +1667,163 @@ impl CommandCtx<'_> {
     fn refresh_talkback(&self, now_ms: u64) {
         let status = self.talkback.status(now_ms);
         *self.talkback_status.write().unwrap() = status;
+    }
+}
+
+/// A command request on its way through the scheduler: the request, the result
+/// of its background load once that has run, and the load generation it arrived
+/// under.
+type SchedulerInput = (
+    mqtt::commands::CommandRequest,
+    Option<Result<PreparedPlayback, mqtt::commands::CommandError>>,
+    u64,
+);
+
+/// The most background loads that may run at once; a command needing another is
+/// rejected until one finishes.
+const MAX_CONCURRENT_LOADS: usize = 32;
+
+/// Takes command requests from HTTP and MQTT and the background loads they
+/// finish, starts the loads a command needs, and hands each command to
+/// `handle_command` once it is ready.
+struct CommandScheduler {
+    loads: tokio::task::JoinSet<SchedulerInput>,
+    load_permit: std::sync::Arc<tokio::sync::Semaphore>,
+    load_generation: u64,
+}
+
+impl CommandScheduler {
+    fn new(load_permit: std::sync::Arc<tokio::sync::Semaphore>) -> Self {
+        Self {
+            loads: tokio::task::JoinSet::new(),
+            load_permit,
+            load_generation: 0,
+        }
+    }
+
+    /// The next background load to finish, or `None` for a load task that ended
+    /// without a result. Never completes while no load is running.
+    async fn next_load(&mut self) -> Option<SchedulerInput> {
+        if self.loads.is_empty() {
+            return std::future::pending().await;
+        }
+        match self.loads.join_next().await {
+            Some(Ok(ready)) => Some(ready),
+            _ => None,
+        }
+    }
+
+    fn abort_loads(&mut self) {
+        self.loads.abort_all();
+    }
+
+    /// Take one request: a newly received command, or one whose load has finished.
+    async fn take(&mut self, input: SchedulerInput, ctx: &mut CommandCtx<'_>) {
+        let (request, prepared, generation) = input;
+        let mqtt::commands::CommandRequest { payload, reply } = request;
+        if reply.as_ref().is_some_and(|reply| reply.is_closed()) {
+            return;
+        }
+        if generation != self.load_generation {
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(mqtt::commands::CommandError::new(
+                    mqtt::commands::CommandErrorKind::Cancelled,
+                    "Superseded by stopall/fadeall",
+                )));
+            }
+            return;
+        }
+        let prepared = match prepared {
+            Some(Err(error)) => {
+                tracing::error!("Load failed: {}", error);
+                if let Some(reply) = reply {
+                    let _ = reply.send(Err(error));
+                }
+                return;
+            }
+            Some(Ok(prepared)) => Some(prepared),
+            None => None,
+        };
+        // Expand macros before parsing
+        let expanded = match mqtt::commands::expand_macros(&payload, &ctx.config.macros) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("Macro expansion error: {}", e);
+                if let Some(reply) = reply {
+                    let _ = reply.send(Err(mqtt::commands::CommandError::new(
+                        mqtt::commands::CommandErrorKind::InvalidRequest,
+                        e.to_string(),
+                    )));
+                }
+                return;
+            }
+        };
+
+        match mqtt::commands::parse_command(&expanded) {
+            Ok(cmd) => {
+                if matches!(
+                    cmd,
+                    mqtt::commands::AudioCommand::StopAll
+                        | mqtt::commands::AudioCommand::FadeAll { .. }
+                ) {
+                    self.load_generation = self.load_generation.wrapping_add(1);
+                    self.loads.abort_all();
+                }
+                if loading::needs_preparation(&cmd) && prepared.is_none() {
+                    if self.loads.len() >= MAX_CONCURRENT_LOADS {
+                        if let Some(reply) = reply {
+                            let _ = reply.send(Err(mqtt::commands::CommandError::new(
+                                mqtt::commands::CommandErrorKind::Internal,
+                                "Too many concurrent loads",
+                            )));
+                        }
+                        return;
+                    }
+                    let config = ctx.config.clone();
+                    let cache = ctx.cache_manager.clone();
+                    let permit = self.load_permit.clone();
+                    let output_sample_rate = ctx.output_sample_rate;
+                    self.loads.spawn(async move {
+                        let mut reply = loading::PendingReply(reply);
+                        let _permit = permit
+                            .acquire_owned()
+                            .await
+                            .expect("load semaphore stays open");
+                        let result =
+                            loading::prepare(&cmd, &config, &cache, output_sample_rate).await;
+                        (
+                            mqtt::commands::CommandRequest {
+                                payload,
+                                reply: reply.0.take(),
+                            },
+                            Some(result),
+                            generation,
+                        )
+                    });
+                    return;
+                }
+                ctx.prepared = prepared;
+                ctx.error = None;
+                handle_command(cmd, ctx).await;
+                if let Some(reply) = reply {
+                    let outcome = ctx
+                        .error
+                        .take()
+                        .map_or_else(|| Ok("Command completed".to_string()), Err);
+                    let _ = reply.send(outcome);
+                }
+                ctx.refresh_talkback(ctx.start_time.elapsed().as_millis() as u64);
+            }
+            Err(e) => {
+                tracing::error!("Failed to parse command: {}", e);
+                if let Some(reply) = reply {
+                    let _ = reply.send(Err(mqtt::commands::CommandError::new(
+                        mqtt::commands::CommandErrorKind::InvalidRequest,
+                        e.to_string(),
+                    )));
+                }
+            }
+        }
     }
 }
 
@@ -2955,7 +3054,20 @@ mod tests {
         }
 
         async fn run_prepared(&mut self, cmd: AudioCommand, prepared: Option<PreparedPlayback>) {
-            let mut ctx = CommandCtx {
+            let mut ctx = self.ctx(prepared);
+            handle_command(cmd, &mut ctx).await;
+        }
+
+        /// Hand one request or finished load to `scheduler`, as the command loop
+        /// does, with this fixture's control-side state.
+        async fn take(&mut self, scheduler: &mut CommandScheduler, input: SchedulerInput) {
+            let mut ctx = self.ctx(None);
+            scheduler.take(input, &mut ctx).await;
+        }
+
+        /// The control-side state a command runs against, borrowed from the fixture.
+        fn ctx(&mut self, prepared: Option<PreparedPlayback>) -> CommandCtx<'_> {
+            CommandCtx {
                 cache_manager: &self.cache_manager,
                 voice_manager: &self.voice_manager,
                 cmd_tx: &mut self.cmd_tx,
@@ -2969,6 +3081,7 @@ mod tests {
                 talkback: &mut self.talkback,
                 talkback_status: &self.talkback_status,
                 now_ms: 0,
+                start_time: std::time::Instant::now(),
                 output_channels: 2,
                 output_sample_rate: SR,
                 config: &self.config,
@@ -2977,8 +3090,7 @@ mod tests {
                 max_block_frames: 512,
                 error: None,
                 prepared,
-            };
-            handle_command(cmd, &mut ctx).await;
+            }
         }
 
         /// Apply every queued audio command to the mixer, as the audio callback
@@ -3349,18 +3461,26 @@ mod tests {
         cmd: AudioCommand,
         prepared: Option<PreparedPlayback>,
     ) -> Vec<String> {
+        capturing_warnings(fixture.run_prepared(cmd, prepared))
+            .await
+            .1
+    }
+
+    /// Run `work` under a WARN-capturing subscriber and return its output with
+    /// every captured warning message.
+    async fn capturing_warnings<T>(work: impl std::future::Future<Output = T>) -> (T, Vec<String>) {
         use tracing_subscriber::layer::SubscriberExt;
         let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(CaptureLayer {
             warnings: warnings.clone(),
         });
-        // `with_default` needs a sync scope, but `handle_command` is async; use a
+        // `with_default` needs a sync scope, but the work is async; use a
         // dispatcher guard that stays in scope across the await.
         let dispatch = tracing::Dispatch::new(subscriber);
         let _guard = tracing::dispatcher::set_default(&dispatch);
-        fixture.run_prepared(cmd, prepared).await;
+        let output = work.await;
         let captured = warnings.lock().unwrap().clone();
-        captured
+        (output, captured)
     }
 
     /// One captured per-play latency stage event (Sprint 11, D50).
@@ -4993,6 +5113,383 @@ mod tests {
         assert!(
             serde_json::from_str::<serde_json::Value>(output.trim()).is_err(),
             "text format must not be JSON, got: {output:?}"
+        );
+    }
+
+    // ---- Command scheduler: requests and background loads ----------------------
+
+    type Outcome = tokio::sync::oneshot::Receiver<mqtt::commands::CommandOutcome>;
+
+    /// Submit `json` as an HTTP request does, returning where its outcome arrives.
+    async fn submit(
+        fixture: &mut Fixture,
+        scheduler: &mut CommandScheduler,
+        json: &str,
+    ) -> Outcome {
+        let (request, outcome) = mqtt::commands::CommandRequest::with_reply(json.to_string());
+        let generation = scheduler.load_generation;
+        fixture.take(scheduler, (request, None, generation)).await;
+        outcome
+    }
+
+    /// Wait for the scheduler's next background load to finish, without taking it.
+    async fn next_load(scheduler: &mut CommandScheduler) -> Option<SchedulerInput> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.next_load())
+            .await
+            .expect("a background load finishes within 10 s")
+    }
+
+    /// Wait for the scheduler's next background load to finish and take its result.
+    async fn finish_next_load(fixture: &mut Fixture, scheduler: &mut CommandScheduler) {
+        if let Some(input) = next_load(scheduler).await {
+            fixture.take(scheduler, input).await;
+        }
+    }
+
+    /// The outcome a request has already been given.
+    fn outcome_of(outcome: &mut Outcome) -> mqtt::commands::CommandOutcome {
+        outcome.try_recv().expect("the request has its outcome")
+    }
+
+    /// The outcome a request is given within 10 s.
+    async fn awaited_outcome(outcome: Outcome) -> mqtt::commands::CommandOutcome {
+        tokio::time::timeout(std::time::Duration::from_secs(10), outcome)
+            .await
+            .expect("the request gets its outcome within 10 s")
+            .expect("the request is answered, not dropped")
+    }
+
+    /// Whether a request is still waiting for its outcome.
+    fn is_waiting(outcome: &mut Outcome) -> bool {
+        matches!(
+            outcome.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        )
+    }
+
+    fn play_json(file: &str, voice: &str) -> String {
+        serde_json::json!({"command": "play", "file": file, "voice": voice}).to_string()
+    }
+
+    const STOPALL: &str = r#"{"command": "stopall"}"#;
+
+    /// A scheduler whose loads take permits from `permits`, so a test can hold a
+    /// load in flight by giving out none.
+    fn scheduler_with(permits: usize) -> (CommandScheduler, Arc<tokio::sync::Semaphore>) {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
+        (CommandScheduler::new(semaphore.clone()), semaphore)
+    }
+
+    #[tokio::test]
+    async fn scheduler_answers_a_play_once_its_sample_is_queued() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let mut outcome = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        assert!(
+            is_waiting(&mut outcome),
+            "a play is answered only once it starts"
+        );
+        assert!(fixture.playing.is_empty());
+
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(outcome_of(&mut outcome).unwrap(), "Command completed");
+        assert_eq!(fixture.playing.len(), 1);
+        assert_eq!(
+            fixture.drain(),
+            1,
+            "the started sample is on the audio command ring"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_reports_a_missing_file_as_not_found() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let missing = fixture._cache_dir.path().join("missing.wav");
+
+        let mut outcome = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_json(missing.to_str().unwrap(), "v"),
+        )
+        .await;
+        let ((), warnings) =
+            capturing_warnings(finish_next_load(&mut fixture, &mut scheduler)).await;
+
+        let error = outcome_of(&mut outcome).unwrap_err();
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::NotFound);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Load failed")),
+            "a failed load is logged, got {warnings:?}"
+        );
+        assert!(fixture.playing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduler_rejects_a_play_outside_the_allowed_directories() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let allowed = tempfile::tempdir().unwrap();
+        fixture.config.security.allowed_directories =
+            vec![allowed.path().to_string_lossy().into_owned()];
+
+        let mut outcome = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        let ((), warnings) =
+            capturing_warnings(finish_next_load(&mut fixture, &mut scheduler)).await;
+
+        let error = outcome_of(&mut outcome).unwrap_err();
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::Forbidden);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Load failed")),
+            "a rejected load is logged, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_rejects_a_play_routed_to_an_unknown_channel() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let json = serde_json::json!({
+            "command": "play",
+            "file": TEST_WAV,
+            "channel_map": [{"src": 0, "dest": "nowhere"}]
+        })
+        .to_string();
+
+        let mut outcome = submit(&mut fixture, &mut scheduler, &json).await;
+        let ((), warnings) =
+            capturing_warnings(finish_next_load(&mut fixture, &mut scheduler)).await;
+
+        let error = outcome_of(&mut outcome).unwrap_err();
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::InvalidRequest);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Load failed")),
+            "a rejected load is logged, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_rejects_malformed_json_and_unknown_commands() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let (mut malformed, warnings) =
+            capturing_warnings(submit(&mut fixture, &mut scheduler, "{not json")).await;
+        assert_eq!(
+            outcome_of(&mut malformed).unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::InvalidRequest
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Macro expansion error")),
+            "got {warnings:?}"
+        );
+
+        let (mut unknown, warnings) = capturing_warnings(submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "nope"}"#,
+        ))
+        .await;
+        assert_eq!(
+            outcome_of(&mut unknown).unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::InvalidRequest
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Failed to parse command")),
+            "got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_rejects_a_load_beyond_the_concurrent_limit() {
+        let (mut scheduler, _permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+        let mut in_flight = Vec::new();
+        for i in 0..MAX_CONCURRENT_LOADS {
+            in_flight.push(
+                submit(
+                    &mut fixture,
+                    &mut scheduler,
+                    &play_json(TEST_WAV, &format!("v{i}")),
+                )
+                .await,
+            );
+        }
+
+        let mut rejected = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "over")).await;
+        let error = outcome_of(&mut rejected).unwrap_err();
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::Internal);
+        assert_eq!(error.message, "Too many concurrent loads");
+        assert!(in_flight.iter_mut().all(is_waiting));
+    }
+
+    #[tokio::test]
+    async fn scheduler_stopall_cancels_a_load_in_flight() {
+        let (mut scheduler, permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+
+        let play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        // Let the load task start and wait for a permit.
+        tokio::task::yield_now().await;
+        let mut stop = submit(&mut fixture, &mut scheduler, STOPALL).await;
+        assert_eq!(outcome_of(&mut stop).unwrap(), "Command completed");
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+
+        permits.add_permits(4);
+        assert!(
+            next_load(&mut scheduler).await.is_none(),
+            "the cancelled load ends without a result"
+        );
+        assert!(fixture.playing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduler_stopall_cancels_a_load_that_finished_but_was_not_taken() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let mut play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        let loaded = next_load(&mut scheduler)
+            .await
+            .expect("the play's load result");
+        let _stop = submit(&mut fixture, &mut scheduler, STOPALL).await;
+        fixture.take(&mut scheduler, loaded).await;
+
+        assert_eq!(
+            outcome_of(&mut play).unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+        assert!(
+            fixture.playing.is_empty(),
+            "a play cancelled by a stop never starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_plays_sent_after_a_stop_start_normally() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let _stop = submit(&mut fixture, &mut scheduler, STOPALL).await;
+        let mut play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        finish_next_load(&mut fixture, &mut scheduler).await;
+
+        assert_eq!(outcome_of(&mut play).unwrap(), "Command completed");
+        assert_eq!(fixture.playing.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_ignores_a_request_whose_client_has_gone() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let (request, outcome) =
+            mqtt::commands::CommandRequest::with_reply(play_json(TEST_WAV, "v"));
+        drop(outcome);
+        let generation = scheduler.load_generation;
+        fixture
+            .take(&mut scheduler, (request, None, generation))
+            .await;
+
+        assert!(
+            scheduler.loads.is_empty(),
+            "no load starts for a client that has gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_discards_a_loaded_play_whose_client_has_gone() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let outcome = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        drop(outcome);
+        finish_next_load(&mut fixture, &mut scheduler).await;
+
+        assert!(fixture.playing.is_empty());
+        assert_eq!(fixture.drain(), 0, "nothing reaches the audio thread");
+    }
+
+    #[tokio::test]
+    async fn scheduler_runs_cache_commands_as_background_loads() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let json = serde_json::json!({"command": "precache", "file": TEST_WAV}).to_string();
+
+        let mut outcome = submit(&mut fixture, &mut scheduler, &json).await;
+        assert!(
+            is_waiting(&mut outcome),
+            "a precache runs in the background"
+        );
+        finish_next_load(&mut fixture, &mut scheduler).await;
+
+        assert_eq!(outcome_of(&mut outcome).unwrap(), "Command completed");
+        assert!(fixture.playing.is_empty(), "a precache plays nothing");
+    }
+
+    #[tokio::test]
+    async fn scheduler_stopall_cancels_a_cache_command_in_flight() {
+        let (mut scheduler, _permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+        let json = serde_json::json!({"command": "precache", "file": TEST_WAV}).to_string();
+
+        let precache = submit(&mut fixture, &mut scheduler, &json).await;
+        // Let the load task start and wait for a permit.
+        tokio::task::yield_now().await;
+        let _stop = submit(&mut fixture, &mut scheduler, STOPALL).await;
+
+        assert_eq!(
+            awaited_outcome(precache).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_keeps_taking_commands_after_a_load_task_panics() {
+        let (mut scheduler, permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+
+        let play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        // A closed semaphore makes the waiting load task panic on its permit.
+        permits.close();
+        assert!(
+            next_load(&mut scheduler).await.is_none(),
+            "a panicked load task ends without a result"
+        );
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+
+        let mut stop = submit(&mut fixture, &mut scheduler, STOPALL).await;
+        assert_eq!(outcome_of(&mut stop).unwrap(), "Command completed");
+    }
+
+    #[tokio::test]
+    async fn scheduler_shutdown_cancels_loads_in_flight() {
+        let (mut scheduler, _permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+
+        let play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        // Let the load task start and wait for a permit.
+        tokio::task::yield_now().await;
+        scheduler.abort_loads();
+
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
         );
     }
 }

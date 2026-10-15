@@ -1,36 +1,55 @@
-Propose per-voice command ordering and record issues found on the way
+Move the command loop's request handling into a CommandScheduler
 
-docs/command-ordering.md is the design for fixing the play-then-command
-race (a speed, stop or voice_stop sent right after a play runs before
-the play's background load finishes, matches nothing, and is dropped).
-It defines the guarantee (commands touching the same voice take effect
-in arrival order; a slow load only delays commands for the voices it
-touches; stopall/fadeall stay immediate), what each command touches,
-when a command waits, failure and cancellation handling, what is not
-ordered and why, and the implementation and test plan. It is marked as
-a proposal: it is under adversarial review and nothing implements it
-yet.
+The command-ordering fix needs the loop's request handling under test,
+and that code lived inline in main()'s select loop, where no test could
+reach it (only an ignored, device-gated daemon test touched it). This
+moves it, unchanged, into CommandScheduler:
 
-docs/bugs.md gains the out-of-scope issues found while analysing v2.1's
-command semantics for the design: cache commands are not ordered
-against plays and are aborted by stopall; pitch correction engages
-unprimed when a cold play's load completes; voice_volume on a live
-input's voice misreports that input in status; the docs call an empty
-selector a silent no-op while the daemon rejects it; a play dropped by
-a full audio command ring stays in its voice.
+- take() is the old branch body: the closed-reply skip, the stopall /
+  fadeall generation bump and abort, macro expansion and parsing, the
+  32-load limit (now the named MAX_CONCURRENT_LOADS), spawning loads
+  that take a permit, and handing ready commands to handle_command with
+  the post-command talkback refresh.
+- next_load() is the old join branch, pending while no load runs.
+- The load semaphore is a constructor argument, so a test can hold a
+  load in flight by giving out no permits.
+- CommandCtx carries the daemon's start_time so the scheduler can take
+  the talkback refresh's timestamp after the command, as the loop did.
 
-No code changes.
+The loop builds one CommandCtx per input and calls take(); the test
+fixture builds its context through one shared helper and drives the
+same scheduler.
+
+Characterization tests pin the existing behaviour before it changes: a
+play is answered only once its sample is queued; a missing file is
+NotFound, a path outside allowed_directories Forbidden, an unknown
+channel InvalidRequest (each logged as "Load failed"); malformed JSON
+and unknown commands are InvalidRequest and logged; the 33rd concurrent
+load is rejected; stopall cancels a load in flight and one that finished
+but was not yet taken (409), and plays sent after a stop start normally;
+a request whose client has gone starts nothing, and a loaded play whose
+client has gone is discarded; cache commands run as background loads
+and stopall cancels them; the scheduler keeps going after a load task
+panics; shutdown cancels loads in flight.
+
+Writing them exposed a bug that is fixed separately: a load aborted
+before its task first runs drops its HTTP reply instead of answering
+409. The tests here yield once so the task is running when the stop
+arrives, which is the behaviour they pin.
+
+Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
+and a warning-free release build (RUSTFLAGS=-D warnings); fuzz suite 7
+passed; broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA
+set) 973 passed, 0 failed, 7 device-gated ignored.
 
 Prompts that led to this work:
 
 - "Let's go with the per-voice hold fix. Make sure to think through all
-  the possible implications, like conflicting sequences of multiple
-  commands affecting the same voice(s), or commands affecting multiple
-  groups/voices/etc in a complex way, before designing our approach.
-  We'll need a lot of tests in this area before implementation as well.
-  Consider spawning adversarial review agents both before starting the
-  fix and after implementing it."
-- Stop hook: "There are uncommitted changes in the repository. Please
-  commit and push these changes to the remote branch."
+  the possible implications ... We'll need a lot of tests in this area
+  before implementation as well. Consider spawning adversarial review
+  agents both before starting the fix and after implementing it."
+- Design decisions after the adversarial review: carry settings over
+  to unstarted plays instead of holding commands; stops cancel unstarted
+  plays; restore MQTT failure logging; bound HTTP waits.
 
 This commit was authored by Claude (AI assistant) working with Ben Andrews.
