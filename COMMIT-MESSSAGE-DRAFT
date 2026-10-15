@@ -1,78 +1,53 @@
-Give up on HTTP servers that stop answering
+Count live loads against the load limit, and report the speed that plays
 
-Three HTTP waits had no bound:
+Two findings from the post-implementation review of the carry-over
+scheduler.
 
-- open_http_stream, which a windowed (streaming) HTTP play opens first,
-  used bare reqwest::get: no connect timeout and no limit on the wait
-  for response headers.
-- The bounded reader feeding a windowed play's decoder awaited the next
-  body chunk with no stall timeout.
-- DiskCache::revalidate_if_due built a fresh reqwest::Client with no
-  timeout and awaited the conditional GET while the cache was locked.
+The load limit counted every task in the JoinSet. A stop that cancels a
+loading play aborts its task, but an aborted task stays in the set until
+the command loop takes its end, so right after a voice_stop cancelled
+many loading plays, a play arriving before the loop got to them was
+refused with "Too many concurrent loads" while nothing was loading. The
+scheduler now counts the work still running for a command: the plays
+still pending (play_loads) and the cache commands in flight, tracked by
+task id in cache_loads and dropped when they end, panic, or are cleared
+by stopall/fadeall.
 
-A server that accepts the connection and then sends nothing therefore
-hung the load forever. Each such load also held one of the four load
-slots, so four of them stopped every later play from loading, and a
-stuck revalidation held the cache lock, stopping every load at once.
-With carry-over a stuck load no longer blocks its voice's commands, but
-it still held its slot and its voice until a stop.
+The speed arm recorded the requested speed in /status/samples while the
+mixer clamps it (-100 to 100, never nearer zero than 0.01; 0.05 to 8
+with pitch correction). A play that starts at a speed records the
+clamped one, so a speed of 150 showed 100 when it was carried onto a
+loading play and 150 when it reached a playing sound. The clamp is now
+one function, audio::mixer::playable_speed, used by
+ActiveSample::set_speed and by the speed arm for the status. CHANGELOG
+has a Fixed entry.
 
-The full-load paths were already bounded (connect 10 s, response 30 s,
-60 s without body data). The windowed open now uses the same shared
-client and response limit; the bounded reader fails the download with
-"Download stalled: no data for 60 seconds" when a chunk does not arrive
-in time (back-pressure from the decoder is not a stall); and
-revalidate_if_due uses the shared client and gives up after 5 seconds,
-the bound DiskCache::revalidate already had, logging "Revalidation
-failed for <url>: no response within 5 seconds; keeping cached copy".
-The 5 s bound is now one constant used by both.
-
-To test these without waiting tens of seconds, each wait takes its limit
-from a private function (open_http_stream_with_response_limit,
-into_bounded_reader_with_stall_limit,
-revalidate_if_due_with_response_limit) that the public function calls
-with the existing constant. src/test_support.rs (unit tests only) adds a
-local server that answers fixed bytes and then holds the connection
-open, and a capture of the warnings code logs. The paused tokio clock
-was not used: with real sockets it can jump past the connect timeout
-before a loopback connect is seen.
-
-Still open, recorded in docs/bugs.md: revalidate_if_due holds the cache
-lock across its request and does not record a failed attempt, so a
-server that never answers costs up to 5 seconds per cached URL on every
-freshness tick, with loads queued behind it. docs/features/caching.md
-no longer promises "once per interval" for that case.
-
-The design doc's guarantee that plays never wait for each other is
-reworded: a play never waits for an earlier play to start, but loads
-share four slots, so slow downloads can hold up other loads until they
-finish or hit these bounds. commands.md and the CHANGELOG no longer say
-"nothing waits".
-
-Tests (each first seen hanging past a 10 s guard with the limits
-unused):
-- opening_a_stream_gives_up_when_the_server_sends_no_response: "No
-  response from server within 0.2 seconds".
-- a_bounded_download_reports_a_stall_at_its_limit: the first bytes
-  arrive, then "Download stalled: no data for 0.2 seconds".
-- revalidation_keeps_the_cached_copy_when_the_server_sends_no_response:
-  returns unchanged, keeps the cached copy, and logs the one warning.
+Tests (each failed first):
+- plays_a_stop_cancelled_leave_their_load_slots_to_later_plays: 32
+  plays loading into V, a voice_stop, then a play into W was answered
+  "Too many concurrent loads"; now it loads and starts.
+- scheduler_counts_cache_commands_against_the_load_limit_until_they_end:
+  32 precaches in flight refuse a play, and a finished one frees its
+  slot. Removing either the insert or the removal of the cache task id
+  fails it.
+- the_status_reports_the_speed_a_sound_plays_at: 150, 0.001 and -150
+  recorded as 100, 0.01 and -100, matching the mixer.
 
 Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
 and a warning-free release build (RUSTFLAGS=-D warnings); fuzz suite 7
 passed; broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA
-set) 1030 passed, 0 failed, 7 device-gated ignored.
+set) 1033 passed, 0 failed, 7 device-gated ignored. The scheduler
+differential test also passed at 2000 cases.
 
 Prompts that led to this work:
 
-- Decision after the design review, asked as "Uncached HTTP plays open
-  with no connect, response or stall timeout, and cache revalidation
-  runs with no timeout while holding the cache lock, so one dead server
-  can wedge loads indefinitely. Fix that here too?" -- "Yes, separate
-  commit (Recommended)": use the existing connect, response and stall
-  limits for these paths, with tests. Revalidation takes the existing
-  5 s revalidation bound rather than the 30 s response limit, because it
-  runs with the cache locked.
+- "Let's go with the per-voice hold fix. Make sure to think through all
+  the possible implications, like conflicting sequences of multiple
+  commands affecting the same voice(s), or commands affecting multiple
+  groups/voices/etc in a complex way, before designing our approach.
+  We'll need a lot of tests in this area before implementation as well.
+  Consider spawning adversarial review agents both before starting the
+  fix and after implementing it."
 
 This commit was authored by Claude (AI assistant) working with Ben Andrews.
 

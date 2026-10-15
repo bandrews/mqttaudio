@@ -1724,6 +1724,8 @@ struct CommandScheduler {
     pending: pending_plays::PendingPlays<UnstartedPlay>,
     /// The pending play each running play load belongs to.
     play_loads: std::collections::HashMap<tokio::task::Id, u64>,
+    /// The running cache command loads.
+    cache_loads: std::collections::HashSet<tokio::task::Id>,
 }
 
 impl CommandScheduler {
@@ -1733,7 +1735,14 @@ impl CommandScheduler {
             load_permit,
             pending: pending_plays::PendingPlays::new(),
             play_loads: std::collections::HashMap::new(),
+            cache_loads: std::collections::HashSet::new(),
         }
+    }
+
+    /// Loads still doing work for a command. A load a stop cancelled has given up
+    /// its slot, though it stays in `loads` until the loop takes its end.
+    fn loads_running(&self) -> usize {
+        self.play_loads.len() + self.cache_loads.len()
     }
 
     /// The next background load to end. Never completes while no load is running.
@@ -1775,14 +1784,18 @@ impl CommandScheduler {
                 }
             }
             SchedulerInput::Loaded(Ok((
-                _,
+                task,
                 LoadDone::Cache {
                     command,
                     mut reply,
                     result,
                 },
-            ))) => finish_cache_command(command, reply.0.take(), result, ctx).await,
+            ))) => {
+                self.cache_loads.remove(&task);
+                finish_cache_command(command, reply.0.take(), result, ctx).await
+            }
             SchedulerInput::Loaded(Err(ended)) => {
+                self.cache_loads.remove(&ended.id());
                 // A play's load ends without a result only when it panicked; a
                 // cancelled play is no longer pending.
                 if let Some(key) = self.play_loads.remove(&ended.id()) {
@@ -1866,7 +1879,7 @@ impl CommandScheduler {
         reply: Option<tokio::sync::oneshot::Sender<mqtt::commands::CommandOutcome>>,
         ctx: &mut CommandCtx<'_>,
     ) {
-        if self.loads.len() >= MAX_CONCURRENT_LOADS {
+        if self.loads_running() >= MAX_CONCURRENT_LOADS {
             reject_for_load_limit(reply);
             return;
         }
@@ -1907,7 +1920,7 @@ impl CommandScheduler {
         reply: Option<tokio::sync::oneshot::Sender<mqtt::commands::CommandOutcome>>,
         ctx: &mut CommandCtx<'_>,
     ) {
-        if self.loads.len() >= MAX_CONCURRENT_LOADS {
+        if self.loads_running() >= MAX_CONCURRENT_LOADS {
             reject_for_load_limit(reply);
             return;
         }
@@ -1918,7 +1931,7 @@ impl CommandScheduler {
         // Built before the task so a load cancelled before it first runs still
         // answers its client.
         let reply = loading::PendingReply(reply);
-        self.loads.spawn(async move {
+        let load = self.loads.spawn(async move {
             let _permit = permit
                 .acquire_owned()
                 .await
@@ -1930,6 +1943,7 @@ impl CommandScheduler {
                 result,
             }
         });
+        self.cache_loads.insert(load.id());
     }
 
     /// Start a play whose load has ended, with the settings carried onto it.
@@ -1984,6 +1998,7 @@ impl CommandScheduler {
             tokio::task::JoinSet::new(),
         ));
         self.play_loads.clear();
+        self.cache_loads.clear();
     }
 
     /// A command that needs no load: it acts on the playing sounds at once, and on
@@ -3143,7 +3158,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                     if status.windowed || !sample_status_matches(&selector, status) {
                         continue;
                     }
-                    status.speed = speed;
+                    status.speed = audio::mixer::playable_speed(speed, pitch_correction);
                     let bundle = if pitch_correction {
                         Some(Box::new(audio::mixer::PitchBundle::for_voice(
                             status.channels,
@@ -4168,6 +4183,30 @@ mod tests {
             fixture.mixer.active_samples[0].pitch_corrector.is_some(),
             "pitch correction must engage on the upgraded Complete buffer"
         );
+    }
+
+    #[tokio::test]
+    async fn the_status_reports_the_speed_a_sound_plays_at() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("crank"), 1.0)).await;
+        for (requested, plays_at) in [(150.0, 100.0), (0.001, 0.01), (-150.0, -100.0)] {
+            fixture
+                .run(AudioCommand::Speed {
+                    selector: SampleSelector {
+                        internal_id: None,
+                        id: None,
+                        file: None,
+                        voice: Some("crank".to_string()),
+                    },
+                    speed: requested,
+                    pitch_correction: false,
+                })
+                .await;
+            fixture.drain();
+            assert_eq!(fixture.mixer.active_samples[0].speed, plays_at);
+            let status = fixture.playing.values().next().expect("the sound's status");
+            assert_eq!(status.speed, plays_at, "requested {requested}");
+        }
     }
 
     #[tokio::test]
@@ -5995,6 +6034,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_counts_cache_commands_against_the_load_limit_until_they_end() {
+        let (mut scheduler, permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+        let precache = serde_json::json!({"command": "precache", "file": TEST_WAV}).to_string();
+        let mut in_flight = Vec::new();
+        for _ in 0..MAX_CONCURRENT_LOADS {
+            in_flight.push(submit(&mut fixture, &mut scheduler, &precache).await);
+        }
+
+        let mut rejected = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        assert_eq!(
+            outcome_of(&mut rejected).unwrap_err().message,
+            "Too many concurrent loads"
+        );
+
+        permits.add_permits(1);
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        let mut accepted = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        assert!(
+            is_waiting(&mut accepted),
+            "a finished cache command gives up its slot"
+        );
+    }
+
+    #[tokio::test]
     async fn scheduler_stopall_cancels_a_load_in_flight() {
         let (mut scheduler, permits) = scheduler_with(0);
         let mut fixture = Fixture::new(vec![]);
@@ -6653,6 +6717,36 @@ mod tests {
         gate.release();
         finish_every_load(&mut fixture, &mut scheduler).await;
         assert_eq!(fixture.playing.len(), 1, "only the replacement plays");
+    }
+
+    #[tokio::test]
+    async fn plays_a_stop_cancelled_leave_their_load_slots_to_later_plays() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gates: Vec<Gate> = (0..MAX_CONCURRENT_LOADS)
+            .map(|i| server.hold(&format!("l{i}.wav")))
+            .collect();
+        for i in 0..MAX_CONCURRENT_LOADS {
+            submit(
+                &mut fixture,
+                &mut scheduler,
+                &play_from(&server.url(&format!("l{i}.wav")), Some("V"), None),
+            )
+            .await;
+        }
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_stop", "voice": "V"}"#,
+        )
+        .await;
+
+        let mut play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "W")).await;
+        match play.try_recv() {
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            answered => panic!("the play is loading, not answered at once: {answered:?}"),
+        }
+        finish_every_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(outcome_of(&mut play).unwrap(), "Command completed");
     }
 
     #[tokio::test]

@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which stopped every other load as well. The windowed open now fails after 30 seconds and its download
   after 60 seconds without data, as a fully loaded play already did, and a freshness check gives up after
   5 seconds and keeps the cached copy.
+- **`/status/samples` shows the speed a sound plays at.** A `speed` outside the playable range (beyond
+  ±100, beyond 8 with pitch correction, or nearer zero than 0.01) was recorded as requested while the
+  sound played at the nearest playable speed.
 - **A play whose load task panicked is answered with 500.** It got the 409 of a play cancelled by a stop.
   It now gets `Load of <file> stopped unexpectedly`, and the panic is logged as an error.
 - **A load cancelled before it began is answered with 409.** When `stopall`, `fadeall` or shutdown

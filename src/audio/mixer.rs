@@ -431,24 +431,18 @@ impl ActiveSample {
     /// (e.g., negative speed with pitch correction enabled).
     pub fn set_speed(&mut self, speed: f32) -> bool {
         if self.pitch_corrector.is_some() {
-            // Pitch correction: 0.05 to 8.0, no reverse. Rejected silently — this
-            // runs on the audio thread (D57); the dispatcher validates and warns
-            // control-side before sending.
+            // Pitch correction: no reverse. Rejected silently — this runs on the
+            // audio thread (D57); the dispatcher validates and warns control-side
+            // before sending.
             if speed < 0.0 {
                 return false;
             }
-            self.speed = speed.clamp(0.05, 8.0);
+            self.speed = playable_speed(speed, true);
             if let Some(ref mut pc) = self.pitch_corrector {
                 pc.set_speed(self.speed);
             }
         } else {
-            // No pitch correction: -100.0 to 100.0, but not zero
-            if speed.abs() < 0.01 {
-                // Treat very small speeds as minimum
-                self.speed = if speed < 0.0 { -0.01 } else { 0.01 };
-            } else {
-                self.speed = speed.clamp(-100.0, 100.0);
-            }
+            self.speed = playable_speed(speed, false);
         }
         true
     }
@@ -1325,6 +1319,23 @@ impl PitchBundle {
             scratch,
             input_scratch: vec![0.0; max_block_frames.max(1) * 8 * channels],
         }
+    }
+}
+
+/// The speed a sample plays at when `speed` is requested: 0.05 to 8.0 with pitch
+/// correction, and without it -100.0 to 100.0, never nearer zero than 0.01 (a very
+/// small speed is treated as the minimum).
+pub fn playable_speed(speed: f32, pitch_correction: bool) -> f32 {
+    if pitch_correction {
+        speed.clamp(0.05, 8.0)
+    } else if speed.abs() < 0.01 {
+        if speed < 0.0 {
+            -0.01
+        } else {
+            0.01
+        }
+    } else {
+        speed.clamp(-100.0, 100.0)
     }
 }
 
