@@ -163,7 +163,7 @@ struct Voice {
     id: String,
     sample_ids: Vec<u64>,
     volume: f32,
-    fade_state: Option<FadeState>,
+    loading_plays: usize, // plays naming this voice that are still loading
 }
 ```
 
@@ -194,6 +194,13 @@ struct Voice {
 11. **Latency: ~100-300ms**
 
 ## Key Components
+
+### Command Scheduler (`src/main.rs`, `src/pending_plays.rs`)
+
+Takes commands from MQTT and HTTP. A play's file loads in the background while
+the scheduler keeps the play; commands that arrive meanwhile carry their
+settings onto it or cancel it, and the play starts when its load finishes. See
+[Command ordering](command-ordering.md).
 
 ### Mixer (`src/audio/mixer.rs`)
 
@@ -309,6 +316,7 @@ src/
 ├── http/
 │   ├── mod.rs           # HTTP REST API
 │   └── handlers.rs      # Request handlers
+├── pending_plays.rs     # Plays still loading, and the commands that reach them
 └── voice.rs             # Voice management
 ```
 

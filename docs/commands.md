@@ -47,6 +47,8 @@ Play an audio file.
 | `crossfade_ms` | integer | 0 | Crossfade duration at loop boundaries (0 = disabled) |
 | `fade_in` | integer | 0 | Fade-in duration (milliseconds) |
 | `start_position_ms` | integer | 0 | Start position (milliseconds) |
+| `speed` | float | 1.0 | Start speed, as the [`speed`](#speed) command sets it. `0` is rejected; a negative speed plays backwards from `start_position_ms` |
+| `pitch_correction` | boolean | false | Start with pitch correction, as the [`speed`](#speed) command sets it. Rejected with a negative `speed` |
 | `channel_map` | array | auto | Channel routing (see below) |
 | `mode` | string | `auto` | Load strategy: `auto` (decide by size/duration + memory budget), `full` (always in-memory), or `stream` (window a big/long file). Applies to local files and `http(s)://` URLs. A windowed voice plays forward only |
 | `window_ms` | integer | config | Windowed-source ring depth override (streamed plays) |
@@ -57,6 +59,10 @@ Play an audio file.
 Volumes are gains: 1.0 is unity, below that attenuates and above that boosts, up
 to 4.0 (+12 dB). The mixer saturates its output, so a boost loud enough to
 exceed full scale clips rather than wrapping around.
+
+A windowed play (`mode: "stream"`, or a file long or large enough for `auto` to
+window) plays forward only, so it ignores `speed` and `pitch_correction`, starts
+at normal speed, and logs a warning.
 
 **Channel Mapping:**
 
@@ -154,7 +160,9 @@ a microphone.
 
 ## Sample Targeting Commands
 
-These commands control specific playing samples by ID, filename, or voice.
+These commands control specific playing samples by ID, filename, or voice. They
+also reach a play whose file is still loading; see
+[Commands sent while a play is loading](#commands-sent-while-a-play-is-loading).
 
 ### stop
 
@@ -177,7 +185,7 @@ Stop specific samples.
 | `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
 | `fade_out_ms` | integer | 10 | Fade-out duration (milliseconds). The 10 ms default avoids clicks on abrupt stops |
 
-At least one of `internal_id`, `id`, `file`, or `voice` is required. Multiple selectors use OR logic (a sample matches if any one criterion matches). An empty selector matches nothing and is silently a no-op.
+At least one of `internal_id`, `id`, `file`, or `voice` is required. Multiple selectors use OR logic (a sample matches if any one criterion matches). A command with an empty selector is rejected: HTTP answers 400, and over MQTT it is logged as a failed command.
 
 ### seek
 
@@ -300,6 +308,36 @@ Adjust volume for all samples in a voice.
 |-----------|------|---------|-------------|
 | `voice` | string | *required* | Voice name |
 | `volume` | float | *required* | New volume (0.0 to 4.0, unity is 1.0) |
+
+---
+
+## Commands sent while a play is loading
+
+A `play` loads its file before the sound starts, which takes a while for a cold
+file or a URL. Commands that arrive in the meantime still reach the new sound,
+as if they had arrived just after it started:
+
+- `speed`, `volume` and `seek` change the sounds already playing at once, and the
+  play starts with the new setting. When several of one kind arrive, the last
+  one wins.
+- `stop`, `voice_stop` and `voice_fade_out` cancel a matching play before it
+  starts, so it is never heard. An HTTP client waiting on the `play` gets 409.
+- `voice_volume` sets the voice's volume. A voice exists from the moment a play
+  naming it arrives, so the play starts at that volume, and `/status/voices`
+  lists the voice while its play loads.
+- `internal_id` cannot reach a play that has not started, because the id is
+  assigned when it starts. A play without a `voice` can be reached only by `id`
+  or `file` until then.
+- A command that reaches only plays still loading reports success. A stop
+  removes a loading play at once, so a later command that named only that play
+  is answered "not found", where a sound that had started would still be
+  fading.
+- A windowed play plays forward only, so it starts at normal speed from the
+  beginning whatever `speed` or `seek` reached it, and logs a warning.
+
+Commands do not wait for loads, and a play starts when its own load finishes,
+so plays do not always start in the order they were sent. See
+[command ordering](command-ordering.md) for the full rules.
 
 ---
 

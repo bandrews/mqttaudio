@@ -13,6 +13,8 @@ pub struct Voice {
     pub sample_ids: Vec<u64>,
     /// Voice-level volume (0.0 - 1.0)
     pub volume: f32,
+    /// Plays naming this voice whose audio is still loading
+    pub loading_plays: usize,
 }
 
 impl Voice {
@@ -22,6 +24,7 @@ impl Voice {
             id,
             sample_ids: Vec::new(),
             volume: 1.0,
+            loading_plays: 0,
         }
     }
 
@@ -36,9 +39,9 @@ impl Voice {
         self.sample_ids.retain(|&id| id != sample_id);
     }
 
-    /// Check if this voice is empty (no active samples)
+    /// Check if this voice is empty: no active samples and no play loading into it
     pub fn is_empty(&self) -> bool {
-        self.sample_ids.is_empty()
+        self.sample_ids.is_empty() && self.loading_plays == 0
     }
 
     /// Get the number of active samples in this voice
@@ -170,6 +173,27 @@ impl VoiceManager {
     /// Clean up empty voices
     pub fn cleanup_empty_voices(&mut self) {
         self.voices.retain(|_, voice| !voice.is_empty());
+    }
+
+    /// A play naming this voice started loading. The voice exists until the play
+    /// starts or is abandoned, even with no sound playing in it.
+    pub fn add_loading_play(&mut self, voice_id: &str) {
+        self.get_or_create_voice(voice_id).loading_plays += 1;
+    }
+
+    /// A play naming this voice stopped loading: it started, failed, or was
+    /// cancelled. The voice is dropped if nothing else keeps it.
+    pub fn remove_loading_play(&mut self, voice_id: &str) {
+        if let Some(voice) = self.voices.get_mut(voice_id) {
+            debug_assert!(
+                voice.loading_plays > 0,
+                "voice '{voice_id}' let go of a loading play it was not holding"
+            );
+            voice.loading_plays = voice.loading_plays.saturating_sub(1);
+            if voice.is_empty() {
+                self.voices.remove(voice_id);
+            }
+        }
     }
 }
 
@@ -364,5 +388,96 @@ mod tests {
 
         // Verify music is still there
         assert!(manager.get_voice("music").is_some());
+    }
+
+    #[test]
+    fn a_voice_with_a_loading_play_exists_before_any_sound_plays() {
+        let mut manager = VoiceManager::new();
+        manager.add_loading_play("amb");
+
+        assert_eq!(manager.voice_count(), 1);
+        assert_eq!(manager.get_voice("amb").map(Voice::sample_count), Some(0));
+        assert!(
+            manager.set_voice_volume("amb", 0.3),
+            "voice_volume reaches a voice whose play is still loading"
+        );
+    }
+
+    #[test]
+    fn a_play_starting_in_a_held_voice_takes_its_volume() {
+        let mut manager = VoiceManager::new();
+        manager.add_loading_play("amb");
+        manager.set_voice_volume("amb", 0.3);
+
+        manager.add_sample_to_voice("amb");
+        manager.remove_loading_play("amb");
+
+        assert_eq!(manager.get_voice_volume("amb"), Some(0.3));
+        assert_eq!(manager.get_voice("amb").map(Voice::sample_count), Some(1));
+    }
+
+    #[test]
+    fn a_voice_keeps_its_volume_while_a_play_into_it_loads() {
+        let mut manager = VoiceManager::new();
+        let playing = manager.add_sample_to_voice("amb");
+        manager.set_voice_volume("amb", 0.3);
+        manager.add_loading_play("amb");
+
+        // The last playing sound finishes while the next play is still loading.
+        manager.remove_sample(playing);
+        assert_eq!(manager.get_voice_volume("amb"), Some(0.3));
+
+        manager.remove_loading_play("amb");
+        assert!(
+            manager.get_voice("amb").is_none(),
+            "with nothing playing or loading, the voice ends"
+        );
+    }
+
+    #[test]
+    fn a_voice_ends_when_its_last_loading_play_is_abandoned() {
+        let mut manager = VoiceManager::new();
+        manager.add_loading_play("amb");
+        manager.add_loading_play("amb");
+
+        manager.remove_loading_play("amb");
+        assert!(
+            manager.get_voice("amb").is_some(),
+            "one play is still loading"
+        );
+        manager.remove_loading_play("amb");
+        assert_eq!(manager.voice_count(), 0);
+    }
+
+    #[test]
+    fn clearing_a_voice_keeps_it_while_a_play_into_it_loads() {
+        let mut manager = VoiceManager::new();
+        let playing = manager.add_sample_to_voice("amb");
+        manager.add_loading_play("amb");
+
+        assert_eq!(manager.clear_voice("amb"), vec![playing]);
+        assert!(manager.get_voice("amb").is_some());
+
+        manager.remove_loading_play("amb");
+        assert_eq!(manager.voice_count(), 0);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "let go of a loading play it was not holding")]
+    fn letting_go_of_a_loading_play_twice_is_caught() {
+        let mut manager = VoiceManager::new();
+        manager.add_sample_to_voice("amb");
+        manager.add_loading_play("amb");
+        manager.remove_loading_play("amb");
+        manager.remove_loading_play("amb");
+    }
+
+    #[test]
+    fn removing_a_loading_play_from_an_unknown_voice_changes_nothing() {
+        let mut manager = VoiceManager::new();
+        manager.add_sample_to_voice("music");
+        manager.remove_loading_play("amb");
+        assert_eq!(manager.voice_count(), 1);
     }
 }

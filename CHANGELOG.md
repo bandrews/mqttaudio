@@ -7,8 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`play` takes `speed` and `pitch_correction`.** A sound can start at a speed, with or without pitch
+  correction, instead of needing a `speed` command right after the play. Both fields mean exactly what
+  they mean on the `speed` command, with the same ranges and defaults (1.0, no correction); `speed: 0`
+  and a negative speed with `pitch_correction` reject the play. A windowed play cannot change speed, so
+  it starts at normal speed and logs a warning. The typed `POST /play` endpoint accepts both fields.
+
+### Changed
+
+- **A stop cancels a matching play that has not started.** `stop`, `voice_stop` and `voice_fade_out`
+  cancel the matching plays whose files are still loading, as `stopall` and `fadeall` already did for
+  every play. A cancelled play is never heard, its HTTP client gets 409, and the log says `Cancelled play
+  of <file>: <reason>`. A voice now exists from the moment a play naming it arrives, so `/status/voices`
+  lists it while the play loads, `active_voices` counts it, and `voice_volume` sets it.
+
 ### Fixed
 
+- **A `speed` with `pitch_correction` no longer kills the daemon.** A sound whose file was still
+  decoding could record a sample rate of 0, read while the decoder held its buffer, and a `speed` with
+  `pitch_correction` then built the pitch stretcher for that rate, which ends the process with SIGFPE (a
+  division by zero in the native library). A sound now records the rate and channel count it read before it
+  started, and a play that starts with pitch correction builds its stretcher from them too.
+- **Commands sent right after a `play` reach it.** A `speed`, `seek`, `volume`, `stop`, `voice_stop`,
+  `voice_fade_out` or `voice_volume` that arrived while the play's file was still loading ran first,
+  matched nothing (`No sample matches the selector`, or for the voice commands `Voice '<name>' not found`,
+  with `or already empty` for `voice_stop` and `voice_fade_out`) and was lost: the sound started at normal
+  speed, and a looping play followed by a `voice_stop` kept playing. With messages under about 300 µs
+  apart this happened most of the time, and for longer with cold files and URLs. A command now reaches a
+  play that is still loading as if the play had already started: `speed`, `volume` and `seek` carry over
+  and the sound starts with them, and stops cancel the play. Commands do not wait for loads, and plays
+  still start in the order their loads finish. See `docs/command-ordering.md`.
+- **Failed MQTT commands are logged again.** An MQTT sender gets no reply, and several failures left no
+  trace at all: a selector that matched nothing (such as a `speed` for a sound that had already ended), an
+  empty selector, and the concurrent-load limit. Each failed command with no client waiting is now logged
+  once as `Command failed: <reason>`, unless its own handler already logged it. HTTP clients still get the
+  failure in their response.
+- **HTTP plays and cache checks give up on a server that stops answering.** A windowed HTTP play (one
+  that streams instead of loading fully) waited forever for the response headers of a server that accepted
+  the connection but never answered, and its download waited forever when the server stopped sending
+  partway through. Each such load also held one of the four load slots, so four of them stopped every later
+  play from loading. A cached URL's freshness check waited forever for its answer while holding the cache,
+  which stopped every other load as well. The windowed open now fails after 30 seconds and its download
+  after 60 seconds without data, as a fully loaded play already did, and a freshness check gives up after
+  5 seconds and keeps the cached copy.
+- **`volume` reaches windowed plays.** A `volume` aimed at a windowed play (`mode: "stream"`, or a file
+  long or large enough for `auto` to window) changed nothing audible, though `/status/samples` reported the
+  new volume. It now ramps the stream to that volume, as it does a fully loaded sound.
+- **`/status/samples` shows the speed a sound plays at.** A `speed` outside the playable range (beyond
+  ±100, beyond 8 with pitch correction, or nearer zero than 0.01) was recorded as requested while the
+  sound played at the nearest playable speed.
+- **A play whose load task panicked is answered with 500.** It got the 409 of a cancelled load.
+  It now gets `Load of <file> stopped unexpectedly`, and the panic is logged as an error.
+- **A load cancelled before it began is answered with 409.** When `stopall`, `fadeall` or shutdown
+  cancelled a play or cache command whose background load had not started running yet, its HTTP request
+  got a 500 "Command was dropped before completion" instead of the 409 every other cancelled load gets.
+- **Finished sounds leave their voice again.** The voice manager never dropped a finished sample or an
+  empty voice, so it grew with every play (each play without a `voice` added a new one), `/status/voices`
+  listed voices whose sounds had ended, `voice_stop` and `voice_fade_out` on such a voice reported success
+  for sounds that no longer existed, and a later play into a reused voice name inherited the old
+  `voice_volume`. The reaper now removes each finished sample and streamed source from its voice and drops
+  the voice with its last sound, so those commands report "not found" and a voice played again starts at
+  full volume.
 - **Per-route `gain` in `channel_map` now applies to streamed plays.** A windowed play (`mode: "stream"`,
   or a file long or large enough for `auto` to window) resolved its routes but discarded each route's
   `gain`, so the mix ran at unity while a fully loaded play of the same command honoured it. The streamed

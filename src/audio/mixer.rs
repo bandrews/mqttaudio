@@ -431,24 +431,18 @@ impl ActiveSample {
     /// (e.g., negative speed with pitch correction enabled).
     pub fn set_speed(&mut self, speed: f32) -> bool {
         if self.pitch_corrector.is_some() {
-            // Pitch correction: 0.05 to 8.0, no reverse. Rejected silently — this
-            // runs on the audio thread (D57); the dispatcher validates and warns
-            // control-side before sending.
+            // Pitch correction: no reverse. Rejected silently — this runs on the
+            // audio thread (D57); the dispatcher validates and warns control-side
+            // before sending.
             if speed < 0.0 {
                 return false;
             }
-            self.speed = speed.clamp(0.05, 8.0);
+            self.speed = playable_speed(speed, true);
             if let Some(ref mut pc) = self.pitch_corrector {
                 pc.set_speed(self.speed);
             }
         } else {
-            // No pitch correction: -100.0 to 100.0, but not zero
-            if speed.abs() < 0.01 {
-                // Treat very small speeds as minimum
-                self.speed = if speed < 0.0 { -0.01 } else { 0.01 };
-            } else {
-                self.speed = speed.clamp(-100.0, 100.0);
-            }
+            self.speed = playable_speed(speed, false);
         }
         true
     }
@@ -463,11 +457,19 @@ impl ActiveSample {
     /// (F10), priming its analysis buffers so the first mixed block already carries
     /// signal. The pre-roll reads a borrowed slice of the already-decoded buffer and
     /// produces no output, so it allocates nothing on the audio thread.
-    pub fn enable_pitch_correction(&mut self) {
+    ///
+    /// Returns whether correction is enabled. A buffer still decoding cannot report
+    /// its channels or rate while its decoder holds it, and the stretcher cannot be
+    /// built without them, so correction is not enabled then.
+    pub fn enable_pitch_correction(&mut self) -> bool {
         if self.pitch_corrector.is_some() {
-            return;
+            return true;
         }
-        let mut pc = PitchCorrector::new(self.buffer.channels(), self.buffer.sample_rate());
+        let (channels, sample_rate) = (self.buffer.channels(), self.buffer.sample_rate());
+        if channels == 0 || sample_rate == 0 {
+            return false;
+        }
+        let mut pc = PitchCorrector::new(channels, sample_rate);
         pc.set_speed(self.speed);
         self.preroll_corrector(&mut pc);
         // A fresh stretcher starts with no pending input fraction and no tail.
@@ -478,7 +480,7 @@ impl ActiveSample {
         // the per-block drain at EOF never allocates on the audio thread. This sits
         // alongside the (already heap-allocating) stretcher construction, off the
         // per-block mix path.
-        let tail_samples = pc.output_latency() * self.buffer.channels();
+        let tail_samples = pc.output_latency() * channels;
         if self.pitch_tail_buffer.len() < tail_samples {
             self.pitch_tail_buffer.resize(tail_samples, 0.0);
         }
@@ -487,7 +489,7 @@ impl ActiveSample {
         // mid-playback (there is prior audio to be continuous with); a first enable
         // at the very start has nothing to cross-fade from.
         if self.position > 0 {
-            let xfade = (self.buffer.sample_rate() as usize / 200).max(1); // ~5 ms
+            let xfade = (sample_rate as usize / 200).max(1); // ~5 ms
             self.pitch_crossfade_remaining = xfade;
             self.pitch_crossfade_total = xfade;
             self.pitch_crossfade_direct_pos = self.precise_position();
@@ -495,9 +497,9 @@ impl ActiveSample {
             self.pitch_crossfade_remaining = 0;
             self.pitch_crossfade_total = 0;
         }
-        self.pitch_input_scratch
-            .resize(8192 * 8 * self.buffer.channels().max(1), 0.0);
+        self.pitch_input_scratch.resize(8192 * 8 * channels, 0.0);
         self.pitch_corrector = Some(pc);
+        true
     }
 
     /// Feed `pc` the audio leading up to `self.position` so it is primed and emits
@@ -528,11 +530,14 @@ impl ActiveSample {
     /// must be changed before setting speed (negative speeds are rejected
     /// while pitch correction is enabled).
     ///
-    /// Returns true if the speed was set, false if rejected.
+    /// Returns true if the speed was set, false if rejected, including when the
+    /// requested correction cannot be enabled yet.
     pub fn set_speed_with_mode(&mut self, speed: f32, pitch_correction: bool) -> bool {
         // Change pitch correction mode FIRST
         if pitch_correction {
-            self.enable_pitch_correction();
+            if !self.enable_pitch_correction() {
+                return false;
+            }
         } else {
             self.disable_pitch_correction();
         }
@@ -1098,8 +1103,11 @@ pub struct StreamedSource {
     /// Number of channels the producer writes (interleaved).
     pub input_channels: usize,
 
-    /// Per-source volume (0.0 - 1.0).
+    /// Per-source volume (0.0 - 1.0) - current smoothed value.
     pub volume: f32,
+
+    /// Target per-source volume for smooth ramping (0.0 - 1.0).
+    pub target_volume: f32,
 
     /// Voice-level volume (0.0 - 1.0) - current smoothed value.
     pub voice_volume: f32,
@@ -1143,8 +1151,8 @@ pub struct StreamedSource {
 impl StreamedSource {
     /// Build a streamed source over `consumer`, the read end of the ring the producer
     /// task fills. `producer_done`/`stop_flag` are the shared handles the producer
-    /// task also holds. Voice volume starts at unity and ramps toward
-    /// `target_voice_volume`.
+    /// task also holds. The source starts at `volume` and voice volume at unity;
+    /// each then ramps toward its target.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: u64,
@@ -1166,6 +1174,7 @@ impl StreamedSource {
             consumer,
             input_channels,
             volume: volume.clamp(0.0, crate::config::MAX_GAIN),
+            target_volume: volume.clamp(0.0, crate::config::MAX_GAIN),
             voice_volume: 1.0,
             target_voice_volume: 1.0,
             channel_map,
@@ -1233,18 +1242,16 @@ impl StreamedSource {
         self.target_voice_volume = target.clamp(0.0, crate::config::MAX_GAIN);
     }
 
-    /// Advance voice volume toward target by one frame (linear ramp, matching the
-    /// other voices' ~22 ms transition at 44.1 kHz).
-    pub fn advance_voice_volume(&mut self) {
-        const RAMP_RATE: f32 = 0.001;
+    /// Set target per-source volume for smooth ramping.
+    pub fn set_target_volume(&mut self, target: f32) {
+        self.target_volume = target.clamp(0.0, crate::config::MAX_GAIN);
+    }
 
-        if (self.voice_volume - self.target_voice_volume).abs() < RAMP_RATE {
-            self.voice_volume = self.target_voice_volume;
-        } else if self.voice_volume < self.target_voice_volume {
-            self.voice_volume += RAMP_RATE;
-        } else {
-            self.voice_volume -= RAMP_RATE;
-        }
+    /// Advance the source and voice volumes toward their targets by one frame
+    /// (linear ramp, matching the samples' ~22 ms transition at 44.1 kHz).
+    pub fn advance_volumes(&mut self) {
+        ramp_toward(&mut self.voice_volume, self.target_voice_volume);
+        ramp_toward(&mut self.volume, self.target_volume);
     }
 
     /// Whether this source has finished and can be reaped off the audio thread. A
@@ -1314,6 +1321,23 @@ impl PitchBundle {
             scratch,
             input_scratch: vec![0.0; max_block_frames.max(1) * 8 * channels],
         }
+    }
+}
+
+/// The speed a sample plays at when `speed` is requested: 0.05 to 8.0 with pitch
+/// correction, and without it -100.0 to 100.0, never nearer zero than 0.01 (a very
+/// small speed is treated as the minimum).
+pub fn playable_speed(speed: f32, pitch_correction: bool) -> f32 {
+    if pitch_correction {
+        speed.clamp(0.05, 8.0)
+    } else if speed.abs() < 0.01 {
+        if speed < 0.0 {
+            -0.01
+        } else {
+            0.01
+        }
+    } else {
+        speed.clamp(-100.0, 100.0)
     }
 }
 
@@ -2195,9 +2219,9 @@ fn mix_streamed_source_into_output(
     let mut underrun_frames = 0usize;
 
     for frame_idx in 0..frames {
-        // Advance voice volume toward target every frame so the ramp stays
+        // Advance the volumes toward their targets every frame so the ramps stay
         // time-accurate across underruns.
-        source.advance_voice_volume();
+        source.advance_volumes();
 
         // source volume * voice volume * per-frame duck gain (D2) * fade-in/out
         // multiplier; the underrun fade gain is applied inside mix_ring_voice_frame.
@@ -5081,6 +5105,37 @@ mod tests {
         // Mix reverse 10 frames
         mix_audio(&mut output, &mut state);
         assert_eq!(state.active_samples[0].position, 50);
+    }
+
+    #[test]
+    fn pitch_correction_is_refused_while_a_decoding_buffer_cannot_report_its_rate() {
+        use std::sync::RwLock;
+        let streaming = Arc::new(RwLock::new(crate::audio::streaming::StreamingBuffer::new(
+            2, 48000, None,
+        )));
+        let mut sample = ActiveSample::new(
+            1,
+            "voice".into(),
+            SampleBuffer::Streaming(streaming.clone()),
+            1.0,
+            1.0,
+            "file.wav".into(),
+        );
+
+        // The decoder holds the buffer while it appends a chunk.
+        let appending = streaming.write().unwrap();
+        let accepted = sample.set_speed_with_mode(1.2, true);
+        drop(appending);
+        assert!(
+            !accepted,
+            "the speed is refused rather than applied without its correction"
+        );
+        assert_eq!(sample.speed, 1.0);
+        assert!(!sample.has_pitch_correction());
+
+        assert!(sample.set_speed_with_mode(1.2, true));
+        assert!(sample.has_pitch_correction());
+        assert_eq!(sample.speed, 1.2);
     }
 
     // === set_speed_with_mode Tests ===

@@ -292,6 +292,11 @@ fn apply_mutation(state: &mut MixerState, cmd: &AudioCommand, output_sample_rate
                     sample.set_target_volume(*volume);
                 }
             }
+            for source in state.streamed_sources.iter_mut() {
+                if streamed_matches(selector, source) {
+                    source.set_target_volume(*volume);
+                }
+            }
         }
     }
 }
@@ -1131,6 +1136,36 @@ mod tests {
             Arc::new(AtomicBool::new(producer_done)),
             Arc::new(AtomicBool::new(false)),
         )
+    }
+
+    #[test]
+    fn set_volume_matching_reaches_matching_streamed_sources() {
+        let mut state = state_with(vec![]);
+        state
+            .streamed_sources
+            .push(streamed_with(1, "bed", &[], false));
+        state
+            .streamed_sources
+            .push(streamed_with(2, "other", &[], false));
+        apply_command(
+            &mut state,
+            AudioCommand::SetVolumeMatching {
+                selector: selector_voice("bed"),
+                volume: 10.0,
+            },
+            48000,
+        );
+        assert_eq!(
+            state.streamed_sources[0].volume, 1.0,
+            "gain must ramp from the current level"
+        );
+        assert_eq!(
+            state.streamed_sources[0].target_volume,
+            crate::config::MAX_GAIN
+        );
+        assert_eq!(state.streamed_sources[1].target_volume, 1.0);
+        state.streamed_sources[0].advance_volumes();
+        assert!(state.streamed_sources[0].volume > 1.0);
     }
 
     fn is_fading_out_streamed(source: &StreamedSource) -> bool {

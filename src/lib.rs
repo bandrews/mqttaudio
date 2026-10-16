@@ -41,6 +41,9 @@ pub mod http;
 pub mod config;
 pub mod config_editor;
 pub mod loading;
+pub mod pending_plays;
 pub mod rt_engine;
 pub mod talkback;
+#[cfg(test)]
+mod test_support;
 pub mod voice;

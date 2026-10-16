@@ -304,17 +304,21 @@ pub(crate) fn http_client() -> &'static reqwest::Client {
 /// Send a GET request, bounding connect and header time so a wedged server
 /// cannot stall the caller indefinitely. The body is not bounded here.
 pub(crate) async fn get_with_timeout(url: &str) -> Result<reqwest::Response, String> {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(RESPONSE_TIMEOUT_SECS),
-        http_client().get(url).send(),
-    )
-    .await
-    {
+    get_with_response_limit(url, std::time::Duration::from_secs(RESPONSE_TIMEOUT_SECS)).await
+}
+
+/// Send a GET request with the shared client, failing when the response headers do
+/// not arrive within `response_limit`.
+async fn get_with_response_limit(
+    url: &str,
+    response_limit: std::time::Duration,
+) -> Result<reqwest::Response, String> {
+    match tokio::time::timeout(response_limit, http_client().get(url).send()).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(e)) => Err(format!("Failed to connect: {}", e)),
         Err(_) => Err(format!(
             "No response from server within {} seconds",
-            RESPONSE_TIMEOUT_SECS
+            response_limit.as_secs_f64()
         )),
     }
 }
@@ -546,11 +550,22 @@ fn header_string(response: &reqwest::Response, name: &str) -> Option<String> {
 }
 
 /// Open an HTTP URL and read its response headers, without downloading the body. Fails
-/// on a connection error or a non-success status.
+/// on a connection error, a non-success status, or no response within
+/// `RESPONSE_TIMEOUT_SECS`.
 pub async fn open_http_stream(url: &str) -> Result<OpenHttpStream, HttpStreamError> {
-    let response = reqwest::get(url)
+    open_http_stream_with_response_limit(url, std::time::Duration::from_secs(RESPONSE_TIMEOUT_SECS))
         .await
-        .map_err(|e| HttpStreamError::Request(format!("Failed to connect: {}", e)))?;
+}
+
+/// [`open_http_stream`], failing when the response headers do not arrive within
+/// `response_limit`.
+async fn open_http_stream_with_response_limit(
+    url: &str,
+    response_limit: std::time::Duration,
+) -> Result<OpenHttpStream, HttpStreamError> {
+    let response = get_with_response_limit(url, response_limit)
+        .await
+        .map_err(HttpStreamError::Request)?;
     if !response.status().is_success() {
         return Err(HttpStreamError::Request(format!(
             "HTTP {} from {}",
@@ -596,8 +611,22 @@ impl OpenHttpStream {
     /// download task. Resident memory stays O(channel) — the download parks when the
     /// channel is full and the decoder drains it as it consumes. When `persist` is set,
     /// the same bytes are teed to disk (temp file + atomic rename on success), so a
-    /// cacheable windowed play also lands in the disk cache for the next replay.
+    /// cacheable windowed play also lands in the disk cache for the next replay. The
+    /// download fails when no bytes arrive for `BODY_STALL_TIMEOUT_SECS`.
     pub fn into_bounded_reader(self, persist: Option<PersistTarget>) -> BoundedHttpReader {
+        self.into_bounded_reader_with_stall_limit(
+            persist,
+            std::time::Duration::from_secs(BODY_STALL_TIMEOUT_SECS),
+        )
+    }
+
+    /// [`Self::into_bounded_reader`], failing the download when no bytes arrive for
+    /// `stall_limit`.
+    fn into_bounded_reader_with_stall_limit(
+        self,
+        persist: Option<PersistTarget>,
+        stall_limit: std::time::Duration,
+    ) -> BoundedHttpReader {
         use futures_util::StreamExt;
         let (tx, rx) = mpsc::channel::<Result<Bytes, String>>(WINDOWED_CHUNK_CHANNEL_CAPACITY);
         let content_length = self.content_length;
@@ -622,7 +651,23 @@ impl OpenHttpStream {
                 None => None,
             };
 
-            while let Some(chunk_result) = stream.next().await {
+            loop {
+                let chunk_result = match tokio::time::timeout(stall_limit, stream.next()).await {
+                    Ok(Some(chunk_result)) => chunk_result,
+                    Ok(None) => break,
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(format!(
+                                "Download stalled: no data for {} seconds",
+                                stall_limit.as_secs_f64()
+                            )))
+                            .await;
+                        if let Some(s) = sink.take() {
+                            s.abandon().await;
+                        }
+                        return;
+                    }
+                };
                 match chunk_result {
                     Ok(chunk) => {
                         if let Some(s) = sink.as_mut() {
@@ -838,6 +883,50 @@ mod tests {
             content_length: len,
             finished: false,
         }
+    }
+
+    #[tokio::test]
+    async fn opening_a_stream_gives_up_when_the_server_sends_no_response() {
+        let server = crate::test_support::HeldServer::start(vec![], b"");
+        let opened = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            open_http_stream_with_response_limit(
+                &server.url(),
+                std::time::Duration::from_millis(200),
+            ),
+        )
+        .await
+        .expect("the open gives up at its response limit");
+        match opened {
+            Err(HttpStreamError::Request(message)) => {
+                assert_eq!(message, "No response from server within 0.2 seconds")
+            }
+            Err(other) => panic!("expected a request error, got {other}"),
+            Ok(_) => panic!("a server that sends nothing opens no stream"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bounded_download_reports_a_stall_at_its_limit() {
+        let server = crate::test_support::HeldServer::start(
+            vec![],
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\nRIFF",
+        );
+        let open = open_http_stream(&server.url()).await.unwrap();
+        let mut reader =
+            open.into_bounded_reader_with_stall_limit(None, std::time::Duration::from_millis(200));
+        let limit = std::time::Duration::from_secs(10);
+        let first = tokio::time::timeout(limit, reader.rx.recv())
+            .await
+            .expect("the first bytes arrive");
+        assert_eq!(first, Some(Ok(Bytes::from_static(b"RIFF"))));
+        let stalled = tokio::time::timeout(limit, reader.rx.recv())
+            .await
+            .expect("the stall is reported at its limit");
+        assert_eq!(
+            stalled,
+            Some(Err("Download stalled: no data for 0.2 seconds".to_string()))
+        );
     }
 
     #[test]

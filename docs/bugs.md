@@ -523,3 +523,154 @@ raises a `latency_ms` whose ring cannot hold two bursts, with a warning. Covered
 `run_mixer_sim` tests in `tests/input_resample_test.rs` (equal clocks at 256/512/1024-frame
 blocks, ±1.5% inside the authority, 4% beyond it) and
 `minimum_latency_holds_the_target_plus_one_burst`.
+
+## Commands sent right after a `play` can run before it (resolved in 2.1)
+
+A `play` loads its file outside the command loop, so `stopall` is never queued
+behind a slow load. Nothing ordered the commands that arrived while that load
+was in flight: a `speed`, `seek`, `volume`, `stop`, `voice_stop`,
+`voice_fade_out` or `voice_volume` aimed at the new sample ran immediately,
+matched nothing, and the play started afterwards with none of it applied. A
+`voice_stop` sent right after a looping `play` left the loop running
+indefinitely. Only `stopall` and `fadeall` were covered, by a generation counter
+that discarded the loads they overtook.
+
+Both `main` (the Play arm hands the load to `tokio::spawn`) and 2.1.0-rc.1 (the
+play waits in the `loads` JoinSet and re-enters the loop once prepared) have
+this. It shows up in the log as `Command failed: Speed command matched no
+active samples` on `main` and `Command failed: No sample matches the selector`
+on rc.1.
+
+Measured with a local broker and a null ALSA sink, sending `play` then `speed`
+for the same voice on one connection, 20 pairs per gap, counting `Set speed`
+log lines:
+
+| Gap between messages | `main` dropped | 2.1.0-rc.1 dropped |
+|---|---|---|
+| 0 µs, cached file | 20/20 | 20/20 |
+| 100 µs, cached file | 19/20 | 20/20 |
+| 300 µs, cached file | 12/20 | 8/20 |
+| 1 ms, cached file | 1/20 | 0/20 |
+| 1 ms, first play of a 30 s WAV | 20/20 | 3/20 |
+| 5 ms, first play of a 30 s WAV | 20/20 | 0/20 |
+| 20 ms, first play of a 30 s WAV | 6/20 | 0/20 |
+
+The window is the load time, so it grows with cold files, HTTP URLs, and
+contention for the cache lock. A delay between messages narrowed the window
+but did not close it. HTTP clients that wait for the `play` response before
+sending the next command were ordered correctly, because the response is only
+sent once the play has been dispatched.
+
+The command loop now keeps each play until it starts. A command that reaches
+one carries its setting onto it (`speed`, `volume`, `seek`) or cancels it
+(`stop`, `voice_stop`, `voice_fade_out`), and a voice exists while a play naming
+it loads, so `voice_volume` reaches it directly. `docs/command-ordering.md` has
+the rules and the remaining differences from one-at-a-time processing; plays
+still start in the order their loads finish. The same sweep against the fixed
+build, checking each sound's speed in `/status/samples` instead of counting log
+lines: 20/20 at 1.08x for every gap in the table, and for a cached file at
+5 ms and a first play at 0 µs, with no `Command failed` lines. `voice_stop` sent
+0, 100 µs or 1 ms after a looping `play` left 0 of 50 loops running.
+
+## Cache commands are not ordered against plays
+
+`precache`, `cache_clear`, `cache_invalidate` and `cache_reload` run as
+background tasks next to play loads, with nothing ordering them. A
+`cache_invalidate` or `cache_reload` of a file followed at once by a `play` of
+it can race the play's load, so the play may still start from the stale entry.
+`stopall` and `fadeall` also abort these tasks along with play loads, so a
+`cache_reload` cut off by a stop can leave the entry invalidated but not
+reloaded. Left alone because ordering them needs a play's load (not its start)
+to wait for earlier cache work on the same file, which is a different mechanism
+from the carry-over in `docs/command-ordering.md`.
+
+## Pitch correction engages unprimed when a cold play's load completes
+
+A `speed` with `pitch_correction` (or a `play` with both) aimed at a cold play
+whose progressive load is still filling installs the corrector while the buffer
+cannot be pre-rolled. The mixer plays the speed without correction until the
+D51 upgrade swaps in the complete buffer, then switches straight to the
+corrector's output. There is no pre-roll and no direct-to-stretched crossfade,
+which `apply_shipped_speed` uses when correction is enabled on a complete
+buffer. Expect an audible switch from pitch-shifted to corrected audio, possibly
+with a short gap while the stretcher warms up. A dispatch warning says the
+correction is deferred. Left alone because the fix belongs in the upgrade path
+(prime and crossfade on `UpgradeSampleBuffer`) and needs its own render test.
+
+## `voice_volume` on a live input's voice misreports the input in status
+
+When a voice id belongs to a live input, `voice_volume` writes the target into
+that input's `volume` and `unmuted_volume` in the status snapshot and marks it
+unmuted. On the audio thread it only sets the input's voice multiplier, which is
+separate from the input volume and does not unmute it. `/status/inputs` then
+reports a volume and mute state the input does not have. Left alone as a
+status-reporting fix outside the command-ordering work.
+
+## A play dropped by a full audio command ring stays in its voice
+
+A play registers its sample with the voice manager before pushing it onto the
+1024-entry audio command ring. If the ring is full, the push fails (logged as
+"Audio command ring full") and the sample never reaches the mixer, so it never
+reaches the graveyard and the reaper never removes it from its voice. Narrow,
+since the ring only fills when the audio thread stalls. Left alone because the
+fix is to register after a successful push, which touches both play paths.
+
+## Windowed plays ignore `start_position_ms`
+
+A play that windows (`mode: "stream"`, or a file long or large enough for `auto`
+to window) always starts from the beginning: neither the local nor the HTTP
+windowed path passes `start_position_ms` to the streamed source, and nothing
+warns about the play's own `start_position_ms`. A `seek` carried onto a
+windowed play while it loads does warn. The docs only say a windowed voice
+"plays forward only". Left alone because starting a windowed decode at an offset
+is a feature of the streamed source, not a dispatch fix.
+
+## `seek` does not reach streamed sources
+
+The audio thread applies `SeekMatching` to `active_samples` only, so a `seek`
+aimed at a windowed play changes nothing; a windowed play plays forward only.
+A `seek` naming a streamed voice warns, but one naming a windowed play by `id`
+or `file` is skipped without a warning. Left alone because seeking a windowed
+decode needs the streamed source to restart its decoder at an offset.
+
+## Revalidation holds the cache lock across its request
+
+`revalidate_if_due` runs with the cache locked: when a play finds its URL on
+disk but not in memory, and for every URL resident in memory on each 30 s
+freshness tick (`revalidate_stale_http` holds the lock for its whole loop).
+Every load waits behind it. The request gives up after 5 seconds, but a failed
+check is not recorded, so a server that accepts connections and never answers
+costs 5 seconds per cached URL on every tick, and plays queue behind the tick
+for that long. `maybe_revalidate` (the `get_or_load` path) records each attempt
+and retries once per interval; `revalidate_if_due` does not. Left alone because
+the fix is to send the request without holding the lock and to record failed
+attempts, which reshapes both revalidation paths.
+
+## A shutdown signal can be missed while a command is being handled
+
+`shutdown_signal()` creates fresh Ctrl-C and SIGTERM listeners every time the
+command loop's `select!` runs, and drops them whenever another branch wins.
+Tokio delivers a signal only to listeners that exist when its driver
+broadcasts it, and a broadcast that finds none is discarded. A SIGTERM that
+arrives while a handler is awaiting can therefore be lost, leaving the daemon
+running until a second signal. The fix is to create the shutdown future once,
+outside the loop, and pin it.
+
+## A huge `start_position_ms` or `seek` overflows in debug builds
+
+`start_ms * sample_rate` (dispatch, and the prebuffer gate in `loading.rs`) and
+the audio thread's seek conversion multiply a client-supplied millisecond
+count without overflow checks. A debug build panics once the product overflows
+(above about 3.8 × 10¹⁴ ms at 48 kHz), which stops the daemon when it happens
+on the audio thread or in the command loop. A release build wraps and then
+clamps to the end of the clip. Left alone because release
+builds are what run, but the multiplications should saturate.
+
+## A seek on a still-decoding sound can land at its start
+
+The audio thread converts a `seek`'s milliseconds to frames with the buffer's
+sample rate (`SeekMatching` in `rt_engine.rs`), read without blocking. A buffer
+still decoding reports a rate of 0 while its decoder holds it, so the seek goes
+to frame 0 instead of the requested position. Left alone because the audio
+thread must not block; the fix is to keep the sample rate on the sample when it
+starts.

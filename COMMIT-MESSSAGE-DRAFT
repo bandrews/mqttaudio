@@ -1,2 +1,44 @@
-(no work in progress - committed through "Open capture with the output's
-buffer size so shared-clock cards run duplex")
+Ramp windowed plays to the volume a volume command sets
+
+The audio thread applied SetVolumeMatching to active_samples only, so a
+`volume` aimed at a windowed play (mode "stream", or a file long or
+large enough for auto to window) changed nothing audible while
+/status/samples reported the new volume. Since carry-over, a volume
+sent while such a play was still loading did apply, as its start
+volume, so the result depended on whether the load had finished.
+
+StreamedSource now has a target_volume beside its volume and ramps the
+two together per frame (advance_volumes, using the same ramp_toward as
+samples, which also replaces its hand-written voice-volume ramp), and
+SetVolumeMatching sets the target of every matching streamed source as
+it does for samples. A carried volume still becomes the start volume.
+
+docs/bugs.md keeps only the seek half of the entry; command-ordering.md
+no longer lists this as a difference; the CHANGELOG has a Fixed entry.
+The README's feature list mentions starting a sound at a speed.
+
+Tests (each failed first, and fails again with the streamed half of
+SetVolumeMatching disabled):
+- volume_reaches_a_windowed_play_that_has_started (src/main.rs): a
+  windowed play, then volume 0.4 on its voice; after two mixed blocks
+  the stream is at 0.4 and its status says 0.4 (it stayed at 1.0).
+- set_volume_matching_reaches_matching_streamed_sources (rt_engine):
+  only the matching source's target moves, clamped to MAX_GAIN, and the
+  current volume ramps toward it.
+
+Validation: cargo fmt --check, cargo clippy --all-targets -D warnings,
+and a warning-free release build (RUSTFLAGS=-D warnings); fuzz suite 7
+passed; broker-backed native suite (MQTTAUDIO_BROKER_TESTS=1, TLS CA
+set) 1044 passed, 0 failed, 7 device-gated ignored.
+
+Prompts that led to this work:
+
+- "Fix the volume case you identified, then open a PR. Please also
+  write a quick copy-and-paste message I can share with the client
+  about 1- the fix and 2- the new speed params in the play command.
+  Also make sure we updated the docs to reflect the new feature."
+
+This commit was authored by Claude (AI assistant) working with Ben Andrews.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01QoxMvY6GSh6tWs3evekDsG

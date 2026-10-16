@@ -103,6 +103,35 @@ Try connecting to localhost first to rule out network problems:
 ./mqttaudio --server localhost --topic audio/commands
 ```
 
+### A Command Did Nothing
+
+An MQTT sender gets no reply, so the daemon logs each command it could not carry
+out:
+
+```
+WARN mqttaudio: Command failed: No sample matches the selector
+```
+
+A failure that has its own message, such as an unknown voice or a file that
+failed to load, is logged once under that message instead. Over HTTP the same
+failure comes back in the response.
+
+A command sent right after a `play` reaches that play even while its file is
+still loading, so `No sample matches the selector` means the selector named no
+playing sound and no loading play: compare its `id`, `file` or `voice` with the
+`play`'s, and check whether a stop already cancelled the play. An `internal_id`
+exists only once a sound has started.
+
+A play cancelled before it started is logged at INFO, not as a failed command:
+
+```
+INFO mqttaudio: Cancelled play of /sounds/rain.wav: Cancelled by a stop before it started
+INFO mqttaudio: Cancelled play of /sounds/rain.wav: Superseded by stopall/fadeall
+```
+
+The first is a `stop`, `voice_stop` or `voice_fade_out` that matched it; the
+second is `stopall` or `fadeall`.
+
 ---
 
 ## Files Not Playing

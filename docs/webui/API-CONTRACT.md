@@ -38,7 +38,7 @@ out-of-range `volume`/`speed`. Defaults below are the parser/handler defaults.
 
 | Command | Required | Optional (default) | Notes |
 |---------|----------|--------------------|-------|
-| `play` (`soundPlay`) | `file` | `id`, `volume`(1.0), `voice`(auto), `loop`(false), `crossfade_ms`(0), `fade_in`, `start_position_ms`, `channel_map`, `mode`(auto), `window_ms`, `prebuffer_ms`, `freshness`(trusting), `cacheable`(true) | Only command taking routing/load/window params. See §3, §4. |
+| `play` (`soundPlay`) | `file` | `id`, `volume`(1.0), `voice`(auto), `loop`(false), `crossfade_ms`(0), `fade_in`, `start_position_ms`, `speed`(1.0), `pitch_correction`(false), `channel_map`, `mode`(auto), `window_ms`, `prebuffer_ms`, `freshness`(trusting), `cacheable`(true) | Only command taking routing/load/window params. See §3, §4. |
 | `stop` | one selector | `internal_id`,`id`,`file`,`voice`, `fade_out_ms` | Selector OR-logic (§3). |
 | `stopall` (`soundStopAll`) | — | — | Stops everything. |
 | `volume` | `volume` + a selector | `internal_id`,`id`,`file`,`voice` | `volume` clamped 0..1 downstream. |
@@ -87,7 +87,7 @@ numeric string (`"3"` → index 3), or an alias string resolved against `audio.c
 - Per-route `gain` applies on both the full-load and the `mode:stream` paths: each resolves the map and
   its gains through the same helper (`channel_route_gains` in `main.rs`) and hands them to
   `ActiveSample`/`StreamedSource::set_channel_route_gains`.
-- `channel_map` is **not** on the typed `/play` endpoint — reach it via `/command` (DW10).
+- `channel_map` is also accepted by the typed `/play` endpoint.
 
 ## 5. REST endpoints
 
@@ -98,8 +98,9 @@ numeric string (`"3"` → index 3), or an alias string resolved against `audio.c
 
 **Typed-endpoint quirks (must encode in the client):**
 - `POST /play` accepts **only** `file`,`id`,`volume`,`voice`,`fade_in`,`start_position_ms`,`loop`(or
-  `loop_mode`),`crossfade_ms`. It **silently ignores** `channel_map`,`mode`,`window_ms`,`prebuffer_ms`,
-  `freshness`,`cacheable` (`handlers.rs:181-198`). Use `/command` for those (DW10).
+  `loop_mode`),`crossfade_ms`,`speed`,`pitch_correction`,`channel_map`. It **silently ignores**
+  `mode`,`window_ms`,`prebuffer_ms`,`freshness`,`cacheable` (`PlayParams` in `handlers.rs`). Use `/command`
+  for those (DW10).
 - `loop`: MQTT/flattened accepts **only** `loop`; typed `/play` accepts **`loop` or `loop_mode`**
   (`handlers.rs:194`).
 - `voice_fade_out`: wire key `time`; **typed `/voice/fade_out` body key is `time_ms`** (`handlers.rs:550`).

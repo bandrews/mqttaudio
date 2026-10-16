@@ -93,16 +93,21 @@ Command endpoints wait for the command to be processed and report the
 real outcome: `{"success": true, "message": ...}` on success, or an error
 with a matching status code - 400 for malformed requests, 404 when a
 file fails to load or a selector matches nothing, 403 when a path is
-outside `security.allowed_directories`, 409 when a pending play was
-cancelled by a stop, 504 if the result takes longer than 30 seconds.
-Loads run in the background, so a slow download never delays other
-commands (an emergency `stopall` also cancels any loads still in flight).
+outside `security.allowed_directories`, 409 when a play still loading was
+cancelled (by `stopall`, `fadeall`, or a `stop`, `voice_stop` or
+`voice_fade_out` that matched it), 504 if the result takes longer than 30
+seconds. Loads run in the background, so a slow download never delays other
+commands (an emergency `stopall` also cancels any loads still in flight). A
+`play` is answered once its sound has started; a command sent before that
+still reaches it (see [commands sent while a play is
+loading](commands.md#commands-sent-while-a-play-is-loading)).
 
 > **Typed endpoints vs `/command`.** The convenience endpoints above deserialize a fixed set of fields. In
 > particular, `POST /play` accepts only `file`, `id`, `volume`, `voice`, `fade_in`, `start_position_ms`,
-> `loop` (also `loop_mode`), and `crossfade_ms`. It does **not** accept `channel_map`, `mode`, `window_ms`,
-> `prebuffer_ms`, `freshness`, or `cacheable` — to use those, POST the full command JSON to `/command`
-> (which accepts the same payload as MQTT). Unknown fields sent to a typed endpoint are silently ignored.
+> `loop` (also `loop_mode`), `crossfade_ms`, `speed`, `pitch_correction`, and `channel_map`. It does **not**
+> accept `mode`, `window_ms`, `prebuffer_ms`, `freshness`, or `cacheable` — to use those, POST the full
+> command JSON to `/command` (which accepts the same payload as MQTT). Unknown fields sent to a typed
+> endpoint are silently ignored.
 > Note also that `POST /voice/fade_out` takes `time_ms`, whereas the raw command / MQTT key is `time`.
 
 ## Authentication
@@ -149,7 +154,7 @@ Returns a summary of playback and cache state:
 | `version` | string | Package version string |
 | `active_samples` | integer | Number of samples currently playing |
 | `active_inputs` | integer | Number of active live inputs |
-| `active_voices` | integer | Number of active voice groups |
+| `active_voices` | integer | Number of active voice groups, including one held open by a play still loading |
 | `output_channels` | integer | Output channel count |
 | `clip_count` | integer | Output samples the limiter held at the ceiling since startup |
 | `xruns` | integer | Audio stream-error callbacks (dropouts/underruns that triggered a stream rebuild) since startup |
@@ -199,7 +204,7 @@ Operational telemetry for monitoring. Every field is real — no placeholders.
 | `uptime_seconds` | float | Seconds since the daemon started |
 | `clips` | integer | Output samples the limiter held at the ceiling since startup |
 | `xruns` | integer | Audio stream-error callbacks (dropouts/underruns) since startup |
-| `active_voices` | integer | Number of active voice groups |
+| `active_voices` | integer | Number of active voice groups, including one held open by a play still loading |
 | `active_samples` | integer | Number of samples currently playing |
 | `active_inputs` | integer | Number of active live inputs |
 | `output_channels` | integer | Output channel count |
@@ -217,7 +222,9 @@ Operational telemetry for monitoring. Every field is real — no placeholders.
 
 ### `/status/voices` Response
 
-Each voice carries its resolved ducking multiplier (`1.0` when not ducked):
+Each voice carries its resolved ducking multiplier (`1.0` when not ducked). A
+voice is listed while it has a sound playing or a play naming it is still
+loading, so a voice can appear with `sample_count: 0` until its play starts:
 
 ```json
 {
