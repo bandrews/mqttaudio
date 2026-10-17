@@ -1,42 +1,33 @@
 // ABOUTME: Audio engine coordinator managing playback, caching, and state.
 // ABOUTME: Handles sample loading, voice management, and mixer state updates.
 
-use crate::audio::decoder;
-use crate::audio::mixer::{ActiveSample, MixerState};
+use crate::audio::device::output_device_identifier;
 use crate::audio::types::DeviceConfig;
-use crate::config::ResamplerQuality;
+use crate::rt_engine::AudioCallbackState;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::Stream;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// List available audio output devices
 pub fn list_devices() {
-    #[cfg(target_os = "linux")]
-    {
-        list_devices_linux();
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        list_devices_cpal_only();
-    }
-}
-
-/// Linux-specific device listing with ALSA probing
-#[cfg(target_os = "linux")]
-fn list_devices_linux() {
-    use super::alsa_probe::probe_alsa_devices;
     use super::device::format_device_list;
 
-    let list = probe_alsa_devices();
-    print!("{}", format_device_list(&list));
+    print!("{}", format_device_list(&output_device_list()));
 }
 
-/// Fallback device listing using only cpal (for macOS, Windows, etc.)
+/// Enumerate output devices with their capabilities. On Linux this probes ALSA
+/// directly for native hardware capabilities; elsewhere it queries cpal.
+#[cfg(target_os = "linux")]
+pub fn output_device_list() -> super::device::DeviceList {
+    super::alsa_probe::probe_alsa_devices()
+}
+
+/// Enumerate output devices with their capabilities. On Linux this probes ALSA
+/// directly for native hardware capabilities; elsewhere it queries cpal.
 #[cfg(not(target_os = "linux"))]
-fn list_devices_cpal_only() {
-    use super::device::{DeviceCategory, DeviceInfo, DeviceList, format_device_list};
+pub fn output_device_list() -> super::device::DeviceList {
+    use super::device::{DeviceCategory, DeviceInfo, DeviceList};
 
     let host = cpal::default_host();
     let mut list = DeviceList::new();
@@ -44,7 +35,10 @@ fn list_devices_cpal_only() {
     match host.output_devices() {
         Ok(devices) => {
             for device in devices {
-                if let Ok(name) = device.name() {
+                if let Ok(name) = device
+                    .description()
+                    .map(|d| output_device_identifier(&d, cfg!(target_os = "linux")).to_string())
+                {
                     let mut info = DeviceInfo::new(name.clone(), DeviceCategory::Hardware);
 
                     // Query supported configs
@@ -56,13 +50,13 @@ fn list_devices_cpal_only() {
                         const MAX_REASONABLE_SAMPLE_RATE: u32 = 384000;
 
                         for config in configs {
-                            let config_max_rate = config.max_sample_rate().0;
+                            let config_max_rate = config.max_sample_rate();
                             if config_max_rate > MAX_REASONABLE_SAMPLE_RATE {
                                 continue;
                             }
 
                             max_channels = max_channels.max(config.channels());
-                            min_rate = min_rate.min(config.min_sample_rate().0);
+                            min_rate = min_rate.min(config.min_sample_rate());
                             max_rate = max_rate.max(config_max_rate);
                         }
 
@@ -77,8 +71,8 @@ fn list_devices_cpal_only() {
                     if info.cpal_channels.is_none() {
                         if let Ok(config) = device.default_output_config() {
                             info.cpal_channels = Some(config.channels());
-                            info.cpal_sample_rate_min = Some(config.sample_rate().0);
-                            info.cpal_sample_rate_max = Some(config.sample_rate().0);
+                            info.cpal_sample_rate_min = Some(config.sample_rate());
+                            info.cpal_sample_rate_max = Some(config.sample_rate());
                         }
                     }
 
@@ -87,41 +81,45 @@ fn list_devices_cpal_only() {
             }
         }
         Err(e) => {
-            list.discovery_notes.push(format!("Error listing devices: {}", e));
+            list.discovery_notes
+                .push(format!("Error listing devices: {}", e));
         }
     }
 
-    print!("{}", format_device_list(&list));
+    list
 }
 
 /// Get default device configuration
 pub fn get_default_device_config() -> Result<DeviceConfig, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
-    let device = host.default_output_device()
+    let device = host
+        .default_output_device()
         .ok_or("No default output device available")?;
 
     let config = device.default_output_config()?;
 
     Ok(DeviceConfig {
-        sample_rate: config.sample_rate().0,
+        sample_rate: config.sample_rate(),
         channels: config.channels() as usize,
         buffer_size: 512, // Default buffer size
     })
 }
 
 /// Find an output device by name (returns default if name is None)
-/// On ALSA, devices may be openable even if not enumerated, so we try
-/// both enumeration and direct construction.
+/// Linux matches ALSA PCM IDs; other platforms match human-readable names.
 pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn std::error::Error>> {
     let host = cpal::default_host();
 
     match name {
         Some(device_name) => {
-            // First try to find in enumerated devices
+            // First try to find in enumerated devices. The ALSA null device
+            // discards audio and is never matched.
             if let Ok(devices) = host.output_devices() {
                 for device in devices {
-                    if let Ok(n) = device.name() {
-                        if n == device_name {
+                    if let Ok(n) = device.description().map(|d| {
+                        output_device_identifier(&d, cfg!(target_os = "linux")).to_string()
+                    }) {
+                        if n != "null" && n == device_name {
                             return Ok(device);
                         }
                     }
@@ -135,12 +133,20 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
             {
                 if let Ok(devices) = host.output_devices() {
                     for device in devices {
-                        if let Ok(n) = device.name() {
+                        if let Ok(n) = device.description().map(|d| {
+                            output_device_identifier(&d, cfg!(target_os = "linux")).to_string()
+                        }) {
                             // Try matching ALSA device names by card number
                             // Supports hw:, plughw:, sysdefault:
-                            if let Some(matched) = super::device::try_match_alsa_device(device_name, &n) {
+                            if let Some(matched) =
+                                super::device::try_match_alsa_device(device_name, &n)
+                            {
                                 if matched {
-                                    tracing::info!("Matched ALSA device '{}' to '{}'", device_name, n);
+                                    tracing::info!(
+                                        "Matched ALSA device '{}' to '{}'",
+                                        device_name,
+                                        n
+                                    );
                                     return Ok(device);
                                 }
                             }
@@ -149,381 +155,330 @@ pub fn find_output_device(name: Option<&str>) -> Result<cpal::Device, Box<dyn st
                 }
             }
 
-            Err(format!("Output device not found: {}", device_name).into())
+            let mut message = format!(
+                "Output device not found: {}. Run mqttaudio --list-devices and copy a Device ID exactly into --device or audio.device.",
+                device_name
+            );
+            if cfg!(target_os = "linux") {
+                message.push_str(
+                    " On Linux, use the ALSA ID (for example plughw:CARD=HD,DEV=0), not the human-readable description.",
+                );
+            }
+            Err(message.into())
         }
-        None => {
-            host.default_output_device()
-                .ok_or_else(|| "No default output device available".into())
-        }
+        None => host
+            .default_output_device()
+            .ok_or_else(|| "No default output device available".into()),
     }
 }
 
-/// Find a stream config for the device with the requested channel count
-/// If requested_channels is None, uses the maximum available (capped at 32 for sanity)
-/// If requested_sample_rate is None, uses the device's preferred sample rate
-/// If requested_buffer_size is None, uses the device's default buffer size
+/// The output configuration chosen for a device: the stream config plus the
+/// sample format the typed callback must produce.
+pub struct OutputConfig {
+    pub stream_config: cpal::StreamConfig,
+    pub sample_format: cpal::SampleFormat,
+}
+
+/// Find an output configuration for the device — channel count, sample format,
+/// sample rate, and buffer size — delegating the choices to the pure helpers in
+/// `device_select` and validating the result against the device's supported
+/// configs before returning. This negotiates non-f32 and discrete-rate devices
+/// correctly instead of crashing at stream-build time.
+///
+/// `requested_channels`/`requested_sample_rate` of `None` use the device's
+/// maximum/preferred values. `requested_buffer_size` is honored when the device
+/// supports it, otherwise the device default is used.
 pub fn find_output_config(
     device: &cpal::Device,
     requested_channels: Option<usize>,
     requested_sample_rate: Option<u32>,
-    requested_buffer_size: Option<u32>,
-) -> Result<cpal::StreamConfig, Box<dyn std::error::Error>> {
-    use cpal::SampleRate;
+    requested_buffer_size: u32,
+) -> Result<OutputConfig, Box<dyn std::error::Error>> {
+    use crate::audio::device_select::{
+        select_buffer_size, select_channels, select_sample_format, select_sample_rate,
+        BufferLimits, ConfigOption, SelectError,
+    };
 
-    // Get all supported configs
-    let supported_configs: Vec<_> = device.supported_output_configs()?.collect();
-
-    if supported_configs.is_empty() {
+    let supported: Vec<_> = device.supported_output_configs()?.collect();
+    if supported.is_empty() {
         return Err("No supported output configurations found".into());
     }
 
-    // Determine target channels
-    let target_channels = match requested_channels {
-        Some(ch) => ch as u16,
-        None => {
-            // Find maximum available channels, but cap at 32 for sanity
-            // (ALSA plugins may report absurdly high values)
-            supported_configs.iter()
-                .map(|c| c.channels())
-                .filter(|&ch| ch <= 32)
-                .max()
-                .unwrap_or(2)
-        }
-    };
-
-    // Find configs that match the requested channel count
-    let matching_configs: Vec<_> = supported_configs.iter()
-        .filter(|c| c.channels() == target_channels)
+    let options: Vec<ConfigOption> = supported
+        .iter()
+        .map(|c| ConfigOption {
+            channels: c.channels(),
+            sample_format: c.sample_format(),
+            min_rate: c.min_sample_rate(),
+            max_rate: c.max_sample_rate(),
+            buffer: match c.buffer_size() {
+                cpal::SupportedBufferSize::Range { min, max } => BufferLimits::Range {
+                    min: *min,
+                    max: *max,
+                },
+                cpal::SupportedBufferSize::Unknown => BufferLimits::Unknown,
+            },
+        })
         .collect();
 
-    if matching_configs.is_empty() {
-        // No exact match - list available channel counts (capped for display)
-        let available: Vec<_> = supported_configs.iter()
-            .map(|c| c.channels())
-            .filter(|&ch| ch <= 32)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
-        return Err(format!(
-            "No configuration found for {} channels. Available: {:?}",
-            target_channels, available
-        ).into());
-    }
+    let channels = select_channels(&options, requested_channels)?;
+    let sample_format =
+        select_sample_format(&options, channels).ok_or(SelectError::NoFormat { channels })?;
 
-    // Determine target sample rate
-    let target_sample_rate = requested_sample_rate.unwrap_or_else(|| {
-        // Use the default config's sample rate if possible, otherwise pick a common rate
-        device.default_output_config()
-            .map(|c| c.sample_rate().0)
+    // Rate spans for the chosen (channels, format).
+    let ranges: Vec<(u32, u32)> = options
+        .iter()
+        .filter(|o| o.channels == channels && o.sample_format == sample_format)
+        .map(|o| (o.min_rate, o.max_rate))
+        .collect();
+
+    let requested_rate = requested_sample_rate.unwrap_or_else(|| {
+        device
+            .default_output_config()
+            .map(|c| c.sample_rate())
             .unwrap_or(48000)
     });
 
-    // Find the best matching config for sample rate
-    // Prefer configs with reasonable sample rate ranges, but accept any if needed
-    let best_config = matching_configs.iter()
-        .filter(|c| {
-            let min = c.min_sample_rate().0;
-            let max = c.max_sample_rate().0;
-            target_sample_rate >= min && target_sample_rate <= max
-        })
-        .next();
-
-    match best_config {
-        Some(config_range) => {
-            let buffer_size = resolve_buffer_size(requested_buffer_size, config_range.buffer_size());
-            let config = config_range.with_sample_rate(SampleRate(target_sample_rate));
-            Ok(cpal::StreamConfig {
-                channels: config.channels(),
-                sample_rate: config.sample_rate(),
-                buffer_size,
-            })
-        }
-        None => {
-            // Sample rate not directly supported - clamp to valid range
-            let config_range = matching_configs[0];
-            let min_rate = config_range.min_sample_rate().0;
-            let max_rate = config_range.max_sample_rate().0;
-            let buffer_size = resolve_buffer_size(requested_buffer_size, config_range.buffer_size());
-            // Clamp target to valid range, but also cap max at 384kHz for sanity
-            let capped_max = max_rate.min(384000);
-            let sample_rate = target_sample_rate.max(min_rate).min(capped_max);
-            let config = config_range.with_sample_rate(SampleRate(sample_rate));
-            Ok(cpal::StreamConfig {
-                channels: config.channels(),
-                sample_rate: config.sample_rate(),
-                buffer_size,
-            })
-        }
-    }
-}
-
-/// Turn a requested buffer size into a cpal BufferSize, clamped to the range
-/// the device reports so an out-of-range value cannot make the stream fail.
-fn resolve_buffer_size(
-    requested: Option<u32>,
-    supported: &cpal::SupportedBufferSize,
-) -> cpal::BufferSize {
-    let Some(size) = requested else {
-        return cpal::BufferSize::Default;
-    };
-
-    match supported {
-        cpal::SupportedBufferSize::Range { min, max } => {
-            let clamped = size.clamp(*min, *max);
-            if clamped != size {
-                tracing::warn!(
-                    "Requested buffer size {} is outside the device's supported range {}-{}; using {}",
-                    size, min, max, clamped
-                );
-            }
-            cpal::BufferSize::Fixed(clamped)
-        }
-        cpal::SupportedBufferSize::Unknown => cpal::BufferSize::Fixed(size),
-    }
-}
-
-/// Initialize audio output stream with a test sine wave
-pub fn init_test_sine_wave() -> Result<Stream, Box<dyn std::error::Error>> {
-    let host = cpal::default_host();
-    let device = host.default_output_device()
-        .ok_or("No default output device available")?;
-
-    let config = device.default_output_config()?;
-    let sample_rate = config.sample_rate().0;
-    let channels = config.channels() as usize;
-
-    tracing::info!("Initializing audio stream:");
-    tracing::info!("  Device: {}", device.name()?);
-    tracing::info!("  Sample rate: {} Hz", sample_rate);
-    tracing::info!("  Channels: {}", channels);
-    tracing::info!("  Format: {:?}", config.sample_format());
-
-    // Phase accumulator for sine wave (stored as atomic for thread safety)
-    // Note: This is a simplified approach for Phase 1 testing only
-    static PHASE: AtomicU32 = AtomicU32::new(0);
-    let phase_increment = (440.0 * 2.0 * std::f32::consts::PI / sample_rate as f32) * 1000.0;
-
-    let stream = device.build_output_stream(
-        &config.into(),
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            // Audio callback - generates 440Hz sine wave
-            for frame in data.chunks_mut(channels) {
-                // Get current phase and increment
-                let phase_int = PHASE.fetch_add(phase_increment as u32, Ordering::Relaxed);
-                let phase = (phase_int as f32) / 1000.0;
-
-                // Generate sine wave sample at low volume (0.2)
-                let sample = (phase.sin() * 0.2).clamp(-1.0, 1.0);
-
-                // Write same sample to all channels
-                for channel_sample in frame {
-                    *channel_sample = sample;
-                }
-
-                // Wrap phase to prevent overflow
-                if phase > 2.0 * std::f32::consts::PI {
-                    PHASE.fetch_sub((2.0 * std::f32::consts::PI * 1000.0) as u32, Ordering::Relaxed);
-                }
-            }
-        },
-        move |err| {
-            tracing::error!("Stream error: {}", err);
-        },
-        None,
-    )?;
-
-    stream.play()?;
-    tracing::info!("Audio stream started - you should hear a 440Hz tone");
-
-    Ok(stream)
-}
-
-/// Play an audio file
-pub fn play_file(path: &str) -> Result<Stream, Box<dyn std::error::Error>> {
-    // Get audio device first to determine target sample rate
-    let host = cpal::default_host();
-    let device = host.default_output_device()
-        .ok_or("No default output device available")?;
-
-    let config = device.default_output_config()?;
-    let output_sample_rate = config.sample_rate().0;
-
-    // Decode the audio file with automatic resampling to device sample rate
-    tracing::info!("Loading audio file: {}", path);
-    let buffer = decoder::decode_file(path, Some(output_sample_rate), ResamplerQuality::default())?;
-
-    tracing::info!(
-        "Loaded: {} channels, {} Hz, {} frames ({:.2}s)",
-        buffer.channels,
-        buffer.sample_rate,
-        buffer.frames,
-        buffer.frames as f32 / buffer.sample_rate as f32
+    // On ALSA a raw `hw:` device may advertise a continuous range but accept
+    // only discrete rates; prefer the probed discrete set when available.
+    #[cfg(target_os = "linux")]
+    let discrete = crate::audio::alsa_probe::discrete_rates_for(
+        &device
+            .description()
+            .map(|d| output_device_identifier(&d, true).to_string())
+            .unwrap_or_default(),
     );
+    #[cfg(not(target_os = "linux"))]
+    let discrete: Option<Vec<u32>> = None;
 
-    let output_channels = config.channels() as usize;
+    let sample_rate = select_sample_rate(&ranges, discrete.as_deref(), requested_rate);
 
-    tracing::info!("Initializing audio stream:");
-    tracing::info!("  Device: {}", device.name()?);
-    tracing::info!("  Sample rate: {} Hz", output_sample_rate);
-    tracing::info!("  Channels: {}", output_channels);
+    let buffer_limits = options
+        .iter()
+        .find(|o| {
+            o.channels == channels
+                && o.sample_format == sample_format
+                && sample_rate >= o.min_rate
+                && sample_rate <= o.max_rate
+        })
+        .map(|o| o.buffer)
+        .unwrap_or(BufferLimits::Unknown);
+    let buffer_size = select_buffer_size(buffer_limits, requested_buffer_size);
 
-    // Wrap buffer in Arc for sharing with callback
-    let buffer = Arc::new(buffer);
-    let buffer_clone = buffer.clone();
+    // Validate the chosen config against the device's real supported configs.
+    let supported_here = supported.iter().any(|c| {
+        c.channels() == channels
+            && c.sample_format() == sample_format
+            && sample_rate >= c.min_sample_rate()
+            && sample_rate <= c.max_sample_rate()
+    });
+    if !supported_here {
+        return Err(format!(
+            "selected output config ({} ch, {:?}, {} Hz) is not supported by the device",
+            channels, sample_format, sample_rate
+        )
+        .into());
+    }
 
-    // Atomic position tracker (frames, not samples)
-    let position = Arc::new(AtomicUsize::new(0));
-    let position_clone = position.clone();
+    Ok(OutputConfig {
+        stream_config: cpal::StreamConfig {
+            channels,
+            sample_rate,
+            buffer_size,
+        },
+        sample_format,
+    })
+}
 
-    let stream = device.build_output_stream(
-        &config.into(),
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            // Audio callback - play from buffer
-            let frames_needed = data.len() / output_channels;
-            let current_pos = position_clone.load(Ordering::Relaxed);
+/// Run one audio callback's worth of work into the f32 bus: drain the pending
+/// control commands, mix, then reap finished samples into the graveyard for an
+/// off-RT drop. Shared by every typed output stream so the device sample format
+/// never changes the mix logic. The control thread never locks this state —
+/// mutations arrive over the command ring and voice/ducking reconciliation is
+/// done control-side — so this lock is uncontended (D22a).
+fn run_mix_callback(bus: &mut [f32], callback_state: &Arc<Mutex<AudioCallbackState>>) {
+    let mut guard = callback_state.lock();
+    let acs = &mut *guard;
+    // Destructure for disjoint &mut borrows of the bundled fields.
+    let AudioCallbackState {
+        mixer,
+        commands,
+        command_returns,
+        graveyard,
+        streamed_graveyard,
+        output_sample_rate,
+    } = acs;
 
-            for frame_idx in 0..frames_needed {
-                let buffer_frame = current_pos + frame_idx;
+    crate::rt_engine::drain_commands(
+        commands,
+        mixer,
+        command_returns,
+        graveyard,
+        *output_sample_rate,
+        64,
+    );
+    crate::audio::mixer::mix_audio(bus, mixer);
+    crate::rt_engine::reap_finished(mixer, graveyard);
+    crate::rt_engine::reap_finished_streamed(mixer, streamed_graveyard);
+}
 
-                if buffer_frame >= buffer_clone.frames {
-                    // End of buffer - output silence
-                    for ch in 0..output_channels {
-                        data[frame_idx * output_channels + ch] = 0.0;
-                    }
-                    continue;
-                }
-
-                // Read frame from buffer
-                // Handle channel mismatch by simple mapping
-                for out_ch in 0..output_channels {
-                    // Map output channel to input channel (wrap if necessary)
-                    let in_ch = out_ch % buffer_clone.channels;
-                    let src_idx = buffer_frame * buffer_clone.channels + in_ch;
-                    let dst_idx = frame_idx * output_channels + out_ch;
-
-                    if src_idx < buffer_clone.data.len() {
-                        data[dst_idx] = buffer_clone.data[src_idx];
-                    } else {
-                        data[dst_idx] = 0.0;
-                    }
-                }
+/// Build an output stream of element type `T`, mixing into an f32 scratch bus and
+/// converting each sample to `T`. The scratch bus is reused across callbacks.
+fn build_typed_output_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    callback_state: Arc<Mutex<AudioCallbackState>>,
+    xruns: Arc<AtomicU64>,
+    error_flag: Arc<AtomicBool>,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    T: cpal::SizedSample + cpal::FromSample<f32> + Send + 'static,
+{
+    let mut scratch: Vec<f32> = Vec::new();
+    device.build_output_stream(
+        *config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            scratch.resize(data.len(), 0.0);
+            run_mix_callback(&mut scratch, &callback_state);
+            for (out, &s) in data.iter_mut().zip(scratch.iter()) {
+                *out = T::from_sample(s);
             }
-
-            // Update position
-            let new_pos = current_pos + frames_needed;
-            position_clone.store(new_pos, Ordering::Relaxed);
         },
         move |err| {
-            tracing::error!("Stream error: {}", err);
+            tracing::error!("Audio stream error: {}", err);
+            xruns.fetch_add(1, Ordering::Relaxed);
+            // Signal the supervisor to rebuild; the cpal callback must not do it.
+            if super::rebuild::requires_rebuild(err.kind()) {
+                error_flag.store(true, Ordering::Relaxed);
+            }
         },
         None,
-    )?;
+    )
+}
 
-    stream.play()?;
-
-    // Log when playback should finish
-    let duration_secs = buffer.frames as f32 / buffer.sample_rate as f32;
-    tracing::info!("Playback started - duration: {:.2}s", duration_secs);
-
+/// Dispatch over the device's native sample format and build the matching typed
+/// output stream. The mixer always works in f32; only the device-facing
+/// conversion differs, so non-f32 devices no longer crash at build time.
+pub fn build_output_stream(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
+    callback_state: Arc<Mutex<AudioCallbackState>>,
+    xruns: Arc<AtomicU64>,
+    error_flag: Arc<AtomicBool>,
+) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
+    use cpal::SampleFormat;
+    let stream = match sample_format {
+        SampleFormat::F32 => {
+            build_typed_output_stream::<f32>(device, config, callback_state, xruns, error_flag)?
+        }
+        SampleFormat::I16 => {
+            build_typed_output_stream::<i16>(device, config, callback_state, xruns, error_flag)?
+        }
+        SampleFormat::U16 => {
+            build_typed_output_stream::<u16>(device, config, callback_state, xruns, error_flag)?
+        }
+        SampleFormat::I32 => {
+            build_typed_output_stream::<i32>(device, config, callback_state, xruns, error_flag)?
+        }
+        other => return Err(format!("unsupported device sample format: {:?}", other).into()),
+    };
     Ok(stream)
 }
 
-/// Test mixer with multiple simultaneous samples
-pub fn test_mixer() -> Result<Stream, Box<dyn std::error::Error>> {
-    // Get audio device
-    let host = cpal::default_host();
-    let device = host.default_output_device()
-        .ok_or("No default output device available")?;
+/// Own and supervise the output stream on a dedicated thread. On a fatal stream
+/// error the supervisor rebuilds it — re-resolving the device by name and reusing
+/// the original negotiated config (so the mixer's channel count and resample
+/// target stay valid) — with exponential backoff. If the device cannot be
+/// rebuilt after the backoff is exhausted, the process exits so a service manager
+/// (e.g. systemd) can restart with a fresh full setup. Returns when `shutdown`
+/// is set.
+pub fn spawn_output_supervisor(
+    device_name: Option<String>,
+    config: cpal::StreamConfig,
+    sample_format: cpal::SampleFormat,
+    callback_state: Arc<Mutex<AudioCallbackState>>,
+    xruns: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use crate::audio::rebuild::RebuildPolicy;
+    use std::time::{Duration, Instant};
 
-    let config = device.default_output_config()?;
-    let output_sample_rate = config.sample_rate().0;
-    let output_channels = config.channels() as usize;
-
-    tracing::info!("Initializing mixer test:");
-    tracing::info!("  Device: {}", device.name()?);
-    tracing::info!("  Sample rate: {} Hz", output_sample_rate);
-    tracing::info!("  Channels: {}", output_channels);
-
-    // Load test files if they exist, otherwise generate test tones
-    // Paths are relative to the working directory (run from the repo root)
-    let test_files = vec![
-        "tests/audio/test_440hz_2s.wav",
-        "tests/audio/test_880hz_48khz.wav",
-    ];
-
-    let mut buffers = Vec::new();
-    for (i, file_path) in test_files.iter().enumerate() {
-        match decoder::decode_file(file_path, Some(output_sample_rate), ResamplerQuality::default()) {
-            Ok(buffer) => {
-                tracing::info!(
-                    "Loaded sample {}: {} channels, {} frames ({:.2}s)",
-                    i + 1,
-                    buffer.channels,
-                    buffer.frames,
-                    buffer.frames as f32 / buffer.sample_rate as f32
-                );
-                buffers.push(Arc::new(buffer));
+    std::thread::spawn(move || {
+        let mut policy = RebuildPolicy::new();
+        let mut ever_succeeded = false;
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                return;
             }
-            Err(e) => {
-                tracing::warn!("Could not load {}: {}", file_path, e);
+
+            let error_flag = Arc::new(AtomicBool::new(false));
+            let built = (|| -> Result<cpal::Stream, Box<dyn std::error::Error>> {
+                let device = find_output_device(device_name.as_deref())?;
+                let stream = build_output_stream(
+                    &device,
+                    &config,
+                    sample_format,
+                    callback_state.clone(),
+                    xruns.clone(),
+                    error_flag.clone(),
+                )?;
+                stream.play()?;
+                Ok(stream)
+            })();
+
+            match built {
+                Ok(stream) => {
+                    tracing::info!("Audio stream started ({:?})", sample_format);
+                    ever_succeeded = true;
+                    let started = Instant::now();
+                    // Hold the stream alive until a fatal error or shutdown.
+                    while !error_flag.load(Ordering::Relaxed) && !shutdown.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                    drop(stream);
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // A stable run that then errors is a transient blip: reset the
+                    // backoff and rebuild immediately. Rapid failures fall through
+                    // to the growing backoff below.
+                    if started.elapsed() >= Duration::from_secs(5) {
+                        policy.reset();
+                        tracing::warn!(
+                            "Audio stream error after a stable run; rebuilding output..."
+                        );
+                        continue;
+                    }
+                    tracing::warn!("Audio stream failed shortly after start; backing off...");
+                }
+                Err(e) => {
+                    tracing::error!("Audio output unavailable: {}", e);
+                    if !ever_succeeded {
+                        // A startup misconfiguration won't self-heal; fail fast.
+                        #[cfg(target_os = "linux")]
+                        tracing::error!(
+                            "On ALSA, a raw 'hw:' device may require its native format; try a \
+                             'plughw:' or 'default' device, which converts formats automatically."
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            match policy.next_delay() {
+                Some(delay) => {
+                    tracing::info!("Retrying output device in {:?}", delay);
+                    std::thread::sleep(delay);
+                }
+                None => {
+                    tracing::error!(
+                        "Output device could not be (re)built after several attempts; \
+                         exiting for a service-manager restart."
+                    );
+                    std::process::exit(1);
+                }
             }
         }
-    }
-
-    if buffers.is_empty() {
-        return Err("No test files could be loaded for mixer test".into());
-    }
-
-    // Create active samples with different volumes to demonstrate mixing
-    let mut active_samples = Vec::new();
-    for (i, buffer) in buffers.iter().enumerate() {
-        let volume = 0.3; // Reduce volume to avoid clipping when mixing
-        let sample = ActiveSample::new(
-            (i + 1) as u64,
-            "test_mixer".to_string(),
-            buffer.clone(),
-            volume,
-            1.0, // Voice volume
-            format!("test_file_{}.wav", i + 1),
-        );
-        active_samples.push(sample);
-        tracing::info!("Added sample {} to mixer at {}% volume", i + 1, (volume * 100.0) as u32);
-    }
-
-    // Create mixer state
-    let mixer_state = Arc::new(Mutex::new(MixerState {
-        active_samples,
-        live_inputs: Vec::new(),
-        output_channels,
-        channel_gains: vec![1.0; output_channels],
-        ducking_engine: None,
-        bass_management: None,
-        finished_samples: Vec::new(),
-    }));
-
-    let mixer_state_clone = mixer_state.clone();
-
-    // Build audio stream with mixer
-    let stream = device.build_output_stream(
-        &config.into(),
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            // Audio callback - mix all active samples
-            let mut state = mixer_state_clone.lock().unwrap();
-            crate::audio::mixer::mix_audio(data, &mut state);
-
-            // Remove finished samples
-            state.active_samples.retain(|s| !s.is_finished());
-        },
-        move |err| {
-            tracing::error!("Stream error: {}", err);
-        },
-        None,
-    )?;
-
-    stream.play()?;
-
-    let num_samples = mixer_state.lock().unwrap().active_samples.len();
-    tracing::info!("Mixer started with {} simultaneous samples", num_samples);
-
-    Ok(stream)
+    })
 }

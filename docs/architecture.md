@@ -158,17 +158,20 @@ struct ActiveSample {
 
 A group of samples controlled together. A voice holds settings that apply
 to every sample played into it, and lasts until `voice_clear` or `reset`
-whether or not anything is playing. Only voices created by a play that named
-no voice are transient, forgotten once their last sample finishes.
+whether or not anything is playing. A voice that exists only for a play that
+named no voice, or only for plays still loading, is transient: it is
+forgotten once empty, unless a setting is stored on it or a play naming it
+starts.
 
 ```rust
 struct Voice {
     id: String,
     sample_ids: Vec<u64>,
     volume: f32,
+    loading_plays: usize, // plays naming this voice that are still loading
     speed: f32,
     pitch_correction: bool,
-    transient: bool,       // created by an unnamed play
+    transient: bool,       // only for an unnamed play or plays still loading
     has_live_input: bool,  // a microphone's voice_id; never forgotten
 }
 ```
@@ -200,6 +203,13 @@ struct Voice {
 11. **Latency: ~100-300ms**
 
 ## Key Components
+
+### Command Scheduler (`src/main.rs`, `src/pending_plays.rs`)
+
+Takes commands from MQTT and HTTP. A play's file loads in the background while
+the scheduler keeps the play; commands that arrive meanwhile carry their
+settings onto it or cancel it, and the play starts when its load finishes. See
+[Command ordering](command-ordering.md).
 
 ### Mixer (`src/audio/mixer.rs`)
 
@@ -254,7 +264,7 @@ Two-tier caching:
 
 | Crate | Purpose |
 |-------|---------|
-| cpal | Cross-platform audio I/O |
+| cpal | Cross-platform audio I/O (`0.17`; device names via `Device::description()`) |
 | symphonia | Audio decoding |
 | rubato | Sample rate conversion |
 | rumqttc | MQTT client |
@@ -315,6 +325,7 @@ src/
 ├── http/
 │   ├── mod.rs           # HTTP REST API
 │   └── handlers.rs      # Request handlers
+├── pending_plays.rs     # Plays still loading, and the commands that reach them
 └── voice.rs             # Voice management
 ```
 

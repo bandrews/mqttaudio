@@ -47,11 +47,22 @@ Play an audio file.
 | `crossfade_ms` | integer | 0 | Crossfade duration at loop boundaries (0 = disabled) |
 | `fade_in` | integer | 0 | Fade-in duration (milliseconds) |
 | `start_position_ms` | integer | 0 | Start position (milliseconds) |
+| `speed` | float | the voice's | Start speed, as the [`speed`](#speed) command sets it. Without it the sound starts at its voice's [`voice_speed`](#voice_speed) (1.0 if none was set). `0` is rejected; a negative speed plays backwards from `start_position_ms` |
+| `pitch_correction` | boolean | false | Start with pitch correction, as the [`speed`](#speed) command sets it; applies with `speed`. Rejected with a negative `speed` |
 | `channel_map` | array | auto | Channel routing (see below) |
+| `mode` | string | `auto` | Load strategy: `auto` (decide by size/duration + memory budget), `full` (always in-memory), or `stream` (window a big/long file). Applies to local files and `http(s)://` URLs. A windowed voice plays forward only |
+| `window_ms` | integer | config | Windowed-source ring depth override (streamed plays) |
+| `prebuffer_ms` | integer | config | Windowed-source prebuffer override (streamed plays) |
+| `freshness` | string | config | Cache freshness override: `trusting`, `dev`, or `pinned` |
+| `cacheable` | boolean | `true` | HTTP windowed plays only: `true` (default) tees the download to the disk cache so a replay hits disk; `false` treats the source as live (window, never persist). A URL with no `Content-Length` is always live |
 
 Volumes are gains: 1.0 is unity, below that attenuates and above that boosts, up
 to 4.0 (+12 dB). The mixer saturates its output, so a boost loud enough to
 exceed full scale clips rather than wrapping around.
+
+A windowed play (`mode: "stream"`, or a file long or large enough for `auto` to
+window) plays forward only, so it ignores `speed` and `pitch_correction`, starts
+at normal speed, and logs a warning.
 
 **Channel Mapping:**
 
@@ -95,6 +106,23 @@ You can route one source to multiple destinations:
 }
 ```
 
+Each route accepts an optional `gain` (default `1.0`). When several source channels are routed to the same
+destination they sum, which can clip; a per-route `gain` lets you attenuate (or boost) each route. A route
+without `gain` is unity, so existing maps are unaffected:
+
+```json
+{
+  "command": "play",
+  "file": "/quad.wav",
+  "channel_map": [
+    {"src": 0, "dest": 0, "gain": 0.5},
+    {"src": 2, "dest": 0, "gain": 0.5},
+    {"src": 1, "dest": 1, "gain": 0.5},
+    {"src": 3, "dest": 1, "gain": 0.5}
+  ]
+}
+```
+
 ### stopall
 
 Stop all playing audio immediately.
@@ -132,7 +160,9 @@ a microphone.
 
 ## Sample Targeting Commands
 
-These commands control specific playing samples by ID, filename, or voice.
+These commands control specific playing samples by ID, filename, or voice. They
+also reach a play whose file is still loading; see
+[Commands sent while a play is loading](#commands-sent-while-a-play-is-loading).
 
 ### stop
 
@@ -148,13 +178,14 @@ Stop specific samples.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
 | `id` | string | — | Stop sample with this ID |
 | `file` | string | — | Stop all samples playing this file |
 | `voice` | string | — | Stop all samples in this voice |
 | `internal_id` | string | — | Target one sample by the system-assigned id shown in `/status/samples` |
 | `fade_out_ms` | integer | 10 | Fade-out duration (milliseconds). The 10 ms default avoids clicks on abrupt stops |
 
-At least one of `internal_id`, `id`, `file`, or `voice` is required. Multiple selectors use OR logic.
+At least one of `internal_id`, `id`, `file`, or `voice` is required. Multiple selectors use OR logic (a sample matches if any one criterion matches). A command with an empty selector is rejected: HTTP answers 400, and over MQTT it is logged as a failed command.
 
 ### seek
 
@@ -170,6 +201,7 @@ Jump to a position in a playing sample.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target all samples playing this file |
 | `voice` | string | — | Target all samples in this voice |
@@ -191,6 +223,7 @@ Change playback speed.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target samples playing this file |
 | `voice` | string | — | Target samples in this voice |
@@ -220,6 +253,7 @@ Adjust volume of specific samples.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
+| `internal_id` | string | — | Target the exact sample by its system-assigned internal ID (from `/status/samples`); checked first |
 | `id` | string | — | Target sample ID |
 | `file` | string | — | Target samples playing this file |
 | `voice` | string | — | Target samples in this voice |
@@ -239,7 +273,7 @@ full lifecycle.
 ### voice_stop
 
 Stop all samples in a voice immediately. The voice keeps its settings.
-Stopping a voice with nothing playing succeeds and reports 0 samples.
+Stopping a voice with nothing playing succeeds.
 
 ```json
 {
@@ -251,7 +285,7 @@ Stopping a voice with nothing playing succeeds and reports 0 samples.
 ### voice_fade_out
 
 Fade out all samples in a voice. The voice keeps its settings. Fading a
-voice with nothing playing succeeds and reports 0 samples.
+voice with nothing playing succeeds.
 
 ```json
 {
@@ -307,7 +341,10 @@ sample played into it. Creates the voice if it does not exist yet.
 
 The voice speed sets each sample's speed rather than multiplying it. A
 [`speed`](#speed) command aimed at one sample changes that sample until the
-next `voice_speed` on its voice.
+next `voice_speed` on its voice, and a `play` that gives its own `speed`
+starts at that speed instead. A windowed source plays forward only, so it
+stays at normal speed with a warning; the voice still stores the speed for
+its later full plays.
 
 ### voice_clear
 
@@ -325,11 +362,44 @@ every voice.
 |-----------|------|---------|-------------|
 | `voice` | string | *required* | Voice name, or `"*"` for all voices |
 
-A microphone's voice stays registered with default settings, so its voice
-volume returns to 1.0; the microphone's own volume and mute are left alone
-(use [`reset`](#reset) for those). Clearing a voice that does not exist
-succeeds and reports 0 samples. Unlike `reset`, a play still loading when
-`voice_clear` arrives starts afterwards.
+A play into the voice that is still loading is cancelled, and `"*"` cancels
+every play still loading. A microphone's voice stays registered with default
+settings, so its voice volume returns to 1.0; the microphone's own volume and
+mute are left alone (use [`reset`](#reset) for those). Clearing a voice that
+does not exist succeeds.
+
+---
+
+## Commands sent while a play is loading
+
+A `play` loads its file before the sound starts, which takes a while for a cold
+file or a URL. Commands that arrive in the meantime still reach the new sound,
+as if they had arrived just after it started:
+
+- `speed`, `voice_speed`, `volume` and `seek` change the sounds already playing
+  at once, and the play starts with the new setting. When several `speed` or
+  `voice_speed` commands reach it, the last one wins.
+- `stop`, `voice_stop`, `voice_fade_out` and `voice_clear` cancel a matching
+  play before it starts, so it is never heard; `voice_clear` of `"*"` and
+  `reset` cancel every play still loading. An HTTP client waiting on the
+  `play` gets 409.
+- `voice_volume` sets the voice's volume. A voice exists from the moment a play
+  naming it arrives, so the play starts at that volume, and `/status/voices`
+  lists the voice while its play loads. If no play naming the voice starts and
+  no setting was stored on it, the voice ends with the last of them.
+- `internal_id` cannot reach a play that has not started, because the id is
+  assigned when it starts. A play without a `voice` can be reached only by `id`
+  or `file` until then.
+- A command that reaches only plays still loading reports success. A stop
+  removes a loading play at once, so a later command that named only that play
+  is answered "not found", where a sound that had started would still be
+  fading.
+- A windowed play plays forward only, so it starts at normal speed from the
+  beginning whatever `speed` or `seek` reached it, and logs a warning.
+
+Commands do not wait for loads, and a play starts when its own load finishes,
+so plays do not always start in the order they were sent. See
+[command ordering](command-ordering.md) for the full rules.
 
 ---
 
@@ -364,6 +434,18 @@ Remove a specific file from cache.
 {
   "command": "cache_invalidate",
   "file": "https://example.com/updated-file.wav"
+}
+```
+
+### cache_reload
+
+Invalidate a cached entry and immediately re-precache it, so the next play is both fresh and instant. Useful
+after a content pipeline republishes an asset.
+
+```json
+{
+  "command": "cache_reload",
+  "file": "/sounds/updated-cue.wav"
 }
 ```
 
@@ -422,11 +504,14 @@ games or shows.
 {"command": "reset"}
 ```
 
-- Stops all playback (10ms fade) and cancels plays still loading, like `stopall`
+- Stops all playback (10ms fade) and cancels every play still loading
 - Forgets every voice and its settings (microphone voices stay registered
   with default settings)
-- Restores every microphone to its configured volume, unmuted
-- Ducking driven by playback releases as the playback stops
+- Restores every microphone to its configured volume, unmuted, at full voice
+  volume. A microphone a talkback lease owns keeps its level; the lease
+  decides whether it is live
+- Ducking driven by playback releases as the playback stops; ducking driven
+  by a live microphone follows the microphone
 
 The caches are kept, so precached files stay ready; use `cache_clear` to
 drop them too. The configuration file is not reloaded.
@@ -579,4 +664,16 @@ For backward compatibility, commands also accept parameters wrapped in a `messag
 }
 ```
 
-This format is equivalent to the flattened format shown throughout this document. When both formats are present in the same message, the `message` object takes precedence.
+This format is equivalent to the flattened format shown throughout this document. When both formats are present in the same message, the `message` object takes precedence (its contents replace the flattened keys wholesale rather than merging).
+
+### Legacy command names
+
+Three commands also accept a legacy alias for their `command` value:
+
+| Canonical | Legacy alias |
+|-----------|--------------|
+| `play` | `soundPlay` |
+| `stopall` | `soundStopAll` |
+| `precache` | `soundPrecache` |
+
+These aliases are accepted only for those three commands; every other command uses its canonical name. Command names are matched case-sensitively.

@@ -1,2 +1,129 @@
-(no work in progress - committed through "Make voices persistent and add
-voice_speed, voice_clear and reset")
+Merge v2.1 and rebuild persistent voices on its command scheduler
+
+Brings the v2.1 release line (lock-free audio engine, CommandScheduler
+with carry-over onto loading plays, talkback, webui, and the rest of
+its 123 commits) into this branch, and re-implements the persistent
+voice work from beb3932 on top of it. That work was written against
+main's old inline command loop, which v2.1 replaced, so the conflicting
+code was resolved to v2.1's side and the feature was ported rather than
+hunk-merged.
+
+Voice lifecycle (src/voice.rs)
+- A voice is kept once a play naming it starts or a setting is stored
+  on it (voice_volume, voice_speed), and lasts until voice_clear or
+  reset. Each opened microphone's voice_id is registered at startup.
+- v2.1's loading-play count stays: a voice exists from the moment a
+  play naming it arrives. A voice held only by plays still loading is
+  transient, so a play that fails, is cancelled, or whose HTTP client
+  left still leaves nothing behind, as v2.1 intended. Voices created by
+  a play that named no voice are transient too, so one-off plays do not
+  accumulate.
+- clear_voice forgets a voice; a microphone's voice stays registered
+  with default settings.
+
+Commands
+- voice_speed {voice, speed, pitch_correction}: stored on the voice,
+  applied to its playing full-load sounds, and carried onto plays into
+  it that are still loading (PendingPlays), so the last speed or
+  voice_speed to reach a play wins. A windowed voice warns and stays at
+  normal speed; the setting is still stored.
+- play's speed is now optional: a play without one starts at its
+  voice's speed, one with its own speed overrides it.
+- voice_clear {voice | "*"}: cancels matching plays still loading,
+  fades the voice's sounds (10ms), forgets it, and returns its
+  microphones to full voice volume.
+- reset: fades everything, cancels every play still loading, forgets
+  every voice, and returns each opened input to its configured volume,
+  unmuted, at full voice volume, using the existing SetInputVolume and
+  SetVoiceVolume audio commands. An input a talkback lease owns keeps
+  its level, following v2.1's rule that an ordinary unmute is rejected
+  while a lease owns the input. Inputs are addressed by their position
+  among opened inputs, matching the audio thread's list. Caches and
+  in-flight cache loads are untouched.
+- voice_stop and voice_fade_out on an idle or unknown voice succeed
+  without creating it; voice_volume always succeeds and creates the
+  voice, which also covers v2.1's input-only voice case. voice_stop
+  keeps the voice's settings.
+- set_speed_of_matching is factored out of the speed handler and shared
+  with voice_speed; one STOP_FADE_MS constant replaces the per-arm ones.
+
+HTTP and webui
+- /status and /metrics report voices (all remembered) next to
+  active_voices (playing, loading a play, or fed by a live input);
+  /status/voices lists idle voices and adds speed, pitch_correction and
+  active. POST /voice/speed, /voice/clear and /reset.
+- webui: contract types, client methods (voiceSpeed, voiceClear,
+  reset), and console controls for them.
+
+Tests (new ones written first and seen failing)
+- voice.rs: v2.1's and this branch's suites combined; v2.1 tests that
+  asserted a voice ends with its last sound now assert it stays, and
+  new tests cover the transient rule.
+- pending_plays: voice_speed carries; voice_clear and reset cancel.
+- main.rs fixture: voice_speed on playing and later plays, play speed
+  override, streamed-voice warning, voice_clear (one and all, mic
+  voice), reset (inputs restored, talkback-owned input left alone),
+  input voice registration, scheduler carry and cancellation. v2.1
+  tests that expected "not found" or a voice ending were updated to the
+  agreed behaviour; the failed-MQTT-command logging test now uses an
+  unavailable input as its failing command.
+- carry_over_property_test and the scheduler script property test:
+  their one-at-a-time references model kept voices, and the property
+  test gains voice_speed, voice_clear and reset ops with coverage
+  counters. A play that the scheduler never starts (cancelled or
+  failed) does not keep its voice; documented as a difference in
+  docs/command-ordering.md.
+
+Validation: cargo fmt --check; cargo clippy --all-targets -D warnings
+on 1.97 and on the 1.95 toolchain v2.1 pins; RUSTFLAGS=-D warnings
+release build; broker-backed suite with plain and TLS listeners
+(MQTTAUDIO_BROKER_TESTS=1, MQTTAUDIO_TLS_CA) 1096 passed, 0 failed, 7
+device-gated ignored; carry-over property test at 20000 cases and the
+scheduler script property at 512 cases; webui typecheck, lint, 86 unit
+tests, build, and the 4 Playwright smoke tests; and a release daemon
+driven over HTTP on an ALSA null device with a null-capture microphone.
+The Docker validation image could not run (no Docker daemon in this
+environment).
+
+docs/bugs.md gains an entry for numeric input selectors meaning
+different inputs on the control side and the audio thread once an
+earlier input fails to open (pre-existing in v2.1).
+
+Prompts:
+
+- Question from a customer: "Q: Do voices last forever?" / "I'll say I
+  kind of want them to last forever (maybe a special command can clean up
+  all inactive voices for systems that are generating voice names
+  dynamically, but I don't think we'd ever do that), and I also would like
+  them to be created as soon as they get any message, not just a play
+  command."
+- "1. Agree with all of those. Voices should be created the second there's
+  something persistent we need to store about them. Speed might be another
+  one that matters here? Also ok with not materializing a voice until there
+  is a setting we need to retain for it, so ducking rules can be silent on
+  it. 2. Agree with the behavior change. 3. Yes, keep volume on stop. Let's
+  introduce a new voice_clear which can also accept a wildcard. Maybe we
+  also want a "reset" that resets the whole system to its startup
+  conditions, for predictable reset between games? 4. maybe we expose both
+  voices (active and inactive) and active_voices (active only) counts?
+  seems like both could be useful. I don't think the breaking change here
+  will impact any current consumers, but maybe the web dashboard we've
+  written might need updates."
+- "Speed - yes, let's make this a sticky thing stored on the voice similar
+  to volume. I like the consistency of that behavior and think it's worth
+  the enginering effort. Microphone voices - let's register these at
+  startup if configured but not require that to be the case. voice_clear
+  should indeed imply voice_stop. wildcard matching should only be * for
+  all voices, no other wildcard match needed yet. I agree with your spec
+  for reset. include it in this change."
+- (Answer to a follow-up question) Voice speed sets each sample's speed
+  rather than multiplying it.
+- "Please push to the v2.1 branch."
+- "Wait, you didn't do this work on the 2.1 branch? Yeah, need to
+  integrate 2.1 forward into this and merge/reconcile first. a lot of
+  improvements are in 2.1."
+
+This code was written by Claude (Claude Code).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_018i4286N4bHJhgtkXdE4Snc

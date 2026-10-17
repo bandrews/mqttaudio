@@ -1,8 +1,6 @@
 // ABOUTME: Linux-specific ALSA device probing for native hardware capabilities.
 // ABOUTME: Provides detailed device information beyond what cpal exposes.
 
-#![cfg(target_os = "linux")]
-
 use alsa::pcm::{Format, HwParams, PCM};
 use alsa::{Card, Direction};
 use std::collections::HashSet;
@@ -26,9 +24,13 @@ fn classify_device_name(name: &str) -> DeviceCategory {
         || name.starts_with("iec958")
     {
         DeviceCategory::ChannelLayout
-    } else if name.starts_with("sysdefault:") || name == "default" {
-        DeviceCategory::System
-    } else if name == "pulse" || name == "jack" || name == "oss" {
+    } else if name.starts_with("sysdefault:")
+        || name == "default"
+        || name.starts_with("default:")
+        || name == "pulse"
+        || name == "jack"
+        || name == "oss"
+    {
         DeviceCategory::System
     } else if name == "null" {
         DeviceCategory::Unavailable
@@ -51,7 +53,7 @@ fn is_plugin_device(name: &str) -> bool {
         "upmix",
         "vdownmix",
     ];
-    plugins.iter().any(|p| name == *p)
+    plugins.contains(&name)
 }
 
 /// Check if a device is likely to be useful for mqttaudio
@@ -64,8 +66,12 @@ fn should_suggest_device(name: &str, category: &DeviceCategory) -> bool {
             // But filter out common plugin names
             !is_plugin_device(name)
         }
-        // sysdefault for specific cards is often good
-        DeviceCategory::System if name.starts_with("sysdefault:CARD=") => true,
+        // Defaults for specific cards are often good
+        DeviceCategory::System
+            if name.starts_with("sysdefault:CARD=") || name.starts_with("default:CARD=") =>
+        {
+            true
+        }
         _ => false,
     }
 }
@@ -85,8 +91,8 @@ fn alsa_format_to_native(fmt: Format) -> Option<NativeSampleFormat> {
 
 /// Probe native hardware capabilities for an ALSA device
 fn probe_device_capabilities(name: &str) -> Result<NativeCapabilities, String> {
-    let pcm = PCM::new(name, Direction::Playback, false)
-        .map_err(|e| format!("Failed to open: {}", e))?;
+    let pcm =
+        PCM::new(name, Direction::Playback, false).map_err(|e| format!("Failed to open: {}", e))?;
 
     let hwp = HwParams::any(&pcm).map_err(|e| format!("Failed to get hw params: {}", e))?;
 
@@ -112,12 +118,10 @@ fn probe_device_capabilities(name: &str) -> Result<NativeCapabilities, String> {
     // Get channel range (cap at reasonable values for display)
     let min_channels = hwp
         .get_channels_min()
-        .map_err(|e| format!("Failed to get min channels: {}", e))?
-        as u16;
-    let max_channels_raw = hwp
-        .get_channels_max()
-        .map_err(|e| format!("Failed to get max channels: {}", e))?
-        as u16;
+        .map_err(|e| format!("Failed to get min channels: {}", e))? as u16;
+    let max_channels_raw =
+        hwp.get_channels_max()
+            .map_err(|e| format!("Failed to get max channels: {}", e))? as u16;
     // Plugin devices may report absurd values (10000+), cap for sanity
     let max_channels = max_channels_raw.min(128);
 
@@ -160,6 +164,15 @@ fn probe_device_capabilities(name: &str) -> Result<NativeCapabilities, String> {
     })
 }
 
+/// Probe an ALSA device's discrete output sample rates, if it advertises a
+/// discrete set. Returns `None` if the device can't be probed or exposes a
+/// continuous rate range. Used to steer rate selection for raw `hw:` devices.
+pub fn discrete_rates_for(name: &str) -> Option<Vec<u32>> {
+    probe_device_capabilities(name)
+        .ok()
+        .and_then(|caps| caps.discrete_rates)
+}
+
 /// Get card ID (short name) from ALSA
 #[allow(dead_code)]
 fn get_card_id(card_index: i32) -> Option<String> {
@@ -187,8 +200,7 @@ fn extract_card_name_from_device(name: &str) -> Option<String> {
     let rest = &name[prefix.len()..];
 
     // Try "CARD=name" format
-    if rest.starts_with("CARD=") {
-        let card_part = &rest[5..];
+    if let Some(card_part) = rest.strip_prefix("CARD=") {
         let card_name = if let Some(comma_pos) = card_part.find(',') {
             &card_part[..comma_pos]
         } else {
@@ -240,8 +252,7 @@ fn extract_card_index_from_name(name: &str) -> Option<i32> {
     // Try numeric format (hw:1,0)
     let prefixes = ["hw:", "plughw:", "sysdefault:", "dmix:", "front:", "hdmi:"];
     for prefix in prefixes {
-        if name.starts_with(prefix) {
-            let rest = &name[prefix.len()..];
+        if let Some(rest) = name.strip_prefix(prefix) {
             let num_part = if let Some(comma_pos) = rest.find(',') {
                 &rest[..comma_pos]
             } else {
@@ -338,14 +349,10 @@ pub fn probe_alsa_devices() -> DeviceList {
             }
 
             // Check for sound servers that aren't running
-            if name == "jack" {
-                if PCM::new(&name, Direction::Playback, false).is_err() {
-                    device = device.with_unavailable_reason("JACK server not running");
-                }
-            } else if name == "pulse" {
-                if PCM::new(&name, Direction::Playback, false).is_err() {
-                    device = device.with_unavailable_reason("PulseAudio not available");
-                }
+            if name == "jack" && PCM::new(&name, Direction::Playback, false).is_err() {
+                device = device.with_unavailable_reason("JACK server not running");
+            } else if name == "pulse" && PCM::new(&name, Direction::Playback, false).is_err() {
+                device = device.with_unavailable_reason("PulseAudio not available");
             }
 
             // Mark as suggested if appropriate
@@ -358,7 +365,7 @@ pub fn probe_alsa_devices() -> DeviceList {
                 if name.starts_with("plughw:") {
                     suggested.suggestion_reason =
                         Some("Hardware device with automatic format conversion".to_string());
-                } else if name.starts_with("sysdefault:") {
+                } else if name.starts_with("sysdefault:") || name.starts_with("default:") {
                     suggested.suggestion_reason =
                         Some("System default for this sound card".to_string());
                 } else {
@@ -390,14 +397,24 @@ mod tests {
             classify_device_name("plughw:CARD=UMC1820,DEV=0"),
             DeviceCategory::PluginHardware
         );
-        assert_eq!(classify_device_name("dmix:CARD=PCH,DEV=0"), DeviceCategory::SoftwareMixer);
+        assert_eq!(
+            classify_device_name("dmix:CARD=PCH,DEV=0"),
+            DeviceCategory::SoftwareMixer
+        );
         assert_eq!(classify_device_name("default"), DeviceCategory::System);
+        assert_eq!(
+            classify_device_name("default:CARD=HD"),
+            DeviceCategory::System
+        );
         assert_eq!(classify_device_name("pulse"), DeviceCategory::System);
         assert_eq!(
             classify_device_name("surround71:CARD=PCH,DEV=0"),
             DeviceCategory::ChannelLayout
         );
-        assert_eq!(classify_device_name("hdmi:CARD=PCH,DEV=0"), DeviceCategory::Hdmi);
+        assert_eq!(
+            classify_device_name("hdmi:CARD=PCH,DEV=0"),
+            DeviceCategory::Hdmi
+        );
         assert_eq!(classify_device_name("ch1"), DeviceCategory::Virtual);
         assert_eq!(classify_device_name("room"), DeviceCategory::Virtual);
         assert_eq!(classify_device_name("lavrate"), DeviceCategory::System);
@@ -413,6 +430,10 @@ mod tests {
         assert!(should_suggest_device("room", &DeviceCategory::Virtual));
         assert!(!should_suggest_device("lavrate", &DeviceCategory::Virtual));
         assert!(!should_suggest_device("default", &DeviceCategory::System));
+        assert!(should_suggest_device(
+            "default:CARD=HD",
+            &DeviceCategory::System
+        ));
         assert!(should_suggest_device(
             "sysdefault:CARD=UMC1820",
             &DeviceCategory::System

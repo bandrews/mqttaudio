@@ -192,6 +192,29 @@ Start playback from a specific position:
 }
 ```
 
+### Start Speed
+
+Start playback at a speed, with or without pitch correction, instead of sending
+a `speed` command after the play:
+
+```json
+{
+  "command": "play",
+  "file": "/sounds/engine.wav",
+  "voice": "engine",
+  "speed": 1.08,
+  "pitch_correction": false
+}
+```
+
+`speed` and `pitch_correction` mean exactly what they mean on the `speed`
+command, with the same ranges. `speed: 0`, and a negative speed with
+`pitch_correction`, reject the play. A negative speed plays backwards from
+`start_position_ms`, so give one, or the sound is already at its beginning and
+ends at once. A windowed play (`mode: "stream"`, or a file long or large enough
+for `auto` to window) plays forward only: it starts at normal speed and logs a
+warning. Use `mode: "full"` for a sound that has to start at another speed.
+
 ## Examples
 
 ### DJ-Style Speed Control

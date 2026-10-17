@@ -78,6 +78,30 @@ You don't need to map all source channels. To play only the left channel of a st
 }
 ```
 
+### Per-Route Gain
+
+Each route accepts an optional `gain` (default `1.0`, unity). It scales only that route, so one source
+channel can reach several outputs at different levels instead of being sent at full level to each:
+
+```json
+{
+  "command": "play",
+  "file": "/sounds/mono.wav",
+  "channel_map": [
+    {"src": 0, "dest": 0},
+    {"src": 0, "dest": 1, "gain": 0.4}
+  ]
+}
+```
+
+This plays the mono source at full level on channel 0 with a quieter copy on channel 1. Values above
+`1.0` boost; gains are clamped to `0.0`–`8.0`. A route without `gain` is unity, so existing maps are
+unchanged. The same gain tames a downmix that sums several source channels into one destination so the
+sum does not clip (see [commands](../commands.md)).
+
+To level-match a speaker for every play rather than per command, set a per-output-channel gain in
+`audio.channel_volumes` instead (see [configuration](../configuration.md)).
+
 ## Examples
 
 ### Surround Sound Installation

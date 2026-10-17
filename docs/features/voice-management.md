@@ -9,7 +9,8 @@ A voice is created the first time any of these name it:
 - `play` with a `voice`
 - `voice_volume` or `voice_speed` — so a voice can be set up before anything
   plays in it
-- a microphone's `voice_id` in the config file, registered at startup
+- a microphone's `voice_id` in the config file, registered at startup when
+  the input opens
 
 Once created, a voice and its settings last until `voice_clear` or `reset`,
 including while nothing is playing in it. Stopping or fading a voice stops
@@ -40,6 +41,15 @@ Multiple sounds can belong to the same voice:
 ```
 
 All three sounds are now in the "ambience" voice.
+
+A voice exists from the moment a play naming it arrives, while the play's file
+is still loading. Once one of those plays starts, the voice stays. If none of
+them starts (each fails or is cancelled) and no setting was stored on the
+voice, it ends with the last of them. Voice commands sent while a play loads
+reach it: `voice_volume` and `voice_speed` set the volume and speed it starts
+at, and `voice_stop`, `voice_fade_out` or `voice_clear` cancels it before it
+is heard (see
+[Commands sent while a play is loading](../commands.md#commands-sent-while-a-play-is-loading)).
 
 ## Voice Commands
 
@@ -101,7 +111,9 @@ Change the playback speed of all sounds in a voice:
 Like volume, this affects currently playing sounds and any new sounds added
 to this voice, and is remembered until the voice is cleared. It sets each
 sound's speed (it does not multiply it); a `speed` command aimed at one sound
-overrides that sound until the next `voice_speed`. See
+overrides that sound until the next `voice_speed`, and a `play` that gives
+its own `speed` starts at that speed instead. Windowed (streamed) sources
+play forward only and stay at normal speed. See
 [Playback Control](playback-control.md) for speed ranges and pitch
 correction.
 
