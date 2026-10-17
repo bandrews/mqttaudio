@@ -129,8 +129,8 @@ INFO mqttaudio: Cancelled play of /sounds/rain.wav: Cancelled by a stop before i
 INFO mqttaudio: Cancelled play of /sounds/rain.wav: Superseded by stopall/fadeall
 ```
 
-The first is a `stop`, `voice_stop` or `voice_fade_out` that matched it; the
-second is `stopall` or `fadeall`.
+The first is a `stop`, `voice_stop`, `voice_fade_out` or `voice_clear` that
+matched it, or a `reset`; the second is `stopall` or `fadeall`.
 
 ---
 

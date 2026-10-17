@@ -38,15 +38,18 @@ out-of-range `volume`/`speed`. Defaults below are the parser/handler defaults.
 
 | Command | Required | Optional (default) | Notes |
 |---------|----------|--------------------|-------|
-| `play` (`soundPlay`) | `file` | `id`, `volume`(1.0), `voice`(auto), `loop`(false), `crossfade_ms`(0), `fade_in`, `start_position_ms`, `speed`(1.0), `pitch_correction`(false), `channel_map`, `mode`(auto), `window_ms`, `prebuffer_ms`, `freshness`(trusting), `cacheable`(true) | Only command taking routing/load/window params. See §3, §4. |
+| `play` (`soundPlay`) | `file` | `id`, `volume`(1.0), `voice`(auto), `loop`(false), `crossfade_ms`(0), `fade_in`, `start_position_ms`, `speed`(the voice's `voice_speed`, else 1.0), `pitch_correction`(false; applies with `speed`), `channel_map`, `mode`(auto), `window_ms`, `prebuffer_ms`, `freshness`(trusting), `cacheable`(true) | Only command taking routing/load/window params. See §3, §4. |
 | `stop` | one selector | `internal_id`,`id`,`file`,`voice`, `fade_out_ms` | Selector OR-logic (§3). |
 | `stopall` (`soundStopAll`) | — | — | Stops everything. |
 | `volume` | `volume` + a selector | `internal_id`,`id`,`file`,`voice` | `volume` clamped 0..1 downstream. |
 | `seek` | `position_ms` + a selector | `internal_id`,`id`,`file`,`voice` | Unsupported on `mode:stream` (forward-only). |
 | `speed` | `speed` + a selector | `internal_id`,`id`,`file`,`voice`, `pitch_correction`(false) | Range: no pitch → −100..100 (negative = reverse); with pitch → 0.05..8.0 (no reverse). Clamped at `mixer.rs:369-379`. |
-| `voice_volume` | `voice`, `volume` | — | |
+| `voice_volume` | `voice`, `volume` | — | Stored on the voice; creates it if needed. |
 | `voice_fade_out` | `voice`, **`time`** | — | **Wire key is `time` (ms).** Typed REST body uses `time_ms` (§5). |
-| `voice_stop` | `voice` | — | |
+| `voice_stop` | `voice` | — | Keeps the voice's settings. Succeeds on an idle or unknown voice. |
+| `voice_speed` | `voice`, `speed` | `pitch_correction`(false) | Stored on the voice: sets its playing sounds and every later play into it (a play's own `speed` overrides it). `0` and reverse with pitch correction are rejected at parse time. |
+| `voice_clear` | `voice` | — | Stops the voice, cancels plays into it still loading, forgets its settings. `"*"` clears every voice. |
+| `reset` | — | — | Startup state: stops everything, cancels loading plays, forgets voices, restores inputs to configured volume unmuted (a talkback-owned input keeps its level). Caches kept. |
 | `input_volume` | `input`, `volume` | — | `input` is a **string** — index `"0"` or a `voice_id`. A bare number errors. |
 | `input_mute` | `input`, **`mute`** | — | `mute` required over MQTT; **defaults false** on the typed REST endpoint (§5). |
 | `precache` (`soundPrecache`) | `file` | — | Decode/cache without playing. |

@@ -306,6 +306,9 @@ When `config.inputs` is configured to mix a microphone or line input (see
 - **Talkback uses a daemon-owned expiring lease.** `talkback_acquire` renewals are exclusive to one client and
   `talkback_release`/`talkback_hard_mute` return the input to silence; a stopped renewer expires to muted without
   relying on browser cleanup. See the `/status/talkback` HTTP endpoint for applied state.
+- **`reset` restores inputs.** The `reset` command returns every opened input to its configured volume,
+  unmuted, as at startup (an input owned by a talkback lease keeps its level), along with stopping playback
+  and forgetting every voice's settings.
 - **Inputs can trigger ducking.** A mic whose `voice_id` is a ducking rule's `primary_voice` ducks that
   rule's background voices while its stream is open.
 - **Out-of-range routes warn.** A route reading a source channel the device does not have is logged once at
@@ -352,8 +355,8 @@ The server also exposes observability endpoints (no auth in open mode):
 - `GET /ready` — readiness (HTTP 200 only when output and every configured input are ready; `/health` remains
   the process-liveness probe).
 - `GET /metrics` — operational telemetry: `uptime_seconds`, `clips` (limiter holds), `xruns` (audio
-  stream-error/dropout count), active voice/sample/input counts, and a per-voice `ducking` map of resolved
-  multipliers. Every value is real, suitable for scraping into a monitor.
+  stream-error/dropout count), active voice/sample/input counts, the total `voices` the daemon remembers
+  (idle voices keep their settings), and a per-voice `ducking` map of resolved multipliers. Every value is real, suitable for scraping into a monitor.
 - `GET /status` and `/status/voices` also carry the limiter `clip_count`, the `xruns` counter, and (on
   `/status/voices`) each voice's current `ducking_multiplier`.
 - `GET /status/talkback` includes `now_ms` alongside `lease_expires_at_ms`; both values use the daemon's

@@ -68,6 +68,21 @@ Change playback speed in real-time:
 }
 ```
 
+### Voice Speed
+
+To set the speed of a whole voice and keep it for later plays into that voice, use [`voice_speed`](../commands.md#voice_speed):
+
+```json
+{
+  "command": "voice_speed",
+  "voice": "music",
+  "speed": 0.8,
+  "pitch_correction": true
+}
+```
+
+The voice speed sets each sound's speed rather than multiplying it. A `speed` aimed at one sound changes that sound until the next `voice_speed` on its voice, and a `play` that gives its own `speed` starts at it; a `play` without one starts at its voice's speed.
+
 ### Speed Values
 
 | Speed | Effect |

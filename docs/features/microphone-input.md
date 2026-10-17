@@ -197,6 +197,12 @@ An input's `voice_id` is a first-class voice: a `voice_volume` command targeting
 
 This is separate from `input_volume` (a per-input gain): `voice_volume` is the shared voice-level gain that also scales any samples playing on the same voice.
 
+Each input that opens registers its `voice_id` as a voice at startup, so it is listed in `/status/voices` (as active) before anything touches it. `voice_clear` on that voice returns its voice volume to `1.0` and leaves the voice registered; it does not change the input's own `input_volume` or mute.
+
+### Reset
+
+The `reset` command returns every opened input to its configured `volume`, unmuted, at full voice volume, as at startup. An input a talkback lease currently owns keeps its level, because the lease decides whether it is live. See [`reset`](../commands.md#reset).
+
 ## Ducking Integration
 
 A microphone's `voice_id` can be listed in a rule's `ducked_voices`, so
