@@ -1,12 +1,14 @@
 // ABOUTME: Entry point for mqttaudio MQTT-controlled audio daemon.
 // ABOUTME: Handles CLI parsing, initialization, and main event loop.
 
-use mqttaudio::{audio, cache, config, http, mqtt, voice};
+use mqttaudio::{
+    audio, cache, config, config_editor, http, mqtt, pending_plays, rt_engine, talkback, voice,
+};
 
 use clap::Parser;
-use cpal::traits::{DeviceTrait, StreamTrait};
+use cpal::traits::DeviceTrait;
+use mqttaudio::loading::{self, PreparedPlayback};
 use tokio::sync::mpsc;
-use tracing_subscriber;
 
 #[derive(Parser, Debug)]
 #[command(name = "mqttaudio")]
@@ -29,7 +31,7 @@ struct Args {
     #[arg(short, long)]
     topic: Option<String>,
 
-    /// Audio output device name
+    /// Output Device ID from --list-devices (ALSA ID on Linux, not the description)
     #[arg(short, long)]
     device: Option<String>,
 
@@ -45,7 +47,11 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
-    /// List available audio output devices and exit
+    /// Launch the interactive configuration editor and exit
+    #[arg(long)]
+    configure: bool,
+
+    /// List audio output Device IDs with CLI and JSON config examples, then exit
     #[arg(long)]
     list_devices: bool,
 
@@ -53,17 +59,13 @@ struct Args {
     #[arg(long)]
     list_inputs: bool,
 
-    /// Play a 440Hz test tone (for testing audio output)
+    /// LFE (subwoofer) channel number for bass management
     #[arg(long)]
-    test_tone: bool,
+    lfe_channel: Option<usize>,
 
-    /// Play an audio file (for testing decoder)
+    /// Crossover frequency (Hz) for bass management
     #[arg(long)]
-    file: Option<String>,
-
-    /// Test mixer with multiple simultaneous files (Phase 4)
-    #[arg(long)]
-    test_mixer: bool,
+    crossover_frequency: Option<f32>,
 
     /// MQTT topic to publish log messages to
     #[arg(long)]
@@ -81,86 +83,60 @@ struct Args {
     #[arg(long)]
     http_port: Option<u16>,
 
-    /// Maximum memory cache size in MB (0 = unlimited)
+    /// Override the memory cache cap in MiB (0 = auto-detect a bounded cap)
     #[arg(long)]
     max_cache_mb: Option<u32>,
 }
 
-/// Report capture health for live inputs on a fixed interval.
-///
-/// Overruns, backlog trims and starvation are counted inside the audio
-/// callbacks, which must not log or allocate; this reports the deltas from an
-/// ordinary task so problems are visible without stalling the audio threads.
-fn spawn_input_health_monitor(
-    mixer_state: std::sync::Arc<std::sync::Mutex<audio::mixer::MixerState>>,
-) {
-    const INTERVAL_SECS: u64 = 10;
-
-    tokio::spawn(async move {
-        let mut previous: Vec<(u64, u64, u64)> = Vec::new();
-        let mut ticker =
-            tokio::time::interval(std::time::Duration::from_secs(INTERVAL_SECS));
-        ticker.tick().await; // the first tick completes immediately
-
-        loop {
-            ticker.tick().await;
-
-            let snapshot: Vec<(String, usize, u64, u64, u64)> = {
-                let state = mixer_state.lock().unwrap();
-                state
-                    .live_inputs
-                    .iter()
-                    .map(|i| {
-                        (
-                            i.voice_id.clone(),
-                            i.backlog_frames(),
-                            i.dropped_frames(),
-                            i.trimmed_frames,
-                            i.underrun_frames,
-                        )
-                    })
-                    .collect()
-            };
-
-            previous.resize(snapshot.len(), (0, 0, 0));
-
-            for (idx, (voice_id, backlog, dropped, trimmed, underrun)) in
-                snapshot.iter().enumerate()
-            {
-                let (prev_dropped, prev_trimmed, prev_underrun) = previous[idx];
-                previous[idx] = (*dropped, *trimmed, *underrun);
-
-                let new_dropped = dropped.saturating_sub(prev_dropped);
-                let new_trimmed = trimmed.saturating_sub(prev_trimmed);
-                let new_underrun = underrun.saturating_sub(prev_underrun);
-
-                if new_dropped == 0 && new_trimmed == 0 && new_underrun == 0 {
-                    continue;
-                }
-
-                tracing::warn!(
-                    "Input {} ('{}'): {} frames overran, {} trimmed, {} starved in {}s (backlog {} frames)",
-                    idx,
-                    voice_id,
-                    new_dropped,
-                    new_trimmed,
-                    new_underrun,
-                    INTERVAL_SECS,
-                    backlog
-                );
-            }
-        }
-    });
+/// Build the formatting log layer for the chosen `logging.format`, filtered to
+/// `level` and writing through `make_writer` (F13/D40). `"json"` produces
+/// line-delimited JSON records for log aggregation; anything else (the validated
+/// default `"text"`) produces the human-readable rendering. Boxed so both formats
+/// share one type and compose with the optional MQTT layer in the registry.
+fn build_fmt_layer<S, W>(
+    format: &str,
+    level: tracing::Level,
+    make_writer: W,
+) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
+{
+    use tracing_subscriber::Layer;
+    let filter = tracing_subscriber::filter::LevelFilter::from_level(level);
+    if format == "json" {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(make_writer)
+            .with_filter(filter)
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer()
+            .with_writer(make_writer)
+            .with_filter(filter)
+            .boxed()
+    }
 }
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if args.config.is_none() {
+        args.config = std::env::var("MQTTAUDIO_CONFIG").ok();
+    }
 
-    // Load configuration: --config wins, then MQTTAUDIO_CONFIG, then the
-    // default search paths
-    let config_path = args.config.clone().or_else(|| std::env::var("MQTTAUDIO_CONFIG").ok());
-    let mut config = match config::Config::load_from_path_or_default(config_path.as_deref()) {
+    // Handle --configure before logging init: a tracing subscriber writing to
+    // stdout would corrupt the editor's raw-mode alternate screen.
+    if args.configure {
+        if let Err(e) = config_editor::run(args.config.as_deref()) {
+            eprintln!("Configuration editor error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // Load configuration
+    let mut config = match config::Config::load_from_path_or_default(args.config.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to load configuration: {}", e);
@@ -184,9 +160,29 @@ async fn main() {
         args.max_cache_mb,
     );
 
-    // Initialize logging based on config.
-    // logging.verbose is documented as equivalent to level "debug", so it
-    // raises the level when the configured level is less detailed.
+    // Container/deployment environments must be able to enable the internal
+    // HTTP gateway without baking a bearer token into the checked-in venue
+    // config. A requested non-loopback bind always requires auth; an absent
+    // token leaves startup validation failed closed rather than exposing an
+    // unauthenticated daemon on the Compose network.
+    if let Ok(bind_address) = std::env::var("MQTTAUDIO_HTTP_BIND_ADDRESS") {
+        if !bind_address.trim().is_empty() {
+            config.http.bind_address = bind_address;
+        }
+    }
+    if let Ok(auth_token) = std::env::var("MQTTAUDIO_HTTP_AUTH_TOKEN") {
+        if !auth_token.is_empty() {
+            config.http.auth_token = Some(auth_token);
+        }
+    }
+    if std::env::var("MQTTAUDIO_HTTP_REQUIRE_AUTH")
+        .is_ok_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        config.http.require_auth = true;
+        config.http.enabled = true;
+    }
+
+    // Initialize logging based on config
     let log_level = match config.logging.level.as_str() {
         "error" => tracing::Level::ERROR,
         "warn" => tracing::Level::WARN,
@@ -203,42 +199,45 @@ async fn main() {
 
     // The WebSocket log broadcaster is created before logging is initialized
     // so its tracing layer can stream every log line to /ws clients
+
+    // Initialize logging: a console fmt layer (text or JSON per logging.format),
+    // the WebSocket log layer (D62 — created BEFORE logging init and shared with
+    // the HTTP server so /ws clients stream live log lines), plus, when an MQTT
+    // log topic is configured, a composable MQTT publish layer. All sinks live in
+    // one registry so the format choice applies regardless (F13/D40).
     let log_broadcaster = std::sync::Arc::new(http::LogBroadcaster::new());
-
-    // Create log channel for MQTT publishing (if configured)
-    let (mqtt_layer, mqtt_log_receiver): (Option<mqtt::logger::MqttLogLayer>, Option<mqtt::logger::LogReceiver>) =
-        if config.logging.mqtt_topic.is_some() {
-            let (sender, receiver) = mqtt::logger::create_log_channel(100);
-            (Some(mqtt::logger::MqttLogLayer::new(sender, log_level)), Some(receiver))
-        } else {
-            (None, None)
-        };
-
-    {
+    let mqtt_log_receiver = {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
+
         use tracing_subscriber::Layer;
-
-        // Console output honors RUST_LOG (per-module filtering) when set,
-        // falling back to the configured level
-        let fmt_layer = tracing_subscriber::fmt::layer();
-        let fmt_layer = match std::env::var("RUST_LOG") {
-            Ok(env) => fmt_layer
-                .with_filter(tracing_subscriber::EnvFilter::new(env))
-                .boxed(),
-            Err(_) => fmt_layer
-                .with_filter(tracing_subscriber::filter::LevelFilter::from_level(log_level))
-                .boxed(),
-        };
-
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_level.to_string()));
+        let fmt_layer = build_fmt_layer(
+            &config.logging.format,
+            tracing::Level::TRACE,
+            std::io::stdout,
+        )
+        .with_filter(filter);
         let ws_layer = http::WebSocketLogLayer::new(log_broadcaster.clone(), log_level);
 
-        tracing_subscriber::registry()
-            .with(fmt_layer)
-            .with(ws_layer)
-            .with(mqtt_layer)
-            .init();
-    }
+        if config.logging.mqtt_topic.is_some() {
+            let (sender, receiver) = mqtt::logger::create_log_channel(100);
+            let mqtt_layer = mqtt::logger::MqttLogLayer::new(sender, log_level);
+            tracing_subscriber::registry()
+                .with(fmt_layer)
+                .with(ws_layer)
+                .with(mqtt_layer)
+                .init();
+            Some(receiver)
+        } else {
+            tracing_subscriber::registry()
+                .with(fmt_layer)
+                .with(ws_layer)
+                .init();
+            None
+        }
+    };
 
     tracing::info!("mqttaudio {} starting", env!("CARGO_PKG_VERSION"));
     tracing::info!("Copyright © 2016-2025 Mo Fang Heavy Industries LLC");
@@ -271,91 +270,22 @@ async fn main() {
             // Only warn here - we'll fail later if the actual device can't be configured
             tracing::warn!("Could not probe default audio device: {}", e);
             if config.audio.device.is_some() {
-                tracing::info!("Will attempt to use specified device: {:?}", config.audio.device);
+                tracing::info!(
+                    "Will attempt to use specified device: {:?}",
+                    config.audio.device
+                );
             } else {
-                tracing::warn!("No device specified and default device unavailable - audio may fail");
+                tracing::warn!(
+                    "No device specified and default device unavailable - audio may fail"
+                );
             }
         }
     }
 
-    // Handle --test-tone (Phase 1)
-    if args.test_tone {
-        tracing::info!("Starting test tone mode (440Hz sine wave)...");
-        match audio::engine::init_test_sine_wave() {
-            Ok(_stream) => {
-                tracing::info!("Test tone playing. Press Ctrl+C to exit.");
-
-                // Keep stream alive until Ctrl+C
-                let (tx, rx) = std::sync::mpsc::channel();
-                ctrlc::set_handler(move || {
-                    tx.send(()).expect("Could not send signal on channel");
-                })
-                .expect("Error setting Ctrl-C handler");
-
-                rx.recv().expect("Could not receive from channel");
-                tracing::info!("Stopping test tone...");
-
-                // Stream will be dropped here, stopping playback
-            }
-            Err(e) => {
-                tracing::error!("Failed to initialize audio stream: {}", e);
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
-    // Handle --file (Phase 2)
-    if let Some(file_path) = args.file {
-        match audio::engine::play_file(&file_path) {
-            Ok(_stream) => {
-                tracing::info!("File playing. Press Ctrl+C to exit.");
-
-                // Keep stream alive until Ctrl+C
-                let (tx, rx) = std::sync::mpsc::channel();
-                ctrlc::set_handler(move || {
-                    tx.send(()).expect("Could not send signal on channel");
-                })
-                .expect("Error setting Ctrl-C handler");
-
-                rx.recv().expect("Could not receive from channel");
-                tracing::info!("Stopping playback...");
-
-                // Stream will be dropped here, stopping playback
-            }
-            Err(e) => {
-                tracing::error!("Failed to play file: {}", e);
-                std::process::exit(1);
-            }
-        }
-        return;
-    }
-
-    // Handle --test-mixer (Phase 4)
-    if args.test_mixer {
-        tracing::info!("Starting mixer test (multiple simultaneous samples)...");
-        match audio::engine::test_mixer() {
-            Ok(_stream) => {
-                tracing::info!("Mixer test running. Press Ctrl+C to exit.");
-
-                // Keep stream alive until Ctrl+C
-                let (tx, rx) = std::sync::mpsc::channel();
-                ctrlc::set_handler(move || {
-                    tx.send(()).expect("Could not send signal on channel");
-                })
-                .expect("Error setting Ctrl-C handler");
-
-                rx.recv().expect("Could not receive from channel");
-                tracing::info!("Stopping mixer test...");
-
-                // Stream will be dropped here, stopping playback
-            }
-            Err(e) => {
-                tracing::error!("Failed to start mixer test: {}", e);
-                std::process::exit(1);
-            }
-        }
-        return;
+    // Warn (do not fail) if the config declares a schema version newer than this
+    // build understands — newer fields may be silently ignored (F4/D38).
+    if let Some(warning) = config.schema_version_warning() {
+        tracing::warn!("{}", warning);
     }
 
     // Validate config
@@ -384,14 +314,7 @@ async fn main() {
     // Connect to MQTT broker if enabled
     let mqtt_connection = if mqtt_enabled {
         let topic = config.mqtt.topic.as_ref().unwrap();
-        match mqtt::client::connect_mqtt(
-            &config.mqtt.server,
-            config.mqtt.port,
-            topic,
-            config.mqtt.client_id.as_deref(),
-            config.mqtt.username.as_deref(),
-            config.mqtt.password.as_deref(),
-        ).await {
+        match mqtt::client::connect_mqtt(&config.mqtt, topic).await {
             Ok((c, el)) => Some((c, el)),
             Err(e) => {
                 tracing::error!("Failed to connect to MQTT broker: {}", e);
@@ -437,72 +360,115 @@ async fn main() {
         }
     };
 
-    let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
-    let stream_config = match audio::engine::find_output_config(
+    let device_name = device
+        .description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|_| "Unknown".to_string());
+    let output_config = match audio::engine::find_output_config(
         &device,
         config.audio.channels,
         Some(config.audio.sample_rate),
-        Some(config.audio.buffer_size),
+        config.audio.buffer_size,
     ) {
         Ok(c) => c,
         Err(e) => {
-            tracing::error!(
-                "Failed to configure output device '{}': {}",
-                device_name, e
-            );
+            tracing::error!("Failed to configure output device '{}': {}", device_name, e);
             tracing::error!(
                 "Requested: {} channels, {} Hz sample rate",
-                config.audio.channels.map_or("default".to_string(), |c| c.to_string()),
+                config
+                    .audio
+                    .channels
+                    .map_or("default".to_string(), |c| c.to_string()),
                 config.audio.sample_rate
             );
             std::process::exit(1);
         }
     };
 
-    let output_sample_rate = stream_config.sample_rate.0;
+    let stream_config = output_config.stream_config;
+    let sample_format = output_config.sample_format;
+    let output_sample_rate = stream_config.sample_rate;
     let output_channels = stream_config.channels as usize;
-    // Capture streams run with the same buffer size so shared-clock USB
-    // interfaces accept both directions at once
-    let output_buffer_frames = match stream_config.buffer_size {
-        cpal::BufferSize::Fixed(frames) => Some(frames),
-        _ => None,
+    // The largest block the output stream can deliver, for pre-sizing the
+    // shipped pitch scratch (D56/D58): the fixed size when configured, else a
+    // documented cap (the per-block resize fallback is counted on /metrics).
+    let max_block_frames = match stream_config.buffer_size {
+        cpal::BufferSize::Fixed(n) => n as usize,
+        cpal::BufferSize::Default => 8192,
     };
 
     tracing::info!("Audio device: {}", device_name);
     tracing::info!("  Sample rate: {} Hz", output_sample_rate);
     tracing::info!("  Channels: {}", output_channels);
+    tracing::info!("  Sample format: {:?}", sample_format);
 
     // Resolving a device opens handles for both directions and keeps them.
     // Release them before the inputs open: a retained idle capture handle
     // holds the card's capture side, which makes the card invisible to input
     // enumeration and blocks every other capture application. The device is
     // re-resolved when the output stream is built.
+    #[cfg(target_os = "linux")]
     drop(device);
 
     // Create mixer state and voice manager
-    use audio::mixer::{ActiveSample, MixerState};
-    use audio::ducking::DuckingEngine;
-    use std::sync::{Arc, Mutex};
-    use std::collections::HashSet;
+    use audio::ducking::{DuckingApplier, DuckingEngine};
+    use audio::mixer::MixerState;
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, RwLock};
     use voice::VoiceManager;
 
-    // Create ducking engine from config rules
-    let ducking_engine = if !config.ducking_rules.is_empty() {
-        Some(DuckingEngine::new(config.ducking_rules.clone(), output_sample_rate))
+    // The ducking engine that resolves rules lives on the control thread (it is
+    // driven by command sends and graveyard completions, never by the callback);
+    // the audio thread only applies the resolved targets via a DuckingApplier.
+    let mut ducking_engine = if !config.ducking_rules.is_empty() {
+        Some(DuckingEngine::new(
+            config.ducking_rules.clone(),
+            output_sample_rate,
+        ))
+    } else {
+        None
+    };
+    let ducking_applier = if ducking_engine.is_some() {
+        // Pre-populated with every duckable voice so the first duck of a voice
+        // never inserts (allocates) on the audio thread (Sprint 13 F1).
+        Some(DuckingApplier::with_ducked_voices(
+            config
+                .ducking_rules
+                .iter()
+                .flat_map(|rule| rule.ducked_voices.iter().cloned()),
+        ))
     } else {
         None
     };
 
-    // Create bass management from config
+    // Control-side per-voice ducking multiplier snapshot the HTTP handlers read
+    // (D40). The control thread updates it through `notify_voice_activity` as
+    // ducking targets resolve; the audio thread never touches it (D20). Created
+    // before the input loop so configured-input voices that trigger ducking can
+    // record their target.
+    let ducking_snapshot: Arc<RwLock<HashMap<String, f32>>> = Arc::new(RwLock::new(HashMap::new()));
+
+    // Create bass management from config. Also keep the resolved LFE channel (when
+    // enabled) so the input-setup loop can warn about routes that collide with it.
+    let mut bass_lfe_channel: Option<usize> = None;
     let bass_management = if config.bass_management.enabled {
-        let resolved = config.resolve_bass_management()
-            .expect("Channel alias resolution failed (should have been caught during validation)");
+        let resolved = match config.resolve_bass_management() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("Bass management channel resolution failed: {}", e);
+                std::process::exit(1);
+            }
+        };
+        bass_lfe_channel = Some(resolved.lfe_channel);
         let bm_config = audio::bass_management::BassManagementConfig {
             enabled: resolved.enabled,
             lfe_channel: resolved.lfe_channel,
             crossover_frequency_hz: resolved.crossover_frequency_hz,
             source_channels: resolved.source_channels.clone(),
             remove_bass_from_sources: resolved.remove_bass_from_sources,
+            lfe_gain: resolved.lfe_gain,
         };
         tracing::info!(
             "Bass management enabled: LFE channel {}, crossover {} Hz, sources {:?}",
@@ -510,188 +476,395 @@ async fn main() {
             bm_config.crossover_frequency_hz,
             bm_config.source_channels
         );
-        // Config validation cannot know the device width; say so now rather
-        // than processing silently with routes that can never sound
-        if bm_config.lfe_channel >= output_channels {
-            tracing::warn!(
-                "Bass management is inactive: lfe_channel {} but the device opened with {} channels",
-                bm_config.lfe_channel, output_channels
-            );
-        }
-        for src in &bm_config.source_channels {
-            if *src >= output_channels {
-                tracing::warn!(
-                    "Bass management source channel {} is beyond the device's {} channels and contributes nothing",
-                    src, output_channels
-                );
-            }
-        }
-        Some(audio::bass_management::BassManagement::new(bm_config, output_sample_rate, output_channels))
+        Some(audio::bass_management::BassManagement::new(
+            bm_config,
+            output_sample_rate,
+            output_channels,
+        ))
     } else {
         None
     };
 
-    let channel_gains = config.resolve_channel_gains(output_channels)
-        .expect("Channel volume resolution failed (should have been caught during validation)");
-    for (channel, gain) in channel_gains.iter().enumerate() {
-        if *gain != 1.0 {
-            tracing::info!("Channel {} gain: {:.2}", channel, gain);
-        }
+    // Shared clip/over counter: the audio thread increments it (lock-free) when the
+    // limiter acts; HTTP `/status` reads it. Created once and cloned into both sides.
+    let clip_count = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+    // Opt-in telemetry gate (Sprint W6, DW3). Off by default. Shared between the RT
+    // `MixerState` (which gates its per-sample position store on it) and the HTTP
+    // `AppState` (POST /telemetry flips it). The control thread never locks the RT.
+    let telemetry_enabled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Per-output-channel peak meters (Sprint W7), shared between the RT mixer (which
+    // stores into them when telemetry is on) and the HTTP state-event tick timer.
+    let output_meters: std::sync::Arc<Vec<std::sync::atomic::AtomicU32>> = std::sync::Arc::new(
+        (0..output_channels)
+            .map(|_| std::sync::atomic::AtomicU32::new(0))
+            .collect(),
+    );
+
+    // Snapshot the running config as redacted JSON for the read-only `GET /config`
+    // (Sprint W8, DW11). Config is read once at startup (DW8), so a startup snapshot
+    // is accurate. Secrets (http.auth_token, mqtt.password) are nulled out.
+    let config_json = std::sync::Arc::new(http::redact_config_json(
+        serde_json::to_value(&config).unwrap_or_else(|_| serde_json::json!({})),
+    ));
+
+    let mixer = MixerState {
+        active_samples: Vec::with_capacity(audio::mixer::MAX_VOICES),
+        live_inputs: Vec::with_capacity(audio::mixer::MAX_LIVE_INPUTS),
+        streamed_sources: Vec::with_capacity(audio::mixer::MAX_STREAMED_SOURCES),
+        output_channels,
+        ducking_applier,
+        bass_management,
+        channel_gains: config.resolve_channel_gains(output_channels),
+        output_ceiling: audio::mixer::db_to_linear(config.audio.output_ceiling_db),
+        master_gain: config.audio.master_gain,
+        clip_count: clip_count.clone(),
+        telemetry_enabled: telemetry_enabled.clone(),
+        output_meters: output_meters.clone(),
+    };
+
+    // Control->audio command ring, audio->reaper graveyard ring, and audio->reaper
+    // command-return ring. The control thread holds the command producer and the two
+    // reaper consumers; the audio callback owns the bundle behind one uncontended
+    // mutex (D15/D22a). Spent heap-owning mutation commands travel back over the
+    // return ring so the callback never frees their heap.
+    let (cmd_tx, cmd_rx) = rt_engine::command_channel(1024);
+    let (grave_tx, mut grave_rx) = rt_engine::graveyard_channel(1024);
+    // Bounded well above MAX_STREAMED_SOURCES so the callback can always hand a
+    // finished source off for off-RT drop.
+    let (streamed_grave_tx, mut streamed_grave_rx) = rt_engine::streamed_graveyard_channel(256);
+    let (cmd_return_tx, mut cmd_return_rx) = rt_engine::command_return_channel(1024);
+
+    // Initialize audio inputs from config.
+    // Keep active input streams alive - they will be kept alive until the app exits.
+    // Live inputs are added to the mix by command (AddLiveInput); their static
+    // status is recorded for the control-side snapshot.
+    let mut _active_inputs: Vec<audio::input::ActiveInput> = Vec::new();
+    let mut input_statuses: Vec<http::InputStatus> = Vec::new();
+    // Per-input capture-path counters (D57): the capture callback bumps them, the
+    // reaper logs deltas off-RT, and /metrics sums the totals.
+    let mut input_telemetry: Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)> =
+        Vec::new();
+    let mut activity_watchers: Vec<(
+        String,
+        Arc<audio::input::InputTelemetry>,
+        Vec<usize>,
+        audio::activity::ActivityDetector,
+    )> = Vec::new();
+    let mut cmd_tx = cmd_tx;
+    let mut talkback_lease = talkback::TalkbackLease::default();
+    let talkback_status = std::sync::Arc::new(std::sync::RwLock::new(talkback_lease.status(0)));
+    struct SharedCapture {
+        active: audio::input::ActiveInput,
+        consumers: Vec<ringbuf::HeapConsumer<f32>>,
+    }
+    type CaptureKey = (Option<String>, u32, Option<usize>, Option<u32>);
+    let mut captures: std::collections::HashMap<CaptureKey, Result<SharedCapture, String>> =
+        std::collections::HashMap::new();
+    for input_config in &config.inputs {
+        let key = (
+            input_config.device.clone(),
+            input_config.latency_ms,
+            input_config.channels,
+            input_config.sample_rate,
+        );
+        captures.entry(key.clone()).or_insert_with(|| {
+            let stream_config = audio::input::InputStreamConfig {
+                device_name: input_config.device.clone(),
+                latency_ms: input_config.latency_ms,
+                min_channels: config
+                    .inputs
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.device == input_config.device
+                            && candidate.latency_ms == input_config.latency_ms
+                            && candidate.channels == input_config.channels
+                            && candidate.sample_rate == input_config.sample_rate
+                    })
+                    .flat_map(|candidate| candidate.routes.iter())
+                    .filter_map(|route| config.resolve_channel(&route.source_channel).ok())
+                    .max()
+                    .map_or(1, |ch| ch + 1),
+                channels: input_config.channels,
+                sample_rate: input_config.sample_rate.or(Some(output_sample_rate)),
+                buffer_size: match stream_config.buffer_size {
+                    cpal::BufferSize::Fixed(frames) => Some(frames),
+                    _ => None,
+                },
+                resampler_quality: config.advanced.resampler_quality,
+            };
+            audio::input::create_input_stream_with_fanout(
+                stream_config,
+                output_sample_rate,
+                config
+                    .inputs
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.device == input_config.device
+                            && candidate.latency_ms == input_config.latency_ms
+                            && candidate.channels == input_config.channels
+                            && candidate.sample_rate == input_config.sample_rate
+                    })
+                    .count(),
+            )
+            .map(|mut active| {
+                let mut consumers = active.take_consumers();
+                consumers.reverse();
+                SharedCapture { active, consumers }
+            })
+            .map_err(|error| error.to_string())
+        });
     }
 
-    let mixer_state = Arc::new(Mutex::new(MixerState {
-        active_samples: Vec::new(),
-        live_inputs: Vec::new(),
-        output_channels,
-        channel_gains,
-        ducking_engine,
-        bass_management,
-        finished_samples: Vec::new(),
-    }));
-
-    // Initialize audio inputs from config
-    // Keep active input streams alive - they will be kept alive until the app exits
-    let mut _active_inputs: Vec<audio::input::ActiveInput> = Vec::new();
-    // Inputs with an activity_threshold feed ducking as (voice, peak, detector)
-    let mut activity_watchers: Vec<(String, std::sync::Arc<std::sync::atomic::AtomicU32>, audio::activity::ActivityDetector)> = Vec::new();
     for (idx, input_config) in config.inputs.iter().enumerate() {
-        // Resolve routing first: it determines how many capture channels the
-        // stream has to be opened with.
-        let channel_map: Vec<(usize, usize)> = config.resolve_input_routes(&input_config.routes)
-            .expect("Channel alias resolution failed (should have been caught during validation)");
+        let key = (
+            input_config.device.clone(),
+            input_config.latency_ms,
+            input_config.channels,
+            input_config.sample_rate,
+        );
+        match captures.get_mut(&key) {
+            Some(Ok(capture)) => {
+                let channels = capture.active.channels;
+                if let Some(consumer) = capture.consumers.pop() {
+                    tracing::info!(
+                        "Opened input device: {} ({} channels, voice '{}')",
+                        input_config.device.as_deref().unwrap_or("default"),
+                        channels,
+                        input_config.voice_id
+                    );
+                    // Build channel map from routes config (resolve aliases)
+                    let channel_map: Vec<(usize, usize)> =
+                        match config.resolve_input_routes(&input_config.routes) {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::error!("Input route channel resolution failed: {}", e);
+                                std::process::exit(1);
+                            }
+                        };
 
-        let stream_config = audio::input::InputStreamConfig {
-            device_name: input_config.device.clone(),
-            latency_ms: input_config.latency_ms,
-            channels: input_config.channels,
-            min_channels: audio::input::required_channels(&channel_map),
-            sample_rate: input_config.sample_rate,
-            resampler_quality: config.advanced.resampler_quality,
-            buffer_size: output_buffer_frames,
-        };
-
-        match audio::input::create_input_stream(stream_config, output_sample_rate) {
-            Ok(mut active_input) => {
-                tracing::info!(
-                    "Opened input device: {} ({} channels, {} Hz, voice '{}')",
-                    input_config.device.as_deref().unwrap_or("default"),
-                    active_input.channels,
-                    active_input.sample_rate,
-                    input_config.voice_id
-                );
-
-                // Take ownership of the consumer for the mixer
-                if let Some(consumer) = active_input.take_consumer() {
                     tracing::info!(
                         "Input {} routed: {:?}",
                         idx,
-                        channel_map.iter()
+                        channel_map
+                            .iter()
                             .map(|(src, dest)| format!("{}→{}", src, dest))
                             .collect::<Vec<_>>()
                     );
 
+                    // Now that the device's channel count is known, warn about any
+                    // route reading a source channel the device does not have; the
+                    // mixer would otherwise drop it silently (F5).
+                    if let Some(warning) = out_of_range_input_routes(idx, &channel_map, channels) {
+                        tracing::warn!("{}", warning);
+                    }
+
+                    // With bass management enabled, warn once if any route lands
+                    // content directly on the LFE channel: that content bypasses the
+                    // crossover and the extracted bass is summed on top (F7).
+                    if let Some(lfe) = bass_lfe_channel {
+                        if let Some(warning) = input_routes_collide_with_lfe(idx, &channel_map, lfe)
+                        {
+                            tracing::warn!("{}", warning);
+                        }
+                    }
+
                     // Create LiveInput for the mixer
-                    let live_input = audio::mixer::LiveInput::new(
+                    let mut live_input = audio::mixer::LiveInput::new(
                         input_config.voice_id.clone(),
                         consumer,
-                        active_input.channels,
+                        channels,
                         input_config.volume,
                         channel_map,
-                    ).with_dropped_frames(active_input.dropped_frames.clone());
+                        capture.active.max_backlog_frames,
+                    )
+                    .with_dropped_frames(capture.active.telemetry.dropped_frames.clone());
 
-                    // Add to mixer state
-                    mixer_state.lock().unwrap().live_inputs.push(live_input);
-                }
-
-                // Watch this input's level for ducking if configured
-                if let Some(threshold) = input_config.activity_threshold {
-                    activity_watchers.push((
-                        input_config.voice_id.clone(),
-                        active_input.peak_level.clone(),
-                        audio::activity::ActivityDetector::new(
-                            threshold,
-                            input_config.activity_hold_ms,
-                            std::time::Instant::now(),
-                        ),
+                    // The audio callback publishes applied input state through
+                    // preallocated atomics. HTTP status reads these values without
+                    // locking or mirroring a requested command as applied.
+                    let applied_volume = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
+                        input_config.volume.to_bits(),
                     ));
-                    tracing::info!(
-                        "Voice activity detection on input '{}' (threshold {:.3}, hold {}ms)",
-                        input_config.voice_id, threshold, input_config.activity_hold_ms
+                    let applied_muted =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let applied_unmuted_volume = std::sync::Arc::new(
+                        std::sync::atomic::AtomicU32::new(input_config.volume.to_bits()),
                     );
-                }
+                    live_input.set_status_observers(
+                        applied_volume.clone(),
+                        applied_muted.clone(),
+                        applied_unmuted_volume.clone(),
+                    );
 
-                // Keep the stream alive by storing it
-                _active_inputs.push(active_input);
+                    input_statuses.push(http::InputStatus {
+                        index: idx,
+                        voice_id: input_config.voice_id.clone(),
+                        volume: input_config.volume,
+                        channels,
+                        muted: false,
+                        unmuted_volume: input_config.volume,
+                        applied_volume: Some(applied_volume),
+                        applied_muted: Some(applied_muted),
+                        applied_unmuted_volume: Some(applied_unmuted_volume),
+                        health: Some(live_input.health.clone()),
+                        ready: true,
+                        last_error: None,
+                    });
+                    input_telemetry.push((
+                        input_config.voice_id.clone(),
+                        std::sync::Arc::clone(&capture.active.telemetry),
+                    ));
+
+                    // Add to the mix via the command ring (drained once the
+                    // output stream starts).
+                    if cmd_tx
+                        .push(rt_engine::AudioCommand::AddLiveInput(live_input))
+                        .is_err()
+                    {
+                        tracing::error!("Command ring full while adding live input {}", idx);
+                    }
+
+                    // Mark the configured input voice active so it can trigger ducking
+                    // as a primary (D4), through the same off-RT notify path as sample
+                    // voices. The stream is open for the process lifetime, so the voice
+                    // is active for it; signal-gated activation is Sprint 8 (D36).
+                    if let Some(threshold) = input_config.activity_threshold {
+                        let sources = input_config
+                            .routes
+                            .iter()
+                            .filter_map(|route| config.resolve_channel(&route.source_channel).ok())
+                            .collect();
+                        activity_watchers.push((
+                            input_config.voice_id.clone(),
+                            capture.active.telemetry.clone(),
+                            sources,
+                            audio::activity::ActivityDetector::new(
+                                threshold,
+                                input_config.activity_hold_ms,
+                                std::time::Instant::now(),
+                            ),
+                        ));
+                    } else {
+                        notify_voice_activity(
+                            &input_config.voice_id,
+                            true,
+                            ducking_engine.as_mut(),
+                            &mut cmd_tx,
+                            &ducking_snapshot,
+                        );
+                    }
+                } else {
+                    tracing::error!("No logical capture ring available for input {}", idx);
+                }
             }
-            Err(e) => {
+            Some(Err(error)) => {
                 tracing::error!(
                     "Failed to open input device '{}': {}",
                     input_config.device.as_deref().unwrap_or("default"),
-                    e
+                    error
                 );
+                input_statuses.push(http::InputStatus {
+                    index: idx,
+                    voice_id: input_config.voice_id.clone(),
+                    volume: input_config.volume,
+                    channels: 0,
+                    muted: true,
+                    unmuted_volume: input_config.volume,
+                    applied_volume: None,
+                    applied_muted: None,
+                    applied_unmuted_volume: None,
+                    health: None,
+                    ready: false,
+                    last_error: Some(error.clone()),
+                });
             }
+            None => unreachable!("capture key was populated in the first pass"),
         }
     }
 
-    if !mixer_state.lock().unwrap().live_inputs.is_empty() {
-        spawn_input_health_monitor(mixer_state.clone());
+    for capture in captures.into_values().flatten() {
+        _active_inputs.push(capture.active);
     }
 
-    // Bridge microphone activity into the ducking engine: poll the peak
-    // levels the capture callbacks publish, run them through the per-input
-    // threshold/hold detectors, and notify the engine on transitions. This
-    // is what makes a rule with a mic's voice_id as primary_voice fire.
-    if !activity_watchers.is_empty() {
-        if config.ducking_rules.is_empty() {
-            tracing::warn!(
-                "activity_threshold is set on an input but no ducking_rules are configured; \
-                 activity detection will have no effect"
-            );
-        }
-        let mixer_state = mixer_state.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                let now = std::time::Instant::now();
-                for (voice_id, peak_level, detector) in activity_watchers.iter_mut() {
-                    let level = f32::from_bits(
-                        peak_level.swap(0, std::sync::atomic::Ordering::Relaxed),
-                    );
-                    if let Some(active) = detector.update(level, now) {
-                        tracing::debug!(
-                            "Input voice '{}' {}",
-                            voice_id,
-                            if active { "went active" } else { "went quiet" }
-                        );
-                        let mut state = mixer_state.lock().unwrap();
-                        if let Some(ref mut engine) = state.ducking_engine {
-                            engine.notify_voice_active(voice_id, active);
-                        }
-                    }
-                }
-            }
-        });
-    }
+    // The bundle the cpal callback owns. The control thread never locks this.
+    let callback_state = Arc::new(Mutex::new(rt_engine::AudioCallbackState {
+        mixer,
+        commands: cmd_rx,
+        command_returns: cmd_return_tx,
+        graveyard: grave_tx,
+        streamed_graveyard: streamed_grave_tx,
+        output_sample_rate,
+    }));
+    let xruns = Arc::new(AtomicU64::new(0));
 
     let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));
+    register_input_voices(&mut voice_manager.lock(), &input_statuses);
 
-    // Track active voices for ducking notifications
-    let active_voices: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    // Control-side voice activity bookkeeping and the authoritative status
+    // snapshot the HTTP handlers read. `active_counts` drives ducking restore;
+    // `playing` mirrors the live sample list for status (position excluded).
+    let mut active_counts: HashMap<String, usize> = HashMap::new();
+    let mut streamed_voices: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut playing: HashMap<u64, http::SampleStatus> = HashMap::new();
+    let status_snapshot = Arc::new(RwLock::new(http::StatusSnapshot {
+        active_samples: 0,
+        output_channels,
+        samples: Vec::new(),
+        inputs: input_statuses.clone(),
+    }));
+
+    // When the daemon started, for the `/metrics` uptime field (D40).
+    let start_time = std::time::Instant::now();
 
     // Create cache manager using config
     let cache_dir = config.cache_directory();
-    let cache_options = cache::CacheOptions {
-        resampler_quality: config.advanced.resampler_quality,
-        max_memory_mb: config.cache.max_memory_mb,
-        disk_enabled: config.cache.enabled,
-        revalidate_after_seconds: config.cache.revalidate_after_seconds,
-    };
+    let resampler_quality = config.advanced.resampler_quality;
+    // Resolve the memory-cache cap from config + a one-shot read of system memory. The
+    // `auto` budget targets a clamped fraction of available RAM so the daemon never
+    // camps all of it; an explicit cap or `unlimited` overrides.
+    let available_memory = detect_available_memory();
+    let memory_cap = config.cache.resolve_memory_cap(available_memory);
     tracing::info!("Cache directory: {}", cache_dir.display());
-    tracing::info!("Resampler quality: {:?}", cache_options.resampler_quality);
+    tracing::info!("Resampler quality: {:?}", resampler_quality);
+    match available_memory {
+        Some(avail) => tracing::info!(
+            "Memory budget resolved to {:?} ({:.0} MB available at startup)",
+            memory_cap,
+            avail as f64 / (1024.0 * 1024.0)
+        ),
+        None => tracing::info!(
+            "Memory budget resolved to {:?} (system memory not detectable)",
+            memory_cap
+        ),
+    }
 
-    let cache_manager = match cache::CacheManager::with_options(cache_dir, cache_options) {
+    if config.security.allowed_directories.is_empty() {
+        tracing::warn!(
+            "No security.allowed_directories configured: any local file path in a Play command \
+             will be opened (open-by-default). Set security.allowed_directories to restrict access."
+        );
+    } else {
+        tracing::info!(
+            "Local file access restricted to {} allowed director{}",
+            config.security.allowed_directories.len(),
+            if config.security.allowed_directories.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+    }
+
+    let cache_manager = match cache::CacheManager::with_disk_cache(
+        cache_dir,
+        resampler_quality,
+        memory_cap,
+        config.security.allowed_directories.clone(),
+        config.cache.revalidate_after_seconds,
+        config.cache.enabled,
+    ) {
         Ok(cm) => Arc::new(tokio::sync::Mutex::new(cm)),
         Err(e) => {
             tracing::error!("Failed to initialize cache: {}", e);
@@ -720,10 +893,16 @@ async fn main() {
             }
             tracing::info!("Startup precaching complete");
         } else {
-            tracing::info!("Starting background precache for {} files (non-blocking)...", precache_files.len());
+            tracing::info!(
+                "Starting background precache for {} files (non-blocking)...",
+                precache_files.len()
+            );
             for file_path in &precache_files {
                 let mut cache_mgr = cache_manager.lock().await;
-                match cache_mgr.precache_streaming(file_path, output_sample_rate).await {
+                match cache_mgr
+                    .precache_streaming(file_path, output_sample_rate)
+                    .await
+                {
                     Ok(()) => {}
                     Err(e) => {
                         tracing::error!("Failed to start precache for {}: {}", file_path, e);
@@ -735,325 +914,1634 @@ async fn main() {
         }
     }
 
-    // Start audio stream. The callback builder exists so the stream can be
-    // rebuilt with the device's default buffer size if the device rejects the
-    // configured fixed size.
-    let make_audio_callback = {
-        let mixer_state = mixer_state.clone();
-        let active_voices = active_voices.clone();
-        move || {
-            let mixer_state_clone = mixer_state.clone();
-            let active_voices_clone = active_voices.clone();
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                let mut state = mixer_state_clone.lock().unwrap();
-                audio::mixer::mix_audio(data, &mut state);
+    // Start audio stream — build a typed stream that matches the device's
+    // native sample format and convert the f32 mix bus to it per sample.
+    // Supervise the output stream on its own thread so a fatal device error
+    // rebuilds it (with backoff) instead of going permanently silent. The
+    // supervisor re-resolves the device by name and reuses this negotiated
+    // config, exiting for a service-manager restart if it can't recover.
+    let _output_supervisor = audio::engine::spawn_output_supervisor(
+        config.audio.device.clone(),
+        stream_config,
+        sample_format,
+        callback_state.clone(),
+        xruns.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
 
-                // The steady-state callback allocates nothing: bookkeeping
-                // below runs only in the callback where a sample actually
-                // finished (cue endings), the moment the work is unavoidable
-                if !state.active_samples.iter().any(|s| s.is_finished()) {
-                    return;
-                }
+    // Capture-path telemetry (D57): shared with the HTTP layer for /metrics and
+    // drained into log lines by the reaper tick.
+    let input_telemetry = std::sync::Arc::new(input_telemetry);
+    let mut input_telemetry_drain = InputTelemetryDrain::new(input_telemetry.clone());
 
-                // Record finished samples for off-thread bookkeeping cleanup
-                // (voice manager), then remove them
-                let mut finished: Vec<(u64, String)> = state.active_samples.iter()
-                    .filter(|s| s.is_finished())
-                    .map(|s| (s.id, s.voice_id.clone()))
-                    .collect();
-                state.active_samples.retain(|s| !s.is_finished());
+    // First-start play-latency aggregate + probe registry (Sprint 11, D50): the
+    // stats feed /metrics; the tracker registers a probe per play and the reaper
+    // tick folds fired probes into the stats.
+    let latency_stats = Arc::new(http::PlayLatencyStats::default());
+    let latency_tracker = http::LatencyTracker::new(latency_stats.clone());
 
-                // A finished sample's voice goes inactive when it was the
-                // voice's last sample
-                for (_, voice_id) in &finished {
-                    let voice_still_playing = state.active_samples.iter()
-                        .any(|s| &s.voice_id == voice_id);
-                    if !voice_still_playing {
-                        if let Some(ref mut engine) = state.ducking_engine {
-                            engine.notify_voice_active(voice_id, false);
-                        }
-                        active_voices_clone.lock().unwrap().remove(voice_id);
-                    }
-                }
+    // Cold plays awaiting their buffer upgrade once the progressive load
+    // finishes (D51); the reaper tick drains it.
+    let mut streaming_upgrades: Vec<StreamingUpgrade> = Vec::new();
 
-                state.finished_samples.append(&mut finished);
-            }
-        }
-    };
-    let audio_error_callback = |err| {
-        tracing::error!("Audio stream error: {}", err);
-    };
+    // Create the text-command channel (HTTP/MQTT payloads -> control loop).
+    let (text_tx, mut text_rx) = mpsc::channel::<mqtt::commands::CommandRequest>(100);
 
-    // The stream takes ownership of the playback handle only, so the device
-    // is dropped as soon as the stream exists; keeping it would hold the
-    // card's capture side open for the life of the process.
-    let device = match audio::engine::find_output_device(config.audio.device.as_deref()) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::error!("Output device disappeared before stream start: {}", e);
-            std::process::exit(1);
-        }
-    };
-    // A build failure with capture streams open usually means the two
-    // directions' parameters conflict on a shared-clock interface, so the
-    // report includes what capture is running
-    let report_stream_failure = |error: &dyn std::fmt::Display| -> ! {
-        tracing::error!("Failed to open the output stream on '{}': {}", device_name, error);
-        tracing::error!(
-            "  Requested: {} channels, {} Hz, buffer {:?}",
-            stream_config.channels, stream_config.sample_rate.0, stream_config.buffer_size
-        );
-        for input in &_active_inputs {
-            tracing::error!(
-                "  Capture is open at {} Hz with {} channels on this system",
-                input.sample_rate, input.channels
-            );
-        }
-        if !_active_inputs.is_empty() {
-            tracing::error!(
-                "  USB interfaces that share a clock between directions need playback \
-                 and capture at the same sample rate and compatible buffer sizes"
-            );
-        }
-        std::process::exit(1);
-    };
-    let stream = match device.build_output_stream(
-        &stream_config,
-        make_audio_callback(),
-        audio_error_callback,
-        None,
-    ) {
-        Ok(s) => s,
-        Err(e) if matches!(stream_config.buffer_size, cpal::BufferSize::Fixed(_)) => {
-            tracing::warn!(
-                "Device rejected the configured buffer size ({:?}): {}; retrying with the device default",
-                stream_config.buffer_size, e
-            );
-            let mut fallback_config = stream_config.clone();
-            fallback_config.buffer_size = cpal::BufferSize::Default;
-            match device.build_output_stream(
-                &fallback_config,
-                make_audio_callback(),
-                audio_error_callback,
-                None,
-            ) {
-                Ok(s) => s,
-                Err(e) => report_stream_failure(&e),
-            }
-        }
-        Err(e) => report_stream_failure(&e),
-    };
-    drop(device);
-
-        stream.play().expect("Failed to start audio stream");
-        tracing::info!("Audio stream started");
-
-        // Create command channel
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<mqtt::commands::CommandRequest>(100);
-
-        // Generation counter for cancelling in-flight loads: stopall/fadeall
-        // bump it, and a play whose load finishes under an older generation
-        // is discarded instead of starting after the stop
-        let stop_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-        // Periodic bookkeeping: prune finished samples from the voice
-        // manager, drop empty voices, and fold finished streaming loads into
-        // the caches. Each lock is held only briefly.
+    // Start HTTP server if enabled
+    if config.http.enabled {
+        let http_cmd_tx = text_tx.clone();
+        match http::start_server(
+            &config.http,
+            http_cmd_tx,
+            status_snapshot.clone(),
+            voice_manager.clone(),
+            cache_manager.clone(),
+            clip_count.clone(),
+            xruns.clone(),
+            start_time,
+            ducking_snapshot.clone(),
+            telemetry_enabled.clone(),
+            output_meters.clone(),
+            config_json.clone(),
+            latency_stats.clone(),
+            input_telemetry.clone(),
+            talkback_status.clone(),
+            log_broadcaster.clone(),
+        )
+        .await
         {
-            let mixer_state = mixer_state.clone();
-            let voice_manager = voice_manager.clone();
-            let cache_manager = cache_manager.clone();
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    interval.tick().await;
+            Ok(addr) => {
+                tracing::info!("HTTP REST API available at http://{}", addr);
+                if config.http.websocket_enabled {
+                    tracing::info!("WebSocket logs available at ws://{}/ws", addr);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to start HTTP server: {}", e);
+                // Continue without HTTP server - not fatal
+            }
+        }
+    }
 
-                    let finished = {
-                        let mut state = mixer_state.lock().unwrap();
-                        std::mem::take(&mut state.finished_samples)
-                    };
-                    if !finished.is_empty() {
-                        let mut voice_mgr = voice_manager.lock().unwrap();
-                        for (sample_id, _voice_id) in &finished {
-                            voice_mgr.remove_sample(*sample_id);
+    // Spawn MQTT event processor if connected
+    if let Some((client, eventloop)) = mqtt_connection {
+        let mqtt_cmd_tx = text_tx.clone();
+        let mqtt_topic = config.mqtt.topic.clone().unwrap_or_default();
+        let reconnect_delay =
+            std::time::Duration::from_secs(config.mqtt.reconnect_delay_seconds.max(1));
+        tokio::spawn(async move {
+            mqtt::client::process_mqtt_events(
+                client,
+                mqtt_topic,
+                eventloop,
+                mqtt_cmd_tx,
+                reconnect_delay,
+            )
+            .await;
+        });
+        tracing::info!(
+            "Ready to receive MQTT commands on topic: {}",
+            config.mqtt.topic.as_ref().unwrap()
+        );
+    }
+
+    // Keep the text-command sender alive if only HTTP is running (no MQTT)
+    let _text_tx_keepalive = text_tx;
+
+    // Main command processing loop
+    if mqtt_enabled || http_enabled {
+        tracing::info!("Command processing loop started");
+    }
+
+    // Periodic reaper: drains finished samples returned by the audio thread,
+    // decrements voice activity, and lets the ducking engine restore voices.
+    let mut reaper_tick = tokio::time::interval(std::time::Duration::from_millis(20));
+    // Periodic HTTP freshness tick (stale-while-revalidate): refreshes stale remote
+    // cache entries out-of-band so a play never blocks on the network. Idle when
+    // freshness is pinned.
+    let mut freshness_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+    let mut scheduler = CommandScheduler::new(Arc::new(tokio::sync::Semaphore::new(4)));
+    let mut freshness_task: Option<tokio::task::JoinHandle<()>> = None;
+
+    loop {
+        tokio::select! {
+            input = async {
+                tokio::select! {
+                    loaded = scheduler.next_load() => Some(loaded),
+                    request = text_rx.recv() => request.map(SchedulerInput::Request),
+                }
+            } => {
+                let Some(input) = input else { continue; };
+                let mut ctx = CommandCtx {
+                    cache_manager: &cache_manager,
+                    voice_manager: &voice_manager,
+                    cmd_tx: &mut cmd_tx,
+                    ducking_engine: &mut ducking_engine,
+                    active_counts: &mut active_counts,
+                    streamed_voices: &mut streamed_voices,
+                    playing: &mut playing,
+                    snapshot: &status_snapshot,
+                    ducking_snapshot: &ducking_snapshot,
+                    inputs: &mut input_statuses,
+                    talkback: &mut talkback_lease,
+                    talkback_status: &talkback_status,
+                    now_ms: start_time.elapsed().as_millis() as u64,
+                    start_time,
+                    output_channels,
+                    output_sample_rate,
+                    config: &config,
+                    latency: &latency_tracker,
+                    streaming_upgrades: &mut streaming_upgrades,
+                    max_block_frames,
+                    error: None,
+                    error_logged: false,
+                    prepared: None,
+                };
+                scheduler.take(input, &mut ctx).await;
+            }
+            _ = reaper_tick.tick() => {
+                let mut capture_peaks = std::collections::HashMap::new();
+                for (voice_id, telemetry, channels, detector) in &mut activity_watchers {
+                    let peaks = capture_peaks.entry(Arc::as_ptr(telemetry)).or_insert_with(|| telemetry.peak_levels.iter()
+                        .map(|peak| f32::from_bits(peak.swap(0, std::sync::atomic::Ordering::Relaxed))).collect::<Vec<_>>());
+                    let level = channels.iter().filter_map(|&ch| peaks.get(ch)).copied().fold(0.0f32, f32::max);
+                    if let Some(active) = detector.update(level, std::time::Instant::now()) {
+                        notify_voice_activity(voice_id, active, ducking_engine.as_mut(), &mut cmd_tx, &ducking_snapshot);
+                    }
+                }
+                let now_ms = start_time.elapsed().as_millis() as u64;
+                if let Some(source_id) = talkback_lease.active_source().map(str::to_string) {
+                    if let Some((_transition, status)) = talkback_lease.expire(now_ms) {
+                        if let Some(input) = resolve_talkback_input(&input_statuses, &source_id) {
+                            if cmd_tx
+                                .push(rt_engine::AudioCommand::SetInputMute { input, mute: true })
+                                .is_err()
+                            {
+                                tracing::error!("Audio command ring full while expiring talkback lease");
+                            }
                         }
-                        voice_mgr.cleanup_empty_voices();
+                        *talkback_status.write().unwrap() = status;
                     }
-
-                    cache_manager.lock().await.cleanup_completed_loads();
                 }
-            });
+                reap_finished_samples(
+                    &mut grave_rx,
+                    &mut streamed_grave_rx,
+                    &mut cmd_return_rx,
+                    &voice_manager,
+                    &mut cmd_tx,
+                    ducking_engine.as_mut(),
+                    &mut active_counts,
+                    &mut streamed_voices,
+                    &mut playing,
+                    &status_snapshot,
+                    &ducking_snapshot,
+                    &input_statuses,
+                    output_channels,
+                );
+                // Fold any first-mix latency probes the audio thread fired into
+                // the /metrics aggregate (Sprint 11, D50).
+                latency_tracker.fold_fired();
+                // Upgrade cold plays whose progressive load finished (D51).
+                upgrade_completed_streaming_plays(
+                    &mut streaming_upgrades,
+                    &cache_manager,
+                    &mut cmd_tx,
+                    &mut playing,
+                )
+                .await;
+                // Turn capture-path counter growth into off-RT log lines (D57).
+                input_telemetry_drain.drain_and_log();
+            }
+            _ = freshness_tick.tick() => {
+                if config.cache.freshness != config::FreshnessMode::Pinned {
+                    // Dev re-checks every tick (zero window); trusting honours the
+                    // configured revalidation window.
+                    let window = if config.cache.freshness == config::FreshnessMode::Dev {
+                        std::time::Duration::ZERO
+                    } else {
+                        std::time::Duration::from_secs(config.cache.revalidate_after_seconds)
+                    };
+                    if freshness_task.as_ref().is_none_or(|task| task.is_finished()) {
+                        let cache = cache_manager.clone();
+                        freshness_task = Some(tokio::spawn(async move {
+                            let n = cache.lock().await.revalidate_stale_http(window).await;
+                            if n > 0 { tracing::info!("Freshness tick refreshed {} entries", n); }
+                        }));
+                    }
+                }
+            }
+            _ = shutdown_signal() => {
+                tracing::info!("Shutdown signal received");
+                scheduler.abort_loads();
+                if let Some(task) = freshness_task.take() { task.abort(); }
+                shutdown(&mut cmd_tx, &cache_manager).await;
+                break;
+            }
         }
+    }
+}
 
-        // Start HTTP server if enabled
-        if config.http.enabled {
-            let http_cmd_tx = cmd_tx.clone();
-            match http::start_server(
-                &config.http,
-                http_cmd_tx,
-                mixer_state.clone(),
-                voice_manager.clone(),
-                cache_manager.clone(),
-                log_broadcaster.clone(),
-            ).await {
-                Ok(addr) => {
-                    tracing::info!("HTTP REST API available at http://{}", addr);
-                    if config.http.websocket_enabled {
-                        tracing::info!("WebSocket logs available at ws://{}/ws", addr);
+/// Rebuild the control-side status snapshot from the live sample map and the
+/// configured inputs. Cheap; called whenever the playing set changes.
+fn refresh_snapshot(
+    snapshot: &std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
+    playing: &std::collections::HashMap<u64, http::SampleStatus>,
+    inputs: &[http::InputStatus],
+    output_channels: usize,
+) {
+    let mut samples: Vec<http::SampleStatus> = playing.values().cloned().collect();
+    samples.sort_by_key(|s| s.internal_id);
+    let mut guard = snapshot.write().unwrap();
+    guard.active_samples = samples.len();
+    guard.output_channels = output_channels;
+    guard.samples = samples;
+    guard.inputs = inputs.to_vec();
+}
+
+/// Resolve the same input selector semantics used by the real-time mixer on
+/// the control side so `/status/inputs` reflects the command that was actually
+/// queued. Numeric selectors address the stable configured index; any other
+/// selector addresses the declared voice id. Returning the control-side record
+/// lets callers update the authoritative status without touching the RT state.
+fn find_input_status_mut<'a>(
+    inputs: &'a mut [http::InputStatus],
+    selector: &str,
+) -> Option<&'a mut http::InputStatus> {
+    if let Ok(index) = selector.parse::<usize>() {
+        return inputs.get_mut(index);
+    }
+    inputs.iter_mut().find(|input| input.voice_id == selector)
+}
+
+fn resolve_talkback_input(inputs: &[http::InputStatus], source_id: &str) -> Option<String> {
+    if inputs
+        .iter()
+        .any(|input| input.ready && input.voice_id == source_id)
+    {
+        return Some(source_id.to_string());
+    }
+    // The venue profile uses the semantic GM_MIC name while the checked-in
+    // daemon config historically calls the same first strip `mic`.
+    if source_id == "GM_MIC"
+        && inputs
+            .iter()
+            .any(|input| input.ready && input.voice_id == "mic")
+    {
+        return Some("mic".to_string());
+    }
+    None
+}
+
+/// Per-route gains for a Play `channel_map`, parallel to its routes (D29). A route
+/// with no gain defaults to unity, leaving plain 1:1 mappings unchanged. A value is
+/// clamped to a sane finite, non-negative range (matching audio.master_gain) so a
+/// bad value can never push NaN/Inf or a wild level onto the bus. Returns an empty
+/// vector when every route is unity, which the mixer reads as unity throughout, so
+/// a map without gains stores nothing.
+fn channel_route_gains(map: &[mqtt::commands::ChannelMapping]) -> Vec<f32> {
+    let gains: Vec<f32> = map
+        .iter()
+        .map(|m| match m.gain {
+            Some(g) if g.is_finite() => g.clamp(0.0, 8.0),
+            _ => 1.0,
+        })
+        .collect();
+    if gains.iter().all(|&g| g == 1.0) {
+        Vec::new()
+    } else {
+        gains
+    }
+}
+
+/// Build the warning for an input whose resolved routes read source channels the
+/// device does not have, or `None` when every source is within range (F5). The
+/// device channel count is only known once the stream opens, so this runs at input
+/// setup rather than during config validation; the mixer silently drops such routes,
+/// so the warning is what makes the misconfiguration visible. Source channels are
+/// 0-based, so a valid index is `< channels`.
+fn out_of_range_input_routes(
+    input_index: usize,
+    channel_map: &[(usize, usize)],
+    channels: usize,
+) -> Option<String> {
+    let mut offending: Vec<usize> = channel_map
+        .iter()
+        .map(|&(src, _)| src)
+        .filter(|&src| src >= channels)
+        .collect();
+    if offending.is_empty() {
+        return None;
+    }
+    offending.sort_unstable();
+    offending.dedup();
+    Some(format!(
+        "Input {} routes read source channel(s) {:?} but the device has only {} channel(s) \
+         (0..{}); those routes will be silently dropped — fix the input's routes config",
+        input_index,
+        offending,
+        channels,
+        channels.saturating_sub(1)
+    ))
+}
+
+/// Build the warning for an input whose resolved routes land content directly on
+/// the bass-management LFE channel, or `None` when no route targets it (F7/D41).
+/// Content routed straight to the LFE output index is *not* high-passed by the
+/// crossover, and bass management then sums the extracted bass on top of it (the
+/// additive-LFE behavior) — so the sub carries that full-range content unfiltered.
+/// This is a documented footgun, not a hard error: routing to the LFE deliberately
+/// is valid, so this warns rather than rejecting. Only meaningful when bass
+/// management is enabled; the caller gates on that.
+fn input_routes_collide_with_lfe(
+    input_index: usize,
+    channel_map: &[(usize, usize)],
+    lfe_channel: usize,
+) -> Option<String> {
+    if !channel_map.iter().any(|&(_, dest)| dest == lfe_channel) {
+        return None;
+    }
+    Some(format!(
+        "Input {} routes content to the bass-management LFE channel {}; that content is sent to the \
+         sub full-range (the crossover is bypassed) and the extracted bass is added on top — route \
+         to the LFE deliberately or change the destination",
+        input_index, lfe_channel
+    ))
+}
+
+/// Generate a unique voice id for a Play that did not specify one. The wall-clock
+/// millisecond keeps the id human-readable/orderable, and a process-global monotonic
+/// counter makes two Plays in the same millisecond distinct (F5/D41) so a later
+/// voice_stop/voice_volume/ducking on one does not affect the other.
+fn next_auto_voice_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static AUTO_VOICE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = AUTO_VOICE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("_auto_{}_{}", millis, n)
+}
+
+/// Register the voice of every input that opened, so microphone voices exist
+/// from startup: their settings can be adjusted and they show in status.
+fn register_input_voices(voice_manager: &mut voice::VoiceManager, inputs: &[http::InputStatus]) {
+    for input in inputs.iter().filter(|input| input.ready) {
+        voice_manager.register_input_voice(&input.voice_id);
+    }
+}
+
+/// Register a starting sound with its voice: a voice the play named is kept,
+/// and one generated for a play that named none is forgotten once it empties.
+fn add_sample_to_play_voice(
+    voice_manager: &mut voice::VoiceManager,
+    voice_id: &str,
+    named: bool,
+) -> u64 {
+    if named {
+        voice_manager.add_sample_to_voice(voice_id)
+    } else {
+        voice_manager.add_sample_to_anonymous_voice(voice_id)
+    }
+}
+
+/// Fade-out applied by stop commands, short enough to sound immediate while
+/// preventing clicks/pops.
+const STOP_FADE_MS: u32 = 10;
+
+/// Notify the control-side ducking engine that a voice's activity changed and
+/// forward any resulting target changes to the audio thread. Used by both the
+/// sample-playback path and the configured-input path (D4), so live-input voices
+/// can trigger ducking through the same off-RT `compute_changes` path. A no-op when
+/// ducking is not configured.
+///
+/// Each forwarded change also updates the control-side per-voice ducking snapshot
+/// the HTTP `/metrics` and `/status/voices` handlers read (D40): a target below
+/// full volume records the voice's multiplier, a restore (>= 1.0) clears it. The
+/// snapshot tracks resolved targets, not the in-flight fade, matching what the
+/// control thread authoritatively knows (D20).
+fn notify_voice_activity(
+    voice_id: &str,
+    is_active: bool,
+    ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
+    cmd_tx: &mut rt_engine::CommandProducer,
+    ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
+) {
+    if let Some(engine) = ducking_engine {
+        for change in engine.compute_changes(voice_id, is_active) {
+            {
+                let mut guard = ducking_snapshot.write().unwrap();
+                if change.target_volume >= 1.0 {
+                    guard.remove(&change.voice);
+                } else {
+                    guard.insert(change.voice.clone(), change.target_volume);
+                }
+            }
+            if cmd_tx
+                .push(rt_engine::AudioCommand::SetDuckTarget(change))
+                .is_err()
+            {
+                tracing::error!("Audio command ring full; duck target dropped");
+            }
+        }
+    }
+}
+
+/// Read the system's available memory in bytes for the auto memory budget, or `None`
+/// if it cannot be determined (the budget then falls back to its bounded ceiling, never
+/// unlimited). A one-shot read at startup; no background polling.
+fn detect_available_memory() -> Option<u64> {
+    use sysinfo::System;
+    let mut sys = System::new();
+    sys.refresh_memory();
+    let available = sys.available_memory();
+    (available > 0).then_some(available)
+}
+
+/// Reconcile control-side bookkeeping for one finished voice-bearing entry (a sample
+/// or a streamed source): drop it from the live `playing` map and from its voice in
+/// the voice manager (which removes the voice once it is empty) and decrement its
+/// voice's active count; when that count reaches zero, restore the voice through the
+/// shared notify path (which, for a ducking primary, recomputes restore targets sent
+/// back to the audio thread). Returns whether the voice's count reached zero (it is
+/// now fully idle), so the caller can drop it from the streamed-voice set.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_finished_voice(
+    voice: &str,
+    id: u64,
+    voice_manager: &parking_lot::Mutex<voice::VoiceManager>,
+    cmd_tx: &mut rt_engine::CommandProducer,
+    ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
+    active_counts: &mut std::collections::HashMap<String, usize>,
+    playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
+    ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
+) -> bool {
+    playing.remove(&id);
+    voice_manager.lock().remove_sample(id);
+    if let Some(count) = active_counts.get_mut(voice) {
+        *count -= 1;
+        if *count == 0 {
+            active_counts.remove(voice);
+            notify_voice_activity(voice, false, ducking_engine, cmd_tx, ducking_snapshot);
+            return true;
+        }
+    }
+    false
+}
+
+/// Drain the sample and streamed-source graveyards and the command-return ring,
+/// dropping finished voices and spent mutation commands off the audio thread, and
+/// reconcile control-side voice activity. When a voice's last sample or source
+/// finishes, the ducking engine computes restore targets that are sent back to the
+/// audio thread. Refreshes the status snapshot if anything was reaped.
+#[allow(clippy::too_many_arguments)]
+fn reap_finished_samples(
+    grave_rx: &mut rt_engine::GraveyardConsumer,
+    streamed_grave_rx: &mut rt_engine::StreamedGraveyardConsumer,
+    cmd_return_rx: &mut rt_engine::CommandReturnConsumer,
+    voice_manager: &parking_lot::Mutex<voice::VoiceManager>,
+    cmd_tx: &mut rt_engine::CommandProducer,
+    mut ducking_engine: Option<&mut audio::ducking::DuckingEngine>,
+    active_counts: &mut std::collections::HashMap<String, usize>,
+    streamed_voices: &mut std::collections::HashSet<String>,
+    playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
+    snapshot: &std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
+    ducking_snapshot: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
+    inputs: &[http::InputStatus],
+    output_channels: usize,
+) {
+    // Drop spent mutation commands the callback returned, off the audio thread.
+    // Their String/Vec/SampleSelector heap is freed here, never in the callback.
+    while let Some(spent) = cmd_return_rx.pop() {
+        drop(spent);
+    }
+
+    let mut reaped = 0;
+    while let Some(finished) = grave_rx.pop() {
+        let voice = finished.voice_id.clone();
+        let id = finished.id;
+        // Dropping `finished` here is the off-RT free of the sample's buffers.
+        drop(finished);
+        if reconcile_finished_voice(
+            &voice,
+            id,
+            voice_manager,
+            cmd_tx,
+            ducking_engine.as_deref_mut(),
+            active_counts,
+            playing,
+            ducking_snapshot,
+        ) {
+            streamed_voices.remove(&voice);
+        }
+        reaped += 1;
+    }
+
+    // Finished streamed sources reconcile the same way. The off-RT drop frees the
+    // source's ring buffer and Arcs here (never in the callback) and, via the
+    // source's Drop, signals its producer thread to stop (a no-op once it has already
+    // exited at EOF).
+    while let Some(finished) = streamed_grave_rx.pop() {
+        let voice = finished.voice_id.clone();
+        let id = finished.id;
+        drop(finished);
+        if reconcile_finished_voice(
+            &voice,
+            id,
+            voice_manager,
+            cmd_tx,
+            ducking_engine.as_deref_mut(),
+            active_counts,
+            playing,
+            ducking_snapshot,
+        ) {
+            streamed_voices.remove(&voice);
+        }
+        reaped += 1;
+    }
+
+    if reaped > 0 {
+        refresh_snapshot(snapshot, playing, inputs, output_channels);
+    }
+}
+
+/// Bundles the control-side state a single command operates on. All audio-state
+/// mutations are sent to the audio thread through `cmd_tx`; the control thread
+/// owns the ducking engine, voice-activity counts, live sample map, and the
+/// status snapshot, and never touches the audio thread's `MixerState`.
+/// Turns capture-path counter growth into off-RT log lines (D57): the capture
+/// thread only bumps relaxed atomics; the reaper tick calls `drain_and_log`,
+/// which emits at most one warning per input per tick when a counter moved.
+struct InputTelemetryDrain {
+    inputs: std::sync::Arc<Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)>>,
+    last: Vec<[u64; 4]>,
+}
+
+impl InputTelemetryDrain {
+    fn new(
+        inputs: std::sync::Arc<Vec<(String, std::sync::Arc<audio::input::InputTelemetry>)>>,
+    ) -> Self {
+        let last = vec![[0u64; 4]; inputs.len()];
+        Self { inputs, last }
+    }
+
+    fn drain_and_log(&mut self) {
+        use std::sync::atomic::Ordering;
+        for ((voice, telemetry), last) in self.inputs.iter().zip(self.last.iter_mut()) {
+            let now = [
+                telemetry.resample_errors.load(Ordering::Relaxed),
+                telemetry.overflow_dropped_samples.load(Ordering::Relaxed),
+                telemetry.ratio_rejects.load(Ordering::Relaxed),
+                telemetry.scratch_regrows.load(Ordering::Relaxed),
+            ];
+            if now != *last {
+                tracing::warn!(
+                    "Input '{}' capture counters moved: +{} resample errors, +{} overflowed \
+                     samples, +{} ratio rejects, +{} scratch regrows (totals {}/{}/{}/{})",
+                    voice,
+                    now[0] - last[0],
+                    now[1] - last[1],
+                    now[2] - last[2],
+                    now[3] - last[3],
+                    now[0],
+                    now[1],
+                    now[2],
+                    now[3]
+                );
+                *last = now;
+            }
+        }
+    }
+}
+
+/// A cold full-load play still on its progressive buffer, awaiting the upgrade
+/// to the promoted Complete buffer once its decode finishes (D51).
+struct StreamingUpgrade {
+    internal_id: u64,
+    buffer: audio::streaming::SampleBuffer,
+    file: String,
+}
+
+/// Upgrade cold plays whose progressive load finished: run the cache's promotion
+/// pass, then swap each playing sample onto its promoted Complete buffer over the
+/// command ring — restoring the full random-access feature set (pitch correction
+/// needs slice access) that a full decode used to provide. Runs on the reaper
+/// tick, entirely off-RT; the displaced streaming buffer returns via the spent
+/// husk for off-RT drop. A play whose promotion was skipped (stale generation or
+/// an over-budget cache) simply keeps its streaming buffer.
+async fn upgrade_completed_streaming_plays(
+    upgrades: &mut Vec<StreamingUpgrade>,
+    cache_manager: &std::sync::Arc<tokio::sync::Mutex<cache::CacheManager>>,
+    cmd_tx: &mut rt_engine::CommandProducer,
+    playing: &mut std::collections::HashMap<u64, http::SampleStatus>,
+) {
+    if upgrades.is_empty() {
+        return;
+    }
+    // A finished/stopped play no longer needs (or can take) an upgrade.
+    upgrades.retain(|u| playing.contains_key(&u.internal_id));
+    if !upgrades.iter().any(|u| u.buffer.is_complete()) {
+        return;
+    }
+
+    let Ok(mut cache) = cache_manager.try_lock() else {
+        return;
+    };
+    cache.cleanup_completed_loads();
+
+    let mut remaining = Vec::with_capacity(upgrades.len());
+    for upgrade in upgrades.drain(..) {
+        if !upgrade.buffer.is_complete() {
+            remaining.push(upgrade);
+            continue;
+        }
+        if let Some(decoded) = cache.get_cached(&upgrade.file) {
+            let frames = decoded.frames;
+            let command = rt_engine::AudioCommand::UpgradeSampleBuffer {
+                id: upgrade.internal_id,
+                buffer: audio::streaming::SampleBuffer::Complete(decoded),
+            };
+            if cmd_tx.push(command).is_err() {
+                tracing::error!(
+                    "Audio command ring full; buffer upgrade dropped for {}",
+                    upgrade.file
+                );
+            } else {
+                if let Some(status) = playing.get_mut(&upgrade.internal_id) {
+                    status.total_frames = frames;
+                }
+                tracing::debug!(
+                    "Upgraded cold play of {} to its complete buffer",
+                    upgrade.file
+                );
+            }
+        }
+    }
+    *upgrades = remaining;
+}
+
+/// Control-side stage clock for one play command (Sprint 11, D50). Captures the
+/// dispatch instant and the instants the windowing decision and the buffer/
+/// prebuffer readiness were reached; `log_enqueued` emits the one per-play
+/// latency event once the command is on the ring. Copy so the play path can
+/// hand it through the windowed helpers without an ownership dance.
+#[derive(Clone, Copy)]
+struct PlayStages {
+    t0_dispatch: std::time::Instant,
+    t2_decision: Option<std::time::Instant>,
+    t3_ready: Option<std::time::Instant>,
+}
+
+impl PlayStages {
+    fn begin() -> Self {
+        Self {
+            t0_dispatch: std::time::Instant::now(),
+            t2_decision: None,
+            t3_ready: None,
+        }
+    }
+
+    /// The windowing/load decision for this play has been made.
+    fn decision(&mut self) {
+        self.t2_decision = Some(std::time::Instant::now());
+    }
+
+    /// The buffer is loaded / the prebuffer gate released; the sample can be built.
+    fn ready(&mut self) {
+        self.t3_ready = Some(std::time::Instant::now());
+    }
+
+    /// Emit the per-play stage event. Durations are micros from dispatch; a stage
+    /// that was not reached on this path reports 0.
+    fn log_enqueued(&self, file: &str, kind: &str, t4_enqueued: std::time::Instant) {
+        let us = |t: Option<std::time::Instant>| {
+            t.map(|t| t.duration_since(self.t0_dispatch).as_micros() as u64)
+                .unwrap_or(0)
+        };
+        tracing::info!(
+            target: "latency",
+            kind,
+            file,
+            decision_us = us(self.t2_decision),
+            ready_us = us(self.t3_ready),
+            enqueue_us = t4_enqueued.duration_since(self.t0_dispatch).as_micros() as u64,
+            "play stages"
+        );
+    }
+}
+
+struct CommandCtx<'a> {
+    cache_manager: &'a std::sync::Arc<tokio::sync::Mutex<cache::CacheManager>>,
+    voice_manager: &'a std::sync::Arc<parking_lot::Mutex<voice::VoiceManager>>,
+    cmd_tx: &'a mut rt_engine::CommandProducer,
+    ducking_engine: &'a mut Option<audio::ducking::DuckingEngine>,
+    active_counts: &'a mut std::collections::HashMap<String, usize>,
+    /// Voices that currently have a windowed/streamed source, so the seek/speed gate
+    /// can warn that those commands do not apply to them.
+    streamed_voices: &'a mut std::collections::HashSet<String>,
+    playing: &'a mut std::collections::HashMap<u64, http::SampleStatus>,
+    snapshot: &'a std::sync::Arc<std::sync::RwLock<http::StatusSnapshot>>,
+    ducking_snapshot: &'a std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, f32>>>,
+    inputs: &'a mut [http::InputStatus],
+    talkback: &'a mut talkback::TalkbackLease,
+    talkback_status: &'a std::sync::Arc<std::sync::RwLock<talkback::TalkbackStatus>>,
+    now_ms: u64,
+    /// When the daemon started; talkback lease times are milliseconds since then.
+    start_time: std::time::Instant,
+    output_channels: usize,
+    output_sample_rate: u32,
+    config: &'a config::Config,
+    /// Per-play first-mix latency probe registry (Sprint 11, D50).
+    latency: &'a http::LatencyTracker,
+    /// Cold plays awaiting their buffer upgrade once the progressive load
+    /// finishes (D51); drained by the reaper tick's upgrade pass.
+    streaming_upgrades: &'a mut Vec<StreamingUpgrade>,
+    /// The largest output block the stream can deliver (fixed buffer size, or a
+    /// documented cap when the device default is unknown) — sizes the shipped
+    /// pitch scratch (D56/D58).
+    max_block_frames: usize,
+    error: Option<mqtt::commands::CommandError>,
+    /// Whether the handler already logged `error`, so the scheduler does not log
+    /// it again for a client that gets no reply.
+    error_logged: bool,
+    prepared: Option<PreparedPlayback>,
+}
+
+impl CommandCtx<'_> {
+    fn fail(&mut self, kind: mqtt::commands::CommandErrorKind, message: impl Into<String>) {
+        self.error = Some(mqtt::commands::CommandError::new(kind, message.into()));
+        self.error_logged = false;
+    }
+
+    /// Record a failure the caller has already logged.
+    fn fail_logged(&mut self, kind: mqtt::commands::CommandErrorKind, message: impl Into<String>) {
+        self.fail(kind, message);
+        self.error_logged = true;
+    }
+
+    /// Push a resolved command to the audio thread, logging if the ring is full.
+    fn send(&mut self, command: rt_engine::AudioCommand) -> bool {
+        if self.cmd_tx.push(command).is_err() {
+            tracing::error!("Audio command ring full; command dropped");
+            self.fail_logged(
+                mqtt::commands::CommandErrorKind::Internal,
+                "Audio command queue is full",
+            );
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Rebuild the status snapshot from the current live sample map and inputs.
+    fn refresh(&self) {
+        refresh_snapshot(
+            self.snapshot,
+            self.playing,
+            self.inputs,
+            self.output_channels,
+        );
+    }
+
+    fn refresh_talkback(&self, now_ms: u64) {
+        let status = self.talkback.status(now_ms);
+        *self.talkback_status.write().unwrap() = status;
+    }
+}
+
+/// What reaches the scheduler: a command request from HTTP or MQTT, or a
+/// background load that ended.
+enum SchedulerInput {
+    Request(mqtt::commands::CommandRequest),
+    Loaded(Result<(tokio::task::Id, LoadDone), tokio::task::JoinError>),
+}
+
+/// What a background load hands back.
+enum LoadDone {
+    /// A play's audio is ready, or failed to load. The play itself waits among
+    /// the scheduler's pending plays.
+    Play(Result<PreparedPlayback, mqtt::commands::CommandError>),
+    /// A cache command finished its work.
+    Cache {
+        command: mqtt::commands::AudioCommand,
+        reply: loading::PendingReply,
+        result: Result<PreparedPlayback, mqtt::commands::CommandError>,
+    },
+}
+
+/// What the scheduler keeps for a play from its arrival until it starts.
+struct UnstartedPlay {
+    command: mqtt::commands::AudioCommand,
+    reply: Option<tokio::sync::oneshot::Sender<mqtt::commands::CommandOutcome>>,
+    load: tokio::task::AbortHandle,
+}
+
+/// The most background loads that may run at once; a command needing another is
+/// rejected until one finishes.
+const MAX_CONCURRENT_LOADS: usize = 32;
+
+/// Takes command requests from HTTP and MQTT and the background loads they
+/// start. A play's load is started when the play arrives (it may wait for a
+/// load slot), and the play starts when it finishes. Meanwhile setting commands
+/// carry over onto the play and stops cancel it, so a command reaches a sound
+/// that is still loading as if the sound had started. Commands act on playing
+/// sounds, and plays start, through `handle_command`.
+struct CommandScheduler {
+    loads: tokio::task::JoinSet<LoadDone>,
+    load_permit: std::sync::Arc<tokio::sync::Semaphore>,
+    pending: pending_plays::PendingPlays<UnstartedPlay>,
+    /// The pending play each running play load belongs to.
+    play_loads: std::collections::HashMap<tokio::task::Id, u64>,
+    /// The running cache command loads.
+    cache_loads: std::collections::HashSet<tokio::task::Id>,
+}
+
+impl CommandScheduler {
+    fn new(load_permit: std::sync::Arc<tokio::sync::Semaphore>) -> Self {
+        Self {
+            loads: tokio::task::JoinSet::new(),
+            load_permit,
+            pending: pending_plays::PendingPlays::new(),
+            play_loads: std::collections::HashMap::new(),
+            cache_loads: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Loads still doing work for a command. A load a stop cancelled has given up
+    /// its slot, though it stays in `loads` until the loop takes its end.
+    fn loads_running(&self) -> usize {
+        self.play_loads.len() + self.cache_loads.len()
+    }
+
+    /// The next background load to end. Never completes while no load is running.
+    async fn next_load(&mut self) -> SchedulerInput {
+        if self.loads.is_empty() {
+            return std::future::pending().await;
+        }
+        match self.loads.join_next_with_id().await {
+            Some(ended) => SchedulerInput::Loaded(ended),
+            None => std::future::pending().await,
+        }
+    }
+
+    /// End every load and cancel every play that has not started: shutdown.
+    fn abort_loads(&mut self) {
+        for play in self.pending.take_all() {
+            deliver(
+                play.payload.reply,
+                Err(mqtt::commands::CommandError::new(
+                    mqtt::commands::CommandErrorKind::Cancelled,
+                    "Load cancelled before playback",
+                )),
+                true,
+            );
+        }
+        self.loads.abort_all();
+    }
+
+    /// Take one input: a request, or a load that ended.
+    async fn take(&mut self, input: SchedulerInput, ctx: &mut CommandCtx<'_>) {
+        match input {
+            SchedulerInput::Request(request) => self.receive(request, ctx).await,
+            SchedulerInput::Loaded(Ok((task, LoadDone::Play(result)))) => {
+                // A cancelled play has already left the pending plays.
+                if let Some(key) = self.play_loads.remove(&task) {
+                    if let Some(play) = self.pending.remove(key) {
+                        self.start(play, result, ctx).await;
                     }
                 }
-                Err(e) => {
-                    tracing::error!("Failed to start HTTP server: {}", e);
-                    if !mqtt_enabled {
-                        // HTTP was the only control surface; a daemon that can
-                        // receive no commands should fail loudly, not idle
-                        tracing::error!("HTTP was the only enabled interface - exiting");
-                        std::process::exit(1);
+            }
+            SchedulerInput::Loaded(Ok((
+                task,
+                LoadDone::Cache {
+                    command,
+                    mut reply,
+                    result,
+                },
+            ))) => {
+                self.cache_loads.remove(&task);
+                finish_cache_command(command, reply.0.take(), result, ctx).await
+            }
+            SchedulerInput::Loaded(Err(ended)) => {
+                self.cache_loads.remove(&ended.id());
+                // A play's load ends without a result only when it panicked; a
+                // cancelled play is no longer pending.
+                if let Some(key) = self.play_loads.remove(&ended.id()) {
+                    if let Some(play) = self.pending.remove(key) {
+                        tracing::error!(
+                            "Load of {} stopped unexpectedly: {}",
+                            play.identity.file,
+                            ended
+                        );
+                        let_go_of_voice(&play.identity, ctx);
+                        deliver(
+                            play.payload.reply,
+                            Err(mqtt::commands::CommandError::new(
+                                mqtt::commands::CommandErrorKind::Internal,
+                                format!("Load of {} stopped unexpectedly", play.identity.file),
+                            )),
+                            true,
+                        );
                     }
-                    tracing::warn!("Continuing with MQTT only");
                 }
             }
         }
+    }
 
-        // Spawn MQTT event processor if connected
-        if let Some((client, eventloop)) = mqtt_connection {
-            let mqtt_cmd_tx = cmd_tx.clone();
-            let mqtt_topic = config.mqtt.topic.as_ref().unwrap().clone();
-            let reconnect_delay = std::time::Duration::from_secs(config.mqtt.reconnect_delay_seconds.max(1));
-            tokio::spawn(async move {
-                mqtt::client::process_mqtt_events(client, eventloop, mqtt_topic, reconnect_delay, mqtt_cmd_tx).await;
-            });
-            tracing::info!("Ready to receive MQTT commands on topic: {}", config.mqtt.topic.as_ref().unwrap());
+    async fn receive(&mut self, request: mqtt::commands::CommandRequest, ctx: &mut CommandCtx<'_>) {
+        let mqtt::commands::CommandRequest { payload, reply } = request;
+        if reply.as_ref().is_some_and(|reply| reply.is_closed()) {
+            return;
         }
-
-        // Keep cmd_tx alive if only HTTP is running (no MQTT)
-        let _cmd_tx_keepalive = cmd_tx;
-
-        // Main command processing loop
-        if mqtt_enabled || http_enabled {
-            tracing::info!("Command processing loop started");
-        }
-
-        use mqtt::commands::{CommandError, CommandErrorKind, CommandOutcome};
-
-        /// Hand the outcome back to a waiting HTTP client (when there is
-        /// one) and log failures so MQTT senders can find them too.
-        fn deliver(reply: Option<tokio::sync::oneshot::Sender<CommandOutcome>>, outcome: CommandOutcome) {
-            if let Err(e) = &outcome {
-                tracing::error!("Command failed: {}", e.message);
+        // Expand macros before parsing
+        let expanded = match mqtt::commands::expand_macros(&payload, &ctx.config.macros) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("Macro expansion error: {}", e);
+                deliver(
+                    reply,
+                    Err(mqtt::commands::CommandError::new(
+                        mqtt::commands::CommandErrorKind::InvalidRequest,
+                        e.to_string(),
+                    )),
+                    true,
+                );
+                return;
             }
-            if let Some(tx) = reply {
-                let _ = tx.send(outcome);
+        };
+        let command = match mqtt::commands::parse_command(&expanded) {
+            Ok(command) => command,
+            Err(e) => {
+                tracing::error!("Failed to parse command: {}", e);
+                deliver(
+                    reply,
+                    Err(mqtt::commands::CommandError::new(
+                        mqtt::commands::CommandErrorKind::InvalidRequest,
+                        e.to_string(),
+                    )),
+                    true,
+                );
+                return;
             }
+        };
+
+        match command {
+            mqtt::commands::AudioCommand::Play { .. } => self.load_play(command, reply, ctx),
+            mqtt::commands::AudioCommand::StopAll
+            | mqtt::commands::AudioCommand::FadeAll { .. } => {
+                self.cancel_every_play(ctx);
+                ctx.prepared = None;
+                run_command(command, reply, ctx).await;
+            }
+            command if loading::needs_preparation(&command) => {
+                self.load_cache_command(command, reply, ctx)
+            }
+            command => self.route(command, reply, ctx).await,
         }
+    }
 
-        while let Some(request) = cmd_rx.recv().await {
-            let mqtt::commands::CommandRequest { payload, mut reply } = request;
+    /// Start a play's load. The play waits among the pending plays until it ends.
+    fn load_play(
+        &mut self,
+        command: mqtt::commands::AudioCommand,
+        reply: Option<tokio::sync::oneshot::Sender<mqtt::commands::CommandOutcome>>,
+        ctx: &mut CommandCtx<'_>,
+    ) {
+        if self.loads_running() >= MAX_CONCURRENT_LOADS {
+            reject_for_load_limit(reply);
+            return;
+        }
+        let identity =
+            pending_plays::PlayIdentity::of(&command).expect("a play command has an identity");
+        let config = ctx.config.clone();
+        let cache = ctx.cache_manager.clone();
+        let permit = self.load_permit.clone();
+        let output_sample_rate = ctx.output_sample_rate;
+        let to_load = command.clone();
+        let load = self.loads.spawn(async move {
+            let _permit = permit
+                .acquire_owned()
+                .await
+                .expect("load semaphore stays open");
+            LoadDone::Play(loading::prepare(&to_load, &config, &cache, output_sample_rate).await)
+        });
+        // A play naming a voice keeps it open while it loads.
+        if let Some(voice) = &identity.voice {
+            ctx.voice_manager.lock().add_loading_play(voice);
+        }
+        let task = load.id();
+        let key = self.pending.insert(
+            identity,
+            UnstartedPlay {
+                command,
+                reply,
+                load,
+            },
+        );
+        self.play_loads.insert(task, key);
+    }
 
-            // Expand macros before parsing
-            let expanded = match mqtt::commands::expand_macros(&payload, &config.macros) {
-                Ok(e) => e,
-                Err(e) => {
-                    deliver(reply, Err(CommandError::new(
-                        CommandErrorKind::InvalidRequest,
-                        format!("Macro expansion error: {}", e),
-                    )));
-                    continue;
+    /// Start a cache command's work in the background.
+    fn load_cache_command(
+        &mut self,
+        command: mqtt::commands::AudioCommand,
+        reply: Option<tokio::sync::oneshot::Sender<mqtt::commands::CommandOutcome>>,
+        ctx: &mut CommandCtx<'_>,
+    ) {
+        if self.loads_running() >= MAX_CONCURRENT_LOADS {
+            reject_for_load_limit(reply);
+            return;
+        }
+        let config = ctx.config.clone();
+        let cache = ctx.cache_manager.clone();
+        let permit = self.load_permit.clone();
+        let output_sample_rate = ctx.output_sample_rate;
+        // Built before the task so a load cancelled before it first runs still
+        // answers its client.
+        let reply = loading::PendingReply(reply);
+        let load = self.loads.spawn(async move {
+            let _permit = permit
+                .acquire_owned()
+                .await
+                .expect("load semaphore stays open");
+            let result = loading::prepare(&command, &config, &cache, output_sample_rate).await;
+            LoadDone::Cache {
+                command,
+                reply,
+                result,
+            }
+        });
+        self.cache_loads.insert(load.id());
+    }
+
+    /// Start a play whose load has ended, with the settings carried onto it.
+    async fn start(
+        &mut self,
+        play: pending_plays::PendingPlay<UnstartedPlay>,
+        result: Result<PreparedPlayback, mqtt::commands::CommandError>,
+        ctx: &mut CommandCtx<'_>,
+    ) {
+        let pending_plays::PendingPlay {
+            identity,
+            carried,
+            payload: UnstartedPlay {
+                mut command, reply, ..
+            },
+        } = play;
+        if reply.as_ref().is_some_and(|reply| reply.is_closed()) {
+            // Nobody is waiting for this sound any more.
+            let_go_of_voice(&identity, ctx);
+            return;
+        }
+        match result {
+            Err(error) => {
+                tracing::error!("Load failed: {}", error);
+                let_go_of_voice(&identity, ctx);
+                deliver(reply, Err(error), true);
+            }
+            Ok(prepared) => {
+                if carried.position_ms.is_some() && matches!(prepared, PreparedPlayback::Stream(_))
+                {
+                    tracing::warn!("{}", SEEK_ON_STREAM_IGNORED);
                 }
+                carried.apply_to(&mut command);
+                ctx.prepared = Some(prepared);
+                run_command(command, reply, ctx).await;
+                // Released after the start, so the voice is never empty in between.
+                let_go_of_voice(&identity, ctx);
+            }
+        }
+    }
+
+    /// Cancel every play that has not started and end every load: stopall and
+    /// fadeall.
+    fn cancel_every_play(&mut self, ctx: &mut CommandCtx<'_>) {
+        for play in self.pending.take_all() {
+            cancel(play, "Superseded by stopall/fadeall", ctx);
+        }
+        // Dropping the set aborts every load, cache commands included, and drops
+        // any result that finished but was not taken.
+        drop(std::mem::replace(
+            &mut self.loads,
+            tokio::task::JoinSet::new(),
+        ));
+        self.play_loads.clear();
+        self.cache_loads.clear();
+    }
+
+    /// A command that needs no load: it acts on the playing sounds at once, and on
+    /// the plays still loading by carrying over onto them or cancelling them.
+    async fn route(
+        &mut self,
+        command: mqtt::commands::AudioCommand,
+        reply: Option<tokio::sync::oneshot::Sender<mqtt::commands::CommandOutcome>>,
+        ctx: &mut CommandCtx<'_>,
+    ) {
+        let reached_unstarted = self.pending.reached_by(&command) > 0;
+        for play in self.pending.cancel(&command) {
+            self.play_loads.remove(&play.payload.load.id());
+            cancel(play, "Cancelled by a stop before it started", ctx);
+        }
+        // A setting `handle_command` ignores carries onto nothing either.
+        let ignored = ignored_setting(&command, ctx.streamed_voices);
+        if ignored.is_none() {
+            let carried = self.pending.carry(&command);
+            if carried > 0 {
+                tracing::info!(
+                    "Carried {:?} onto {} play(s) still loading",
+                    command,
+                    carried
+                );
+            }
+        }
+        if reached_unstarted && !reaches_playing(&command, ctx) {
+            // Nothing is playing for `handle_command` to act on, and it would
+            // answer "not found" although the command reached a play.
+            if let Some(warning) = ignored {
+                tracing::warn!("{}", warning);
+            }
+            deliver(reply, Ok("Command completed".to_string()), false);
+            ctx.refresh_talkback(ctx.start_time.elapsed().as_millis() as u64);
+            return;
+        }
+        ctx.prepared = None;
+        run_command(command, reply, ctx).await;
+    }
+}
+
+/// Run one command through `handle_command` (with whatever load the caller put in
+/// `ctx.prepared`) and answer it.
+async fn run_command(
+    command: mqtt::commands::AudioCommand,
+    reply: Option<tokio::sync::oneshot::Sender<mqtt::commands::CommandOutcome>>,
+    ctx: &mut CommandCtx<'_>,
+) {
+    ctx.error = None;
+    ctx.error_logged = false;
+    handle_command(command, ctx).await;
+    let outcome = ctx
+        .error
+        .take()
+        .map_or_else(|| Ok("Command completed".to_string()), Err);
+    deliver(reply, outcome, ctx.error_logged);
+    ctx.refresh_talkback(ctx.start_time.elapsed().as_millis() as u64);
+}
+
+/// Answer a cache command whose background work has ended.
+async fn finish_cache_command(
+    command: mqtt::commands::AudioCommand,
+    reply: Option<tokio::sync::oneshot::Sender<mqtt::commands::CommandOutcome>>,
+    result: Result<PreparedPlayback, mqtt::commands::CommandError>,
+    ctx: &mut CommandCtx<'_>,
+) {
+    if reply.as_ref().is_some_and(|reply| reply.is_closed()) {
+        return;
+    }
+    match result {
+        Err(error) => {
+            tracing::error!("Load failed: {}", error);
+            deliver(reply, Err(error), true);
+        }
+        Ok(prepared) => {
+            ctx.prepared = Some(prepared);
+            run_command(command, reply, ctx).await;
+        }
+    }
+}
+
+fn reject_for_load_limit(
+    reply: Option<tokio::sync::oneshot::Sender<mqtt::commands::CommandOutcome>>,
+) {
+    deliver(
+        reply,
+        Err(mqtt::commands::CommandError::new(
+            mqtt::commands::CommandErrorKind::Internal,
+            "Too many concurrent loads",
+        )),
+        false,
+    );
+}
+
+/// Cancel a play that has not started: end its load, let go of its voice, and
+/// answer it.
+fn cancel(play: pending_plays::PendingPlay<UnstartedPlay>, reason: &str, ctx: &mut CommandCtx<'_>) {
+    play.payload.load.abort();
+    tracing::info!("Cancelled play of {}: {}", play.identity.file, reason);
+    let_go_of_voice(&play.identity, ctx);
+    deliver(
+        play.payload.reply,
+        Err(mqtt::commands::CommandError::new(
+            mqtt::commands::CommandErrorKind::Cancelled,
+            reason,
+        )),
+        true,
+    );
+}
+
+/// A play naming a voice stopped loading, so it no longer keeps that voice open.
+fn let_go_of_voice(identity: &pending_plays::PlayIdentity, ctx: &mut CommandCtx<'_>) {
+    if let Some(voice) = &identity.voice {
+        ctx.voice_manager.lock().remove_loading_play(voice);
+    }
+}
+
+/// Logged when a seek cannot apply because its sound is a windowed/streamed source.
+const SEEK_ON_STREAM_IGNORED: &str = "Seek is not supported for windowed/streamed voices; \
+     ignoring (a streamed source plays forward only)";
+
+/// Why a `speed` or `seek` is ignored instead of applied, as the warning to log:
+/// reverse playback cannot be pitch-corrected, and a voice playing a windowed or
+/// streamed source plays forward only. `None` for one that applies, and for any
+/// other command.
+fn ignored_setting(
+    command: &mqtt::commands::AudioCommand,
+    streamed_voices: &std::collections::HashSet<String>,
+) -> Option<String> {
+    match command {
+        // Validated here, off the audio thread (D57): the RT-side set_speed
+        // rejects this combination silently.
+        mqtt::commands::AudioCommand::Speed {
+            speed,
+            pitch_correction: true,
+            ..
+        } if *speed < 0.0 => Some(format!(
+            "Negative speed ({}) is not supported with pitch correction; ignoring",
+            speed
+        )),
+        mqtt::commands::AudioCommand::Speed { selector, .. }
+            if selector_targets_streamed_voice(selector, streamed_voices) =>
+        {
+            Some(
+                "Speed/pitch is not supported for windowed/streamed voices; ignoring (a \
+                 streamed source plays forward only)"
+                    .to_string(),
+            )
+        }
+        mqtt::commands::AudioCommand::Seek { selector, .. }
+            if selector_targets_streamed_voice(selector, streamed_voices) =>
+        {
+            Some(SEEK_ON_STREAM_IGNORED.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Whether a command reaches a sound that is already playing, so
+/// `handle_command` has work beyond what carried over or was cancelled.
+fn reaches_playing(command: &mqtt::commands::AudioCommand, ctx: &CommandCtx<'_>) -> bool {
+    match command {
+        mqtt::commands::AudioCommand::Seek { selector, .. }
+        | mqtt::commands::AudioCommand::Speed { selector, .. }
+        | mqtt::commands::AudioCommand::Stop { selector, .. }
+        | mqtt::commands::AudioCommand::Volume { selector, .. } => ctx
+            .playing
+            .values()
+            .any(|sample| sample_status_matches(selector, sample)),
+        mqtt::commands::AudioCommand::VoiceStop { voice }
+        | mqtt::commands::AudioCommand::VoiceFadeOut { voice, .. } => !ctx
+            .voice_manager
+            .lock()
+            .get_voice_sample_ids(voice)
+            .is_empty(),
+        _ => true,
+    }
+}
+
+/// Answer a request: send its outcome to the HTTP client waiting on it, or, with
+/// nobody waiting (an MQTT message), log a failure the handler has not already
+/// logged, so the sender can find it.
+fn deliver(
+    reply: Option<tokio::sync::oneshot::Sender<mqtt::commands::CommandOutcome>>,
+    outcome: mqtt::commands::CommandOutcome,
+    logged: bool,
+) {
+    match reply {
+        Some(reply) => {
+            let _ = reply.send(outcome);
+        }
+        None => {
+            if let Err(error) = outcome {
+                if !logged {
+                    tracing::warn!("Command failed: {}", error.message);
+                }
+            }
+        }
+    }
+}
+
+/// Gate a freshly-spawned streamed source on its prebuffer, then build the StreamedSource
+/// and register it (voice activity, ducking, status, AddStreamedSource). Shared by the
+/// local-file and HTTP windowed-play paths.
+#[allow(clippy::too_many_arguments)]
+async fn finish_streamed_play(
+    handles: audio::streamed_source::StreamHandles,
+    file: String,
+    id: Option<String>,
+    volume: f32,
+    voice: Option<String>,
+    channel_map: Option<Vec<mqtt::commands::ChannelMapping>>,
+    fade_in: Option<u32>,
+    loop_mode: bool,
+    prebuffer_frames: usize,
+    deadline_ms: u32,
+    mut stages: PlayStages,
+    ctx: &mut CommandCtx<'_>,
+) {
+    use std::sync::atomic::Ordering;
+    let config = ctx.config;
+    let output_sample_rate = ctx.output_sample_rate;
+    let named_voice = voice.is_some();
+    let voice_id = voice.unwrap_or_else(next_auto_voice_id);
+
+    // Gate on the prebuffer so the first audio is glitch-free, but never wait past
+    // the deadline (start anyway; the underrun fade covers any gap). Event-driven
+    // (D53): the producer's notify wakes the gate the moment data lands, so there
+    // is no polling quantum on the start latency.
+    let filled = handles
+        .wait_prebuffer(
+            prebuffer_frames,
+            std::time::Duration::from_millis(deadline_ms as u64),
+        )
+        .await;
+    if !filled {
+        tracing::warn!(
+            "Streamed source {} hit the {}ms prebuffer deadline with {}/{} frames; \
+             starting anyway",
+            file,
+            deadline_ms,
+            handles.frames_buffered.load(Ordering::Acquire),
+            prebuffer_frames
+        );
+    }
+    // Prebuffer gate released (threshold, producer done, or deadline): the source
+    // is as ready as it will be before start (Sprint 11, D50).
+    stages.ready();
+
+    // Resolve the internal id and the voice's current volume.
+    let mut voice_mgr = ctx.voice_manager.lock();
+    let internal_id = add_sample_to_play_voice(&mut voice_mgr, &voice_id, named_voice);
+    let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
+    drop(voice_mgr);
+
+    // Channel routing: resolve aliases if given, else default 1:1 over decoded channels.
+    let channels = handles.channels;
+    let (resolved_map, route_gains): (Vec<(usize, usize)>, Vec<f32>) = match channel_map {
+        Some(map) => {
+            let mut out = Vec::with_capacity(map.len());
+            for m in &map {
+                match (
+                    config.resolve_channel(&m.src),
+                    config.resolve_channel(&m.dest),
+                ) {
+                    (Ok(s), Ok(d)) => out.push((s, d)),
+                    (Err(e), _) | (_, Err(e)) => {
+                        tracing::error!("Failed to resolve channel alias for streamed play: {}", e);
+                        return;
+                    }
+                }
+            }
+            (out, channel_route_gains(&map))
+        }
+        None => ((0..channels).map(|c| (c, c)).collect(), Vec::new()),
+    };
+
+    let mut source = audio::mixer::StreamedSource::new(
+        internal_id,
+        voice_id.clone(),
+        file.clone(),
+        id.clone(),
+        handles.consumer,
+        channels,
+        volume,
+        resolved_map,
+        handles.producer_done,
+        handles.stop_flag,
+    );
+    // Start at the voice's current level (no ramp), like a sample play.
+    source.voice_volume = voice_volume;
+    source.target_voice_volume = voice_volume;
+    source.set_channel_route_gains(route_gains);
+    if let Some(fade_ms) = fade_in {
+        source.set_fade(audio::mixer::FadeState::fade_in(
+            fade_ms,
+            output_sample_rate,
+        ));
+    }
+
+    let status = http::SampleStatus {
+        internal_id: source.id,
+        sample_id: source.sample_id.clone(),
+        voice_id: voice_id.clone(),
+        file_path: source.file_path.clone(),
+        total_frames: 0, // unbounded / unknown for a stream
+        sample_rate: output_sample_rate,
+        channels,
+        volume: source.volume,
+        voice_volume: source.voice_volume,
+        speed: 1.0,
+        loop_mode,
+        // Streamed/windowed sources are forward-only (no seek/speed/reverse).
+        windowed: true,
+        position: None,
+    };
+
+    let became_active = !ctx.active_counts.contains_key(&voice_id);
+    if became_active {
+        notify_voice_activity(
+            &voice_id,
+            true,
+            ctx.ducking_engine.as_mut(),
+            ctx.cmd_tx,
+            ctx.ducking_snapshot,
+        );
+    }
+    *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
+    ctx.playing.insert(status.internal_id, status);
+    ctx.streamed_voices.insert(voice_id.clone());
+
+    // First-mix latency probe (Sprint 11, D50), mirroring the full-load path.
+    let enqueued_at = std::time::Instant::now();
+    source.set_latency_probe(enqueued_at, ctx.latency.new_probe());
+
+    ctx.send(rt_engine::AudioCommand::AddStreamedSource(source));
+    stages.log_enqueued(&file, "windowed", enqueued_at);
+    ctx.refresh();
+    tracing::info!(
+        "Now streaming {} (voice '{}'); {} active voices",
+        file,
+        voice_id,
+        ctx.playing.len()
+    );
+}
+
+/// Pitch correction stays dormant while a cold play's progressive load is still
+/// filling (the mixer needs slice access) and engages when the D51 upgrade lands.
+/// Tell the operator instead of silently doing nothing in the meantime.
+fn warn_pitch_correction_deferred(file: &str) {
+    tracing::warn!(
+        "Pitch correction for {} is deferred: its cold play is still loading; it engages when \
+         the load completes",
+        file
+    );
+}
+
+/// Whether a selector targets a voice that currently has a windowed/streamed source.
+/// Streamed voices are forward-only, so seek/speed/pitch do not apply. Best-effort:
+/// it matches on the selector's voice (the common case) and is used only to warn — a
+/// stray seek/speed would be a structural no-op on streamed sources anyway, since they
+/// live in a separate voice list the sample-targeted commands never touch.
+fn selector_targets_streamed_voice(
+    selector: &mqtt::commands::SampleSelector,
+    streamed_voices: &std::collections::HashSet<String>,
+) -> bool {
+    selector
+        .voice
+        .as_deref()
+        .is_some_and(|v| streamed_voices.contains(v))
+}
+
+/// Apply a single parsed command to the shared audio state.
+async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<'_>) {
+    let cache_manager = ctx.cache_manager;
+    let voice_manager = ctx.voice_manager;
+    let output_sample_rate = ctx.output_sample_rate;
+    let config = ctx.config;
+    use audio::mixer::ActiveSample;
+
+    tracing::info!("Processing command: {:?}", cmd);
+    use mqtt::commands::{AudioCommand as ParsedCommand, CommandErrorKind};
+    if let ParsedCommand::Seek { selector, .. }
+    | ParsedCommand::Speed { selector, .. }
+    | ParsedCommand::Stop { selector, .. }
+    | ParsedCommand::Volume { selector, .. } = &cmd
+    {
+        if selector.is_empty() {
+            ctx.fail(
+                CommandErrorKind::InvalidRequest,
+                "Command has no sample selector",
+            );
+            return;
+        }
+        if !ctx
+            .playing
+            .values()
+            .any(|sample| sample_status_matches(selector, sample))
+        {
+            ctx.fail(CommandErrorKind::NotFound, "No sample matches the selector");
+            return;
+        }
+    }
+    if let Some(warning) = ignored_setting(&cmd, ctx.streamed_voices) {
+        tracing::warn!("{}", warning);
+        return;
+    }
+
+    if loading::needs_preparation(&cmd) && ctx.prepared.is_none() {
+        match loading::prepare(&cmd, config, cache_manager, output_sample_rate).await {
+            Ok(prepared) => ctx.prepared = Some(prepared),
+            Err(error) => {
+                ctx.error = Some(error);
+                return;
+            }
+        }
+    }
+    if matches!(ctx.prepared, Some(PreparedPlayback::Done)) {
+        ctx.prepared.take();
+        return;
+    }
+
+    match cmd {
+        mqtt::commands::AudioCommand::Play {
+            file,
+            id,
+            volume,
+            voice,
+            channel_map,
+            fade_in,
+            start_position_ms,
+            loop_mode,
+            crossfade_ms,
+            mode: _,
+            window_ms: _,
+            prebuffer_ms: _,
+            freshness: _,
+            cacheable: _,
+            speed,
+            pitch_correction,
+        } => {
+            // Stage clock for this play's latency event (Sprint 11, D50).
+            let mut stages = PlayStages::begin();
+
+            // A play without its own speed starts at its voice's.
+            let (speed, pitch_correction) = match speed {
+                Some(speed) => (speed, pitch_correction),
+                None => voice
+                    .as_deref()
+                    .and_then(|voice| voice_manager.lock().get_voice_speed(voice))
+                    .unwrap_or((1.0, false)),
             };
 
-            match mqtt::commands::parse_command(&expanded) {
-                Ok(cmd) => {
-                    tracing::info!("Processing command: {:?}", cmd);
+            let buffer_result = match ctx.prepared.take() {
+                Some(PreparedPlayback::Stream(handles)) => {
+                    let handles = handles.into_handles();
+                    stages.decision();
+                    if speed != 1.0 || pitch_correction {
+                        tracing::warn!(
+                            "Speed/pitch is not supported for windowed/streamed plays; playing \
+                             {} at normal speed (a streamed source plays forward only)",
+                            file
+                        );
+                    }
+                    finish_streamed_play(
+                        handles,
+                        file.clone(),
+                        id,
+                        volume,
+                        voice,
+                        channel_map,
+                        fade_in,
+                        loop_mode && !file.starts_with("http"),
+                        0,
+                        0,
+                        stages,
+                        ctx,
+                    )
+                    .await;
+                    return;
+                }
+                Some(PreparedPlayback::Full(buffer)) => {
+                    stages.decision();
+                    Ok(buffer)
+                }
+                _ => Err("Missing prepared playback".to_string()),
+            };
 
-                    // None = the arm handed the reply to a spawned task
-                    let outcome: Option<CommandOutcome> = match cmd {
-                        mqtt::commands::AudioCommand::Play { file, id, volume, voice, channel_map, fade_in, start_position_ms, loop_mode, crossfade_ms } => {
-                            if let Err(e) = config.is_local_path_allowed(&file) {
-                                deliver(reply.take(), Err(CommandError::new(CommandErrorKind::Forbidden, format!("Play rejected: {}", e))));
-                                continue;
-                            }
+            match buffer_result {
+                Ok(buffer) => {
+                    stages.ready();
 
-                            // Resolve channel aliases now, while the config is at hand
-                            let resolved_mapping: Option<Vec<(usize, usize)>> = match &channel_map {
-                                Some(map) => {
-                                    let mapping: Result<Vec<(usize, usize)>, String> = map.iter()
-                                        .map(|m| {
-                                            let src = config.resolve_channel(&m.src)?;
-                                            let dest = config.resolve_channel(&m.dest)?;
-                                            Ok((src, dest))
-                                        })
-                                        .collect();
-                                    match mapping {
-                                        Ok(m) => {
-                                            // Routes past the device width mix to nothing; say so
-                                            // once at command time instead of playing silence
-                                            if m.is_empty() {
-                                                tracing::warn!("channel_map for '{}' is empty - it will play silently", file);
-                                            }
-                                            for (_, dest) in &m {
-                                                if *dest >= output_channels {
-                                                    tracing::warn!(
-                                                        "channel_map for '{}' routes to channel {} but the device opened with {} channels - that route will be silent",
-                                                        file, dest, output_channels
-                                                    );
-                                                }
-                                            }
-                                            Some(m)
-                                        }
-                                        Err(e) => {
-                                            deliver(reply.take(), Err(CommandError::new(CommandErrorKind::InvalidRequest, format!("Failed to resolve channel alias: {}", e))));
-                                            continue;
-                                        }
-                                    }
-                                }
-                                None => None,
-                            };
+                    // Use provided voice or auto-generate a unique one.
+                    let named_voice = voice.is_some();
+                    let voice_id = voice.unwrap_or_else(next_auto_voice_id);
 
-                            // The load (possibly a slow download or decode) runs as
-                            // its own task so stopall/volume/status commands are
-                            // never queued behind it
-                            let cache_manager = cache_manager.clone();
-                            let mixer_state = mixer_state.clone();
-                            let voice_manager = voice_manager.clone();
-                            let active_voices = active_voices.clone();
-                            let stop_generation = stop_generation.clone();
-                            let generation = stop_generation.load(std::sync::atomic::Ordering::SeqCst);
-                            let task_reply = reply.take();
+                    let is_streaming =
+                        matches!(&buffer, audio::streaming::SampleBuffer::Streaming(_));
+                    let (channels, sample_rate, frames) = buffer.metadata_blocking();
+                    if channels == 0 || sample_rate == 0 {
+                        ctx.fail(
+                            CommandErrorKind::Internal,
+                            "Decoded audio metadata is unavailable",
+                        );
+                        return;
+                    }
+                    let duration_secs = if frames > 0 && sample_rate > 0 {
+                        frames as f32 / sample_rate as f32
+                    } else {
+                        0.0
+                    };
 
-                            tokio::spawn(async move {
-                                let buffer_result = {
-                                    let mut cache_mgr = cache_manager.lock().await;
-                                    cache_mgr.get_or_load_streaming(&file, output_sample_rate).await
-                                };
-
-                                let outcome = match buffer_result {
-                                    Ok(buffer) => {
-                                        if stop_generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
-                                            tracing::info!("Discarding load of {}: a stop arrived while it was loading", file);
-                                            Err(CommandError::new(CommandErrorKind::Cancelled, format!("Play of {} cancelled by a stop command", file)))
-                                        } else {
-                                    // Use provided voice or auto-generate one
-                                    let voice_id = voice.unwrap_or_else(|| {
-                                        format!("_auto_{}", std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_millis())
-                                    });
-
-                                    let is_streaming = !buffer.is_complete();
-                                    let frames = buffer.frames();
-                                    let sample_rate = buffer.sample_rate();
-                                    let channels = buffer.channels();
-                                    let duration_secs = if frames > 0 && sample_rate > 0 {
-                                        frames as f32 / sample_rate as f32
-                                    } else {
-                                        0.0
-                                    };
-
-                                    if is_streaming {
-                                        tracing::info!(
+                    if is_streaming {
+                        tracing::info!(
                                             "Playing {} (streaming): {} channels, {} frames loaded so far [voice: {}{}{}]",
                                             file,
                                             channels,
@@ -1062,556 +2550,5817 @@ async fn main() {
                                             if loop_mode { ", looping" } else { "" },
                                             if crossfade_ms > 0 { format!(", crossfade {}ms", crossfade_ms) } else { String::new() }
                                         );
-                                    } else {
-                                        tracing::info!(
-                                            "Playing {}: {} channels, {} frames ({:.2}s) [voice: {}{}{}]",
-                                            file,
-                                            channels,
-                                            frames,
-                                            duration_secs,
-                                            voice_id,
-                                            if loop_mode { ", looping" } else { "" },
-                                            if crossfade_ms > 0 { format!(", crossfade {}ms", crossfade_ms) } else { String::new() }
-                                        );
-                                    }
-
-                                    // Get sample ID and voice volume from voice manager
-                                    let mut voice_mgr = voice_manager.lock().unwrap();
-                                    let sample_id = voice_mgr.add_sample_to_voice(&voice_id);
-                                    let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
-                                    drop(voice_mgr);
-
-                                    // Convert crossfade_ms to samples
-                                    let crossfade_samples = (crossfade_ms as usize * output_sample_rate as usize) / 1000;
-
-                                    // Build the sample with the pre-resolved mapping
-                                    let mut sample = if let Some(mapping) = resolved_mapping {
-                                        tracing::debug!("Using custom channel mapping: {:?}", mapping);
-                                        ActiveSample::new_with_mapping(
-                                            sample_id,
-                                            voice_id.clone(),
-                                            buffer.clone(),
-                                            volume,
-                                            voice_volume,
-                                            mapping,
-                                            file.clone(),
-                                            id.clone(),
-                                            loop_mode,
-                                            crossfade_samples,
-                                        )
-                                    } else {
-                                        // Default channel mapping (1:1)
-                                        ActiveSample::new_with_id(
-                                            sample_id,
-                                            voice_id.clone(),
-                                            buffer.clone(),
-                                            volume,
-                                            voice_volume,
-                                            file.clone(),
-                                            id.clone(),
-                                            loop_mode,
-                                            crossfade_samples,
-                                        )
-                                    };
-
-                                    // Apply start position if requested
-                                    if let Some(start_ms) = start_position_ms {
-                                        let target_frame = ((start_ms * sample_rate as u64) / 1000) as usize;
-                                        // For streaming buffers, use estimate if available, otherwise don't clamp
-                                        // (mixer will return silence for unloaded frames)
-                                        let max_frame = buffer.total_frames_or_estimate()
-                                            .unwrap_or(usize::MAX)
-                                            .saturating_sub(1);
-                                        sample.position = target_frame.min(max_frame);
-                                        if is_streaming && !buffer.is_frame_loaded(sample.position) {
-                                            tracing::debug!(
-                                                "Starting at position {}ms (frame {}), waiting for data to load",
-                                                start_ms, sample.position
-                                            );
-                                        } else {
-                                            tracing::debug!("Starting at position {}ms (frame {})", start_ms, sample.position);
-                                        }
-                                    }
-
-                                    // Apply fade in if requested
-                                    if let Some(fade_ms) = fade_in {
-                                        sample.set_fade(audio::mixer::FadeState::fade_in(fade_ms, output_sample_rate));
-                                        tracing::debug!("Applied {}ms fade in to voice '{}'", fade_ms, voice_id);
-                                    }
-
-                                    // Notify ducking engine if voice became active
-                                    let mut active_voices_guard = active_voices.lock().unwrap();
-                                    let was_active = active_voices_guard.contains(&voice_id);
-                                    if !was_active {
-                                        active_voices_guard.insert(voice_id.clone());
-                                        drop(active_voices_guard);
-
-                                        // Notify ducking engine that voice became active
-                                        let mut state = mixer_state.lock().unwrap();
-                                        if let Some(ref mut engine) = state.ducking_engine {
-                                            engine.notify_voice_active(&voice_id, true);
-                                        }
-                                        state.active_samples.push(sample);
-                                        tracing::info!("Now playing {} active samples", state.active_samples.len());
-                                    } else {
-                                        drop(active_voices_guard);
-                                        let mut state = mixer_state.lock().unwrap();
-                                        state.active_samples.push(sample);
-                                        tracing::info!("Now playing {} active samples", state.active_samples.len());
-                                    }
-
-                                    Ok(format!("Playing {} [voice: {}]", file, voice_id))
-                                        }
-                                    }
-                                    Err(e) => Err(CommandError::new(
-                                        CommandErrorKind::NotFound,
-                                        format!("Failed to load {}: {}", file, e),
-                                    )),
-                                };
-
-                                deliver(task_reply, outcome);
-                            });
-
-                            None
-                        }
-                        mqtt::commands::AudioCommand::StopAll => {
-                            // Apply quick 10ms fade-out to prevent clicks/pops
-                            const STOP_FADE_MS: u32 = 10;
-
-                            // Cancel any loads still in flight so nothing starts
-                            // playing after the stop
-                            stop_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-                            let mut state = mixer_state.lock().unwrap();
-                            let count = state.active_samples.len();
-
-                            for sample in state.active_samples.iter_mut() {
-                                sample.set_fade(audio::mixer::FadeState::fade_out(STOP_FADE_MS, output_sample_rate));
-                            }
-                            drop(state);
-
-                            // Note: Samples will be automatically removed by the audio callback
-                            // when the fade completes (is_finished() returns true).
-                            // Voice cleanup also happens automatically.
-
-                            tracing::info!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS);
-                            Some(Ok(format!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS)))
-                        }
-                        mqtt::commands::AudioCommand::FadeAll { time_ms } => {
-                            // Cancel any loads still in flight, matching stopall
-                            stop_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-                            let mut state = mixer_state.lock().unwrap();
-                            let count = state.active_samples.len();
-
-                            for sample in state.active_samples.iter_mut() {
-                                sample.set_fade(audio::mixer::FadeState::fade_out(time_ms, output_sample_rate));
-                            }
-                            drop(state);
-
-                            // Samples are removed by the audio callback once the
-                            // fade completes, and voice cleanup follows from that.
-                            tracing::info!("Fading out {} samples over {}ms", count, time_ms);
-                            Some(Ok(format!("Fading out {} samples over {}ms", count, time_ms)))
-                        }
-                        mqtt::commands::AudioCommand::VoiceStop { voice } => {
-                            // Apply quick 10ms fade-out to prevent clicks/pops
-                            const STOP_FADE_MS: u32 = 10;
-
-                            // Get sample IDs in the voice
-                            let mut voice_mgr = voice_manager.lock().unwrap();
-                            let sample_ids = voice_mgr.clear_voice(&voice);
-                            drop(voice_mgr);
-
-                            if sample_ids.is_empty() {
-                                tracing::warn!("Voice '{}' not found or already empty", voice);
-                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Voice '{}' not found or already empty", voice))))
+                    } else {
+                        tracing::info!(
+                            "Playing {}: {} channels, {} frames ({:.2}s) [voice: {}{}{}]",
+                            file,
+                            channels,
+                            frames,
+                            duration_secs,
+                            voice_id,
+                            if loop_mode { ", looping" } else { "" },
+                            if crossfade_ms > 0 {
+                                format!(", crossfade {}ms", crossfade_ms)
                             } else {
-                                // Apply fade-out to all samples in the voice
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-                                for sample in state.active_samples.iter_mut() {
-                                    if sample_ids.contains(&sample.id) {
-                                        sample.set_fade(audio::mixer::FadeState::fade_out(STOP_FADE_MS, output_sample_rate));
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                tracing::info!(
-                                    "Stopping voice '{}': {} samples ({}ms fade-out)",
-                                    voice, updated_count, STOP_FADE_MS
-                                );
-                                Some(Ok(format!("Stopping voice '{}': {} samples", voice, updated_count)))
+                                String::new()
                             }
-                        }
-                        mqtt::commands::AudioCommand::VoiceFadeOut { voice, time_ms } => {
-                            // Get sample IDs in the voice
-                            let voice_mgr = voice_manager.lock().unwrap();
-                            let sample_ids = voice_mgr.get_voice_sample_ids(&voice);
-                            drop(voice_mgr);
+                        );
+                    }
 
-                            if sample_ids.is_empty() {
-                                tracing::warn!("Voice '{}' not found or already empty", voice);
-                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Voice '{}' not found or already empty", voice))))
-                            } else {
-                                // Apply fade out to all samples in the voice
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-                                for sample in state.active_samples.iter_mut() {
-                                    if sample_ids.contains(&sample.id) {
-                                        sample.set_fade(audio::mixer::FadeState::fade_out(time_ms, output_sample_rate));
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                tracing::info!(
-                                    "Applied {}ms fade out to voice '{}' ({} samples)",
-                                    time_ms, voice, updated_count
-                                );
-                                Some(Ok(format!("Fading out voice '{}' over {}ms ({} samples)", voice, time_ms, updated_count)))
-                            }
-                        }
-                        mqtt::commands::AudioCommand::VoiceVolume { voice, volume: new_volume } => {
-                            // Set voice volume in voice manager
-                            let mut voice_mgr = voice_manager.lock().unwrap();
-                            let success = voice_mgr.set_voice_volume(&voice, new_volume);
-                            let actual_volume = voice_mgr.get_voice_volume(&voice).unwrap_or(1.0);
-                            drop(voice_mgr);
-
-                            if success {
-                                // Update all active samples and live inputs in this voice with smooth ramping
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut sample_count = 0;
-                                let mut input_count = 0;
-
-                                for sample in state.active_samples.iter_mut() {
-                                    if sample.voice_id == voice {
-                                        // Set target for smooth ramping (avoids pops)
-                                        sample.set_target_voice_volume(actual_volume);
-                                        sample_count += 1;
-                                    }
-                                }
-
-                                for input in state.live_inputs.iter_mut() {
-                                    if input.voice_id == voice {
-                                        // Set target for smooth ramping (avoids pops)
-                                        input.set_target_voice_volume(actual_volume);
-                                        input_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                tracing::info!(
-                                    "Set voice '{}' volume to {:.2} (updated {} samples, {} inputs)",
-                                    voice, actual_volume, sample_count, input_count
-                                );
-                                Some(Ok(format!("Set voice '{}' volume to {:.2} ({} samples, {} inputs)", voice, actual_volume, sample_count, input_count)))
-                            } else {
-                                tracing::warn!("Voice '{}' not found", voice);
-                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Voice '{}' not found", voice))))
-                            }
-                        }
-                        mqtt::commands::AudioCommand::Precache { file } => {
-                            if let Err(e) = config.is_local_path_allowed(&file) {
-                                deliver(reply.take(), Err(CommandError::new(CommandErrorKind::Forbidden, format!("Precache rejected: {}", e))));
-                                continue;
-                            }
-
-                            // The load starts as its own task so it never delays
-                            // the command loop
-                            let cache_manager = cache_manager.clone();
-                            let verbose = config.logging.verbose;
-                            let task_reply = reply.take();
-                            tokio::spawn(async move {
-                                let mut cache_mgr = cache_manager.lock().await;
-                                let outcome = match cache_mgr.precache_streaming(&file, output_sample_rate).await {
-                                    Ok(()) => {
-                                        if verbose {
-                                            cache_mgr.log_stats();
-                                        }
-                                        Ok(format!("Precache started for {}", file))
-                                    }
-                                    Err(e) => Err(CommandError::new(
-                                        CommandErrorKind::NotFound,
-                                        format!("Failed to start precache for {}: {}", file, e),
-                                    )),
-                                };
-                                drop(cache_mgr);
-                                deliver(task_reply, outcome);
-                            });
-
-                            None
-                        }
-                        mqtt::commands::AudioCommand::CacheClear => {
-                            let mut cache_mgr = cache_manager.lock().await;
-                            if config.logging.verbose {
-                                let mem = cache_mgr.memory_stats();
-                                let disk = cache_mgr.disk_stats();
-                                tracing::debug!(
-                                    "Clearing cache - Memory: {} entries ({:.2} MB), Disk: {} entries ({:.2} MB)",
-                                    mem.entry_count,
-                                    mem.size_bytes as f64 / (1024.0 * 1024.0),
-                                    disk.entry_count,
-                                    disk.size_bytes as f64 / (1024.0 * 1024.0)
-                                );
-                            }
-                            match cache_mgr.clear_all() {
-                                Ok(()) => {
-                                    tracing::info!("Cache cleared successfully");
-                                    Some(Ok("Cache cleared".to_string()))
-                                }
-                                Err(e) => Some(Err(CommandError::new(CommandErrorKind::Internal, format!("Failed to clear cache: {}", e)))),
-                            }
-                        }
-                        mqtt::commands::AudioCommand::CacheInvalidate { file } => {
-                            let mut cache_mgr = cache_manager.lock().await;
-                            match cache_mgr.invalidate(&file) {
-                                Ok(()) => {
-                                    tracing::info!("Invalidated cache for: {}", file);
-                                    if config.logging.verbose {
-                                        cache_mgr.log_stats();
-                                    }
-                                    Some(Ok(format!("Invalidated cache for {}", file)))
-                                }
-                                Err(e) => Some(Err(CommandError::new(CommandErrorKind::Internal, format!("Failed to invalidate {}: {}", file, e)))),
-                            }
-                        }
-                        mqtt::commands::AudioCommand::InputVolume { input, volume: new_volume } => {
-                            let mut state = mixer_state.lock().unwrap();
-                            let mut found = false;
-
-                            // Try to find by index first
-                            if let Ok(idx) = input.parse::<usize>() {
-                                if idx < state.live_inputs.len() {
-                                    state.live_inputs[idx].set_target_volume(new_volume);
-                                    tracing::info!(
-                                        "Set input {} volume to {:.2}",
-                                        idx, state.live_inputs[idx].target_volume
-                                    );
-                                    found = true;
-                                }
-                            }
-
-                            // Try to find by voice_id if not found by index
-                            if !found {
-                                for live_input in state.live_inputs.iter_mut() {
-                                    if live_input.voice_id == input {
-                                        live_input.set_target_volume(new_volume);
-                                        tracing::info!(
-                                            "Set input '{}' volume to {:.2}",
-                                            input, live_input.target_volume
-                                        );
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if found {
-                                Some(Ok(format!("Set input '{}' volume", input)))
-                            } else {
-                                tracing::warn!("Input '{}' not found", input);
-                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Input '{}' not found", input))))
-                            }
-                        }
-                        mqtt::commands::AudioCommand::InputMute { input, mute } => {
-                            let mut state = mixer_state.lock().unwrap();
-                            let mut found = false;
-
-                            // Try to find by index first
-                            if let Ok(idx) = input.parse::<usize>() {
-                                if idx < state.live_inputs.len() {
-                                    state.live_inputs[idx].set_muted(mute);
-                                    tracing::info!(
-                                        "Input {} {}",
-                                        idx, if mute { "muted" } else { "unmuted" }
-                                    );
-                                    found = true;
-                                }
-                            }
-
-                            // Try to find by voice_id if not found by index
-                            if !found {
-                                for live_input in state.live_inputs.iter_mut() {
-                                    if live_input.voice_id == input {
-                                        live_input.set_muted(mute);
-                                        tracing::info!(
-                                            "Input '{}' {}",
-                                            input, if mute { "muted" } else { "unmuted" }
-                                        );
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if found {
-                                Some(Ok(format!("Input '{}' {}", input, if mute { "muted" } else { "unmuted" })))
-                            } else {
-                                tracing::warn!("Input '{}' not found", input);
-                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Input '{}' not found", input))))
-                            }
-                        }
-                        mqtt::commands::AudioCommand::Seek { selector, position_ms } => {
-                            if selector.is_empty() {
-                                Some(Err(CommandError::new(CommandErrorKind::InvalidRequest, "Seek command with empty selector - no samples targeted".to_string())))
-                            } else {
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-
-                                for sample in state.active_samples.iter_mut() {
-                                    if selector.matches(
-                                        sample.id,
-                                        sample.sample_id.as_deref(),
-                                        &sample.file_path,
-                                        &sample.voice_id,
-                                    ) {
-                                        let sample_rate = sample.buffer.sample_rate();
-                                        if sample_rate == 0 {
-                                            tracing::warn!("Seek skipped for sample {}: sample rate not yet known", sample.id);
-                                            continue;
-                                        }
-                                        // Convert milliseconds to frames
-                                        let target_frame = ((position_ms as u64 * sample_rate as u64) / 1000) as usize;
-                                        // Clamp to the total length when known. A still-loading
-                                        // stream seeks to the requested position and plays
-                                        // silence until data arrives, matching how Play handles
-                                        // start_position_ms; clamping to frames() would snap the
-                                        // seek back to whatever has downloaded so far.
-                                        sample.position = match sample.buffer.total_frames_or_estimate() {
-                                            Some(total) if total > 0 => target_frame.min(total - 1),
-                                            _ => target_frame,
-                                        };
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                if updated_count > 0 {
-                                    tracing::info!(
-                                        "Seeked {} samples to {}ms",
-                                        updated_count, position_ms
-                                    );
-                                    Some(Ok(format!("Seeked {} samples to {}ms", updated_count, position_ms)))
-                                } else {
-                                    Some(Err(CommandError::new(CommandErrorKind::NotFound, "Seek command matched no active samples".to_string())))
-                                }
-                            }
-                        }
-                        mqtt::commands::AudioCommand::Speed { selector, speed, pitch_correction } => {
-                            if selector.is_empty() {
-                                Some(Err(CommandError::new(CommandErrorKind::InvalidRequest, "Speed command with empty selector - no samples targeted".to_string())))
-                            } else {
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-
-                                for sample in state.active_samples.iter_mut() {
-                                    if selector.matches(
-                                        sample.id,
-                                        sample.sample_id.as_deref(),
-                                        &sample.file_path,
-                                        &sample.voice_id,
-                                    ) {
-                                        sample.set_speed_with_mode(speed, pitch_correction);
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                if updated_count > 0 {
-                                    let mode = if pitch_correction { "pitch-corrected" } else { "normal" };
-                                    tracing::info!(
-                                        "Set speed to {}x ({}) for {} samples",
-                                        speed, mode, updated_count
-                                    );
-                                    Some(Ok(format!("Set speed to {}x ({}) for {} samples", speed, mode, updated_count)))
-                                } else {
-                                    Some(Err(CommandError::new(CommandErrorKind::NotFound, "Speed command matched no active samples".to_string())))
-                                }
-                            }
-                        }
-                        mqtt::commands::AudioCommand::Stop { selector, fade_out_ms } => {
-                            if selector.is_empty() {
-                                Some(Err(CommandError::new(CommandErrorKind::InvalidRequest, "Stop command with empty selector - no samples targeted".to_string())))
-                            } else {
-                                // Default to 10ms fade for smooth stop if not specified
-                                let fade_ms = fade_out_ms.unwrap_or(10);
-
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-
-                                for sample in state.active_samples.iter_mut() {
-                                    if selector.matches(
-                                        sample.id,
-                                        sample.sample_id.as_deref(),
-                                        &sample.file_path,
-                                        &sample.voice_id,
-                                    ) {
-                                        sample.set_fade(audio::mixer::FadeState::fade_out(fade_ms, output_sample_rate));
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                if updated_count > 0 {
-                                    tracing::info!(
-                                        "Stopping {} samples ({}ms fade-out)",
-                                        updated_count, fade_ms
-                                    );
-                                    Some(Ok(format!("Stopping {} samples ({}ms fade-out)", updated_count, fade_ms)))
-                                } else {
-                                    Some(Err(CommandError::new(CommandErrorKind::NotFound, "Stop command matched no active samples".to_string())))
-                                }
-                            }
-                        }
-                        mqtt::commands::AudioCommand::Volume { selector, volume } => {
-                            if selector.is_empty() {
-                                Some(Err(CommandError::new(CommandErrorKind::InvalidRequest, "Volume command with empty selector - no samples targeted".to_string())))
-                            } else {
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-
-                                for sample in state.active_samples.iter_mut() {
-                                    if selector.matches(
-                                        sample.id,
-                                        sample.sample_id.as_deref(),
-                                        &sample.file_path,
-                                        &sample.voice_id,
-                                    ) {
-                                        sample.set_target_volume(volume);
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                if updated_count > 0 {
-                                    tracing::info!(
-                                        "Set volume to {:.2} for {} samples",
-                                        volume, updated_count
-                                    );
-                                    Some(Ok(format!("Set volume to {:.2} for {} samples", volume, updated_count)))
-                                } else {
-                                    Some(Err(CommandError::new(CommandErrorKind::NotFound, "Volume command matched no active samples".to_string())))
-                                }
-                            }
-                        }
+                    // Get sample ID and voice volume from voice manager. Scoped so
+                    // the guard provably cannot live across the awaits below.
+                    let (sample_id, voice_volume) = {
+                        let mut voice_mgr = voice_manager.lock();
+                        let sample_id =
+                            add_sample_to_play_voice(&mut voice_mgr, &voice_id, named_voice);
+                        let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
+                        (sample_id, voice_volume)
                     };
 
-                    if let Some(outcome) = outcome {
-                        deliver(reply.take(), outcome);
+                    // Convert crossfade_ms to samples
+                    let crossfade_samples =
+                        (crossfade_ms as usize * output_sample_rate as usize) / 1000;
+
+                    // The loop crossfade only engages on a loop boundary of a buffer
+                    // long enough to hold a crossfade at both ends
+                    // (`buffer_frames > crossfade_samples * 2`, see
+                    // `mixer::crossfade_active`). Warn when a requested crossfade can
+                    // therefore never run, so the silent drop is visible (F8/D41). This
+                    // is feedback only — the blend math is unchanged.
+                    if crossfade_ms > 0 {
+                        if !loop_mode {
+                            tracing::warn!(
+                                "Play of {} requested crossfade {}ms without loop:true; \
+                                 the crossfade only applies at loop boundaries and will be \
+                                 ignored",
+                                file,
+                                crossfade_ms
+                            );
+                        } else if let Some(total) = buffer.total_frames_or_estimate() {
+                            // Judge the length only when the total is known. A streaming
+                            // buffer with an unknown total cannot be judged yet (the
+                            // mixer defers looping until the buffer is complete, D11), so
+                            // skip rather than warn on the small loaded-so-far count.
+                            if crossfade_samples * 2 >= total {
+                                tracing::warn!(
+                                    "Play of {} requested crossfade {}ms ({} frames) but the clip \
+                                     is only {} frames; a crossfade needs more than twice its \
+                                     length and will be ignored",
+                                    file,
+                                    crossfade_ms,
+                                    crossfade_samples,
+                                    total
+                                );
+                            }
+                        }
                     }
+
+                    // Convert channel_map to mixer format (resolve any aliases)
+                    let mut sample = if let Some(map) = channel_map {
+                        // Custom channel mapping - resolve aliases
+                        let mapping_result: Result<Vec<(usize, usize)>, String> = map
+                            .iter()
+                            .map(|m| {
+                                let src = config.resolve_channel(&m.src)?;
+                                let dest = config.resolve_channel(&m.dest)?;
+                                Ok((src, dest))
+                            })
+                            .collect();
+
+                        let mapping = match mapping_result {
+                            Ok(m) => m,
+                            Err(e) => {
+                                tracing::error!("Failed to resolve channel alias: {}", e);
+                                ctx.fail_logged(
+                                    mqtt::commands::CommandErrorKind::InvalidRequest,
+                                    e.to_string(),
+                                );
+                                return;
+                            }
+                        };
+                        tracing::debug!("Using custom channel mapping: {:?}", mapping);
+                        let mut sample = ActiveSample::new_with_mapping(
+                            sample_id,
+                            voice_id.clone(),
+                            buffer.clone(),
+                            volume,
+                            voice_volume,
+                            mapping,
+                            file.clone(),
+                            id.clone(),
+                            loop_mode,
+                            crossfade_samples,
+                        );
+                        sample.set_channel_route_gains(channel_route_gains(&map));
+                        sample
+                    } else {
+                        // Default channel mapping (1:1)
+                        ActiveSample::new_with_id(
+                            sample_id,
+                            voice_id.clone(),
+                            buffer.clone(),
+                            volume,
+                            voice_volume,
+                            file.clone(),
+                            id.clone(),
+                            loop_mode,
+                            crossfade_samples,
+                        )
+                    };
+
+                    // Apply start position if requested
+                    if let Some(start_ms) = start_position_ms {
+                        let target_frame = ((start_ms * sample_rate as u64) / 1000) as usize;
+                        // For streaming buffers, use estimate if available, otherwise don't clamp
+                        // (mixer will return silence for unloaded frames)
+                        let max_frame = buffer
+                            .total_frames_or_estimate()
+                            .unwrap_or(usize::MAX)
+                            .saturating_sub(1);
+                        sample.position = target_frame.min(max_frame);
+
+                        tracing::debug!(
+                            "Starting at position {}ms (frame {})",
+                            start_ms,
+                            sample.position
+                        );
+                    }
+
+                    // Apply fade in if requested
+                    if let Some(fade_ms) = fade_in {
+                        sample.set_fade(audio::mixer::FadeState::fade_in(
+                            fade_ms,
+                            output_sample_rate,
+                        ));
+                        tracing::debug!("Applied {}ms fade in to voice '{}'", fade_ms, voice_id);
+                    }
+
+                    // Start at the requested speed, exactly as a speed command sent
+                    // right after the play would set it. The sample is not on the
+                    // audio thread yet, so building its corrector here is off-RT. The
+                    // corrector takes the channels and rate read above: a buffer
+                    // still decoding can be locked by its decoder at this moment.
+                    if speed != 1.0 || pitch_correction {
+                        let mut corrector = pitch_correction.then(|| {
+                            Box::new(audio::mixer::PitchBundle::for_voice(
+                                channels,
+                                sample_rate,
+                                speed,
+                                ctx.max_block_frames,
+                            ))
+                        });
+                        sample.apply_shipped_speed(
+                            speed,
+                            pitch_correction,
+                            &mut corrector,
+                            &mut None,
+                        );
+                        if pitch_correction && !buffer.is_complete() {
+                            warn_pitch_correction_deferred(&file);
+                        }
+                    }
+
+                    // Live-position publisher (Sprint W6, DW12): one atomic, shared
+                    // between the RT sample (which stores into it each block when
+                    // telemetry is on) and the control-side status (which the handler
+                    // reads). Constructed off-RT and moved in with the sample, so the
+                    // callback never allocates it.
+                    let position =
+                        std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(sample.position));
+                    sample.position_publisher = Some(position.clone());
+
+                    // Record the control-side status before the sample is moved
+                    // into the command. Full-load samples are seekable (not windowed).
+                    let status = http::SampleStatus {
+                        internal_id: sample.id,
+                        sample_id: sample.sample_id.clone(),
+                        voice_id: voice_id.clone(),
+                        file_path: sample.file_path.clone(),
+                        // A still-loading progressive buffer reports its header
+                        // estimate so /status carries a real total from the start.
+                        total_frames: sample
+                            .buffer
+                            .total_frames_or_estimate()
+                            .unwrap_or_else(|| sample.buffer.frames()),
+                        sample_rate,
+                        channels,
+                        volume: sample.volume,
+                        voice_volume: sample.voice_volume,
+                        speed: sample.speed,
+                        loop_mode: sample.loop_mode,
+                        windowed: false,
+                        position: Some(position),
+                    };
+
+                    // Voice became active: compute and forward ducking targets
+                    // through the shared off-RT notify path (also used by inputs, D4).
+                    let became_active = !ctx.active_counts.contains_key(&voice_id);
+                    if became_active {
+                        notify_voice_activity(
+                            &voice_id,
+                            true,
+                            ctx.ducking_engine.as_mut(),
+                            ctx.cmd_tx,
+                            ctx.ducking_snapshot,
+                        );
+                    }
+                    *ctx.active_counts.entry(voice_id.clone()).or_insert(0) += 1;
+                    ctx.playing.insert(status.internal_id, status);
+
+                    // First-mix latency probe (Sprint 11, D50): registered with the
+                    // tracker, attached to the sample, published by the audio thread
+                    // on the sample's first mixed block, folded by the reaper tick.
+                    let enqueued_at = std::time::Instant::now();
+                    sample.set_latency_probe(enqueued_at, ctx.latency.new_probe());
+
+                    // A cold play is upgraded to its Complete buffer once the
+                    // progressive load finishes (D51, the reaper's upgrade pass).
+                    if is_streaming {
+                        ctx.streaming_upgrades.push(StreamingUpgrade {
+                            internal_id: sample.id,
+                            buffer: buffer.clone(),
+                            file: file.clone(),
+                        });
+                    }
+
+                    let kind = if is_streaming {
+                        "full_load_streaming"
+                    } else {
+                        "full_load"
+                    };
+                    ctx.send(rt_engine::AudioCommand::AddSample(sample));
+                    stages.log_enqueued(&file, kind, enqueued_at);
+                    ctx.refresh();
+                    tracing::info!("Now playing {} active samples", ctx.playing.len());
                 }
                 Err(e) => {
-                    deliver(reply, Err(CommandError::new(
-                        CommandErrorKind::InvalidRequest,
-                        format!("Failed to parse command: {}", e),
-                    )));
+                    tracing::error!("Failed to load {}: {}", file, e);
+                    ctx.fail_logged(
+                        mqtt::commands::CommandErrorKind::NotFound,
+                        format!("Failed to load {}: {}", file, e),
+                    );
                 }
             }
         }
+        mqtt::commands::AudioCommand::StopAll => {
+            // Apply quick 10ms fade-out to prevent clicks/pops. The audio thread
+            // fades and finishes the samples; the reaper then reconciles voice
+            // activity and the snapshot from the graveyard returns.
+            let count = ctx.playing.len();
+            ctx.send(rt_engine::AudioCommand::FadeOutAll {
+                fade_ms: STOP_FADE_MS,
+            });
+            tracing::info!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS);
+        }
+        mqtt::commands::AudioCommand::FadeAll { time_ms } => {
+            ctx.send(rt_engine::AudioCommand::FadeOutAll { fade_ms: time_ms });
+        }
+        mqtt::commands::AudioCommand::VoiceStop { voice } => {
+            // A voice keeps its settings when stopped; stopping one with nothing
+            // playing succeeds and stops nothing.
+            let sample_ids = voice_manager.lock().get_voice_sample_ids(&voice);
+            tracing::info!(
+                "Stopping voice '{}': {} samples ({}ms fade-out)",
+                voice,
+                sample_ids.len(),
+                STOP_FADE_MS
+            );
+            if !sample_ids.is_empty() {
+                ctx.send(rt_engine::AudioCommand::FadeOutSamples {
+                    ids: sample_ids,
+                    fade_ms: STOP_FADE_MS,
+                });
+            }
+        }
+        mqtt::commands::AudioCommand::VoiceFadeOut { voice, time_ms } => {
+            let sample_ids = voice_manager.lock().get_voice_sample_ids(&voice);
+            tracing::info!(
+                "Applied {}ms fade out to voice '{}' ({} samples)",
+                time_ms,
+                voice,
+                sample_ids.len()
+            );
+            if !sample_ids.is_empty() {
+                ctx.send(rt_engine::AudioCommand::FadeOutSamples {
+                    ids: sample_ids,
+                    fade_ms: time_ms,
+                });
+            }
+        }
+        mqtt::commands::AudioCommand::VoiceVolume {
+            voice,
+            volume: new_volume,
+        } => {
+            // Store the voice volume, creating the voice if needed
+            let target = voice_manager.lock().set_voice_volume(&voice, new_volume);
 
-        // Keep stream alive
-        drop(stream);
+            // The audio thread ramps samples and live inputs in this voice
+            // toward the new target (SetVoiceVolume covers both).
+            ctx.send(rt_engine::AudioCommand::SetVoiceVolume {
+                voice: voice.clone(),
+                volume: target,
+            });
+            // Keep the status snapshot's per-sample voice volume in step.
+            for status in ctx.playing.values_mut() {
+                if status.voice_id == voice {
+                    status.voice_volume = target;
+                }
+            }
+            for input_status in ctx
+                .inputs
+                .iter_mut()
+                .filter(|input| input.voice_id == voice && input.ready)
+            {
+                input_status.volume = target;
+                input_status.unmuted_volume = target;
+                input_status.muted = false;
+            }
+            ctx.refresh();
+            tracing::info!("Set voice '{}' volume to {:.2}", voice, target);
+        }
+        mqtt::commands::AudioCommand::VoiceSpeed {
+            voice,
+            speed,
+            pitch_correction,
+        } => {
+            // Store the voice speed, creating the voice if needed; later plays
+            // into the voice start at it.
+            voice_manager
+                .lock()
+                .set_voice_speed(&voice, speed, pitch_correction);
+            if ctx.streamed_voices.contains(&voice) {
+                tracing::warn!(
+                    "Speed/pitch is not supported for windowed/streamed sources; voice '{}' \
+                     keeps playing its windowed sources at normal speed",
+                    voice
+                );
+            }
+            let selector = mqtt::commands::SampleSelector {
+                internal_id: None,
+                id: None,
+                file: None,
+                voice: Some(voice.clone()),
+            };
+            set_speed_of_matching(ctx, &selector, speed, pitch_correction);
+            tracing::info!("Set voice '{}' speed to {}x", voice, speed);
+        }
+        mqtt::commands::AudioCommand::VoiceClear { voice } => {
+            let sample_ids = {
+                let mut voice_mgr = voice_manager.lock();
+                match &voice {
+                    mqtt::commands::VoiceTarget::Named(name) => voice_mgr.clear_voice(name),
+                    mqtt::commands::VoiceTarget::All => voice_mgr.clear_all_voices(),
+                }
+            };
+            tracing::info!(
+                "Clearing {:?}: stopping {} samples ({}ms fade-out)",
+                voice,
+                sample_ids.len(),
+                STOP_FADE_MS
+            );
+            if !sample_ids.is_empty() {
+                ctx.send(rt_engine::AudioCommand::FadeOutSamples {
+                    ids: sample_ids,
+                    fade_ms: STOP_FADE_MS,
+                });
+            }
+            // A cleared voice's stored volume is gone, so its microphones return
+            // to full voice volume.
+            let input_voices: Vec<String> = ctx
+                .inputs
+                .iter()
+                .filter(|input| input.ready && voice.matches(&input.voice_id))
+                .map(|input| input.voice_id.clone())
+                .collect();
+            for input_voice in input_voices {
+                ctx.send(rt_engine::AudioCommand::SetVoiceVolume {
+                    voice: input_voice,
+                    volume: 1.0,
+                });
+            }
+        }
+        mqtt::commands::AudioCommand::Reset => {
+            let count = ctx.playing.len();
+            ctx.send(rt_engine::AudioCommand::FadeOutAll {
+                fade_ms: STOP_FADE_MS,
+            });
+            voice_manager.lock().clear_all_voices();
+            let restored = restore_configured_inputs(ctx);
+            ctx.refresh();
+            tracing::info!(
+                "Reset: stopping {} samples, cleared all voices, restored {} inputs",
+                count,
+                restored
+            );
+        }
+        mqtt::commands::AudioCommand::Precache { file } => {
+            // Non-blocking precache - starts loading and returns immediately
+            let mut cache_mgr = cache_manager.lock().await;
+            match cache_mgr
+                .precache_streaming(&file, output_sample_rate)
+                .await
+            {
+                Ok(()) => {
+                    if config.logging.verbose {
+                        cache_mgr.log_stats();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start precache for {}: {}", file, e);
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::CacheClear => {
+            let mut cache_mgr = cache_manager.lock().await;
+            if config.logging.verbose {
+                let mem = cache_mgr.memory_stats();
+                let disk = cache_mgr.disk_stats();
+                tracing::debug!(
+                    "Clearing cache - Memory: {} entries ({:.2} MB), Disk: {} entries ({:.2} MB)",
+                    mem.entry_count,
+                    mem.size_bytes as f64 / (1024.0 * 1024.0),
+                    disk.entry_count,
+                    disk.size_bytes as f64 / (1024.0 * 1024.0)
+                );
+            }
+            match cache_mgr.clear_all() {
+                Ok(()) => {
+                    tracing::info!("Cache cleared successfully");
+                }
+                Err(e) => {
+                    tracing::error!("Failed to clear cache: {}", e);
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::CacheInvalidate { file } => {
+            let mut cache_mgr = cache_manager.lock().await;
+            match cache_mgr.invalidate(&file) {
+                Ok(()) => {
+                    tracing::info!("Invalidated cache for: {}", file);
+                    if config.logging.verbose {
+                        cache_mgr.log_stats();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to invalidate {}: {}", file, e);
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::CacheReload { file } => {
+            // Invalidate then re-precache, so the next play is both fresh and instant —
+            // the explicit refresh path for a content pipeline that just republished
+            // an asset (no per-load freshness cost).
+            let mut cache_mgr = cache_manager.lock().await;
+            if let Err(e) = cache_mgr.invalidate(&file) {
+                tracing::error!("Failed to invalidate {} for reload: {}", file, e);
+            }
+            match cache_mgr
+                .precache_streaming(&file, output_sample_rate)
+                .await
+            {
+                Ok(()) => tracing::info!("Reloaded cache for: {}", file),
+                Err(e) => tracing::error!("Failed to reload {}: {}", file, e),
+            }
+        }
+        mqtt::commands::AudioCommand::InputVolume {
+            input,
+            volume: new_volume,
+        } => {
+            // The audio thread resolves the input by index or voice id and clamps.
+            tracing::info!("Set input '{}' volume to {:.2}", input, new_volume);
+            let input_ready = find_input_status_mut(ctx.inputs, &input)
+                .map(|status| status.ready)
+                .unwrap_or(false);
+            if !input_ready {
+                ctx.fail_logged(
+                    mqtt::commands::CommandErrorKind::NotFound,
+                    format!("Input {} is unavailable", input),
+                );
+                tracing::warn!(
+                    "Input '{}' is unavailable; volume command was not queued",
+                    input
+                );
+                return;
+            }
+            let volume = new_volume.clamp(0.0, config::MAX_GAIN);
+            let queued = ctx.send(rt_engine::AudioCommand::SetInputVolume {
+                input: input.clone(),
+                volume,
+            });
+            if queued {
+                if let Some(status) = find_input_status_mut(ctx.inputs, &input) {
+                    status.volume = volume;
+                    status.unmuted_volume = volume;
+                    status.muted = false;
+                }
+                ctx.refresh();
+            }
+        }
+        mqtt::commands::AudioCommand::InputMute { input, mute } => {
+            // Mute stores the input's current volume and zeroes it; unmute restores
+            // that stored volume (D34) — the audio thread owns the live input, so the
+            // save/restore happens there.
+            tracing::info!(
+                "Input '{}' {}",
+                input,
+                if mute { "muted" } else { "unmuted" }
+            );
+            let input_ready = find_input_status_mut(ctx.inputs, &input)
+                .map(|status| status.ready)
+                .unwrap_or(false);
+            if !input_ready {
+                ctx.fail_logged(
+                    mqtt::commands::CommandErrorKind::NotFound,
+                    format!("Input {} is unavailable", input),
+                );
+                tracing::warn!(
+                    "Input '{}' is unavailable; mute command was not queued",
+                    input
+                );
+                return;
+            }
+            if !mute
+                && (ctx.talkback.active_for(&input)
+                    || (input == "mic" && ctx.talkback.active_for("GM_MIC")))
+            {
+                ctx.fail_logged(
+                    mqtt::commands::CommandErrorKind::Forbidden,
+                    "Input is owned by an active talkback lease",
+                );
+                tracing::warn!(
+                    "Input '{}' is owned by an active talkback lease; ordinary unmute was rejected",
+                    input
+                );
+                return;
+            }
+            let queued = ctx.send(rt_engine::AudioCommand::SetInputMute {
+                input: input.clone(),
+                mute,
+            });
+            if queued {
+                if let Some(status) = find_input_status_mut(ctx.inputs, &input) {
+                    if mute {
+                        if !status.muted {
+                            status.unmuted_volume = status.volume;
+                        }
+                        status.volume = 0.0;
+                        status.muted = true;
+                    } else {
+                        status.volume = status.unmuted_volume;
+                        status.muted = false;
+                    }
+                }
+                ctx.refresh();
+            }
+        }
+        mqtt::commands::AudioCommand::TalkbackAcquire(request) => {
+            let Some(input) = resolve_talkback_input(ctx.inputs, &request.source_id) else {
+                tracing::warn!(
+                    "Talkback source '{}' is unavailable; lease was not acquired",
+                    request.source_id
+                );
+                ctx.fail_logged(
+                    mqtt::commands::CommandErrorKind::NotFound,
+                    "Talkback source unavailable",
+                );
+                ctx.refresh_talkback(ctx.now_ms);
+                return;
+            };
+            match ctx.talkback.acquire(
+                &request.client_id,
+                &request.source_id,
+                &request.destination,
+                request.gain,
+                request.lease_ms,
+                ctx.now_ms,
+            ) {
+                Ok((_transition, _status)) => {
+                    if !ctx.send(rt_engine::AudioCommand::SetInputMute {
+                        input: input.clone(),
+                        mute: false,
+                    }) {
+                        ctx.talkback.hard_mute(ctx.now_ms);
+                    }
+                    ctx.refresh_talkback(ctx.now_ms);
+                }
+                Err(error) => {
+                    ctx.fail_logged(
+                        mqtt::commands::CommandErrorKind::Forbidden,
+                        error.to_string(),
+                    );
+                    tracing::warn!("Talkback acquire rejected: {}", error);
+                    ctx.refresh_talkback(ctx.now_ms);
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::TalkbackRelease(request) => {
+            let source = ctx.talkback.active_source().map(str::to_string);
+            match ctx
+                .talkback
+                .release(&request.client_id, &request.lease_id, ctx.now_ms)
+            {
+                Ok((_transition, _status)) => {
+                    if let Some(source_id) = source {
+                        if let Some(input) = resolve_talkback_input(ctx.inputs, &source_id) {
+                            let _ = ctx
+                                .send(rt_engine::AudioCommand::SetInputMute { input, mute: true });
+                        }
+                    }
+                    ctx.refresh_talkback(ctx.now_ms);
+                }
+                Err(error) => {
+                    ctx.fail_logged(
+                        mqtt::commands::CommandErrorKind::Forbidden,
+                        error.to_string(),
+                    );
+                    tracing::warn!("Talkback release rejected: {}", error);
+                    ctx.refresh_talkback(ctx.now_ms);
+                }
+            }
+        }
+        mqtt::commands::AudioCommand::TalkbackHardMute => {
+            let source = ctx.talkback.active_source().map(str::to_string);
+            let _ = ctx.talkback.hard_mute(ctx.now_ms);
+            if let Some(source_id) = source {
+                if let Some(input) = resolve_talkback_input(ctx.inputs, &source_id) {
+                    let _ = ctx.send(rt_engine::AudioCommand::SetInputMute { input, mute: true });
+                }
+            }
+            ctx.refresh_talkback(ctx.now_ms);
+        }
+        mqtt::commands::AudioCommand::Seek {
+            selector,
+            position_ms,
+        } => {
+            if selector.is_empty() {
+                tracing::warn!("Seek command with empty selector - no samples targeted");
+            } else {
+                // The audio thread matches the selector against the live samples
+                // and converts ms to frames per sample's rate.
+                tracing::info!("Seeking matching samples to {}ms", position_ms);
+                ctx.send(rt_engine::AudioCommand::SeekMatching {
+                    selector,
+                    position_ms,
+                });
+            }
+        }
+        mqtt::commands::AudioCommand::Speed {
+            selector,
+            speed,
+            pitch_correction,
+        } => {
+            if selector.is_empty() {
+                tracing::warn!("Speed command with empty selector - no samples targeted");
+            } else {
+                let mode = if pitch_correction {
+                    "pitch-corrected"
+                } else {
+                    "normal"
+                };
+                tracing::info!("Set speed to {}x ({}) for matching samples", speed, mode);
+                set_speed_of_matching(ctx, &selector, speed, pitch_correction);
+            }
+        }
+        mqtt::commands::AudioCommand::Stop {
+            selector,
+            fade_out_ms,
+        } => {
+            if selector.is_empty() {
+                tracing::warn!("Stop command with empty selector - no samples targeted");
+            } else {
+                // Default to 10ms fade for smooth stop if not specified
+                let fade_ms = fade_out_ms.unwrap_or(10);
+                tracing::info!("Stopping matching samples ({}ms fade-out)", fade_ms);
+                ctx.send(rt_engine::AudioCommand::FadeOutMatching { selector, fade_ms });
+            }
+        }
+        mqtt::commands::AudioCommand::Volume { selector, volume } => {
+            if selector.is_empty() {
+                tracing::warn!("Volume command with empty selector - no samples targeted");
+            } else {
+                tracing::info!("Set volume to {:.2} for matching samples", volume);
+                // Keep the snapshot's per-sample volume in step.
+                let clamped = volume.clamp(0.0, config::MAX_GAIN);
+                for status in ctx.playing.values_mut() {
+                    if sample_status_matches(&selector, status) {
+                        status.volume = clamped;
+                    }
+                }
+                ctx.send(rt_engine::AudioCommand::SetVolumeMatching { selector, volume });
+                ctx.refresh();
+            }
+        }
+    }
+}
+
+/// Set the speed and pitch mode of every playing full-load sample `selector`
+/// matches, and keep the status snapshot in step. Windowed sources play forward
+/// only and are skipped.
+fn set_speed_of_matching(
+    ctx: &mut CommandCtx<'_>,
+    selector: &mqtt::commands::SampleSelector,
+    speed: f32,
+    pitch_correction: bool,
+) {
+    // Expand the selector control-side (D56): one command per
+    // matching sample, each carrying its own pre-built corrector
+    // bundle when enabling pitch, so the audio thread never
+    // constructs or frees a stretcher. The snapshot's per-sample
+    // speed is kept in step in the same pass.
+    let mut commands = Vec::new();
+    for status in ctx.playing.values_mut() {
+        if status.windowed || !sample_status_matches(selector, status) {
+            continue;
+        }
+        status.speed = audio::mixer::playable_speed(speed, pitch_correction);
+        let bundle = if pitch_correction {
+            Some(Box::new(audio::mixer::PitchBundle::for_voice(
+                status.channels,
+                status.sample_rate,
+                speed,
+                ctx.max_block_frames,
+            )))
+        } else {
+            None
+        };
+        commands.push(rt_engine::AudioCommand::SetSpeedWithCorrector {
+            id: status.internal_id,
+            speed,
+            pitch_correction,
+            bundle,
+            displaced: None,
+        });
+    }
+    // Pitch correction stays dormant while a cold play's progressive
+    // load is still filling (the mixer needs slice access); it engages
+    // when the D51 upgrade lands. Tell the operator instead of
+    // silently doing nothing in the meantime.
+    if pitch_correction {
+        for upgrade in ctx.streaming_upgrades.iter() {
+            let matches = ctx
+                .playing
+                .get(&upgrade.internal_id)
+                .map(|s| sample_status_matches(selector, s))
+                .unwrap_or(false);
+            if matches && !upgrade.buffer.is_complete() {
+                warn_pitch_correction_deferred(&upgrade.file);
+            }
+        }
+    }
+    for command in commands {
+        ctx.send(command);
+    }
+    ctx.refresh();
+}
+
+/// Return every ready input to its configured volume, unmuted, at full voice
+/// volume, as at startup. An input a talkback lease owns keeps its level: the
+/// lease decides whether it is live. Returns how many inputs were restored.
+fn restore_configured_inputs(ctx: &mut CommandCtx<'_>) -> usize {
+    let leased = ctx
+        .talkback
+        .active_source()
+        .and_then(|source| resolve_talkback_input(ctx.inputs, source));
+    let mut restored = 0;
+    // The audio thread numbers only the inputs that opened.
+    let mut live_index = 0;
+    for position in 0..ctx.inputs.len() {
+        let input = &ctx.inputs[position];
+        if !input.ready {
+            continue;
+        }
+        let selector = live_index.to_string();
+        live_index += 1;
+        let voice = input.voice_id.clone();
+        let config_index = input.index;
+        ctx.send(rt_engine::AudioCommand::SetVoiceVolume {
+            voice: voice.clone(),
+            volume: 1.0,
+        });
+        if leased.as_deref() == Some(voice.as_str()) {
+            continue;
+        }
+        let Some(configured) = ctx
+            .config
+            .inputs
+            .get(config_index)
+            .map(|config| config.volume)
+        else {
+            continue;
+        };
+        let volume = configured.clamp(0.0, config::MAX_GAIN);
+        if ctx.send(rt_engine::AudioCommand::SetInputVolume {
+            input: selector,
+            volume,
+        }) {
+            let status = &mut ctx.inputs[position];
+            status.volume = volume;
+            status.unmuted_volume = volume;
+            status.muted = false;
+            restored += 1;
+        }
+    }
+    restored
+}
+
+/// Whether a control-side sample status matches a selector. Mirrors the
+/// audio-side matching so the status snapshot can track selector-targeted
+/// changes the control thread can see (the audio thread remains authoritative).
+fn sample_status_matches(
+    selector: &mqtt::commands::SampleSelector,
+    status: &http::SampleStatus,
+) -> bool {
+    selector.matches(
+        status.internal_id,
+        status.sample_id.as_deref(),
+        &status.file_path,
+        &status.voice_id,
+    )
+}
+
+/// Resolve when the process receives SIGINT (Ctrl-C) or, on unix, SIGTERM.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to install SIGTERM handler: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+}
+
+/// Graceful shutdown: fade out active samples via the command ring, let the
+/// callback drain the fade, then flush cache metadata before the process exits.
+async fn shutdown(
+    cmd_tx: &mut rt_engine::CommandProducer,
+    cache_manager: &std::sync::Arc<tokio::sync::Mutex<cache::CacheManager>>,
+) {
+    const SHUTDOWN_FADE_MS: u32 = 50;
+
+    tracing::info!("Shutdown: fading out active samples");
+    let _ = cmd_tx.push(rt_engine::AudioCommand::FadeOutAll {
+        fade_ms: SHUTDOWN_FADE_MS,
+    });
+
+    // Let the audio callback drain the fade so output ends on silence, not a click.
+    tokio::time::sleep(std::time::Duration::from_millis(
+        SHUTDOWN_FADE_MS as u64 + 30,
+    ))
+    .await;
+
+    // Flush cache metadata to disk.
+    let cache_mgr = cache_manager.lock().await;
+    if let Err(e) = cache_mgr.flush_metadata() {
+        tracing::error!("Failed to flush cache metadata on shutdown: {}", e);
+    }
+    drop(cache_mgr);
+
+    tracing::info!("Shutdown complete");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use audio::ducking::{DuckingApplier, DuckingEngine, DuckingRule};
+    use audio::mixer::{FadeState, MixerState};
+    use mqtt::commands::{AudioCommand, SampleSelector};
+    use parking_lot::Mutex;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, RwLock};
+    use voice::VoiceManager;
+
+    const TEST_WAV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/audio/test_440hz_2s.wav");
+    const SR: u32 = 48000;
+
+    /// Owns the control-side state needed to drive `handle_command` in tests and
+    /// the audio-side `MixerState` the resulting commands are applied to. The
+    /// control thread never touches `MixerState` directly: `handle_command` pushes
+    /// `rt_engine::AudioCommand`s onto the ring, and `drain` applies them to the
+    /// mixer exactly as the audio callback would — so a test asserts the same end
+    /// state the running engine would reach.
+    struct Fixture {
+        cache_manager: Arc<tokio::sync::Mutex<cache::CacheManager>>,
+        voice_manager: Arc<Mutex<VoiceManager>>,
+        cmd_tx: rt_engine::CommandProducer,
+        cmd_rx: rt_engine::CommandConsumer,
+        cmd_return_tx: rt_engine::CommandReturnProducer,
+        cmd_return_rx: rt_engine::CommandReturnConsumer,
+        grave_tx: rt_engine::GraveyardProducer,
+        grave_rx: rt_engine::GraveyardConsumer,
+        streamed_grave_tx: rt_engine::StreamedGraveyardProducer,
+        streamed_grave_rx: rt_engine::StreamedGraveyardConsumer,
+        mixer: MixerState,
+        ducking_engine: Option<DuckingEngine>,
+        active_counts: HashMap<String, usize>,
+        streamed_voices: std::collections::HashSet<String>,
+        playing: HashMap<u64, http::SampleStatus>,
+        snapshot: Arc<RwLock<http::StatusSnapshot>>,
+        ducking_snapshot: Arc<RwLock<HashMap<String, f32>>>,
+        inputs: Vec<http::InputStatus>,
+        talkback: talkback::TalkbackLease,
+        talkback_status: Arc<RwLock<talkback::TalkbackStatus>>,
+        config: config::Config,
+        latency_stats: Arc<http::PlayLatencyStats>,
+        latency: http::LatencyTracker,
+        streaming_upgrades: Vec<StreamingUpgrade>,
+        _cache_dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        /// Build a fixture. When `ducking_rules` is non-empty, a control-side
+        /// `DuckingEngine` resolves rules and the mixer carries a `DuckingApplier`
+        /// that applies the resolved `SetDuckTarget` commands — mirroring runtime.
+        fn new(ducking_rules: Vec<DuckingRule>) -> Self {
+            let cache_dir = tempfile::tempdir().unwrap();
+            let cache = cache::CacheManager::new(cache_dir.path().to_path_buf()).unwrap();
+            let (ducking_engine, ducking_applier) = if ducking_rules.is_empty() {
+                (None, None)
+            } else {
+                let applier = DuckingApplier::with_ducked_voices(
+                    ducking_rules
+                        .iter()
+                        .flat_map(|rule| rule.ducked_voices.iter().cloned()),
+                );
+                (Some(DuckingEngine::new(ducking_rules, SR)), Some(applier))
+            };
+            let mixer = MixerState {
+                ducking_applier,
+                ..MixerState::new(2)
+            };
+            let (cmd_tx, cmd_rx) = rt_engine::command_channel(1024);
+            let (cmd_return_tx, cmd_return_rx) = rt_engine::command_return_channel(1024);
+            let (grave_tx, grave_rx) = rt_engine::graveyard_channel(1024);
+            let (streamed_grave_tx, streamed_grave_rx) = rt_engine::streamed_graveyard_channel(256);
+            let latency_stats = Arc::new(http::PlayLatencyStats::default());
+            Self {
+                cache_manager: Arc::new(tokio::sync::Mutex::new(cache)),
+                voice_manager: Arc::new(Mutex::new(VoiceManager::new())),
+                cmd_tx,
+                cmd_rx,
+                cmd_return_tx,
+                cmd_return_rx,
+                grave_tx,
+                grave_rx,
+                streamed_grave_tx,
+                streamed_grave_rx,
+                mixer,
+                ducking_engine,
+                active_counts: HashMap::new(),
+                streamed_voices: std::collections::HashSet::new(),
+                playing: HashMap::new(),
+                snapshot: Arc::new(RwLock::new(http::StatusSnapshot {
+                    active_samples: 0,
+                    output_channels: 2,
+                    samples: Vec::new(),
+                    inputs: Vec::new(),
+                })),
+                ducking_snapshot: Arc::new(RwLock::new(HashMap::new())),
+                inputs: Vec::new(),
+                talkback: talkback::TalkbackLease::default(),
+                talkback_status: Arc::new(RwLock::new(
+                    talkback::TalkbackLease::default().status(0),
+                )),
+                config: config::Config::default(),
+                latency_stats: latency_stats.clone(),
+                latency: http::LatencyTracker::new(latency_stats),
+                streaming_upgrades: Vec::new(),
+                _cache_dir: cache_dir,
+            }
+        }
+
+        /// Run the reaper tick's buffer-upgrade pass (D51), as the control loop does.
+        async fn run_upgrades(&mut self) {
+            upgrade_completed_streaming_plays(
+                &mut self.streaming_upgrades,
+                &self.cache_manager,
+                &mut self.cmd_tx,
+                &mut self.playing,
+            )
+            .await;
+        }
+
+        /// Run a parsed command through `handle_command`, pushing the resulting
+        /// audio commands onto the ring (but not yet applying them to the mixer).
+        async fn run(&mut self, cmd: AudioCommand) {
+            self.run_prepared(cmd, None).await;
+        }
+
+        async fn run_prepared(&mut self, cmd: AudioCommand, prepared: Option<PreparedPlayback>) {
+            let mut ctx = self.ctx(prepared);
+            handle_command(cmd, &mut ctx).await;
+        }
+
+        /// Hand one request or finished load to `scheduler`, as the command loop
+        /// does, with this fixture's control-side state.
+        async fn take(&mut self, scheduler: &mut CommandScheduler, input: SchedulerInput) {
+            let mut ctx = self.ctx(None);
+            scheduler.take(input, &mut ctx).await;
+        }
+
+        /// The control-side state a command runs against, borrowed from the fixture.
+        fn ctx(&mut self, prepared: Option<PreparedPlayback>) -> CommandCtx<'_> {
+            CommandCtx {
+                cache_manager: &self.cache_manager,
+                voice_manager: &self.voice_manager,
+                cmd_tx: &mut self.cmd_tx,
+                ducking_engine: &mut self.ducking_engine,
+                active_counts: &mut self.active_counts,
+                streamed_voices: &mut self.streamed_voices,
+                playing: &mut self.playing,
+                snapshot: &self.snapshot,
+                ducking_snapshot: &self.ducking_snapshot,
+                inputs: &mut self.inputs,
+                talkback: &mut self.talkback,
+                talkback_status: &self.talkback_status,
+                now_ms: 0,
+                start_time: std::time::Instant::now(),
+                output_channels: 2,
+                output_sample_rate: SR,
+                config: &self.config,
+                latency: &self.latency,
+                streaming_upgrades: &mut self.streaming_upgrades,
+                max_block_frames: 512,
+                error: None,
+                error_logged: false,
+                prepared,
+            }
+        }
+
+        /// Apply every queued audio command to the mixer, as the audio callback
+        /// would, so the test can assert the resulting `MixerState`. Spent mutation
+        /// commands are routed to the return ring, mirroring the callback.
+        fn drain(&mut self) -> usize {
+            rt_engine::drain_commands(
+                &mut self.cmd_rx,
+                &mut self.mixer,
+                &mut self.cmd_return_tx,
+                &mut self.grave_tx,
+                SR,
+                1024,
+            )
+        }
+
+        /// Drive the control-side reaper exactly as the 20ms tick does, draining
+        /// the graveyard and command-return rings and reconciling voice activity.
+        fn reap(&mut self) {
+            reap_finished_samples(
+                &mut self.grave_rx,
+                &mut self.streamed_grave_rx,
+                &mut self.cmd_return_rx,
+                &self.voice_manager,
+                &mut self.cmd_tx,
+                self.ducking_engine.as_mut(),
+                &mut self.active_counts,
+                &mut self.streamed_voices,
+                &mut self.playing,
+                &self.snapshot,
+                &self.ducking_snapshot,
+                &self.inputs,
+                2,
+            );
+        }
+
+        /// Drive the off-RT voice-activity notify path directly, as the input setup
+        /// (D4) and a future input-activity gate (Sprint 8) will, forwarding any
+        /// resulting duck targets onto the command ring.
+        fn notify_voice(&mut self, voice: &str, is_active: bool) {
+            notify_voice_activity(
+                voice,
+                is_active,
+                self.ducking_engine.as_mut(),
+                &mut self.cmd_tx,
+                &self.ducking_snapshot,
+            );
+        }
+    }
+
+    fn play(voice: Option<&str>, volume: f32) -> AudioCommand {
+        AudioCommand::Play {
+            file: TEST_WAV.to_string(),
+            id: None,
+            volume,
+            voice: voice.map(str::to_string),
+            channel_map: None,
+            fade_in: None,
+            start_position_ms: None,
+            loop_mode: false,
+            crossfade_ms: 0,
+            mode: config::LoadMode::Auto,
+            window_ms: None,
+            prebuffer_ms: None,
+            freshness: None,
+            cacheable: None,
+            speed: None,
+            pitch_correction: false,
+        }
+    }
+
+    /// A windowed/streamed Play (mode=stream) of the test WAV into `voice`.
+    fn play_stream(voice: Option<&str>) -> AudioCommand {
+        AudioCommand::Play {
+            file: TEST_WAV.to_string(),
+            id: None,
+            volume: 1.0,
+            voice: voice.map(str::to_string),
+            channel_map: None,
+            fade_in: None,
+            start_position_ms: None,
+            loop_mode: false,
+            crossfade_ms: 0,
+            mode: config::LoadMode::Stream,
+            window_ms: Some(200),
+            prebuffer_ms: Some(20),
+            freshness: None,
+            cacheable: None,
+            speed: None,
+            pitch_correction: false,
+        }
+    }
+
+    #[test]
+    fn channel_route_gains_default_to_unity_and_clamp() {
+        // D29: a route without a gain is unity; a finite gain is clamped to the
+        // 0.0..=8.0 range the bus allows; a non-finite gain falls back to unity so it
+        // can never push NaN/Inf onto the bus.
+        let route = |gain: Option<f32>| mqtt::commands::ChannelMapping {
+            src: config::ChannelRef::Index(0),
+            dest: config::ChannelRef::Index(0),
+            gain,
+        };
+        let map = vec![
+            route(None),
+            route(Some(0.5)),
+            route(Some(100.0)),
+            route(Some(-1.0)),
+            route(Some(f32::INFINITY)),
+            route(Some(f32::NAN)),
+        ];
+        assert_eq!(
+            channel_route_gains(&map),
+            vec![1.0, 0.5, 8.0, 0.0, 1.0, 1.0]
+        );
+        // A map whose routes are all unity stores no gains at all.
+        assert!(channel_route_gains(&[route(None), route(Some(1.0))]).is_empty());
+    }
+
+    #[test]
+    fn auto_voice_ids_are_unique_within_a_millisecond() {
+        // F5/D41: two Plays with no explicit voice must get distinct ids even when
+        // generated in the same millisecond. `next_auto_voice_id` is called back to
+        // back here (no sleep), so the millisecond component is identical; only the
+        // appended monotonic counter makes them differ. The old `_auto_<millis>`
+        // form would collide and merge the two sounds under one voice.
+        let a = next_auto_voice_id();
+        let b = next_auto_voice_id();
+        assert_ne!(
+            a, b,
+            "same-millisecond auto voice ids must differ: {a} vs {b}"
+        );
+        assert!(
+            a.starts_with("_auto_"),
+            "auto voice id must keep the _auto_ prefix, got {a}"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_no_voice_plays_get_distinct_voice_ids() {
+        // End-to-end through handle_command: two Plays without a `voice` must land in
+        // two distinct voices so a later voice_stop/voice_volume/ducking on one does
+        // not affect the other.
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(None, 1.0)).await;
+        fixture.run(play(None, 1.0)).await;
+        fixture.drain();
+
+        assert_eq!(fixture.mixer.active_samples.len(), 2);
+        let v0 = &fixture.mixer.active_samples[0].voice_id;
+        let v1 = &fixture.mixer.active_samples[1].voice_id;
+        assert_ne!(v0, v1, "two no-voice Plays must get distinct voice ids");
+    }
+
+    fn seek_voice(voice: &str, position_ms: u64) -> AudioCommand {
+        AudioCommand::Seek {
+            selector: mqtt::commands::SampleSelector {
+                internal_id: None,
+                id: None,
+                file: None,
+                voice: Some(voice.to_string()),
+            },
+            position_ms,
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_play_emits_add_streamed_source_and_tracks_the_voice() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_stream(Some("bed"))).await;
+        fixture.drain();
+
+        // The windowed path adds a StreamedSource, not an ActiveSample.
+        assert_eq!(fixture.mixer.streamed_sources.len(), 1);
+        assert!(fixture.mixer.active_samples.is_empty());
+        assert_eq!(fixture.mixer.streamed_sources[0].voice_id, "bed");
+        // The voice is tracked so the seek/speed gate can warn for it.
+        assert!(fixture.streamed_voices.contains("bed"));
+    }
+
+    #[tokio::test]
+    async fn volume_reaches_a_windowed_play_that_has_started() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_stream(Some("bed"))).await;
+        fixture.drain();
+
+        fixture
+            .run(AudioCommand::Volume {
+                selector: SampleSelector {
+                    internal_id: None,
+                    id: None,
+                    file: None,
+                    voice: Some("bed".to_string()),
+                },
+                volume: 0.4,
+            })
+            .await;
+        fixture.drain();
+        // The change ramps over a few hundred frames, as a sample's does.
+        mix_one_block(&mut fixture);
+        mix_one_block(&mut fixture);
+
+        assert_eq!(fixture.mixer.streamed_sources[0].volume, 0.4);
+        let status = fixture
+            .playing
+            .values()
+            .next()
+            .expect("the stream's status");
+        assert_eq!(status.volume, 0.4);
+    }
+
+    #[tokio::test]
+    async fn stream_play_with_channel_map_applies_per_route_gains() {
+        // D29 on the windowed path: a per-route `gain` in the Play channel_map
+        // reaches the StreamedSource, and a route without one reads as unity.
+        let mut fixture = Fixture::new(vec![]);
+        let mut play = play_stream(Some("bed"));
+        if let AudioCommand::Play { channel_map, .. } = &mut play {
+            *channel_map = Some(vec![
+                mqtt::commands::ChannelMapping {
+                    src: config::ChannelRef::Index(0),
+                    dest: config::ChannelRef::Index(0),
+                    gain: Some(0.5),
+                },
+                mqtt::commands::ChannelMapping {
+                    src: config::ChannelRef::Index(0),
+                    dest: config::ChannelRef::Index(1),
+                    gain: None,
+                },
+            ]);
+        }
+        fixture.run(play).await;
+        fixture.drain();
+
+        let source = &fixture.mixer.streamed_sources[0];
+        assert_eq!(source.channel_map, vec![(0, 0), (0, 1)]);
+        assert_eq!(source.channel_route_gain(0), 0.5);
+        assert_eq!(source.channel_route_gain(1), 1.0);
+    }
+
+    #[tokio::test]
+    async fn seek_on_a_streamed_voice_is_gated_and_pushes_nothing() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_stream(Some("bed"))).await;
+        fixture.drain(); // consume the AddStreamedSource; the ring is now empty
+
+        // A seek targeting the streamed voice is skipped (the gate warns instead of
+        // pushing a SeekMatching that would be a no-op on a forward-only ring).
+        fixture.run(seek_voice("bed", 1000)).await;
+        assert!(
+            fixture.cmd_rx.pop().is_none(),
+            "seek on a streamed voice must push no command"
+        );
+
+        // A seek on a playing normal voice still pushes (positive control).
+        fixture.run(play(Some("other"), 1.0)).await;
+        fixture.drain();
+        fixture.run(seek_voice("other", 1000)).await;
+        assert!(
+            matches!(
+                fixture.cmd_rx.pop(),
+                Some(rt_engine::AudioCommand::SeekMatching { .. })
+            ),
+            "seek on a normal voice must still push SeekMatching"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_windows_a_local_asset_over_the_size_threshold() {
+        let mut fixture = Fixture::new(vec![]);
+        // Make the full-load threshold tiny so the 2 s test WAV exceeds it; mode=auto
+        // must then window it (the producer path) rather than fully decode it.
+        fixture.config.cache.full_load_max_bytes = 1000;
+        fixture.run(play(Some("bed"), 1.0)).await; // mode=auto
+        fixture.drain();
+
+        assert_eq!(
+            fixture.mixer.streamed_sources.len(),
+            1,
+            "an over-threshold asset must auto-window"
+        );
+        assert!(fixture.mixer.active_samples.is_empty());
+        assert!(fixture.streamed_voices.contains("bed"));
+    }
+
+    #[tokio::test]
+    async fn auto_full_loads_a_small_local_asset() {
+        let mut fixture = Fixture::new(vec![]);
+        // Default thresholds: the small test WAV is well under them -> full load.
+        fixture.run(play(Some("sfx"), 1.0)).await;
+        fixture.drain();
+
+        assert_eq!(
+            fixture.mixer.active_samples.len(),
+            1,
+            "a small asset must full-load (random-access, all features)"
+        );
+        assert!(fixture.mixer.streamed_sources.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_full_keeps_full_load_even_over_the_size_threshold() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.config.cache.full_load_max_bytes = 1000; // tiny threshold
+                                                         // mode=full overrides the auto size threshold (the budget is unlimited in the
+                                                         // fixture, so nothing forces windowing).
+        let mut cmd = play(Some("v"), 1.0);
+        if let AudioCommand::Play { mode, .. } = &mut cmd {
+            *mode = config::LoadMode::Full;
+        }
+        fixture.run(cmd).await;
+        fixture.drain();
+
+        assert_eq!(
+            fixture.mixer.active_samples.len(),
+            1,
+            "mode=full must full-load regardless of the size threshold"
+        );
+        assert!(fixture.mixer.streamed_sources.is_empty());
+    }
+
+    /// A Play of the test WAV with explicit `loop_mode`/`crossfade_ms`, for the
+    /// crossfade-without-loop warning (F8).
+    fn play_crossfade(loop_mode: bool, crossfade_ms: u32) -> AudioCommand {
+        AudioCommand::Play {
+            file: TEST_WAV.to_string(),
+            id: None,
+            volume: 1.0,
+            voice: Some("v".to_string()),
+            channel_map: None,
+            fade_in: None,
+            start_position_ms: None,
+            loop_mode,
+            crossfade_ms,
+            mode: config::LoadMode::Auto,
+            window_ms: None,
+            prebuffer_ms: None,
+            freshness: None,
+            cacheable: None,
+            speed: None,
+            pitch_correction: false,
+        }
+    }
+
+    /// Captures the `message` field of a tracing event into a shared buffer.
+    struct CaptureVisitor<'a> {
+        message: &'a mut String,
+    }
+
+    impl tracing::field::Visit for CaptureVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.message = format!("{value:?}");
+            }
+        }
+    }
+
+    /// Records event messages at `level` and above so a test can assert on
+    /// emitted log output without it leaking to the console (keeps test output
+    /// pristine).
+    struct CaptureLayer {
+        warnings: Arc<std::sync::Mutex<Vec<String>>>,
+        level: tracing::Level,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() > self.level {
+                return;
+            }
+            let mut message = String::new();
+            event.record(&mut CaptureVisitor {
+                message: &mut message,
+            });
+            self.warnings.lock().unwrap().push(message);
+        }
+    }
+
+    /// Serializes the WARN-capturing tests: `set_default` installs a thread-local
+    /// subscriber, and tokio may schedule async tests on shared worker threads, so
+    /// without this lock one capturing test could observe another's events.
+    static MAIN_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Run `cmd` through `handle_command` under a WARN-capturing subscriber and
+    /// return every captured warning message.
+    async fn run_capturing_warnings(fixture: &mut Fixture, cmd: AudioCommand) -> Vec<String> {
+        run_prepared_capturing_warnings(fixture, cmd, None).await
+    }
+
+    /// Run `cmd` with an already-prepared load through `handle_command` under a
+    /// WARN-capturing subscriber and return every captured warning message.
+    async fn run_prepared_capturing_warnings(
+        fixture: &mut Fixture,
+        cmd: AudioCommand,
+        prepared: Option<PreparedPlayback>,
+    ) -> Vec<String> {
+        capturing_warnings(fixture.run_prepared(cmd, prepared))
+            .await
+            .1
+    }
+
+    /// Run `work` under a WARN-capturing subscriber and return its output with
+    /// every captured warning message.
+    async fn capturing_warnings<T>(work: impl std::future::Future<Output = T>) -> (T, Vec<String>) {
+        capturing_logs(tracing::Level::WARN, work).await
+    }
+
+    /// Run `work` under a subscriber capturing messages at `level` and above, and
+    /// return its output with every captured message.
+    async fn capturing_logs<T>(
+        level: tracing::Level,
+        work: impl std::future::Future<Output = T>,
+    ) -> (T, Vec<String>) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let warnings = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer {
+            warnings: warnings.clone(),
+            level,
+        });
+        // `with_default` needs a sync scope, but the work is async; use a
+        // dispatcher guard that stays in scope across the await.
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        let output = work.await;
+        let captured = warnings.lock().unwrap().clone();
+        (output, captured)
+    }
+
+    /// One captured per-play latency stage event (Sprint 11, D50).
+    #[derive(Default, Clone, Debug)]
+    struct StageEvent {
+        kind: String,
+        decision_us: u64,
+        ready_us: u64,
+        enqueue_us: u64,
+    }
+
+    /// Captures events on the "latency" target so a test can assert the recorded
+    /// play stages without them leaking to the console.
+    struct StageCaptureLayer {
+        events: Arc<std::sync::Mutex<Vec<StageEvent>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for StageCaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "latency" {
+                return;
+            }
+            let mut ev = StageEvent::default();
+            event.record(&mut StageVisitor { ev: &mut ev });
+            self.events.lock().unwrap().push(ev);
+        }
+    }
+
+    struct StageVisitor<'a> {
+        ev: &'a mut StageEvent,
+    }
+
+    impl tracing::field::Visit for StageVisitor<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            match field.name() {
+                "decision_us" => self.ev.decision_us = value,
+                "ready_us" => self.ev.ready_us = value,
+                "enqueue_us" => self.ev.enqueue_us = value,
+                _ => {}
+            }
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "kind" {
+                self.ev.kind = value.to_string();
+            }
+        }
+
+        fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
+    }
+
+    /// Run `cmd` through `handle_command` under a stage-capturing subscriber and
+    /// return every captured per-play latency event.
+    async fn run_capturing_stages(fixture: &mut Fixture, cmd: AudioCommand) -> Vec<StageEvent> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(StageCaptureLayer {
+            events: events.clone(),
+        });
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let _guard = tracing::dispatcher::set_default(&dispatch);
+        fixture.run(cmd).await;
+        let captured = events.lock().unwrap().clone();
+        captured
+    }
+
+    /// Mix one block through the fixture's mixer, as the audio callback would.
+    fn mix_one_block(fixture: &mut Fixture) {
+        let mut block = vec![0.0f32; 512 * 2];
+        audio::mixer::mix_audio(&mut block, &mut fixture.mixer);
+    }
+
+    #[tokio::test]
+    async fn play_emits_monotone_stage_latency_event() {
+        // Sprint 11 (D50): every play emits exactly one stage event whose
+        // dispatch->decision->ready->enqueue durations are monotone.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let events = run_capturing_stages(&mut fixture, play_crossfade(false, 0)).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "exactly one latency event per play, got {events:?}"
+        );
+        let e = &events[0];
+        // A cold local play is progressive after D51 (Sprint 12).
+        assert_eq!(e.kind, "full_load_streaming", "cold local play kind: {e:?}");
+        assert!(
+            e.decision_us <= e.ready_us && e.ready_us <= e.enqueue_us,
+            "stages must be monotone: {e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cache_hit_play_ready_stage_is_bounded() {
+        // Sprint 11: a memory-cache-hit replay must not decode; its decision->ready
+        // stage stays under a generous ceiling so a reintroduced blocking decode on
+        // the hit path fails loudly here.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await; // cold: decodes + caches
+        let events = run_capturing_stages(&mut fixture, play_crossfade(false, 0)).await;
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert!(
+            e.ready_us.saturating_sub(e.decision_us) < 250_000,
+            "cache-hit load stage must be far below 250ms: {e:?}"
+        );
+        // A warm replay may be a Complete cache hit ("full_load") or, if the cold
+        // decode is still in flight, join the progressive load — either way the
+        // ready stage above stays bounded.
+        assert!(
+            e.kind == "full_load" || e.kind == "full_load_streaming",
+            "warm replay kind: {e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_first_mix_latency_folds_into_stats() {
+        // Sprint 11 (D50): the audio thread publishes enqueue->first-mix into the
+        // play's probe; the reaper fold turns it into /metrics values.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain(); // AddSample reaches the mixer
+                         // The cold play is progressive (D51): silence blocks do not count as a
+                         // start, so wait for the decode to land audio before mixing.
+        let mut attempts = 0;
+        while fixture.mixer.active_samples[0].buffer.frames() == 0 && attempts < 500 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            attempts += 1;
+        }
+        assert!(fixture.mixer.active_samples[0].buffer.frames() > 0);
+        mix_one_block(&mut fixture); // first audible block publishes the probe
+        fixture.latency.fold_fired();
+        use std::sync::atomic::Ordering;
+        let last = fixture.latency_stats.last_ns.load(Ordering::Relaxed);
+        let max = fixture.latency_stats.max_ns.load(Ordering::Relaxed);
+        let plays = fixture.latency_stats.plays_measured.load(Ordering::Relaxed);
+        assert_eq!(plays, 1, "one measured play");
+        assert!(last > 0, "a real first-mix latency was published");
+        assert!(max >= last, "max folds correctly");
+    }
+
+    #[tokio::test]
+    async fn windowed_play_emits_stage_event_and_publishes_first_mix() {
+        // Sprint 11 (D50): the windowed path emits its stage event after the
+        // prebuffer gate and publishes first-mix latency from the ring mix.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let mut cmd = play_crossfade(false, 0);
+        if let AudioCommand::Play { mode, .. } = &mut cmd {
+            *mode = config::LoadMode::Stream;
+        }
+        let events = run_capturing_stages(&mut fixture, cmd).await;
+        assert_eq!(events.len(), 1, "one latency event, got {events:?}");
+        let e = &events[0];
+        assert_eq!(e.kind, "windowed", "windowed play kind: {e:?}");
+        assert!(
+            e.decision_us <= e.ready_us && e.ready_us <= e.enqueue_us,
+            "stages must be monotone: {e:?}"
+        );
+
+        fixture.drain(); // AddStreamedSource reaches the mixer
+        mix_one_block(&mut fixture); // the gate guaranteed ring audio; this publishes
+        fixture.latency.fold_fired();
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            fixture.latency_stats.plays_measured.load(Ordering::Relaxed),
+            1,
+            "the windowed first mix must be measured"
+        );
+        assert!(fixture.latency_stats.last_ns.load(Ordering::Relaxed) > 0);
+    }
+
+    #[tokio::test]
+    async fn cold_play_gates_a_deep_start_position_until_loaded() {
+        // D51: a start_position beyond the progressive buffer's loaded edge gates
+        // AddSample until decode reaches it (bounded by the prebuffer deadline),
+        // preserving the instant-seek semantics full decodes used to give.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let mut cmd = play_crossfade(false, 0);
+        if let AudioCommand::Play {
+            start_position_ms, ..
+        } = &mut cmd
+        {
+            *start_position_ms = Some(1500);
+        }
+        fixture.run(cmd).await;
+        let mut attempts = 0;
+        while attempts < 500 {
+            fixture.drain();
+            if let Some(sample) = fixture.mixer.active_samples.first() {
+                if sample.buffer.is_frame_loaded(sample.position) {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            attempts += 1;
+        }
+        let sample = &fixture.mixer.active_samples[0];
+        assert_eq!(sample.position, 1500 * 48, "1500ms at 48k");
+        assert!(
+            sample.buffer.is_frame_loaded(sample.position),
+            "the gate must hold AddSample until the start position is decoded"
+        );
+    }
+
+    #[tokio::test]
+    async fn decode_completed_before_dispatch_still_upgrades_for_pitch_correction() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let command = play(Some("race"), 1.0);
+        let file = match &command {
+            AudioCommand::Play { file, .. } => file.clone(),
+            _ => unreachable!(),
+        };
+        let decoded = fixture
+            .cache_manager
+            .lock()
+            .await
+            .get_or_load(&file, SR)
+            .await
+            .unwrap();
+        let mut buffer = audio::streaming::StreamingBuffer::new(
+            decoded.channels,
+            decoded.sample_rate,
+            Some(decoded.frames),
+        );
+        buffer.append(&decoded.data);
+        buffer.mark_complete();
+        let prepared = audio::streaming::SampleBuffer::Streaming(Arc::new(RwLock::new(buffer)));
+        fixture
+            .run_prepared(command, Some(PreparedPlayback::Full(prepared)))
+            .await;
+        fixture.drain();
+        assert_eq!(
+            fixture.streaming_upgrades.len(),
+            1,
+            "a completed progressive buffer still needs promotion to direct sample access"
+        );
+        fixture.run_upgrades().await;
+        fixture.drain();
+        assert!(fixture.mixer.active_samples[0]
+            .buffer
+            .as_complete()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn cold_play_upgrades_to_a_complete_buffer_for_full_features() {
+        // D51: a cold play starts on the progressive buffer and, once the decode
+        // finishes and promotes, is upgraded to the Complete buffer over the
+        // command ring — restoring pitch correction (which needs slice access).
+        use audio::streaming::SampleBuffer;
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain();
+        assert!(
+            matches!(
+                fixture.mixer.active_samples[0].buffer,
+                SampleBuffer::Streaming(_)
+            ),
+            "a cold play starts on the progressive buffer"
+        );
+
+        let mut attempts = 0;
+        while !fixture.mixer.active_samples[0].buffer.is_complete() && attempts < 500 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            attempts += 1;
+        }
+        assert!(
+            fixture.mixer.active_samples[0].buffer.is_complete(),
+            "the background decode must finish"
+        );
+
+        fixture.run_upgrades().await;
+        fixture.drain();
+        assert!(
+            matches!(
+                fixture.mixer.active_samples[0].buffer,
+                SampleBuffer::Complete(_)
+            ),
+            "the play must be upgraded once the decode completes"
+        );
+
+        // Pitch correction works on the upgraded buffer.
+        fixture
+            .run(AudioCommand::Speed {
+                selector: SampleSelector {
+                    internal_id: None,
+                    voice: Some("v".to_string()),
+                    id: None,
+                    file: None,
+                },
+                speed: 1.2,
+                pitch_correction: true,
+            })
+            .await;
+        fixture.drain();
+        assert!(
+            fixture.mixer.active_samples[0].pitch_corrector.is_some(),
+            "pitch correction must engage on the upgraded Complete buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_status_reports_the_speed_a_sound_plays_at() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("crank"), 1.0)).await;
+        for (requested, plays_at) in [(150.0, 100.0), (0.001, 0.01), (-150.0, -100.0)] {
+            fixture
+                .run(AudioCommand::Speed {
+                    selector: SampleSelector {
+                        internal_id: None,
+                        id: None,
+                        file: None,
+                        voice: Some("crank".to_string()),
+                    },
+                    speed: requested,
+                    pitch_correction: false,
+                })
+                .await;
+            fixture.drain();
+            assert_eq!(fixture.mixer.active_samples[0].speed, plays_at);
+            let status = fixture.playing.values().next().expect("the sound's status");
+            assert_eq!(status.speed, plays_at, "requested {requested}");
+        }
+    }
+
+    #[tokio::test]
+    async fn speed_with_pitch_ships_a_corrector_per_matching_sample() {
+        // D56: the dispatcher expands the selector control-side, shipping one
+        // pre-built corrector bundle per matching sample; the audio thread
+        // installs by move. Disabling moves the correctors back out.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.run(play_crossfade(false, 0)).await; // same voice "v"
+        fixture.drain();
+        // Wait for the cold progressive loads, then upgrade to Complete buffers
+        // (pitch needs slice access).
+        let mut attempts = 0;
+        while fixture
+            .mixer
+            .active_samples
+            .iter()
+            .any(|s| !s.buffer.is_complete())
+            && attempts < 500
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            attempts += 1;
+        }
+        fixture.run_upgrades().await;
+        fixture.drain();
+
+        let speed_cmd = |speed: f32, pitch: bool| AudioCommand::Speed {
+            selector: SampleSelector {
+                internal_id: None,
+                id: None,
+                file: None,
+                voice: Some("v".to_string()),
+            },
+            speed,
+            pitch_correction: pitch,
+        };
+
+        fixture.run(speed_cmd(1.3, true)).await;
+        assert_eq!(
+            fixture.drain(),
+            2,
+            "one shipped command per matching sample"
+        );
+        for sample in &fixture.mixer.active_samples {
+            assert!(
+                sample.has_pitch_correction(),
+                "every matching sample gets its own shipped corrector"
+            );
+            assert!((sample.speed - 1.3).abs() < 1e-6);
+        }
+
+        fixture.run(speed_cmd(1.0, false)).await;
+        fixture.drain();
+        for sample in &fixture.mixer.active_samples {
+            assert!(
+                !sample.has_pitch_correction(),
+                "disable must move every corrector out for off-RT drop"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pitch_on_a_still_loading_cold_play_warns_at_dispatch() {
+        // Sprint 13 F6: pitch correction targeting a cold play whose progressive
+        // load is still filling stays dormant until the D51 upgrade; the
+        // dispatcher says so instead of silently doing nothing.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain();
+
+        // Pin the play's upgrade entry to a provably still-loading buffer (the
+        // real 2s WAV may decode before the Speed command lands).
+        let stalled = audio::streaming::SampleBuffer::Streaming(Arc::new(RwLock::new(
+            audio::streaming::StreamingBuffer::new(2, SR, None),
+        )));
+        assert_eq!(fixture.streaming_upgrades.len(), 1);
+        fixture.streaming_upgrades[0].buffer = stalled;
+
+        let warnings = run_capturing_warnings(
+            &mut fixture,
+            AudioCommand::Speed {
+                selector: SampleSelector {
+                    internal_id: None,
+                    id: None,
+                    file: None,
+                    voice: Some("v".to_string()),
+                },
+                speed: 1.2,
+                pitch_correction: true,
+            },
+        )
+        .await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("deferred") && w.contains("still loading")),
+            "a still-loading pitch target must warn, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn negative_speed_with_pitch_warns_at_dispatch_and_sends_nothing() {
+        // D57: the invalid speed+pitch combination is validated control-side (the
+        // RT-side set_speed keeps a silent reject); the command never reaches the
+        // ring.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_crossfade(false, 0)).await;
+        fixture.drain();
+
+        let warnings = run_capturing_warnings(
+            &mut fixture,
+            AudioCommand::Speed {
+                selector: SampleSelector {
+                    internal_id: None,
+                    id: None,
+                    file: None,
+                    voice: Some("v".to_string()),
+                },
+                speed: -1.5,
+                pitch_correction: true,
+            },
+        )
+        .await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("Negative speed") && w.contains("pitch")),
+            "dispatch must warn about negative speed with pitch correction, got {warnings:?}"
+        );
+        assert_eq!(
+            fixture.drain(),
+            0,
+            "the invalid command must not be sent to the audio thread"
+        );
+        assert_eq!(
+            fixture.mixer.active_samples[0].speed, 1.0,
+            "the sample's speed must be untouched"
+        );
+    }
+
+    /// `command` (a Play) with its start speed and pitch mode set.
+    fn at_speed(mut command: AudioCommand, start_speed: f32, pitch: bool) -> AudioCommand {
+        if let AudioCommand::Play {
+            speed,
+            pitch_correction,
+            ..
+        } = &mut command
+        {
+            *speed = Some(start_speed);
+            *pitch_correction = pitch;
+        }
+        command
+    }
+
+    #[tokio::test]
+    async fn play_with_speed_starts_the_sample_at_that_speed() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture
+            .run(at_speed(play(Some("crank"), 1.0), 1.08, false))
+            .await;
+        fixture.drain();
+
+        let sample = &fixture.mixer.active_samples[0];
+        assert_eq!(sample.speed, 1.08);
+        assert!(!sample.has_pitch_correction());
+        let status = fixture.playing.values().next().expect("the play's status");
+        assert_eq!(
+            status.speed, 1.08,
+            "the status snapshot reports the speed the play started at"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_with_pitch_correction_starts_with_a_corrector() {
+        let mut fixture = Fixture::new(vec![]);
+        // A warm cache hands the play a complete buffer, so the corrector is live
+        // from the first block rather than waiting for a progressive load.
+        fixture
+            .cache_manager
+            .lock()
+            .await
+            .get_or_load(TEST_WAV, SR)
+            .await
+            .unwrap();
+        fixture
+            .run(at_speed(play(Some("crank"), 1.0), 1.5, true))
+            .await;
+        fixture.drain();
+
+        let sample = &fixture.mixer.active_samples[0];
+        assert!(sample.buffer.is_complete());
+        assert!(sample.has_pitch_correction());
+        assert_eq!(sample.speed, 1.5);
+    }
+
+    #[tokio::test]
+    async fn a_play_with_pitch_correction_mixes_its_first_block_without_growing_scratch() {
+        let mut fixture = Fixture::new(vec![]);
+        // A warm cache hands the play a complete buffer, so the corrector runs from
+        // the first block.
+        fixture
+            .cache_manager
+            .lock()
+            .await
+            .get_or_load(TEST_WAV, SR)
+            .await
+            .unwrap();
+        fixture
+            .run(at_speed(play(Some("crank"), 1.0), 1.5, true))
+            .await;
+        fixture.drain();
+        let regrows =
+            audio::mixer::PITCH_SCRATCH_REGROWS.load(std::sync::atomic::Ordering::Relaxed);
+
+        mix_one_block(&mut fixture);
+
+        assert_eq!(
+            audio::mixer::PITCH_SCRATCH_REGROWS.load(std::sync::atomic::Ordering::Relaxed),
+            regrows,
+            "the corrector arrives with scratch for a whole block, so the audio thread allocates nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_with_pitch_correction_on_a_still_loading_cold_play_warns_like_speed() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let still_loading = audio::streaming::SampleBuffer::Streaming(Arc::new(RwLock::new(
+            audio::streaming::StreamingBuffer::new(2, SR, None),
+        )));
+
+        let warnings = run_prepared_capturing_warnings(
+            &mut fixture,
+            at_speed(play(Some("crank"), 1.0), 1.2, true),
+            Some(PreparedPlayback::Full(still_loading)),
+        )
+        .await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("deferred") && w.contains("still loading")),
+            "pitch correction on a still-loading play must warn as the speed command does, got {warnings:?}"
+        );
+        fixture.drain();
+        let sample = &fixture.mixer.active_samples[0];
+        assert!(sample.has_pitch_correction());
+        assert_eq!(sample.speed, 1.2);
+    }
+
+    /// Stands for a cold play's decoder: it takes the buffer's write lock briefly
+    /// for each chunk it appends and decodes the next chunk between, so a play can
+    /// start while the lock is held.
+    struct DecoderHoldingTheLock {
+        running: Arc<std::sync::atomic::AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl DecoderHoldingTheLock {
+        fn start(buffer: Arc<RwLock<audio::streaming::StreamingBuffer>>) -> Self {
+            fn spin_for(duration: std::time::Duration) {
+                let until = std::time::Instant::now() + duration;
+                while std::time::Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            }
+            let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let appended = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let thread = std::thread::spawn({
+                let running = running.clone();
+                let appended = appended.clone();
+                move || {
+                    while running.load(std::sync::atomic::Ordering::Relaxed) {
+                        let appending = buffer.write().unwrap();
+                        spin_for(std::time::Duration::from_micros(5));
+                        drop(appending);
+                        appended.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        spin_for(std::time::Duration::from_micros(20));
+                    }
+                }
+            });
+            while appended.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                std::thread::yield_now();
+            }
+            Self { running, thread }
+        }
+
+        fn stop(self) {
+            self.running
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.thread.join().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_play_with_pitch_correction_starts_while_its_decoder_writes_the_buffer() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let decoding = Arc::new(RwLock::new(audio::streaming::StreamingBuffer::new(
+            2, SR, None,
+        )));
+        let decoder = DecoderHoldingTheLock::start(decoding.clone());
+
+        let ((), warnings) = capturing_warnings(async {
+            for _ in 0..100 {
+                fixture
+                    .run_prepared(
+                        at_speed(play(Some("crank"), 1.0), 1.2, true),
+                        Some(PreparedPlayback::Full(
+                            audio::streaming::SampleBuffer::Streaming(decoding.clone()),
+                        )),
+                    )
+                    .await;
+            }
+        })
+        .await;
+        decoder.stop();
+
+        assert_eq!(warnings.len(), 100, "got {warnings:?}");
+        assert!(
+            warnings.iter().all(|w| w.contains("deferred")),
+            "each cold play says its pitch correction is deferred, got {warnings:?}"
+        );
+        fixture.drain();
+        assert_eq!(fixture.mixer.active_samples.len(), 100);
+        assert!(fixture
+            .mixer
+            .active_samples
+            .iter()
+            .all(|sample| sample.has_pitch_correction() && sample.speed == 1.2));
+    }
+
+    #[tokio::test]
+    async fn a_play_records_its_rate_and_channels_while_its_decoder_writes_the_buffer() {
+        let mut fixture = Fixture::new(vec![]);
+        let decoding = Arc::new(RwLock::new(audio::streaming::StreamingBuffer::new(
+            2, SR, None,
+        )));
+        let decoder = DecoderHoldingTheLock::start(decoding.clone());
+
+        for _ in 0..300 {
+            fixture
+                .run_prepared(
+                    play(Some("crank"), 1.0),
+                    Some(PreparedPlayback::Full(
+                        audio::streaming::SampleBuffer::Streaming(decoding.clone()),
+                    )),
+                )
+                .await;
+        }
+        decoder.stop();
+
+        assert_eq!(fixture.playing.len(), 300);
+        for status in fixture.playing.values() {
+            assert_eq!(
+                (status.sample_rate, status.channels),
+                (SR, 2),
+                "a speed with pitch correction builds its stretcher from these"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn windowed_play_with_speed_warns_and_plays_at_normal_speed() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let warnings =
+            run_capturing_warnings(&mut fixture, at_speed(play_stream(Some("bed")), 1.5, false))
+                .await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("windowed") && w.contains("normal speed")),
+            "a windowed play cannot change speed and must say so, got {warnings:?}"
+        );
+        fixture.drain();
+        assert_eq!(
+            fixture.mixer.streamed_sources.len(),
+            1,
+            "the play still starts"
+        );
+        let status = fixture.playing.values().next().expect("the play's status");
+        assert_eq!(status.speed, 1.0);
+    }
+
+    #[tokio::test]
+    async fn windowed_play_at_normal_speed_does_not_warn_about_speed() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let warnings =
+            run_capturing_warnings(&mut fixture, at_speed(play_stream(Some("bed")), 1.0, false))
+                .await;
+        assert!(
+            !warnings.iter().any(|w| w.contains("speed")),
+            "an explicit normal speed is not a speed change, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reverse_play_runs_backwards_from_its_start_position() {
+        let mut fixture = Fixture::new(vec![]);
+        let mut command = at_speed(play(Some("crank"), 1.0), -1.0, false);
+        if let AudioCommand::Play {
+            start_position_ms, ..
+        } = &mut command
+        {
+            *start_position_ms = Some(1000);
+        }
+        fixture.run(command).await;
+        fixture.drain();
+
+        let sample = &fixture.mixer.active_samples[0];
+        assert_eq!(sample.speed, -1.0);
+        assert_eq!(sample.position, SR as usize, "1000 ms into a 48 kHz buffer");
+    }
+
+    #[tokio::test]
+    async fn crossfade_without_loop_warns() {
+        // F8: a Play with crossfade_ms but no loop:true silently drops the crossfade
+        // (the blend only runs on loop boundaries). Dispatch must warn so the user
+        // gets feedback. Use a Mutex to serialize the thread-local subscriber.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let warnings = run_capturing_warnings(&mut fixture, play_crossfade(false, 100)).await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("crossfade") && w.contains("loop")),
+            "a crossfade without loop must warn about the loop requirement, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn crossfade_with_loop_within_buffer_does_not_warn() {
+        // The happy path: loop:true with a crossfade well under half the buffer
+        // (the 2s test WAV is ~96000 frames; 100ms crossfade is ~4800 frames) must
+        // NOT warn (pristine output).
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let warnings = run_capturing_warnings(&mut fixture, play_crossfade(true, 100)).await;
+        assert!(
+            warnings.is_empty(),
+            "a valid looped crossfade must not warn, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn crossfade_longer_than_half_buffer_warns_even_with_loop() {
+        // Even with loop:true, a crossfade whose 2x exceeds the buffer length never
+        // engages in the mixer (it needs buffer_frames > crossfade_samples * 2). The
+        // 2s test WAV is ~2000ms; a 5000ms crossfade is far past half, so it is
+        // silently dropped and must warn.
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        let warnings = run_capturing_warnings(&mut fixture, play_crossfade(true, 5000)).await;
+        assert!(
+            warnings.iter().any(|w| w.contains("crossfade")),
+            "a crossfade longer than half the buffer must warn, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn play_adds_active_sample_and_marks_voice_active() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("music"), 0.5)).await;
+        fixture.drain();
+
+        assert_eq!(fixture.mixer.active_samples.len(), 1);
+        let sample = &fixture.mixer.active_samples[0];
+        assert_eq!(sample.voice_id, "music");
+        assert_eq!(sample.volume, 0.5);
+        assert_eq!(sample.position, 0);
+        assert!(matches!(sample.fade_state, FadeState::None));
+        assert_eq!(sample.crossfade_samples, 0);
+
+        // The control thread tracks the voice as active for ducking/status.
+        assert!(fixture.active_counts.contains_key("music"));
+    }
+
+    #[tokio::test]
+    async fn play_with_fade_in_sets_fade_state() {
+        let mut fixture = Fixture::new(vec![]);
+        let mut cmd = play(Some("music"), 1.0);
+        if let AudioCommand::Play { fade_in, .. } = &mut cmd {
+            *fade_in = Some(100);
+        }
+        fixture.run(cmd).await;
+        fixture.drain();
+
+        // 100 ms at 48 kHz = 4800 frames
+        assert!(matches!(
+            fixture.mixer.active_samples[0].fade_state,
+            FadeState::In {
+                elapsed: 0,
+                duration: 4800
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn stop_all_applies_fade_out_to_every_sample() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("a"), 1.0)).await;
+        fixture.run(play(Some("b"), 1.0)).await;
+        // StopAll fades whatever is active; draining in order adds both samples
+        // before the fade-out is applied, exactly as the callback would.
+        fixture.run(AudioCommand::StopAll).await;
+        fixture.drain();
+
+        assert_eq!(fixture.mixer.active_samples.len(), 2);
+        for sample in &fixture.mixer.active_samples {
+            assert!(matches!(sample.fade_state, FadeState::Out { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_by_voice_selector_fades_only_matching_samples() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.run(play(Some("sfx"), 1.0)).await;
+
+        let stop = AudioCommand::Stop {
+            selector: SampleSelector {
+                internal_id: None,
+                id: None,
+                file: None,
+                voice: Some("music".to_string()),
+            },
+            fade_out_ms: Some(50),
+        };
+        fixture.run(stop).await;
+        fixture.drain();
+
+        let expected_duration = 50 * SR as usize / 1000; // 2400 frames
+        for sample in &fixture.mixer.active_samples {
+            if sample.voice_id == "music" {
+                assert!(matches!(
+                    sample.fade_state,
+                    FadeState::Out { duration, .. } if duration == expected_duration
+                ));
+            } else {
+                assert!(matches!(sample.fade_state, FadeState::None));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_volume_sets_ramp_target_without_jumping() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture
+            .run(AudioCommand::VoiceVolume {
+                voice: "music".to_string(),
+                volume: 0.3,
+            })
+            .await;
+        fixture.drain();
+
+        let sample = &fixture.mixer.active_samples[0];
+        assert!((sample.target_voice_volume - 0.3).abs() < 1e-6);
+        // Current voice volume is ramped over time, so it must not jump immediately.
+        assert!((sample.voice_volume - 1.0).abs() < 1e-6);
+    }
+
+    #[tokio::test]
+    async fn voice_volume_reaches_an_input_only_voice() {
+        // D35: a VoiceVolume targeting a voice that has only a live input (no
+        // sample-backed voice in the VoiceManager) must still ramp that input. The
+        // handler used to gate the SetVoiceVolume send behind a VoiceManager hit and
+        // silently no-op for input-only voices.
+        let mut fixture = Fixture::new(vec![]);
+        push_live_input(&mut fixture, "mic", 1.0);
+
+        fixture
+            .run(AudioCommand::VoiceVolume {
+                voice: "mic".to_string(),
+                volume: 0.4,
+            })
+            .await;
+        fixture.drain();
+
+        let input = &fixture.mixer.live_inputs[0];
+        assert!(
+            (input.target_voice_volume - 0.4).abs() < 1e-6,
+            "an input-only voice's target_voice_volume must update, got {}",
+            input.target_voice_volume
+        );
+        // The ramp is gradual, so the current value has not jumped to the target.
+        assert!((input.voice_volume - 1.0).abs() < 1e-6);
+        assert_eq!(fixture.inputs[0].volume, 0.4);
+        assert!(!fixture.inputs[0].muted);
+    }
+
+    #[tokio::test]
+    async fn voice_volume_still_updates_a_sample_backed_voice() {
+        // The input-only path must not regress the normal sample case: a VoiceVolume
+        // on a voice with a playing sample still ramps that sample.
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+
+        fixture
+            .run(AudioCommand::VoiceVolume {
+                voice: "music".to_string(),
+                volume: 0.25,
+            })
+            .await;
+        fixture.drain();
+
+        assert!((fixture.mixer.active_samples[0].target_voice_volume - 0.25).abs() < 1e-6);
+    }
+
+    fn voice_speed(voice: &str, speed: f32, pitch_correction: bool) -> AudioCommand {
+        AudioCommand::VoiceSpeed {
+            voice: voice.to_string(),
+            speed,
+            pitch_correction,
+        }
+    }
+
+    fn voice_clear(voice: mqtt::commands::VoiceTarget) -> AudioCommand {
+        AudioCommand::VoiceClear { voice }
+    }
+
+    fn named(voice: &str) -> mqtt::commands::VoiceTarget {
+        mqtt::commands::VoiceTarget::Named(voice.to_string())
+    }
+
+    fn is_stopping(sample: &audio::mixer::ActiveSample) -> bool {
+        matches!(sample.fade_state, FadeState::Out { .. })
+    }
+
+    #[tokio::test]
+    async fn voice_speed_sets_playing_samples_and_later_plays() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+
+        fixture.run(voice_speed("music", 0.5, false)).await;
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+
+        assert_eq!(fixture.mixer.active_samples.len(), 2);
+        for sample in &fixture.mixer.active_samples {
+            assert_eq!(sample.speed, 0.5);
+        }
+        for status in fixture.playing.values() {
+            assert_eq!(status.speed, 0.5, "the status reports the voice speed");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_play_into_a_voice_starts_at_its_stored_speed_and_pitch_mode() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(voice_speed("music", 1.25, true)).await;
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+
+        let sample = &fixture.mixer.active_samples[0];
+        assert_eq!(sample.speed, 1.25);
+        assert!(sample.has_pitch_correction());
+    }
+
+    #[tokio::test]
+    async fn a_play_with_its_own_speed_overrides_the_voice_speed() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(voice_speed("music", 0.5, false)).await;
+        fixture
+            .run(at_speed(play(Some("music"), 1.0), 2.0, false))
+            .await;
+        fixture.drain();
+
+        assert_eq!(fixture.mixer.active_samples[0].speed, 2.0);
+    }
+
+    #[tokio::test]
+    async fn voice_speed_on_a_streamed_voice_warns_and_is_still_stored() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_stream(Some("bed"))).await;
+        fixture.drain();
+
+        let warnings = run_capturing_warnings(&mut fixture, voice_speed("bed", 0.5, false)).await;
+        assert!(
+            warnings.iter().any(|w| w.contains("windowed")),
+            "a streamed voice cannot change speed, got {warnings:?}"
+        );
+        assert_eq!(
+            fixture.voice_manager.lock().get_voice_speed("bed"),
+            Some((0.5, false)),
+            "the voice's later full plays still take the speed"
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_clear_stops_the_voice_and_forgets_its_settings() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.run(play(Some("sfx"), 1.0)).await;
+        fixture
+            .run(AudioCommand::VoiceVolume {
+                voice: "music".to_string(),
+                volume: 0.3,
+            })
+            .await;
+        fixture.run(voice_speed("music", 0.5, false)).await;
+        fixture.drain();
+
+        fixture.run(voice_clear(named("music"))).await;
+        fixture.drain();
+
+        for sample in &fixture.mixer.active_samples {
+            assert_eq!(is_stopping(sample), sample.voice_id == "music");
+        }
+        assert!(fixture.voice_manager.lock().get_voice("music").is_none());
+
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+        let fresh = fixture.mixer.active_samples.last().unwrap();
+        assert_eq!(fresh.voice_volume, 1.0);
+        assert_eq!(fresh.speed, 1.0);
+    }
+
+    #[tokio::test]
+    async fn clearing_every_voice_stops_and_forgets_them_all() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.run(play(None, 1.0)).await;
+        fixture
+            .run(AudioCommand::VoiceVolume {
+                voice: "idle".to_string(),
+                volume: 0.5,
+            })
+            .await;
+        fixture.drain();
+
+        fixture
+            .run(voice_clear(mqtt::commands::VoiceTarget::All))
+            .await;
+        fixture.drain();
+
+        assert!(fixture.mixer.active_samples.iter().all(is_stopping));
+        assert_eq!(fixture.voice_manager.lock().voice_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_clear_returns_a_microphone_to_full_voice_volume() {
+        let mut fixture = Fixture::new(vec![]);
+        push_live_input(&mut fixture, "mic", 0.8);
+        register_input_voices(&mut fixture.voice_manager.lock(), &fixture.inputs);
+        fixture
+            .run(AudioCommand::VoiceVolume {
+                voice: "mic".to_string(),
+                volume: 0.4,
+            })
+            .await;
+        fixture.drain();
+
+        fixture.run(voice_clear(named("mic"))).await;
+        fixture.drain();
+
+        assert_eq!(fixture.mixer.live_inputs[0].target_voice_volume, 1.0);
+        assert_eq!(
+            fixture.voice_manager.lock().get_voice_volume("mic"),
+            Some(1.0),
+            "the microphone's voice stays registered"
+        );
+    }
+
+    #[test]
+    fn ready_inputs_register_their_voices() {
+        let mut fixture = Fixture::new(vec![]);
+        push_live_input(&mut fixture, "mic", 1.0);
+        push_live_input(&mut fixture, "broken", 1.0);
+        fixture.inputs[1].ready = false;
+
+        let mut manager = VoiceManager::new();
+        register_input_voices(&mut manager, &fixture.inputs);
+
+        assert!(manager.get_voice("mic").is_some_and(|v| v.has_live_input));
+        assert!(
+            manager.get_voice("broken").is_none(),
+            "an input that failed to open feeds no voice"
+        );
+    }
+
+    /// A fixture whose config has one input on `mic` at `volume`, with that
+    /// input live and its voice registered as the daemon does at startup.
+    fn fixture_with_mic(volume: f32) -> Fixture {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.config.inputs = vec![config::InputConfig {
+            volume,
+            voice_id: "mic".to_string(),
+            ..Default::default()
+        }];
+        push_live_input(&mut fixture, "mic", volume);
+        register_input_voices(&mut fixture.voice_manager.lock(), &fixture.inputs);
+        fixture
+    }
+
+    #[tokio::test]
+    async fn reset_stops_everything_forgets_voices_and_restores_inputs() {
+        let mut fixture = fixture_with_mic(0.8);
+        fixture
+            .run(AudioCommand::InputVolume {
+                input: "mic".to_string(),
+                volume: 0.2,
+            })
+            .await;
+        fixture
+            .run(AudioCommand::InputMute {
+                input: "mic".to_string(),
+                mute: true,
+            })
+            .await;
+        fixture
+            .run(AudioCommand::VoiceVolume {
+                voice: "mic".to_string(),
+                volume: 0.4,
+            })
+            .await;
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.run(voice_speed("music", 0.5, false)).await;
+        fixture.drain();
+
+        fixture.run(AudioCommand::Reset).await;
+        fixture.drain();
+
+        assert!(fixture.mixer.active_samples.iter().all(is_stopping));
+        let manager = fixture.voice_manager.lock();
+        assert!(manager.get_voice("music").is_none());
+        assert_eq!(manager.get_voice_volume("mic"), Some(1.0));
+        drop(manager);
+
+        let input = &fixture.mixer.live_inputs[0];
+        assert_eq!(input.volume, 0.8, "back to the configured volume");
+        assert!(!input.is_muted());
+        assert_eq!(input.target_voice_volume, 1.0);
+        assert_eq!(fixture.inputs[0].volume, 0.8);
+        assert!(!fixture.inputs[0].muted);
+    }
+
+    #[tokio::test]
+    async fn reset_leaves_an_input_owned_by_a_talkback_lease_alone() {
+        let mut fixture = fixture_with_mic(0.8);
+        fixture
+            .run(AudioCommand::InputVolume {
+                input: "mic".to_string(),
+                volume: 0.3,
+            })
+            .await;
+        fixture
+            .run(AudioCommand::TalkbackAcquire(
+                mqtt::commands::TalkbackAcquireMessage {
+                    client_id: "gm-1".to_string(),
+                    source_id: "GM_MIC".to_string(),
+                    destination: "GUEST_ALL".to_string(),
+                    gain: 0.0,
+                    lease_ms: 500,
+                },
+            ))
+            .await;
+        fixture.drain();
+
+        fixture.run(AudioCommand::Reset).await;
+        fixture.drain();
+
+        assert_eq!(
+            fixture.mixer.live_inputs[0].volume, 0.3,
+            "the lease owns the input, so reset does not touch it"
+        );
+        assert!(fixture.talkback.status(0).applied_live);
+    }
+
+    /// Build a mono live input on `voice` at `volume` with an empty ring and push
+    /// it onto the fixture's mixer, registering a matching control-side
+    /// `InputStatus` so input-targeting commands (which resolve input voice ids on
+    /// the control side, D22a) can see it. The ring content is irrelevant to the
+    /// control-plane tests.
+    fn push_live_input(fixture: &mut Fixture, voice: &str, volume: f32) {
+        use ringbuf::HeapRb;
+        let consumer = HeapRb::<f32>::new(16).split().1;
+        let index = fixture.mixer.live_inputs.len();
+        fixture.mixer.live_inputs.push(audio::mixer::LiveInput::new(
+            voice.to_string(),
+            consumer,
+            1,
+            volume,
+            vec![(0, 0)],
+            8,
+        ));
+        fixture.inputs.push(http::InputStatus {
+            index,
+            voice_id: voice.to_string(),
+            volume,
+            channels: 1,
+            muted: false,
+            unmuted_volume: volume,
+            applied_volume: None,
+            applied_muted: None,
+            applied_unmuted_volume: None,
+            health: None,
+            ready: true,
+            last_error: None,
+        });
+    }
+
+    #[test]
+    fn out_of_range_input_route_produces_a_warning() {
+        // F5: once the device channel count is known, a route whose SOURCE channel is
+        // >= that count is a misconfiguration (the mixer silently drops it). It must
+        // produce a warning naming the offending channel(s) and the device count.
+        // A 2-channel device with a route reading source channel 3 is out of range.
+        let warning = out_of_range_input_routes(1, &[(0, 0), (3, 1)], 2)
+            .expect("an out-of-range source channel must warn");
+        assert!(
+            warning.contains('3') && warning.contains('2'),
+            "warning must name the out-of-range source channel and the device count: {warning}"
+        );
+    }
+
+    #[test]
+    fn in_range_input_routes_do_not_warn() {
+        // Every source channel within the device count: no warning (pristine output).
+        assert!(
+            out_of_range_input_routes(0, &[(0, 0), (1, 1)], 2).is_none(),
+            "in-range routes must not warn"
+        );
+        // Boundary: channel index == count is out of range (0-based); count-1 is the
+        // last valid index.
+        assert!(out_of_range_input_routes(0, &[(1, 0)], 2).is_none());
+        assert!(out_of_range_input_routes(0, &[(2, 0)], 2).is_some());
+    }
+
+    #[test]
+    fn input_route_to_lfe_channel_produces_a_warning() {
+        // F7/D41: with bass management enabled, an input route whose DESTINATION is
+        // the LFE channel lands full-range content on the sub unfiltered; bass
+        // management then *adds* extracted bass on top (the crossover is bypassed for
+        // that directly-routed content). It must warn, naming the offending channel.
+        // LFE is channel 3; a route 0->3 collides.
+        let warning = input_routes_collide_with_lfe(2, &[(0, 0), (0, 3)], 3)
+            .expect("a route destined for the LFE channel must warn");
+        assert!(
+            warning.contains('3'),
+            "warning must name the LFE channel, got {warning}"
+        );
+    }
+
+    #[test]
+    fn input_routes_clear_of_lfe_do_not_warn() {
+        // No route destined for the LFE channel: pristine output. LFE is 3; routes go
+        // to 0 and 1.
+        assert!(
+            input_routes_collide_with_lfe(0, &[(0, 0), (1, 1)], 3).is_none(),
+            "routes that avoid the LFE channel must not warn"
+        );
+    }
+
+    #[tokio::test]
+    async fn input_mute_unmute_restores_the_calibrated_volume() {
+        // D34: a calibrated input volume must survive a mute/unmute round-trip —
+        // unmute restores the prior level (0.7), not a hardcoded 1.0.
+        let mut fixture = Fixture::new(vec![]);
+        push_live_input(&mut fixture, "mic", 1.0);
+
+        // Calibrate the input to 0.7 via InputVolume.
+        fixture
+            .run(AudioCommand::InputVolume {
+                input: "mic".to_string(),
+                volume: 0.7,
+            })
+            .await;
+        fixture.drain();
+        assert!((fixture.mixer.live_inputs[0].volume - 0.7).abs() < 1e-6);
+        assert_eq!(fixture.inputs[0].volume, 0.7);
+        assert_eq!(fixture.inputs[0].unmuted_volume, 0.7);
+        assert!(!fixture.inputs[0].muted);
+
+        // Mute: the input drops to silence.
+        fixture
+            .run(AudioCommand::InputMute {
+                input: "mic".to_string(),
+                mute: true,
+            })
+            .await;
+        fixture.drain();
+        assert_eq!(fixture.mixer.live_inputs[0].volume, 0.0);
+        assert_eq!(fixture.inputs[0].volume, 0.0);
+        assert_eq!(fixture.inputs[0].unmuted_volume, 0.7);
+        assert!(fixture.inputs[0].muted);
+
+        // Unmute: the calibrated 0.7 is restored, NOT 1.0.
+        fixture
+            .run(AudioCommand::InputMute {
+                input: "mic".to_string(),
+                mute: false,
+            })
+            .await;
+        fixture.drain();
+        assert!(
+            (fixture.mixer.live_inputs[0].volume - 0.7).abs() < 1e-6,
+            "unmute must restore the calibrated 0.7, got {}",
+            fixture.mixer.live_inputs[0].volume
+        );
+        assert_eq!(fixture.inputs[0].volume, 0.7);
+        assert!(!fixture.inputs[0].muted);
+    }
+
+    #[tokio::test]
+    async fn talkback_lease_acquire_release_and_expiry_mute_the_input() {
+        let mut fixture = Fixture::new(vec![]);
+        push_live_input(&mut fixture, "mic", 0.7);
+        fixture
+            .run(AudioCommand::TalkbackAcquire(
+                mqtt::commands::TalkbackAcquireMessage {
+                    client_id: "gm-1".to_string(),
+                    source_id: "GM_MIC".to_string(),
+                    destination: "GUEST_ALL".to_string(),
+                    gain: 0.0,
+                    lease_ms: 500,
+                },
+            ))
+            .await;
+        fixture.drain();
+        assert!(fixture.talkback.status(0).applied_live);
+        assert_eq!(fixture.mixer.live_inputs[0].volume, 0.7);
+
+        fixture
+            .run(AudioCommand::TalkbackRelease(
+                mqtt::commands::TalkbackReleaseMessage {
+                    client_id: "gm-1".to_string(),
+                    lease_id: "lease-0001".to_string(),
+                },
+            ))
+            .await;
+        fixture.drain();
+        assert!(!fixture.talkback.status(0).applied_live);
+        assert_eq!(fixture.mixer.live_inputs[0].volume, 0.0);
+
+        fixture
+            .run(AudioCommand::TalkbackAcquire(
+                mqtt::commands::TalkbackAcquireMessage {
+                    client_id: "gm-1".to_string(),
+                    source_id: "GM_MIC".to_string(),
+                    destination: "GUEST_ALL".to_string(),
+                    gain: 0.0,
+                    lease_ms: 500,
+                },
+            ))
+            .await;
+        fixture.drain();
+        let _ = fixture.talkback.expire(500);
+        assert!(!fixture.talkback.status(500).applied_live);
+    }
+
+    #[tokio::test]
+    async fn playing_a_ducking_primary_ducks_the_background_voice() {
+        let rule = DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0, // instant, for a deterministic assertion
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        // Background music starts first. It is not a ducking primary, so it stays
+        // full: the control engine resolves no target change for "music".
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            assert!((applier.get_multiplier("music", 1) - 1.0).abs() < 1e-6);
+        }
+
+        // The primary voice starts: handle_command must drive the control-side
+        // ducking engine, which emits a SetDuckTarget that ducks "music" once the
+        // mixer's applier applies it.
+        fixture.run(play(Some("narration"), 1.0)).await;
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            let multiplier = applier.get_multiplier("music", 1);
+            assert!(
+                multiplier < 0.2,
+                "expected music ducked toward 0.1, got {multiplier}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn control_thread_records_ducking_into_the_status_snapshot() {
+        // F3/D40: the control-side ducking snapshot the HTTP `/metrics` and
+        // `/status/voices` handlers read must be populated by the control thread as
+        // targets resolve, and cleared when a voice restores — proving the value
+        // surfaced over HTTP is the real resolved target, not a placeholder.
+        let rule = DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0,
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        // Music alone is not ducked: the snapshot stays empty.
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+        assert!(
+            fixture.ducking_snapshot.read().unwrap().is_empty(),
+            "no voice is ducked yet"
+        );
+
+        // The primary plays: the snapshot records music's resolved target (0.1).
+        fixture.run(play(Some("narration"), 1.0)).await;
+        fixture.drain();
+        {
+            let snap = fixture.ducking_snapshot.read().unwrap();
+            let music = snap
+                .get("music")
+                .copied()
+                .expect("music must be recorded as ducked");
+            assert!(
+                (music - 0.1).abs() < 1e-6,
+                "the snapshot must hold the resolved target 0.1, got {music}"
+            );
+            assert!(
+                !snap.contains_key("narration"),
+                "the primary voice is not itself ducked"
+            );
+        }
+
+        // The narration sample finishes and is reaped: music restores, and the
+        // snapshot drops it (a restored voice is at full volume, so absent).
+        finish_voice_sample(&mut fixture, "narration");
+        fixture.reap();
+        assert!(
+            !fixture
+                .ducking_snapshot
+                .read()
+                .unwrap()
+                .contains_key("music"),
+            "a restored voice must be cleared from the ducking snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_active_input_voice_ducks_the_background_voice() {
+        // D4: a configured live-input voice used as a ducking primary must duck the
+        // background, driven through the same off-RT notify/compute_changes path as
+        // sample voices. Activity detection is Sprint 8; here the notify is driven
+        // directly (as input setup will, "active while the stream is open").
+        let rule = DuckingRule {
+            primary_voice: "mic".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0, // instant, for a deterministic assertion
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        // Background music plays and is not ducked while the mic is idle.
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            assert!((applier.get_multiplier("music", 1) - 1.0).abs() < 1e-6);
+        }
+
+        // The mic input voice becomes active: the notify path must emit a duck for
+        // "music" that the applier applies.
+        fixture.notify_voice("mic", true);
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            let multiplier = applier.get_multiplier("music", 1);
+            assert!(
+                multiplier < 0.2,
+                "an active input primary must duck music toward 0.1, got {multiplier}"
+            );
+        }
+
+        // The mic goes idle again: music restores toward full volume.
+        fixture.notify_voice("mic", false);
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            let multiplier = applier.get_multiplier("music", 1);
+            assert!(
+                (multiplier - 1.0).abs() < 1e-6,
+                "music must restore once the input primary is idle, got {multiplier}"
+            );
+        }
+    }
+
+    /// Move the (single) active sample for `voice` out of the mixer into the
+    /// graveyard, mirroring the RT thread reaping a finished sample, so the
+    /// control-side reaper can then reconcile it.
+    fn finish_voice_sample(fixture: &mut Fixture, voice: &str) {
+        let idx = fixture
+            .mixer
+            .active_samples
+            .iter()
+            .position(|s| s.voice_id == voice)
+            .expect("an active sample for the voice");
+        let finished = fixture.mixer.active_samples.swap_remove(idx);
+        fixture
+            .grave_tx
+            .push(finished)
+            .ok()
+            .expect("graveyard has room");
+    }
+
+    /// Push a finished streamed source for `voice` into the streamed graveyard,
+    /// mirroring the RT thread reaping it, so the control-side reaper can reconcile it.
+    fn finish_streamed_source(fixture: &mut Fixture, voice: &str, id: u64) {
+        use std::sync::atomic::AtomicBool;
+        let (_producer, consumer) = ringbuf::HeapRb::<f32>::new(16).split();
+        let source = audio::mixer::StreamedSource::new(
+            id,
+            voice.to_string(),
+            "stream.wav".to_string(),
+            None,
+            consumer,
+            2,
+            1.0,
+            vec![(0, 0), (1, 1)],
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        fixture
+            .streamed_grave_tx
+            .push(source)
+            .ok()
+            .expect("streamed graveyard has room");
+    }
+
+    #[tokio::test]
+    async fn reaper_reconciles_a_finished_streamed_source() {
+        let mut fixture = Fixture::new(vec![]);
+
+        // A streamed voice is active (as the Play stream branch will register it).
+        fixture.active_counts.insert("bed".to_string(), 1);
+
+        // The RT thread hands a finished streamed source to the streamed graveyard;
+        // the control-side reaper drains it and clears the voice's active count.
+        finish_streamed_source(&mut fixture, "bed", 42);
+        fixture.reap();
+
+        assert!(
+            !fixture.active_counts.contains_key("bed"),
+            "a finished streamed source must clear its voice's active count off-RT"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaper_restores_ducking_when_last_streamed_source_finishes() {
+        // A streamed source acting as a ducking primary must restore the ducked voice
+        // when it finishes, through the same notify path as a sample (the reaper
+        // reconciles samples and streamed sources identically).
+        let rule = DuckingRule {
+            primary_voice: "bed".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0,
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        // Music plays; the streamed "bed" primary becomes active and ducks music.
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.drain();
+        fixture.active_counts.insert("bed".to_string(), 1);
+        fixture.notify_voice("bed", true);
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            assert!(
+                applier.get_multiplier("music", 1) < 0.2,
+                "music should be ducked while the streamed bed is active"
+            );
+        }
+
+        // The streamed bed finishes: the reaper restores music toward full volume.
+        finish_streamed_source(&mut fixture, "bed", 7);
+        fixture.reap();
+        fixture.drain();
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            assert!(
+                (applier.get_multiplier("music", 1) - 1.0).abs() < 1e-6,
+                "music must restore once the streamed bed finishes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reaper_restores_ducking_and_clears_voice_when_last_sample_finishes() {
+        let rule = DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0, // instant, for a deterministic assertion
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        // Background music + the ducking primary both play and are applied.
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.run(play(Some("narration"), 1.0)).await;
+        fixture.drain();
+
+        // Music is ducked while narration is active.
+        {
+            let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+            assert!(
+                applier.get_multiplier("music", 1) < 0.2,
+                "music should be ducked while narration plays"
+            );
+        }
+        assert_eq!(fixture.active_counts.get("narration"), Some(&1));
+        assert_eq!(fixture.playing.len(), 2);
+
+        // The narration sample finishes: the RT thread hands it to the graveyard.
+        finish_voice_sample(&mut fixture, "narration");
+        fixture.reap();
+
+        // (a) The voice's count hit 0 and the voice was removed.
+        assert!(
+            !fixture.active_counts.contains_key("narration"),
+            "narration should be cleared from active_counts"
+        );
+        // (c) The snapshot/playing map dropped the finished sample.
+        assert_eq!(fixture.playing.len(), 1, "the finished sample is removed");
+        assert!(
+            fixture.playing.values().all(|s| s.voice_id == "music"),
+            "only the music sample remains in the playing map"
+        );
+        {
+            let snap = fixture.snapshot.read().unwrap();
+            assert_eq!(snap.active_samples, 1);
+        }
+
+        // (b) A restore SetDuckTarget (target 1.0) for "music" was emitted on the
+        // command ring; applying it restores music toward full volume.
+        let restore = fixture.cmd_rx.pop().expect("a restore command on the ring");
+        match restore {
+            rt_engine::AudioCommand::SetDuckTarget(change) => {
+                assert_eq!(change.voice, "music");
+                assert!(
+                    (change.target_volume - 1.0).abs() < 1e-6,
+                    "restore target must be 1.0, got {}",
+                    change.target_volume
+                );
+                // Applying the restore and advancing the full fade brings music back
+                // to full volume (the restore fades over the resolved restore time).
+                let fade = change.fade_frames.max(1);
+                let applier = fixture.mixer.ducking_applier.as_mut().unwrap();
+                applier.apply_target(&change);
+                assert!(
+                    (applier.get_multiplier("music", fade) - 1.0).abs() < 1e-6,
+                    "music should be restored to full volume after the restore fade"
+                );
+            }
+            other => panic!(
+                "expected a SetDuckTarget restore, got {:?}",
+                other_variant(&other)
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn reaper_does_not_restore_while_voice_still_has_samples() {
+        let rule = DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 0,
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        // Music plus TWO narration samples (count == 2).
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.run(play(Some("narration"), 1.0)).await;
+        fixture.run(play(Some("narration"), 1.0)).await;
+        fixture.drain();
+        assert_eq!(fixture.active_counts.get("narration"), Some(&2));
+
+        // Drain the duck command the second narration Play may have queued so the
+        // ring only holds whatever the reaper emits next.
+        while fixture.cmd_rx.pop().is_some() {}
+
+        // One narration sample finishes, but the voice is still active (count -> 1).
+        finish_voice_sample(&mut fixture, "narration");
+        fixture.reap();
+
+        // The guard holds: the voice is NOT cleared and NO restore is emitted early.
+        assert_eq!(
+            fixture.active_counts.get("narration"),
+            Some(&1),
+            "narration still has one sample, count must be 1"
+        );
+        assert!(
+            fixture.cmd_rx.pop().is_none(),
+            "no restore should be emitted while the voice still has samples"
+        );
+        assert_eq!(fixture.playing.len(), 2, "one narration + music remain");
+    }
+
+    #[tokio::test]
+    async fn reaper_prunes_finished_samples_from_their_voice() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("fx"), 1.0)).await;
+        fixture.run(play(Some("fx"), 1.0)).await;
+        fixture.drain();
+        assert_eq!(
+            fixture
+                .voice_manager
+                .lock()
+                .get_voice_sample_ids("fx")
+                .len(),
+            2
+        );
+
+        // One sample finishes: only the one still playing stays in the voice.
+        finish_voice_sample(&mut fixture, "fx");
+        fixture.reap();
+        let remaining = fixture.voice_manager.lock().get_voice_sample_ids("fx");
+        assert_eq!(remaining.len(), 1, "the finished sample leaves its voice");
+        assert!(
+            fixture.playing.contains_key(&remaining[0]),
+            "the sample left in the voice is the one still playing"
+        );
+
+        // The last sample finishes: the named voice stays, with nothing in it.
+        finish_voice_sample(&mut fixture, "fx");
+        fixture.reap();
+        let manager = fixture.voice_manager.lock();
+        assert!(
+            manager.get_voice_sample_ids("fx").is_empty(),
+            "the last sample leaves its voice"
+        );
+        assert_eq!(
+            manager.voice_count(),
+            1,
+            "a named voice outlives its sounds"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_voice_with_no_name_ends_with_its_sound() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(None, 1.0)).await;
+        fixture.drain();
+        let voice = fixture.mixer.active_samples[0].voice_id.clone();
+
+        finish_voice_sample(&mut fixture, &voice);
+        fixture.reap();
+        assert_eq!(fixture.voice_manager.lock().voice_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reaper_prunes_a_finished_streamed_source_from_its_voice() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play_stream(Some("bed"))).await;
+        fixture.drain();
+        assert_eq!(
+            fixture
+                .voice_manager
+                .lock()
+                .get_voice_sample_ids("bed")
+                .len(),
+            1
+        );
+
+        // The RT thread retires the real streamed source into its graveyard.
+        let finished = fixture.mixer.streamed_sources.swap_remove(0);
+        fixture
+            .streamed_grave_tx
+            .push(finished)
+            .ok()
+            .expect("streamed graveyard has room");
+        fixture.reap();
+
+        let manager = fixture.voice_manager.lock();
+        assert!(
+            manager.get_voice_sample_ids("bed").is_empty(),
+            "a finished streamed source leaves its voice"
+        );
+        assert_eq!(manager.voice_count(), 1, "the named voice stays");
+    }
+
+    #[tokio::test]
+    async fn voice_commands_on_a_voice_whose_sounds_finished_succeed() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("fx"), 1.0)).await;
+        fixture.drain();
+        finish_voice_sample(&mut fixture, "fx");
+        fixture.reap();
+        while fixture.cmd_rx.pop().is_some() {}
+
+        for json in [
+            r#"{"command": "voice_stop", "voice": "fx"}"#,
+            r#"{"command": "voice_fade_out", "voice": "fx", "time": 500}"#,
+        ] {
+            let mut outcome = submit(&mut fixture, &mut scheduler, json).await;
+            assert_eq!(
+                outcome_of(&mut outcome).unwrap(),
+                "Command completed",
+                "{json}"
+            );
+        }
+        assert!(
+            fixture.cmd_rx.pop().is_none(),
+            "a stop or fade with nothing playing sends nothing to the audio thread"
+        );
+
+        let mut volume = submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_volume", "voice": "fx", "volume": 0.5}"#,
+        )
+        .await;
+        assert_eq!(outcome_of(&mut volume).unwrap(), "Command completed");
+        assert_eq!(
+            fixture.voice_manager.lock().get_voice_volume("fx"),
+            Some(0.5)
+        );
+    }
+
+    #[tokio::test]
+    async fn voice_stop_on_an_unknown_voice_succeeds_without_creating_it() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let mut outcome = submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_stop", "voice": "nobody"}"#,
+        )
+        .await;
+        assert_eq!(outcome_of(&mut outcome).unwrap(), "Command completed");
+        assert_eq!(fixture.voice_manager.lock().voice_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_voice_played_again_after_it_finished_keeps_its_volume() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("fx"), 1.0)).await;
+        fixture
+            .run(AudioCommand::VoiceVolume {
+                voice: "fx".to_string(),
+                volume: 0.3,
+            })
+            .await;
+        fixture.drain();
+        finish_voice_sample(&mut fixture, "fx");
+        fixture.reap();
+
+        // The voice outlived its last sound, so a new play starts at its volume.
+        fixture.run(play(Some("fx"), 1.0)).await;
+        fixture.drain();
+        let sample = fixture
+            .mixer
+            .active_samples
+            .iter()
+            .find(|s| s.voice_id == "fx")
+            .expect("the new fx sample");
+        assert_eq!(sample.voice_volume, 0.3);
+    }
+
+    #[tokio::test]
+    async fn reaper_restore_uses_the_rules_fade_duration_not_a_fixed_default() {
+        // D25/D3: a 200ms rule must restore over ~200ms end-to-end through the
+        // control-side reaper path, not the old hardcoded 2000ms.
+        let rule = DuckingRule {
+            primary_voice: "narration".to_string(),
+            ducked_voices: vec!["music".to_string()],
+            target_volume: 0.1,
+            fade_duration_ms: 200,
+        };
+        let mut fixture = Fixture::new(vec![rule]);
+
+        fixture.run(play(Some("music"), 1.0)).await;
+        fixture.run(play(Some("narration"), 1.0)).await;
+        fixture.drain();
+        // Drain the duck commands so the ring only holds what the reaper emits next.
+        while fixture.cmd_rx.pop().is_some() {}
+
+        // The narration sample finishes; the reaper emits the restore for "music".
+        finish_voice_sample(&mut fixture, "narration");
+        fixture.reap();
+
+        let restore = fixture.cmd_rx.pop().expect("a restore command on the ring");
+        match restore {
+            rt_engine::AudioCommand::SetDuckTarget(change) => {
+                assert_eq!(change.voice, "music");
+                assert!((change.target_volume - 1.0).abs() < 1e-6);
+                // 200ms at 48kHz == 9600 frames, not the old 2000ms (96000 frames).
+                assert_eq!(
+                    change.fade_frames,
+                    (SR / 5) as usize,
+                    "restore must use the rule's 200ms fade, got {} frames",
+                    change.fade_frames
+                );
+            }
+            other => panic!(
+                "expected a SetDuckTarget restore, got {:?}",
+                other_variant(&other)
+            ),
+        }
+    }
+
+    /// Describe a command variant for panic messages without requiring `Debug` on
+    /// the payloads (which carry non-Debug ring consumers).
+    fn other_variant(cmd: &rt_engine::AudioCommand) -> &'static str {
+        match cmd {
+            rt_engine::AudioCommand::AddSample(_) => "AddSample",
+            rt_engine::AudioCommand::AddLiveInput(_) => "AddLiveInput",
+            rt_engine::AudioCommand::AddStreamedSource(_) => "AddStreamedSource",
+            rt_engine::AudioCommand::SetDuckTarget(_) => "SetDuckTarget",
+            rt_engine::AudioCommand::FadeOutAll { .. } => "FadeOutAll",
+            rt_engine::AudioCommand::FadeOutSamples { .. } => "FadeOutSamples",
+            rt_engine::AudioCommand::FadeOutMatching { .. } => "FadeOutMatching",
+            rt_engine::AudioCommand::SetVoiceVolume { .. } => "SetVoiceVolume",
+            rt_engine::AudioCommand::SetInputVolume { .. } => "SetInputVolume",
+            rt_engine::AudioCommand::SetInputMute { .. } => "SetInputMute",
+            rt_engine::AudioCommand::SeekMatching { .. } => "SeekMatching",
+            rt_engine::AudioCommand::SetSpeedMatching { .. } => "SetSpeedMatching",
+            rt_engine::AudioCommand::SetVolumeMatching { .. } => "SetVolumeMatching",
+            rt_engine::AudioCommand::SetSpeedWithCorrector { .. } => "SetSpeedWithCorrector",
+            rt_engine::AudioCommand::UpgradeSampleBuffer { .. } => "UpgradeSampleBuffer",
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_fades_samples_and_flushes_metadata() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.run(play(Some("v"), 1.0)).await;
+
+        shutdown(&mut fixture.cmd_tx, &fixture.cache_manager).await;
+        fixture.drain();
+
+        // Every active sample now has a fade-out applied (drained to silence by the
+        // real callback at runtime; here we just assert the fade was set).
+        assert!(!fixture.mixer.active_samples.is_empty());
+        for sample in &fixture.mixer.active_samples {
+            assert!(matches!(sample.fade_state, FadeState::Out { .. }));
+        }
+        // Cache metadata was flushed to disk on shutdown.
+        let metadata = fixture._cache_dir.path().join("metadata.json");
+        assert!(
+            metadata.exists(),
+            "metadata.json should be flushed on shutdown"
+        );
+    }
+
+    /// A `MakeWriter` that appends every formatted log record to a shared byte
+    /// buffer, so a test can inspect exactly what a tracing layer wrote.
+    #[derive(Clone)]
+    struct BufferWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for BufferWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufferWriter {
+        type Writer = BufferWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn json_logging_format_emits_line_delimited_json() {
+        // F13: with logging.format = "json", each record the fmt layer writes must
+        // be a standalone JSON object on its own line (line-delimited JSON), so a
+        // log aggregator can parse it. Capture the layer's output and assert every
+        // non-empty line parses as JSON carrying the fields we emitted.
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = build_fmt_layer("json", tracing::Level::INFO, BufferWriter(buffer.clone()));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(voice = "music", "first event");
+            tracing::warn!("second event");
+        });
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = output.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "two events => two JSON lines, got: {output:?}"
+        );
+
+        for line in &lines {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("each line must be valid JSON ({e}): {line:?}"));
+            assert!(
+                value.get("level").is_some(),
+                "a JSON log record carries a level field: {line}"
+            );
+            assert!(
+                value.get("fields").and_then(|f| f.get("message")).is_some(),
+                "a JSON log record carries the message under fields: {line}"
+            );
+        }
+
+        // The structured field we attached to the first event is present in JSON.
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(
+            first["fields"]["voice"], "music",
+            "structured fields are serialized in JSON mode: {}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn text_logging_format_is_not_json() {
+        // The default text format is human-readable, not JSON: a captured line must
+        // NOT parse as a JSON object (it is the plain fmt rendering).
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let layer = build_fmt_layer("text", tracing::Level::INFO, BufferWriter(buffer.clone()));
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("a human line");
+        });
+
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains("a human line"),
+            "text output carries the message"
+        );
+        assert!(
+            serde_json::from_str::<serde_json::Value>(output.trim()).is_err(),
+            "text format must not be JSON, got: {output:?}"
+        );
+    }
+
+    // ---- Command scheduler: requests and background loads ----------------------
+
+    type Outcome = tokio::sync::oneshot::Receiver<mqtt::commands::CommandOutcome>;
+
+    /// Submit `json` as an HTTP request does, returning where its outcome arrives.
+    async fn submit(
+        fixture: &mut Fixture,
+        scheduler: &mut CommandScheduler,
+        json: &str,
+    ) -> Outcome {
+        let (request, outcome) = mqtt::commands::CommandRequest::with_reply(json.to_string());
+        fixture
+            .take(scheduler, SchedulerInput::Request(request))
+            .await;
+        outcome
+    }
+
+    /// Wait for the scheduler's next background load to finish, without taking it.
+    async fn next_load(scheduler: &mut CommandScheduler) -> SchedulerInput {
+        tokio::time::timeout(std::time::Duration::from_secs(10), scheduler.next_load())
+            .await
+            .expect("a background load finishes within 10 s")
+    }
+
+    /// Wait for the scheduler's next background load to finish and take its result.
+    async fn finish_next_load(fixture: &mut Fixture, scheduler: &mut CommandScheduler) {
+        let input = next_load(scheduler).await;
+        fixture.take(scheduler, input).await;
+    }
+
+    /// The outcome a request has already been given.
+    fn outcome_of(outcome: &mut Outcome) -> mqtt::commands::CommandOutcome {
+        outcome.try_recv().expect("the request has its outcome")
+    }
+
+    /// The outcome a request is given within 10 s.
+    async fn awaited_outcome(outcome: Outcome) -> mqtt::commands::CommandOutcome {
+        tokio::time::timeout(std::time::Duration::from_secs(10), outcome)
+            .await
+            .expect("the request gets its outcome within 10 s")
+            .expect("the request is answered, not dropped")
+    }
+
+    /// Whether a request is still waiting for its outcome.
+    fn is_waiting(outcome: &mut Outcome) -> bool {
+        matches!(
+            outcome.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        )
+    }
+
+    fn play_json(file: &str, voice: &str) -> String {
+        serde_json::json!({"command": "play", "file": file, "voice": voice}).to_string()
+    }
+
+    const STOPALL: &str = r#"{"command": "stopall"}"#;
+
+    /// A scheduler whose loads take permits from `permits`, so a test can hold a
+    /// load in flight by giving out none.
+    fn scheduler_with(permits: usize) -> (CommandScheduler, Arc<tokio::sync::Semaphore>) {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
+        (CommandScheduler::new(semaphore.clone()), semaphore)
+    }
+
+    /// Submit `json` as an MQTT message does: nobody waits for its outcome.
+    async fn submit_unreplied(fixture: &mut Fixture, scheduler: &mut CommandScheduler, json: &str) {
+        let request = mqtt::commands::CommandRequest::fire_and_forget(json.to_string());
+        fixture
+            .take(scheduler, SchedulerInput::Request(request))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn scheduler_logs_a_failed_mqtt_command() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let ((), warnings) = capturing_warnings(submit_unreplied(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "speed", "voice": "Crank2", "speed": 1.08}"#,
+        ))
+        .await;
+
+        assert_eq!(
+            warnings,
+            vec!["Command failed: No sample matches the selector"]
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_logs_a_failed_mqtt_command_once_when_its_handler_already_did() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let ((), warnings) = capturing_warnings(submit_unreplied(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "input_volume", "input": "nobody", "volume": 0.5}"#,
+        ))
+        .await;
+
+        assert_eq!(
+            warnings,
+            vec!["Input 'nobody' is unavailable; volume command was not queued"]
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_leaves_a_failure_it_answers_over_http_to_the_reply() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let (mut outcome, warnings) = capturing_warnings(submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "speed", "voice": "Crank2", "speed": 1.08}"#,
+        ))
+        .await;
+
+        assert!(warnings.is_empty(), "got {warnings:?}");
+        assert_eq!(
+            outcome_of(&mut outcome).unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_logs_an_mqtt_load_rejected_by_the_limit() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+        for i in 0..MAX_CONCURRENT_LOADS {
+            submit_unreplied(
+                &mut fixture,
+                &mut scheduler,
+                &play_json(TEST_WAV, &format!("v{i}")),
+            )
+            .await;
+        }
+
+        let ((), warnings) = capturing_warnings(submit_unreplied(
+            &mut fixture,
+            &mut scheduler,
+            &play_json(TEST_WAV, "over"),
+        ))
+        .await;
+
+        assert_eq!(warnings, vec!["Command failed: Too many concurrent loads"]);
+    }
+
+    #[tokio::test]
+    async fn scheduler_logs_a_failed_mqtt_load_once() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let missing = fixture._cache_dir.path().join("missing.wav");
+        submit_unreplied(
+            &mut fixture,
+            &mut scheduler,
+            &play_json(missing.to_str().unwrap(), "v"),
+        )
+        .await;
+
+        let ((), warnings) =
+            capturing_warnings(finish_next_load(&mut fixture, &mut scheduler)).await;
+
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|w| w.starts_with("Load failed"))
+                .count(),
+            1,
+            "got {warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.starts_with("Command failed")),
+            "the load failure is not logged a second time, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_logs_an_mqtt_play_superseded_by_a_stop() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        submit_unreplied(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        let loaded = next_load(&mut scheduler).await;
+
+        let ((), logged) = capturing_logs(
+            tracing::Level::INFO,
+            submit_unreplied(&mut fixture, &mut scheduler, STOPALL),
+        )
+        .await;
+        let ((), late) =
+            capturing_logs(tracing::Level::INFO, fixture.take(&mut scheduler, loaded)).await;
+
+        assert_eq!(
+            logged,
+            vec![
+                format!("Cancelled play of {TEST_WAV}: Superseded by stopall/fadeall"),
+                "Processing command: StopAll".to_string(),
+                "Stopping 0 samples (10ms fade-out)".to_string(),
+            ]
+        );
+        assert!(
+            late.is_empty(),
+            "the cancelled play's load result is dropped quietly, got {late:?}"
+        );
+        assert!(fixture.playing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduler_answers_a_play_once_its_sample_is_queued() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let mut outcome = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        assert!(
+            is_waiting(&mut outcome),
+            "a play is answered only once it starts"
+        );
+        assert!(fixture.playing.is_empty());
+
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(outcome_of(&mut outcome).unwrap(), "Command completed");
+        assert_eq!(fixture.playing.len(), 1);
+        assert_eq!(
+            fixture.drain(),
+            1,
+            "the started sample is on the audio command ring"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_reports_a_missing_file_as_not_found() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let missing = fixture._cache_dir.path().join("missing.wav");
+
+        let mut outcome = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_json(missing.to_str().unwrap(), "v"),
+        )
+        .await;
+        let ((), warnings) =
+            capturing_warnings(finish_next_load(&mut fixture, &mut scheduler)).await;
+
+        let error = outcome_of(&mut outcome).unwrap_err();
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::NotFound);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Load failed")),
+            "a failed load is logged, got {warnings:?}"
+        );
+        assert!(fixture.playing.is_empty());
+    }
+
+    #[tokio::test]
+    async fn scheduler_rejects_a_play_outside_the_allowed_directories() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let allowed = tempfile::tempdir().unwrap();
+        fixture.config.security.allowed_directories =
+            vec![allowed.path().to_string_lossy().into_owned()];
+
+        let mut outcome = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        let ((), warnings) =
+            capturing_warnings(finish_next_load(&mut fixture, &mut scheduler)).await;
+
+        let error = outcome_of(&mut outcome).unwrap_err();
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::Forbidden);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Load failed")),
+            "a rejected load is logged, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_rejects_a_play_routed_to_an_unknown_channel() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let json = serde_json::json!({
+            "command": "play",
+            "file": TEST_WAV,
+            "channel_map": [{"src": 0, "dest": "nowhere"}]
+        })
+        .to_string();
+
+        let mut outcome = submit(&mut fixture, &mut scheduler, &json).await;
+        let ((), warnings) =
+            capturing_warnings(finish_next_load(&mut fixture, &mut scheduler)).await;
+
+        let error = outcome_of(&mut outcome).unwrap_err();
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::InvalidRequest);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Load failed")),
+            "a rejected load is logged, got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_rejects_malformed_json_and_unknown_commands() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let (mut malformed, warnings) =
+            capturing_warnings(submit(&mut fixture, &mut scheduler, "{not json")).await;
+        assert_eq!(
+            outcome_of(&mut malformed).unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::InvalidRequest
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Macro expansion error")),
+            "got {warnings:?}"
+        );
+
+        let (mut unknown, warnings) = capturing_warnings(submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "nope"}"#,
+        ))
+        .await;
+        assert_eq!(
+            outcome_of(&mut unknown).unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::InvalidRequest
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Failed to parse command")),
+            "got {warnings:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_rejects_a_load_beyond_the_concurrent_limit() {
+        let (mut scheduler, _permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+        let mut in_flight = Vec::new();
+        for i in 0..MAX_CONCURRENT_LOADS {
+            in_flight.push(
+                submit(
+                    &mut fixture,
+                    &mut scheduler,
+                    &play_json(TEST_WAV, &format!("v{i}")),
+                )
+                .await,
+            );
+        }
+
+        let mut rejected = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "over")).await;
+        let error = outcome_of(&mut rejected).unwrap_err();
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::Internal);
+        assert_eq!(error.message, "Too many concurrent loads");
+        assert!(in_flight.iter_mut().all(is_waiting));
+    }
+
+    #[tokio::test]
+    async fn scheduler_counts_cache_commands_against_the_load_limit_until_they_end() {
+        let (mut scheduler, permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+        let precache = serde_json::json!({"command": "precache", "file": TEST_WAV}).to_string();
+        let mut in_flight = Vec::new();
+        for _ in 0..MAX_CONCURRENT_LOADS {
+            in_flight.push(submit(&mut fixture, &mut scheduler, &precache).await);
+        }
+
+        let mut rejected = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        assert_eq!(
+            outcome_of(&mut rejected).unwrap_err().message,
+            "Too many concurrent loads"
+        );
+
+        permits.add_permits(1);
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        let mut accepted = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        assert!(
+            is_waiting(&mut accepted),
+            "a finished cache command gives up its slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_stopall_cancels_a_load_in_flight() {
+        let (mut scheduler, _permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+
+        let play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        // Let the load task start and wait for a permit.
+        tokio::task::yield_now().await;
+        let mut stop = submit(&mut fixture, &mut scheduler, STOPALL).await;
+        assert_eq!(outcome_of(&mut stop).unwrap(), "Command completed");
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+
+        assert!(scheduler.loads.is_empty());
+        assert!(scheduler.pending.is_empty());
+        assert!(fixture.playing.is_empty());
+        // An aborted load drops what it holds once the runtime polls it; one left
+        // running would still be waiting for a slot, holding the cache.
+        for _ in 0..10 {
+            if Arc::strong_count(&fixture.cache_manager) == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            Arc::strong_count(&fixture.cache_manager),
+            1,
+            "the cancelled load was aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_answers_a_play_cancelled_before_its_load_task_ran() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        // The stop arrives before the runtime has polled the new load task once.
+        let play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        let _stop = submit(&mut fixture, &mut scheduler, STOPALL).await;
+
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_answers_a_cache_command_cancelled_before_its_task_ran() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let json = serde_json::json!({"command": "precache", "file": TEST_WAV}).to_string();
+
+        let precache = submit(&mut fixture, &mut scheduler, &json).await;
+        scheduler.abort_loads();
+
+        assert_eq!(
+            awaited_outcome(precache).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_stopall_cancels_a_load_that_finished_but_was_not_taken() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let mut play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        let loaded = next_load(&mut scheduler).await;
+        let _stop = submit(&mut fixture, &mut scheduler, STOPALL).await;
+        fixture.take(&mut scheduler, loaded).await;
+
+        assert_eq!(
+            outcome_of(&mut play).unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+        assert!(
+            fixture.playing.is_empty(),
+            "a play cancelled by a stop never starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_plays_sent_after_a_stop_start_normally() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let _stop = submit(&mut fixture, &mut scheduler, STOPALL).await;
+        let mut play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        finish_next_load(&mut fixture, &mut scheduler).await;
+
+        assert_eq!(outcome_of(&mut play).unwrap(), "Command completed");
+        assert_eq!(fixture.playing.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scheduler_ignores_a_request_whose_client_has_gone() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let (request, outcome) =
+            mqtt::commands::CommandRequest::with_reply(play_json(TEST_WAV, "v"));
+        drop(outcome);
+        fixture
+            .take(&mut scheduler, SchedulerInput::Request(request))
+            .await;
+
+        assert!(
+            scheduler.loads.is_empty(),
+            "no load starts for a client that has gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_discards_a_loaded_play_whose_client_has_gone() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+
+        let outcome = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        drop(outcome);
+        finish_next_load(&mut fixture, &mut scheduler).await;
+
+        assert!(fixture.playing.is_empty());
+        assert_eq!(fixture.drain(), 0, "nothing reaches the audio thread");
+    }
+
+    #[tokio::test]
+    async fn scheduler_runs_cache_commands_as_background_loads() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let json = serde_json::json!({"command": "precache", "file": TEST_WAV}).to_string();
+
+        let mut outcome = submit(&mut fixture, &mut scheduler, &json).await;
+        assert!(
+            is_waiting(&mut outcome),
+            "a precache runs in the background"
+        );
+        finish_next_load(&mut fixture, &mut scheduler).await;
+
+        assert_eq!(outcome_of(&mut outcome).unwrap(), "Command completed");
+        assert!(fixture.playing.is_empty(), "a precache plays nothing");
+    }
+
+    #[tokio::test]
+    async fn scheduler_stopall_cancels_a_cache_command_in_flight() {
+        let (mut scheduler, _permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+        let json = serde_json::json!({"command": "precache", "file": TEST_WAV}).to_string();
+
+        let precache = submit(&mut fixture, &mut scheduler, &json).await;
+        // Let the load task start and wait for a permit.
+        tokio::task::yield_now().await;
+        let _stop = submit(&mut fixture, &mut scheduler, STOPALL).await;
+
+        assert_eq!(
+            awaited_outcome(precache).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_keeps_taking_commands_after_a_load_task_panics() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut scheduler, permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+
+        let mut play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        // A closed semaphore makes the waiting load task panic on its permit.
+        permits.close();
+        let ended = next_load(&mut scheduler).await;
+        assert!(
+            matches!(&ended, SchedulerInput::Loaded(Err(ended)) if ended.is_panic()),
+            "a panicked load task ends without a result"
+        );
+        let ((), errors) =
+            capturing_logs(tracing::Level::ERROR, fixture.take(&mut scheduler, ended)).await;
+
+        let error = outcome_of(&mut play).unwrap_err();
+        assert_eq!(error.kind, mqtt::commands::CommandErrorKind::Internal);
+        assert_eq!(
+            error.message,
+            format!("Load of {TEST_WAV} stopped unexpectedly")
+        );
+        assert_eq!(errors.len(), 1, "got {errors:?}");
+        assert!(
+            errors[0].starts_with(&format!("Load of {TEST_WAV} stopped unexpectedly: ")),
+            "got {errors:?}"
+        );
+        assert!(
+            fixture.voice_manager.lock().get_voice("v").is_none(),
+            "the play no longer holds its voice open"
+        );
+
+        let mut stop = submit(&mut fixture, &mut scheduler, STOPALL).await;
+        assert_eq!(outcome_of(&mut stop).unwrap(), "Command completed");
+    }
+
+    #[tokio::test]
+    async fn scheduler_shutdown_cancels_loads_in_flight() {
+        let (mut scheduler, _permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+
+        let play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "v")).await;
+        // Let the load task start and wait for a permit.
+        tokio::task::yield_now().await;
+        scheduler.abort_loads();
+
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+    }
+
+    // ---- Command scheduler: commands reaching plays that are still loading ------
+
+    /// A real HTTP server for test audio. Every path serves the test WAV; a path
+    /// held with `hold` answers only once the test opens its gate, which keeps a
+    /// play's load deterministically in flight.
+    struct AudioServer {
+        address: std::net::SocketAddr,
+        gates: Arc<std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Receiver<bool>>>>,
+        _serving: tokio::task::JoinHandle<()>,
+    }
+
+    /// Holds one response of an `AudioServer` until it is opened.
+    struct Gate(tokio::sync::oneshot::Sender<bool>);
+
+    impl Gate {
+        /// Send the audio.
+        fn release(self) {
+            let _ = self.0.send(true);
+        }
+
+        /// Answer 404 instead.
+        fn fail(self) {
+            let _ = self.0.send(false);
+        }
+    }
+
+    impl AudioServer {
+        async fn start() -> Self {
+            use axum::response::IntoResponse;
+            let wav = Arc::new(std::fs::read(TEST_WAV).unwrap());
+            let gates: Arc<
+                std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Receiver<bool>>>,
+            > = Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let routes = axum::Router::new().route(
+                "/:name",
+                axum::routing::get({
+                    let gates = gates.clone();
+                    move |axum::extract::Path(name): axum::extract::Path<String>| {
+                        let gate = gates.lock().unwrap().remove(&name);
+                        let wav = wav.clone();
+                        async move {
+                            let serve = match gate {
+                                Some(gate) => gate.await.unwrap_or(false),
+                                None => true,
+                            };
+                            if serve {
+                                (axum::http::StatusCode::OK, wav.to_vec()).into_response()
+                            } else {
+                                axum::http::StatusCode::NOT_FOUND.into_response()
+                            }
+                        }
+                    }
+                }),
+            );
+            let serving = tokio::spawn(async move {
+                axum::serve(listener, routes).await.unwrap();
+            });
+            Self {
+                address,
+                gates,
+                _serving: serving,
+            }
+        }
+
+        fn url(&self, name: &str) -> String {
+            format!("http://{}/{}", self.address, name)
+        }
+
+        /// Hold the response for `name` until the returned gate is opened.
+        fn hold(&self, name: &str) -> Gate {
+            let (open, opened) = tokio::sync::oneshot::channel();
+            self.gates.lock().unwrap().insert(name.to_string(), opened);
+            Gate(open)
+        }
+    }
+
+    /// A fixture, a scheduler and an audio server for plays loaded over HTTP.
+    async fn http_fixture() -> (Fixture, CommandScheduler, AudioServer) {
+        let mut fixture = Fixture::new(vec![]);
+        // A released load decodes on a shared test machine; give it time.
+        fixture.config.cache.stream_prebuffer_deadline_ms = 10_000;
+        let (scheduler, _permits) = scheduler_with(4);
+        (fixture, scheduler, AudioServer::start().await)
+    }
+
+    fn play_from(url: &str, voice: Option<&str>, id: Option<&str>) -> String {
+        let mut play = serde_json::json!({"command": "play", "file": url});
+        if let Some(voice) = voice {
+            play["voice"] = serde_json::json!(voice);
+        }
+        if let Some(id) = id {
+            play["id"] = serde_json::json!(id);
+        }
+        play.to_string()
+    }
+
+    /// Take finished loads until a sound plays in `voice`.
+    async fn finish_loads_until_playing(
+        fixture: &mut Fixture,
+        scheduler: &mut CommandScheduler,
+        voice: &str,
+    ) {
+        for _ in 0..8 {
+            if fixture.playing.values().any(|s| s.voice_id == voice) {
+                return;
+            }
+            finish_next_load(fixture, scheduler).await;
+        }
+        assert!(
+            fixture.playing.values().any(|s| s.voice_id == voice),
+            "a sound starts in {voice}"
+        );
+    }
+
+    /// Take every load still running, finished or cancelled, so a test can show
+    /// which of them started a sound.
+    async fn finish_every_load(fixture: &mut Fixture, scheduler: &mut CommandScheduler) {
+        while !scheduler.loads.is_empty() {
+            finish_next_load(fixture, scheduler).await;
+        }
+    }
+
+    /// The sound playing in `voice`, after the queued audio commands are applied.
+    fn sound_in<'a>(fixture: &'a mut Fixture, voice: &str) -> &'a audio::mixer::ActiveSample {
+        fixture.drain();
+        fixture
+            .mixer
+            .active_samples
+            .iter()
+            .find(|s| s.voice_id == voice)
+            .unwrap_or_else(|| panic!("a sound playing in {voice}"))
+    }
+
+    #[tokio::test]
+    async fn a_speed_sent_while_its_play_loads_reaches_the_sound_when_it_starts() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let gate = server.hold("crank2.wav");
+        let mut play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("crank2.wav"), Some("Crank2"), Some("Crank2")),
+        )
+        .await;
+
+        let mut speed = submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "speed", "voice": "Crank2", "speed": 1.08}"#,
+        )
+        .await;
+        assert_eq!(
+            outcome_of(&mut speed).unwrap(),
+            "Command completed",
+            "the speed is answered at once, without waiting for the load"
+        );
+        assert!(is_waiting(&mut play));
+
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(outcome_of(&mut play).unwrap(), "Command completed");
+        assert_eq!(sound_in(&mut fixture, "Crank2").speed, 1.08);
+    }
+
+    #[tokio::test]
+    async fn an_mqtt_command_carried_onto_a_loading_play_says_so() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gate = server.hold("crank2.wav");
+        submit_unreplied(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("crank2.wav"), Some("Crank2"), None),
+        )
+        .await;
+
+        let ((), logs) = capturing_logs(
+            tracing::Level::INFO,
+            submit_unreplied(
+                &mut fixture,
+                &mut scheduler,
+                r#"{"command": "speed", "voice": "Crank2", "speed": 1.08}"#,
+            ),
+        )
+        .await;
+
+        assert!(
+            logs.iter()
+                .any(|l| l.starts_with("Carried") && l.contains("1 play(s) still loading")),
+            "got {logs:?}"
+        );
+        assert!(
+            !logs.iter().any(|l| l.starts_with("Command failed")),
+            "a carried command did not fail, got {logs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn volume_and_seek_carry_onto_a_loading_play_by_id_and_file() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let url = server.url("bell.wav");
+        let gate = server.hold("bell.wav");
+        // No voice: commands reach it by id and file before it has one.
+        let _play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&url, None, Some("bell")),
+        )
+        .await;
+
+        let mut volume = submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "volume", "id": "bell", "volume": 0.4}"#,
+        )
+        .await;
+        let seek_json = serde_json::json!({"command": "seek", "file": url, "position_ms": 500});
+        let mut seek = submit(&mut fixture, &mut scheduler, &seek_json.to_string()).await;
+        assert_eq!(outcome_of(&mut volume).unwrap(), "Command completed");
+        assert_eq!(outcome_of(&mut seek).unwrap(), "Command completed");
+
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        fixture.drain();
+        let sound = &fixture.mixer.active_samples[0];
+        assert_eq!(sound.volume, 0.4);
+        assert_eq!(
+            sound.position,
+            SR as usize / 2,
+            "500 ms into a 48 kHz buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_last_carried_setting_of_a_kind_wins_over_the_play_own() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let gate = server.hold("loop.wav");
+        let mut play = serde_json::json!({
+            "command": "play", "file": server.url("loop.wav"), "voice": "V", "speed": 0.5
+        });
+        play["loop"] = serde_json::json!(true);
+        let _play = submit(&mut fixture, &mut scheduler, &play.to_string()).await;
+
+        for speed in [1.2, 1.5] {
+            let json = serde_json::json!({"command": "speed", "voice": "V", "speed": speed});
+            submit(&mut fixture, &mut scheduler, &json.to_string()).await;
+        }
+
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(sound_in(&mut fixture, "V").speed, 1.5);
+    }
+
+    #[tokio::test]
+    async fn a_command_reaches_playing_sounds_at_once_and_loading_plays_when_they_start() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let mut first = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "V")).await;
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(outcome_of(&mut first).unwrap(), "Command completed");
+        let gate = server.hold("second.wav");
+        let _second = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("second.wav"), Some("V"), Some("second")),
+        )
+        .await;
+
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "speed", "voice": "V", "speed": 1.3}"#,
+        )
+        .await;
+        assert_eq!(
+            sound_in(&mut fixture, "V").speed,
+            1.3,
+            "the playing sound changes speed without waiting for the load"
+        );
+
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        fixture.drain();
+        let second = fixture
+            .mixer
+            .active_samples
+            .iter()
+            .find(|s| s.sample_id.as_deref() == Some("second"))
+            .expect("the second sound");
+        assert_eq!(second.speed, 1.3);
+    }
+
+    #[tokio::test]
+    async fn an_internal_id_does_not_reach_a_play_still_loading() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gate = server.hold("a.wav");
+        let _play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("a.wav"), Some("V"), None),
+        )
+        .await;
+
+        let mut speed = submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "speed", "internal_id": "1", "speed": 1.5}"#,
+        )
+        .await;
+        assert_eq!(
+            outcome_of(&mut speed).unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn a_speed_ignored_with_a_warning_reaches_a_loading_play_without_changing_it() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let gate = server.hold("crank2.wav");
+        let play = serde_json::json!({
+            "command": "play", "file": server.url("crank2.wav"), "voice": "Crank2", "speed": 0.5
+        });
+        let _play = submit(&mut fixture, &mut scheduler, &play.to_string()).await;
+
+        let (mut speed, warnings) = capturing_warnings(submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "speed", "voice": "Crank2", "speed": -1.0, "pitch_correction": true}"#,
+        ))
+        .await;
+        assert_eq!(
+            outcome_of(&mut speed).unwrap(),
+            "Command completed",
+            "the speed reached a play, so it is not 'not found'"
+        );
+        assert_eq!(
+            warnings,
+            vec!["Negative speed (-1) is not supported with pitch correction; ignoring"]
+        );
+
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        let sound = sound_in(&mut fixture, "Crank2");
+        assert_eq!(sound.speed, 0.5, "the play keeps its own speed");
+        assert!(
+            !sound.has_pitch_correction(),
+            "the ignored speed does not turn pitch correction on"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_cancels_a_matching_play_before_it_starts() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let gate = server.hold("loop.wav");
+        let play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("loop.wav"), Some("V"), None),
+        )
+        .await;
+
+        let mut stop = submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "stop", "voice": "V"}"#,
+        )
+        .await;
+        assert_eq!(
+            outcome_of(&mut stop).unwrap(),
+            "Command completed",
+            "the stop reached a play, so it is not 'not found'"
+        );
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+
+        gate.release();
+        finish_every_load(&mut fixture, &mut scheduler).await;
+        assert!(
+            fixture.playing.is_empty(),
+            "the cancelled play never starts"
+        );
+        assert_eq!(fixture.drain(), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_fade_out_cancels_loading_plays_and_fades_playing_sounds_together() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _first = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "V")).await;
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        fixture.drain();
+        let gate = server.hold("next.wav");
+        let next = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("next.wav"), Some("V"), None),
+        )
+        .await;
+
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_fade_out", "voice": "V", "time": 500}"#,
+        )
+        .await;
+
+        assert_eq!(
+            awaited_outcome(next).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+        fixture.drain();
+        assert!(
+            matches!(
+                fixture.mixer.active_samples[0].fade_state,
+                FadeState::Out { .. }
+            ),
+            "the playing sound fades out"
+        );
+        gate.release();
+        finish_every_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(fixture.playing.len(), 1, "the cancelled play never starts");
+    }
+
+    #[tokio::test]
+    async fn voice_stop_cancels_a_loading_play_and_a_later_play_still_starts() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let gate = server.hold("old.wav");
+        let old = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("old.wav"), Some("V"), Some("old")),
+        )
+        .await;
+        let mut stop = submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_stop", "voice": "V"}"#,
+        )
+        .await;
+        assert_eq!(outcome_of(&mut stop).unwrap(), "Command completed");
+        assert_eq!(
+            awaited_outcome(old).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+
+        let mut replacement = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "V")).await;
+        finish_loads_until_playing(&mut fixture, &mut scheduler, "V").await;
+        assert_eq!(outcome_of(&mut replacement).unwrap(), "Command completed");
+        gate.release();
+        finish_every_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(fixture.playing.len(), 1, "only the replacement plays");
+    }
+
+    #[tokio::test]
+    async fn plays_a_stop_cancelled_leave_their_load_slots_to_later_plays() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gates: Vec<Gate> = (0..MAX_CONCURRENT_LOADS)
+            .map(|i| server.hold(&format!("l{i}.wav")))
+            .collect();
+        for i in 0..MAX_CONCURRENT_LOADS {
+            submit(
+                &mut fixture,
+                &mut scheduler,
+                &play_from(&server.url(&format!("l{i}.wav")), Some("V"), None),
+            )
+            .await;
+        }
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_stop", "voice": "V"}"#,
+        )
+        .await;
+
+        let mut play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "W")).await;
+        match play.try_recv() {
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+            answered => panic!("the play is loading, not answered at once: {answered:?}"),
+        }
+        finish_every_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(outcome_of(&mut play).unwrap(), "Command completed");
+    }
+
+    #[tokio::test]
+    async fn a_play_does_not_wait_for_an_earlier_play_in_its_voice() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gate = server.hold("slow.wav");
+        let mut slow = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("slow.wav"), Some("V"), None),
+        )
+        .await;
+
+        let mut quick = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "V")).await;
+        finish_loads_until_playing(&mut fixture, &mut scheduler, "V").await;
+
+        assert_eq!(outcome_of(&mut quick).unwrap(), "Command completed");
+        assert!(is_waiting(&mut slow));
+    }
+
+    #[tokio::test]
+    async fn voice_volume_reaches_a_voice_whose_only_play_is_loading() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let gate = server.hold("amb.wav");
+        let _play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("amb.wav"), Some("amb"), None),
+        )
+        .await;
+
+        let mut volume = submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_volume", "voice": "amb", "volume": 0.3}"#,
+        )
+        .await;
+        assert_eq!(outcome_of(&mut volume).unwrap(), "Command completed");
+
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(sound_in(&mut fixture, "amb").voice_volume, 0.3);
+    }
+
+    #[tokio::test]
+    async fn a_voice_keeps_its_volume_while_a_play_into_it_loads() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _first = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "amb")).await;
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_volume", "voice": "amb", "volume": 0.3}"#,
+        )
+        .await;
+        fixture.drain();
+        let gate = server.hold("next.wav");
+        let _next = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("next.wav"), Some("amb"), None),
+        )
+        .await;
+
+        // The playing sound ends while the next play is still loading.
+        finish_voice_sample(&mut fixture, "amb");
+        fixture.reap();
+
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(sound_in(&mut fixture, "amb").voice_volume, 0.3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_load_lets_go_of_its_voice() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let gate = server.hold("gone.wav");
+        let play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("gone.wav"), Some("amb"), None),
+        )
+        .await;
+        let mut volume = submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_volume", "voice": "amb", "volume": 0.3}"#,
+        )
+        .await;
+        assert_eq!(outcome_of(&mut volume).unwrap(), "Command completed");
+
+        gate.fail();
+        let ((), warnings) =
+            capturing_warnings(finish_next_load(&mut fixture, &mut scheduler)).await;
+        assert!(
+            warnings.iter().any(|w| w.starts_with("Load failed")),
+            "got {warnings:?}"
+        );
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::NotFound
+        );
+        let manager = fixture.voice_manager.lock();
+        let voice = manager
+            .get_voice("amb")
+            .expect("the stored volume keeps the voice");
+        assert_eq!(voice.loading_plays, 0, "nothing holds the voice open now");
+        assert_eq!(voice.volume, 0.3);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_play_lets_go_of_its_voice() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gate = server.hold("amb.wav");
+        let _play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("amb.wav"), Some("amb"), None),
+        )
+        .await;
+        assert_eq!(
+            fixture.voice_manager.lock().voice_count(),
+            1,
+            "a loading play holds its voice"
+        );
+
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "stop", "voice": "amb"}"#,
+        )
+        .await;
+        assert_eq!(fixture.voice_manager.lock().voice_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_play_whose_client_left_lets_go_of_its_voice_without_starting() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let gate = server.hold("amb.wav");
+        let play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("amb.wav"), Some("amb"), None),
+        )
+        .await;
+        drop(play);
+
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        assert!(fixture.playing.is_empty());
+        assert_eq!(fixture.voice_manager.lock().voice_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stopall_lets_go_of_every_voice_held_by_a_loading_play() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _a = server.hold("a.wav");
+        let _b = server.hold("b.wav");
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("a.wav"), Some("A"), None),
+        )
+        .await;
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("b.wav"), Some("B"), None),
+        )
+        .await;
+        assert_eq!(fixture.voice_manager.lock().voice_count(), 2);
+
+        submit(&mut fixture, &mut scheduler, STOPALL).await;
+        assert_eq!(fixture.voice_manager.lock().voice_count(), 0);
+        assert!(scheduler.loads.is_empty(), "stopall ends every load");
+    }
+
+    #[tokio::test]
+    async fn settings_carried_onto_a_windowed_play_apply_where_a_stream_allows() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let gate = server.hold("bed.wav");
+        let play = serde_json::json!({
+            "command": "play", "file": server.url("bed.wav"), "voice": "bed",
+            "mode": "stream", "window_ms": 200, "prebuffer_ms": 20
+        });
+        let _play = submit(&mut fixture, &mut scheduler, &play.to_string()).await;
+        for json in [
+            r#"{"command": "speed", "voice": "bed", "speed": 1.5}"#,
+            r#"{"command": "volume", "voice": "bed", "volume": 0.4}"#,
+            r#"{"command": "seek", "voice": "bed", "position_ms": 500}"#,
+        ] {
+            let mut outcome = submit(&mut fixture, &mut scheduler, json).await;
+            assert_eq!(
+                outcome_of(&mut outcome).unwrap(),
+                "Command completed",
+                "{json}"
+            );
+        }
+
+        gate.release();
+        let ((), warnings) =
+            capturing_warnings(finish_next_load(&mut fixture, &mut scheduler)).await;
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("windowed") && w.contains("normal speed")),
+            "a carried speed cannot apply to a stream, got {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.starts_with("Seek is not supported for windowed")),
+            "a carried seek cannot apply to a stream, got {warnings:?}"
+        );
+        fixture.drain();
+        assert_eq!(
+            fixture.mixer.streamed_sources[0].volume, 0.4,
+            "a carried volume does"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_voice_stays_after_the_last_sound_of_a_play_that_loaded() {
+        let (mut scheduler, _permits) = scheduler_with(4);
+        let mut fixture = Fixture::new(vec![]);
+        let mut play = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "amb")).await;
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(outcome_of(&mut play).unwrap(), "Command completed");
+
+        fixture.drain();
+        finish_voice_sample(&mut fixture, "amb");
+        fixture.reap();
+        assert!(
+            fixture.voice_manager.lock().get_voice("amb").is_some(),
+            "a play naming the voice started, so the voice is kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_voice_stays_open_while_a_second_play_into_it_loads() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let gate = server.hold("second.wav");
+        let _second = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("second.wav"), Some("amb"), None),
+        )
+        .await;
+        let _first = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "amb")).await;
+        finish_loads_until_playing(&mut fixture, &mut scheduler, "amb").await;
+
+        fixture.drain();
+        finish_voice_sample(&mut fixture, "amb");
+        fixture.reap();
+        assert!(
+            fixture.voice_manager.lock().get_voice("amb").is_some(),
+            "the second play still holds the voice open"
+        );
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+    }
+
+    #[tokio::test]
+    async fn voice_speed_carries_onto_a_play_still_loading() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let gate = server.hold("amb.wav");
+        let _play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("amb.wav"), Some("amb"), None),
+        )
+        .await;
+
+        let mut outcome = submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_speed", "voice": "amb", "speed": 0.5}"#,
+        )
+        .await;
+        assert_eq!(outcome_of(&mut outcome).unwrap(), "Command completed");
+
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        fixture.drain();
+        assert_eq!(fixture.mixer.active_samples[0].speed, 0.5);
+    }
+
+    #[tokio::test]
+    async fn voice_clear_cancels_plays_into_its_voice_that_have_not_started() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _amb = server.hold("amb.wav");
+        let _sfx = server.hold("sfx.wav");
+        let mut amb = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("amb.wav"), Some("amb"), None),
+        )
+        .await;
+        let _sfx_play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("sfx.wav"), Some("sfx"), None),
+        )
+        .await;
+
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_clear", "voice": "amb"}"#,
+        )
+        .await;
+        assert_eq!(
+            outcome_of(&mut amb).unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+        assert_eq!(scheduler.pending.len(), 1, "the sfx play still loads");
+        assert!(fixture.voice_manager.lock().get_voice("amb").is_none());
+    }
+
+    #[tokio::test]
+    async fn reset_and_clearing_every_voice_cancel_every_play_still_loading() {
+        for json in [
+            r#"{"command": "voice_clear", "voice": "*"}"#,
+            r#"{"command": "reset"}"#,
+        ] {
+            let (mut fixture, mut scheduler, server) = http_fixture().await;
+            let _a = server.hold("a.wav");
+            let _b = server.hold("b.wav");
+            let mut a = submit(
+                &mut fixture,
+                &mut scheduler,
+                &play_from(&server.url("a.wav"), Some("A"), None),
+            )
+            .await;
+            let mut b = submit(
+                &mut fixture,
+                &mut scheduler,
+                &play_from(&server.url("b.wav"), None, None),
+            )
+            .await;
+
+            let mut outcome = submit(&mut fixture, &mut scheduler, json).await;
+            assert_eq!(
+                outcome_of(&mut outcome).unwrap(),
+                "Command completed",
+                "{json}"
+            );
+            for play in [&mut a, &mut b] {
+                assert_eq!(
+                    outcome_of(play).unwrap_err().kind,
+                    mqtt::commands::CommandErrorKind::Cancelled,
+                    "{json}"
+                );
+            }
+            assert!(scheduler.pending.is_empty(), "{json}");
+            assert_eq!(fixture.voice_manager.lock().voice_count(), 0, "{json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_cancels_a_play_aborts_its_load() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gate = server.hold("loop.wav");
+        let _play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("loop.wav"), Some("V"), None),
+        )
+        .await;
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "stop", "voice": "V"}"#,
+        )
+        .await;
+
+        let ended = next_load(&mut scheduler).await;
+        assert!(
+            matches!(&ended, SchedulerInput::Loaded(Err(error)) if error.is_cancelled()),
+            "the cancelled play's load is aborted, not left running"
+        );
+    }
+
+    #[tokio::test]
+    async fn fadeall_cancels_a_play_still_loading() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gate = server.hold("a.wav");
+        let play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("a.wav"), Some("A"), None),
+        )
+        .await;
+        submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "fadeall", "time": 500}"#,
+        )
+        .await;
+
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+        assert_eq!(fixture.voice_manager.lock().voice_count(), 0);
+        assert!(scheduler.loads.is_empty(), "fadeall ends every load");
+    }
+
+    #[tokio::test]
+    async fn voice_fade_out_reaching_only_a_loading_play_succeeds() {
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gate = server.hold("a.wav");
+        let play = submit(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&server.url("a.wav"), Some("V"), None),
+        )
+        .await;
+        let mut fade = submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "voice_fade_out", "voice": "V", "time": 500}"#,
+        )
+        .await;
+        assert_eq!(outcome_of(&mut fade).unwrap(), "Command completed");
+        assert_eq!(
+            awaited_outcome(play).await.unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn a_play_rejected_by_the_load_limit_holds_no_voice() {
+        let (mut scheduler, _permits) = scheduler_with(0);
+        let mut fixture = Fixture::new(vec![]);
+        for i in 0..MAX_CONCURRENT_LOADS {
+            submit(
+                &mut fixture,
+                &mut scheduler,
+                &play_json(TEST_WAV, &format!("v{i}")),
+            )
+            .await;
+        }
+        let mut over = submit(&mut fixture, &mut scheduler, &play_json(TEST_WAV, "over")).await;
+        assert_eq!(
+            outcome_of(&mut over).unwrap_err().kind,
+            mqtt::commands::CommandErrorKind::Internal
+        );
+        assert!(
+            fixture.voice_manager.lock().get_voice("over").is_none(),
+            "a rejected play never held its voice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_speed_for_a_streamed_voice_does_not_carry_onto_a_play_into_it() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let windowed = serde_json::json!({
+            "command": "play", "file": server.url("bed.wav"), "voice": "bed",
+            "mode": "stream", "window_ms": 200, "prebuffer_ms": 20
+        });
+        let mut bed = submit(&mut fixture, &mut scheduler, &windowed.to_string()).await;
+        let ((), started) =
+            capturing_warnings(finish_next_load(&mut fixture, &mut scheduler)).await;
+        assert!(started.is_empty(), "got {started:?}");
+        assert_eq!(outcome_of(&mut bed).unwrap(), "Command completed");
+        assert!(fixture.streamed_voices.contains("bed"));
+
+        let gate = server.hold("next.wav");
+        let full = serde_json::json!({
+            "command": "play", "file": server.url("next.wav"), "voice": "bed", "mode": "full"
+        });
+        let _next = submit(&mut fixture, &mut scheduler, &full.to_string()).await;
+        let (_speed, warnings) = capturing_warnings(submit(
+            &mut fixture,
+            &mut scheduler,
+            r#"{"command": "speed", "voice": "bed", "speed": 1.5}"#,
+        ))
+        .await;
+        assert_eq!(
+            warnings,
+            vec![
+                "Speed/pitch is not supported for windowed/streamed voices; ignoring (a streamed \
+                 source plays forward only)"
+            ]
+        );
+
+        gate.release();
+        finish_next_load(&mut fixture, &mut scheduler).await;
+        assert_eq!(
+            sound_in(&mut fixture, "bed").speed,
+            1.0,
+            "one at a time, the speed reaches a streamed voice and is ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stop_cancelling_an_mqtt_play_logs_why() {
+        let _serial = MAIN_TEST_LOCK.lock().await;
+        let (mut fixture, mut scheduler, server) = http_fixture().await;
+        let _gate = server.hold("a.wav");
+        let url = server.url("a.wav");
+        submit_unreplied(
+            &mut fixture,
+            &mut scheduler,
+            &play_from(&url, Some("V"), None),
+        )
+        .await;
+        let ((), logs) = capturing_logs(
+            tracing::Level::INFO,
+            submit_unreplied(
+                &mut fixture,
+                &mut scheduler,
+                r#"{"command": "voice_stop", "voice": "V"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(
+            logs,
+            vec![format!(
+                "Cancelled play of {url}: Cancelled by a stop before it started"
+            )]
+        );
+    }
+
+    // ---- Command scheduler against one-at-a-time processing ---------------------
+
+    const SCRIPT_VOICES: [&str; 3] = ["A", "B", "C"];
+    const SCRIPT_IDS: [&str; 2] = ["x", "y"];
+    const SCRIPT_FILES: [&str; 2] = ["f.wav", "g.wav"];
+
+    /// Which sounds a selector command names, over the small alphabets above.
+    #[derive(Clone, Debug)]
+    struct Pick {
+        voice: Option<usize>,
+        id: Option<usize>,
+        file: Option<usize>,
+    }
+
+    /// One step of a generated script.
+    #[derive(Clone, Debug)]
+    enum Step {
+        /// A play of a shared file that loads, or of its own file whose load fails.
+        Play {
+            voice: Option<usize>,
+            id: Option<usize>,
+            file: usize,
+            fails: bool,
+            speed: Option<f32>,
+            volume: Option<f32>,
+            position: Option<u64>,
+        },
+        Speed {
+            pick: Pick,
+            speed: f32,
+            pitch: bool,
+        },
+        Volume {
+            pick: Pick,
+            volume: f32,
+        },
+        Seek {
+            pick: Pick,
+            position: u64,
+        },
+        Stop {
+            pick: Pick,
+        },
+        VoiceStop {
+            voice: usize,
+        },
+        VoiceFadeOut {
+            voice: usize,
+        },
+        VoiceVolume {
+            voice: usize,
+            volume: f32,
+        },
+        StopAll,
+        FadeAll,
+        /// The load of the `which`-th play still loading (modulo how many there
+        /// are) ends.
+        Finish {
+            which: usize,
+        },
+    }
+
+    fn arb_pick() -> impl proptest::strategy::Strategy<Value = Pick> {
+        use proptest::prelude::*;
+        (
+            proptest::option::weighted(0.6, 0..SCRIPT_VOICES.len()),
+            proptest::option::weighted(0.35, 0..SCRIPT_IDS.len()),
+            proptest::option::weighted(0.3, 0..SCRIPT_FILES.len()),
+        )
+            .prop_map(|(voice, id, file)| Pick { voice, id, file })
+    }
+
+    fn arb_step() -> impl proptest::strategy::Strategy<Value = Step> {
+        use proptest::prelude::*;
+        let speed = prop_oneof![Just(-1.0f32), Just(0.5), Just(1.5)];
+        let volume = prop_oneof![Just(0.0f32), Just(0.3), Just(1.5)];
+        let position = prop_oneof![Just(0u64), Just(250), Just(1500)];
+        prop_oneof![
+            4 => (
+                proptest::option::weighted(0.8, 0..SCRIPT_VOICES.len()),
+                proptest::option::weighted(0.5, 0..SCRIPT_IDS.len()),
+                0..SCRIPT_FILES.len(),
+                proptest::bool::weighted(0.2),
+                proptest::option::weighted(0.2, speed.clone()),
+                proptest::option::weighted(0.2, volume.clone()),
+                proptest::option::weighted(0.2, position.clone()),
+            )
+                .prop_map(|(voice, id, file, fails, speed, volume, position)| Step::Play {
+                    voice,
+                    id,
+                    file,
+                    fails,
+                    speed,
+                    volume,
+                    position,
+                }),
+            2 => (arb_pick(), speed, any::<bool>())
+                .prop_map(|(pick, speed, pitch)| Step::Speed { pick, speed, pitch }),
+            2 => (arb_pick(), volume.clone()).prop_map(|(pick, volume)| Step::Volume { pick, volume }),
+            1 => (arb_pick(), position).prop_map(|(pick, position)| Step::Seek { pick, position }),
+            1 => arb_pick().prop_map(|pick| Step::Stop { pick }),
+            1 => (0..SCRIPT_VOICES.len()).prop_map(|voice| Step::VoiceStop { voice }),
+            1 => (0..SCRIPT_VOICES.len()).prop_map(|voice| Step::VoiceFadeOut { voice }),
+            2 => (0..SCRIPT_VOICES.len(), volume)
+                .prop_map(|(voice, volume)| Step::VoiceVolume { voice, volume }),
+            1 => Just(Step::StopAll),
+            1 => Just(Step::FadeAll),
+            4 => (0..8usize).prop_map(|which| Step::Finish { which }),
+        ]
+    }
+
+    /// The file a failing play loads: its own, so only its load is answered 404.
+    fn failing_file(step: usize) -> String {
+        format!("fail{step}.wav")
+    }
+
+    /// The JSON a step sends, or `None` for a load ending.
+    fn step_json(step: &Step, index: usize, server: &AudioServer) -> Option<String> {
+        let pick_json = |command: &str, pick: &Pick| {
+            let mut json = serde_json::json!({ "command": command });
+            if let Some(voice) = pick.voice {
+                json["voice"] = serde_json::json!(SCRIPT_VOICES[voice]);
+            }
+            if let Some(id) = pick.id {
+                json["id"] = serde_json::json!(SCRIPT_IDS[id]);
+            }
+            if let Some(file) = pick.file {
+                json["file"] = serde_json::json!(server.url(SCRIPT_FILES[file]));
+            }
+            json
+        };
+        let json = match step {
+            Step::Play {
+                voice,
+                id,
+                file,
+                fails,
+                speed,
+                volume,
+                position,
+            } => {
+                let file = if *fails {
+                    server.url(&failing_file(index))
+                } else {
+                    server.url(SCRIPT_FILES[*file])
+                };
+                let mut json =
+                    serde_json::json!({ "command": "play", "file": file, "mode": "full" });
+                if let Some(voice) = voice {
+                    json["voice"] = serde_json::json!(SCRIPT_VOICES[*voice]);
+                }
+                if let Some(id) = id {
+                    json["id"] = serde_json::json!(SCRIPT_IDS[*id]);
+                }
+                if let Some(speed) = speed {
+                    json["speed"] = serde_json::json!(speed);
+                }
+                if let Some(volume) = volume {
+                    json["volume"] = serde_json::json!(volume);
+                }
+                if let Some(position) = position {
+                    json["start_position_ms"] = serde_json::json!(position);
+                }
+                json
+            }
+            Step::Speed { pick, speed, pitch } => {
+                let mut json = pick_json("speed", pick);
+                json["speed"] = serde_json::json!(speed);
+                json["pitch_correction"] = serde_json::json!(pitch);
+                json
+            }
+            Step::Volume { pick, volume } => {
+                let mut json = pick_json("volume", pick);
+                json["volume"] = serde_json::json!(volume);
+                json
+            }
+            Step::Seek { pick, position } => {
+                let mut json = pick_json("seek", pick);
+                json["position_ms"] = serde_json::json!(position);
+                json
+            }
+            Step::Stop { pick } => pick_json("stop", pick),
+            Step::VoiceStop { voice } => {
+                serde_json::json!({ "command": "voice_stop", "voice": SCRIPT_VOICES[*voice] })
+            }
+            Step::VoiceFadeOut { voice } => serde_json::json!({
+                "command": "voice_fade_out", "voice": SCRIPT_VOICES[*voice], "time": 500
+            }),
+            Step::VoiceVolume { voice, volume } => serde_json::json!({
+                "command": "voice_volume", "voice": SCRIPT_VOICES[*voice], "volume": volume
+            }),
+            Step::StopAll => serde_json::json!({ "command": "stopall" }),
+            Step::FadeAll => serde_json::json!({ "command": "fadeall", "time": 500 }),
+            Step::Finish { .. } => return None,
+        };
+        Some(json.to_string())
+    }
+
+    fn stops(step: &Step) -> bool {
+        matches!(
+            step,
+            Step::Stop { .. }
+                | Step::VoiceStop { .. }
+                | Step::VoiceFadeOut { .. }
+                | Step::StopAll
+                | Step::FadeAll
+        )
+    }
+
+    /// Finish every fade-out at once, as if its time had passed, and reap the faded
+    /// sounds, so a stopped sound is gone in both runs alike.
+    fn end_fades(fixture: &mut Fixture) {
+        fixture.drain();
+        let (faded, playing): (Vec<_>, Vec<_>) = std::mem::take(&mut fixture.mixer.active_samples)
+            .into_iter()
+            .partition(|sample| matches!(sample.fade_state, FadeState::Out { .. }));
+        fixture.mixer.active_samples = playing;
+        for sample in faded {
+            fixture
+                .grave_tx
+                .push(sample)
+                .ok()
+                .expect("graveyard has room");
+        }
+        fixture.reap();
+    }
+
+    /// Remove a sound at once, as a failed load removes the play standing for it.
+    fn end_sound(fixture: &mut Fixture, internal_id: u64) {
+        fixture.drain();
+        if let Some(index) = fixture
+            .mixer
+            .active_samples
+            .iter()
+            .position(|sample| sample.id == internal_id)
+        {
+            let sample = fixture.mixer.active_samples.swap_remove(index);
+            fixture
+                .grave_tx
+                .push(sample)
+                .ok()
+                .expect("graveyard has room");
+        }
+        fixture.reap();
+    }
+
+    /// What a run leaves: the speed, volume, voice volume and position of each
+    /// sound still playing, by the step of the play that started it; the volume of
+    /// each named voice; and the outcome of every command that is not a play.
+    #[derive(Debug, PartialEq)]
+    struct Leftover {
+        sounds: BTreeMap<usize, (f32, f32, f32, usize)>,
+        voices: Vec<Option<f32>>,
+        outcomes: BTreeMap<usize, Result<(), mqtt::commands::CommandErrorKind>>,
+    }
+
+    fn leftover(
+        fixture: &mut Fixture,
+        started: &BTreeMap<usize, u64>,
+        outcomes: BTreeMap<usize, Result<(), mqtt::commands::CommandErrorKind>>,
+    ) -> Leftover {
+        fixture.drain();
+        let sounds = started
+            .iter()
+            .filter_map(|(step, internal_id)| {
+                fixture
+                    .mixer
+                    .active_samples
+                    .iter()
+                    .find(|sample| {
+                        sample.id == *internal_id
+                            && !matches!(sample.fade_state, FadeState::Out { .. })
+                    })
+                    .map(|sample| {
+                        (
+                            *step,
+                            (
+                                sample.speed,
+                                sample.target_volume,
+                                sample.target_voice_volume,
+                                sample.position,
+                            ),
+                        )
+                    })
+            })
+            .collect();
+        let voices = SCRIPT_VOICES
+            .iter()
+            .map(|voice| fixture.voice_manager.lock().get_voice_volume(voice))
+            .collect();
+        Leftover {
+            sounds,
+            voices,
+            outcomes,
+        }
+    }
+
+    /// The internal id of the sound `work` started, if it started one.
+    async fn started_by(
+        fixture: &mut Fixture,
+        work: impl AsyncFnOnce(&mut Fixture),
+    ) -> Option<u64> {
+        let before: std::collections::HashSet<u64> = fixture.playing.keys().copied().collect();
+        work(fixture).await;
+        fixture
+            .playing
+            .keys()
+            .copied()
+            .find(|internal_id| !before.contains(internal_id))
+    }
+
+    /// How often the generated scripts reached each path, so the property cannot
+    /// pass vacuously.
+    #[derive(Default)]
+    struct ScriptCoverage {
+        reached_only_loading: std::cell::Cell<usize>,
+        voice_volume_on_loading_voice: std::cell::Cell<usize>,
+        cancelled: std::cell::Cell<usize>,
+        failed: std::cell::Cell<usize>,
+        started_after_commands: std::cell::Cell<usize>,
+    }
+
+    fn bump(counter: &std::cell::Cell<usize>) {
+        counter.set(counter.get() + 1);
+    }
+
+    /// Whether a command other than a play arrived after step `play` and before
+    /// step `end`.
+    fn commands_between(steps: &[Step], play: usize, end: usize) -> bool {
+        steps[play + 1..end]
+            .iter()
+            .any(|step| !matches!(step, Step::Play { .. } | Step::Finish { .. }))
+    }
+
+    /// Run `steps` through the scheduler, ending each load where the script says.
+    /// Returns what is left and, for each `Finish` in order (then each load left at
+    /// the end), the step of the play whose load ended, if any was loading.
+    async fn run_scheduled(
+        steps: &[Step],
+        server: &AudioServer,
+        coverage: &ScriptCoverage,
+    ) -> (Leftover, Vec<Option<usize>>) {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.config.cache.stream_prebuffer_deadline_ms = 10_000;
+        let (mut scheduler, _permits) = scheduler_with(4);
+        // Plays not yet finished, in arrival order, with their load task.
+        let mut loading: Vec<(usize, tokio::task::Id)> = Vec::new();
+        let mut ended_early: HashMap<tokio::task::Id, SchedulerInput> = HashMap::new();
+        let mut plays = Vec::new();
+        let mut finishes = Vec::new();
+        let mut started = BTreeMap::new();
+        let mut outcomes = BTreeMap::new();
+
+        let finish = async |fixture: &mut Fixture,
+                            scheduler: &mut CommandScheduler,
+                            ended_early: &mut HashMap<tokio::task::Id, SchedulerInput>,
+                            task: tokio::task::Id| {
+            let input = match ended_early.remove(&task) {
+                Some(input) => input,
+                None => loop {
+                    let input = next_load(scheduler).await;
+                    let ended = match &input {
+                        SchedulerInput::Loaded(Ok((ended, _))) => *ended,
+                        SchedulerInput::Loaded(Err(error)) => error.id(),
+                        SchedulerInput::Request(_) => unreachable!("a load ends with a load"),
+                    };
+                    if ended == task {
+                        break input;
+                    }
+                    ended_early.insert(ended, input);
+                },
+            };
+            started_by(fixture, async |fixture| {
+                fixture.take(scheduler, input).await
+            })
+            .await
+        };
+
+        for (index, step) in steps.iter().enumerate() {
+            match step {
+                Step::Play { fails, .. } => {
+                    if *fails {
+                        server.hold(&failing_file(index)).fail();
+                    }
+                    let json = step_json(step, index, server).unwrap();
+                    let mut play = submit(&mut fixture, &mut scheduler, &json).await;
+                    assert!(is_waiting(&mut play), "{json} is loading");
+                    let (task, _) = scheduler
+                        .play_loads
+                        .iter()
+                        .max_by_key(|(_, key)| **key)
+                        .expect("the play's load");
+                    loading.push((index, *task));
+                    plays.push((index, play));
+                }
+                Step::Finish { which } => {
+                    loading.retain(|(_, task)| scheduler.play_loads.contains_key(task));
+                    if loading.is_empty() {
+                        finishes.push(None);
+                        continue;
+                    }
+                    let (play, task) = loading.remove(which % loading.len());
+                    if let Some(internal_id) =
+                        finish(&mut fixture, &mut scheduler, &mut ended_early, task).await
+                    {
+                        started.insert(play, internal_id);
+                        if commands_between(steps, play, index) {
+                            bump(&coverage.started_after_commands);
+                        }
+                    }
+                    finishes.push(Some(play));
+                }
+                command => {
+                    let json = step_json(command, index, server).unwrap();
+                    let reached_playing = match mqtt::commands::parse_command(&json) {
+                        Ok(command) => reaches_playing(&command, &fixture.ctx(None)),
+                        Err(_) => false,
+                    };
+                    let held_open_by_loading = match command {
+                        Step::VoiceVolume { voice, .. } => {
+                            let voices = fixture.voice_manager.lock();
+                            voices.get_voice(SCRIPT_VOICES[*voice]).is_some()
+                                && voices
+                                    .get_voice_sample_ids(SCRIPT_VOICES[*voice])
+                                    .is_empty()
+                        }
+                        _ => false,
+                    };
+                    let mut outcome = submit(&mut fixture, &mut scheduler, &json).await;
+                    let outcome = outcome_of(&mut outcome).map(|_| ()).map_err(|e| e.kind);
+                    if outcome.is_ok() && !reached_playing {
+                        bump(&coverage.reached_only_loading);
+                    }
+                    if outcome.is_ok() && held_open_by_loading {
+                        bump(&coverage.voice_volume_on_loading_voice);
+                    }
+                    outcomes.insert(index, outcome);
+                    if stops(command) {
+                        end_fades(&mut fixture);
+                    }
+                }
+            }
+            fixture.drain();
+        }
+        loading.retain(|(_, task)| scheduler.play_loads.contains_key(task));
+        for (play, task) in loading {
+            if let Some(internal_id) =
+                finish(&mut fixture, &mut scheduler, &mut ended_early, task).await
+            {
+                started.insert(play, internal_id);
+                if commands_between(steps, play, steps.len()) {
+                    bump(&coverage.started_after_commands);
+                }
+            }
+            finishes.push(Some(play));
+        }
+        // The loads of cancelled plays end too, and start nothing.
+        let mut cancelled_loads: Vec<SchedulerInput> = ended_early.into_values().collect();
+        while !scheduler.loads.is_empty() {
+            cancelled_loads.push(next_load(&mut scheduler).await);
+        }
+        for input in cancelled_loads {
+            let internal_id = started_by(&mut fixture, async |fixture| {
+                fixture.take(&mut scheduler, input).await
+            })
+            .await;
+            assert!(internal_id.is_none(), "a cancelled play never starts");
+        }
+        assert!(scheduler.pending.is_empty());
+        for (_, mut play) in plays {
+            match outcome_of(&mut play) {
+                Err(error) if error.kind == mqtt::commands::CommandErrorKind::Cancelled => {
+                    bump(&coverage.cancelled)
+                }
+                Err(error) if error.kind == mqtt::commands::CommandErrorKind::NotFound => {
+                    bump(&coverage.failed)
+                }
+                _ => {}
+            }
+        }
+        (leftover(&mut fixture, &started, outcomes), finishes)
+    }
+
+    /// Run `steps` one at a time in arrival order through `handle_command`. A play
+    /// starts at once; a play whose load fails in the scheduled run plays until
+    /// the point its load ended there.
+    async fn run_one_at_a_time(
+        steps: &[Step],
+        finishes: &[Option<usize>],
+        server: &AudioServer,
+    ) -> Leftover {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.config.cache.stream_prebuffer_deadline_ms = 10_000;
+        let mut started = BTreeMap::new();
+        let mut outcomes = BTreeMap::new();
+        let mut finishes = finishes.iter();
+        // The scheduler starts a play only when its load finishes, so until then
+        // the play keeps its voice only as a play still loading would: one that
+        // fails, or that a stop cancels first, never makes the voice permanent.
+        let voice_of = |play: usize| match steps[play] {
+            Step::Play {
+                voice: Some(voice), ..
+            } => Some(SCRIPT_VOICES[voice]),
+            _ => None,
+        };
+        let end_load = |fixture: &mut Fixture, started: &BTreeMap<usize, u64>, play: usize| {
+            if matches!(steps[play], Step::Play { fails: true, .. }) {
+                end_sound(fixture, started[&play]);
+            } else if let Some(voice) = voice_of(play) {
+                if let Some(voice) = fixture.voice_manager.lock().get_voice_mut(voice) {
+                    voice.transient = false;
+                }
+            }
+        };
+        for (index, step) in steps.iter().enumerate() {
+            match step {
+                Step::Finish { .. } => {
+                    if let Some(Some(play)) = finishes.next() {
+                        end_load(&mut fixture, &started, *play);
+                    }
+                }
+                step => {
+                    let kept_before = voice_of(index).is_some_and(|voice| {
+                        matches!(step, Step::Play { .. })
+                            && fixture
+                                .voice_manager
+                                .lock()
+                                .get_voice(voice)
+                                .is_some_and(|voice| !voice.transient)
+                    });
+                    let json = step_json(step, index, server).unwrap();
+                    let command = mqtt::commands::parse_command(&json);
+                    let mut outcome = Ok(());
+                    let internal_id = started_by(&mut fixture, async |fixture| {
+                        outcome = match command {
+                            Ok(command) => {
+                                let mut ctx = fixture.ctx(None);
+                                handle_command(command, &mut ctx).await;
+                                ctx.error.take().map_or(Ok(()), |error| Err(error.kind))
+                            }
+                            Err(_) => Err(mqtt::commands::CommandErrorKind::InvalidRequest),
+                        };
+                    })
+                    .await;
+                    if let Step::Play { .. } = step {
+                        assert_eq!(outcome, Ok(()), "{json} starts");
+                        started.insert(index, internal_id.expect("the play starts"));
+                        if let Some(voice) = voice_of(index) {
+                            if !kept_before {
+                                if let Some(voice) =
+                                    fixture.voice_manager.lock().get_voice_mut(voice)
+                                {
+                                    voice.transient = true;
+                                }
+                            }
+                        }
+                    } else {
+                        outcomes.insert(index, outcome);
+                    }
+                    if stops(step) {
+                        end_fades(&mut fixture);
+                    }
+                }
+            }
+            fixture.drain();
+        }
+        for play in finishes.flatten() {
+            end_load(&mut fixture, &started, *play);
+        }
+        leftover(&mut fixture, &started, outcomes)
+    }
+
+    #[test]
+    fn the_scheduler_leaves_every_sound_as_one_at_a_time_processing_would() {
+        use proptest::test_runner::{Config as RunnerConfig, TestRunner};
+        let coverage = ScriptCoverage::default();
+        let cases = std::env::var("SCHEDULER_SCRIPT_CASES")
+            .ok()
+            .and_then(|cases| cases.parse().ok())
+            .unwrap_or(64);
+        let mut runner = TestRunner::new(RunnerConfig {
+            cases,
+            ..RunnerConfig::default()
+        });
+        let result = runner.run(&proptest::collection::vec(arb_step(), 1..24), |steps| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let (scheduled, one_at_a_time) = runtime.block_on(async {
+                let server = AudioServer::start().await;
+                let (scheduled, finishes) = run_scheduled(&steps, &server, &coverage).await;
+                // A failing play cancelled before its request left its gate unused.
+                server.gates.lock().unwrap().clear();
+                let one_at_a_time = run_one_at_a_time(&steps, &finishes, &server).await;
+                (scheduled, one_at_a_time)
+            });
+            proptest::prop_assert_eq!(scheduled, one_at_a_time, "steps: {:?}", steps);
+            Ok(())
+        });
+        if let Err(failure) = result {
+            panic!("{failure}");
+        }
+        for (path, count) in [
+            (
+                "answered a command that reached only loading plays",
+                coverage.reached_only_loading.get(),
+            ),
+            (
+                "set the volume of a voice held open by a loading play",
+                coverage.voice_volume_on_loading_voice.get(),
+            ),
+            ("cancelled a play", coverage.cancelled.get()),
+            ("failed a load", coverage.failed.get()),
+            (
+                "started a play that commands arrived during the load of",
+                coverage.started_after_commands.get(),
+            ),
+        ] {
+            assert!(
+                count > 0,
+                "no generated script {path}; the property is vacuous"
+            );
+        }
+    }
 }

@@ -11,10 +11,29 @@ List available devices:
 ./mqttaudio --list-devices
 ```
 
-Specify the correct device:
+Copy the exact **Device ID** from the listing into `--device` or `audio.device`.
+The output includes both CLI options and JSON config lines.
+
+On Linux, locate your card by its **Description**, then use its `plughw:` ID.
+For example, a card described as `GIGAPort HD+, USB Audio` may need:
 ```bash
-./mqttaudio --device "Your Device Name" --topic audio/commands
+./mqttaudio --device 'plughw:CARD=HD,DEV=0' --topic audio/commands
 ```
+
+The corresponding JSON setting inside `"audio"` is
+`"device": "plughw:CARD=HD,DEV=0"`. Replace the ID with the one from your listing.
+On macOS/Windows, copy the displayed Device ID, which is usually a friendly name.
+
+- **Output device not found:** check that you copied the Device ID, including its
+  prefix, rather than the description. Check for a `--device` flag overriding your config.
+- **Format error / Invalid argument when opening `hw:`:** try the matching `plughw:`
+  entry, and choose a channel count and sample rate supported by the hardware.
+  This is a stream configuration failure, not a missing device.
+- **Permission denied / device busy:** check access to the audio device for the
+  account running mqttaudio and whether another process is using the device.
+
+See [Finding Your Audio Device](getting-started.md#finding-your-audio-device)
+for a complete example and an explanation of the ALSA prefixes.
 
 ### Check Volume
 
@@ -83,6 +102,35 @@ Try connecting to localhost first to rule out network problems:
 ```bash
 ./mqttaudio --server localhost --topic audio/commands
 ```
+
+### A Command Did Nothing
+
+An MQTT sender gets no reply, so the daemon logs each command it could not carry
+out:
+
+```
+WARN mqttaudio: Command failed: No sample matches the selector
+```
+
+A failure that has its own message, such as an unknown voice or a file that
+failed to load, is logged once under that message instead. Over HTTP the same
+failure comes back in the response.
+
+A command sent right after a `play` reaches that play even while its file is
+still loading, so `No sample matches the selector` means the selector named no
+playing sound and no loading play: compare its `id`, `file` or `voice` with the
+`play`'s, and check whether a stop already cancelled the play. An `internal_id`
+exists only once a sound has started.
+
+A play cancelled before it started is logged at INFO, not as a failed command:
+
+```
+INFO mqttaudio: Cancelled play of /sounds/rain.wav: Cancelled by a stop before it started
+INFO mqttaudio: Cancelled play of /sounds/rain.wav: Superseded by stopall/fadeall
+```
+
+The first is a `stop`, `voice_stop`, `voice_fade_out` or `voice_clear` that
+matched it, or a `reset`; the second is `stopall` or `fadeall`.
 
 ---
 

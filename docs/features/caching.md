@@ -150,9 +150,11 @@ Cached URLs are checked for freshness on a schedule set by
 3. Not modified (304) - the cached copy is served and the clock resets
 4. Changed (200) - the new content replaces the cache and plays instead
 
-If the server cannot be reached, the cached copy keeps playing and the
-check retries after the next interval - a dead server never blocks
-playback for more than a few seconds, once per interval. `cache_invalidate`
+If the server cannot be reached, the cached copy keeps playing. A check
+waits at most 5 seconds for the server to answer. A server that refuses
+connections fails at once, but one that accepts them and never answers is
+checked again on each freshness tick, holding up other loads for up to 5
+seconds per cached file from it (see `docs/bugs.md`). `cache_invalidate`
 still forces an immediate re-download when you don't want to wait.
 
 ## Local Files

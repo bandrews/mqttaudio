@@ -1,8 +1,8 @@
 // ABOUTME: MQTT command parsing and validation.
 // ABOUTME: Converts JSON messages to internal command types.
 
+use crate::config::{ChannelRef, FreshnessMode, LoadMode};
 use serde::{Deserialize, Serialize};
-use crate::config::ChannelRef;
 
 /// Fade duration used when a fadeall command does not name one
 pub const DEFAULT_FADE_ALL_MS: u32 = 1000;
@@ -16,7 +16,8 @@ pub enum CommandErrorKind {
     NotFound,
     /// The request was valid but not permitted (e.g. path outside allowed_directories)
     Forbidden,
-    /// Superseded by a later stopall/fadeall before it could take effect
+    /// Cancelled before it could take effect: a play still loading that a stop,
+    /// stopall, fadeall or shutdown cancelled
     Cancelled,
     /// Something failed on our side
     Internal,
@@ -31,7 +32,10 @@ pub struct CommandError {
 
 impl CommandError {
     pub fn new(kind: CommandErrorKind, message: impl Into<String>) -> Self {
-        Self { kind, message: message.into() }
+        Self {
+            kind,
+            message: message.into(),
+        }
     }
 }
 
@@ -56,13 +60,22 @@ pub struct CommandRequest {
 impl CommandRequest {
     /// A fire-and-forget request (MQTT publishes)
     pub fn fire_and_forget(payload: String) -> Self {
-        Self { payload, reply: None }
+        Self {
+            payload,
+            reply: None,
+        }
     }
 
     /// A request paired with a receiver for its outcome
     pub fn with_reply(payload: String) -> (Self, tokio::sync::oneshot::Receiver<CommandOutcome>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        (Self { payload, reply: Some(tx) }, rx)
+        (
+            Self {
+                payload,
+                reply: Some(tx),
+            },
+            rx,
+        )
     }
 }
 
@@ -106,6 +119,10 @@ impl MqttCommand {
 pub struct ChannelMapping {
     pub src: ChannelRef,
     pub dest: ChannelRef,
+    /// Optional per-route gain (default 1.0). Lets a downmix that sums several
+    /// source channels into one destination be attenuated to avoid clipping (D29).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gain: Option<f32>,
 }
 
 /// Selector for targeting samples by internal_id, id, file, or voice
@@ -127,7 +144,13 @@ pub struct SampleSelector {
 
 impl SampleSelector {
     /// Check if a sample matches this selector
-    pub fn matches(&self, internal_id: u64, sample_id: Option<&str>, file_path: &str, voice_id: &str) -> bool {
+    pub fn matches(
+        &self,
+        internal_id: u64,
+        sample_id: Option<&str>,
+        file_path: &str,
+        voice_id: &str,
+    ) -> bool {
         // Check if selector specifies internal_id and if it matches (highest priority)
         if let Some(ref iid) = self.internal_id {
             if let Ok(parsed) = iid.parse::<u64>() {
@@ -137,6 +160,19 @@ impl SampleSelector {
             }
         }
 
+        self.matches_unstarted(sample_id, file_path, Some(voice_id))
+    }
+
+    /// Check if a sound that has not started yet matches this selector. It
+    /// matches as a started sound would, except that `internal_id` never does
+    /// (internal ids are assigned when a sound starts) and a sound without a
+    /// voice yet cannot match by voice.
+    pub fn matches_unstarted(
+        &self,
+        sample_id: Option<&str>,
+        file_path: &str,
+        voice_id: Option<&str>,
+    ) -> bool {
         // Check if selector specifies id and if it matches
         if let Some(ref id) = self.id {
             if sample_id == Some(id.as_str()) {
@@ -153,7 +189,7 @@ impl SampleSelector {
 
         // Check if selector specifies voice and if it matches
         if let Some(ref voice) = self.voice {
-            if voice_id == voice {
+            if voice_id == Some(voice.as_str()) {
                 return true;
             }
         }
@@ -164,7 +200,10 @@ impl SampleSelector {
 
     /// Check if this selector is empty (no criteria specified)
     pub fn is_empty(&self) -> bool {
-        self.internal_id.is_none() && self.id.is_none() && self.file.is_none() && self.voice.is_none()
+        self.internal_id.is_none()
+            && self.id.is_none()
+            && self.file.is_none()
+            && self.voice.is_none()
     }
 }
 
@@ -189,8 +228,22 @@ pub struct PlayMessage {
     pub loop_mode: Option<bool>, // Loop playback continuously
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crossfade_ms: Option<u32>, // Crossfade duration at loop boundaries (0 = disabled)
-    // Future fields for later phases:
-    // pub max_play_length: Option<i32>,    // Future
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<LoadMode>, // Load strategy override: auto|full|stream
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_ms: Option<u32>, // Windowed-source ring depth override (streamed plays)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prebuffer_ms: Option<u32>, // Windowed-source prebuffer override (streamed plays)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<FreshnessMode>, // Freshness override: trusting|dev|pinned
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cacheable: Option<bool>, // HTTP windowed plays: persist to disk (true, default) or treat as live (false)
+    /// Start speed multiplier, as the speed command sets it (1.0 = normal)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed: Option<f32>,
+    /// Start with pitch correction, as the speed command sets it
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pitch_correction: Option<bool>,
 }
 
 /// Voice stop command parameters
@@ -222,6 +275,52 @@ pub struct VoiceVolumeMessage {
     pub volume: f32,
 }
 
+/// Voice speed command parameters
+#[derive(Debug, Deserialize, Serialize)]
+pub struct VoiceSpeedMessage {
+    pub voice: String,
+    /// Playback speed multiplier (1.0 = normal, negative = reverse)
+    pub speed: f32,
+    /// If true, the voice's samples keep their pitch (tempo only)
+    #[serde(default)]
+    pub pitch_correction: bool,
+}
+
+/// Voice clear command parameters
+#[derive(Debug, Deserialize, Serialize)]
+pub struct VoiceClearMessage {
+    /// Voice name, or "*" for every voice
+    pub voice: String,
+}
+
+/// The voice name that targets every voice
+const ALL_VOICES: &str = "*";
+
+/// Which voices a command applies to
+#[derive(Debug, Clone, PartialEq)]
+pub enum VoiceTarget {
+    Named(String),
+    All,
+}
+
+impl VoiceTarget {
+    fn from_name(name: String) -> Self {
+        if name == ALL_VOICES {
+            VoiceTarget::All
+        } else {
+            VoiceTarget::Named(name)
+        }
+    }
+
+    /// Whether this target includes the given voice
+    pub fn matches(&self, voice_id: &str) -> bool {
+        match self {
+            VoiceTarget::Named(name) => name == voice_id,
+            VoiceTarget::All => true,
+        }
+    }
+}
+
 /// Precache command parameters
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PrecacheMessage {
@@ -248,6 +347,28 @@ pub struct InputMuteMessage {
     /// Input index (0-based) or voice_id
     pub input: String,
     pub mute: bool,
+}
+
+/// Fail-closed talkback lease request. Destination names are validated again
+/// by the daemon state machine; the parser only enforces field types/ranges.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TalkbackAcquireMessage {
+    pub client_id: String,
+    #[serde(default = "default_talkback_source")]
+    pub source_id: String,
+    pub destination: String,
+    pub gain: f32,
+    pub lease_ms: u64,
+}
+
+fn default_talkback_source() -> String {
+    "GM_MIC".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TalkbackReleaseMessage {
+    pub client_id: String,
+    pub lease_id: String,
 }
 
 /// Seek command parameters
@@ -339,10 +460,17 @@ pub enum AudioCommand {
         volume: f32,
         voice: Option<String>,
         channel_map: Option<Vec<ChannelMapping>>,
-        fade_in: Option<u32>, // Fade in duration in milliseconds
-        start_position_ms: Option<u64>, // Start playback at this offset
-        loop_mode: bool, // Loop playback continuously
-        crossfade_ms: u32, // Crossfade duration at loop boundaries (0 = disabled)
+        fade_in: Option<u32>,             // Fade in duration in milliseconds
+        start_position_ms: Option<u64>,   // Start playback at this offset
+        loop_mode: bool,                  // Loop playback continuously
+        crossfade_ms: u32,                // Crossfade duration at loop boundaries (0 = disabled)
+        mode: LoadMode,                   // Resolved load strategy (auto|full|stream)
+        window_ms: Option<u32>,           // Windowed-source ring depth override
+        prebuffer_ms: Option<u32>,        // Windowed-source prebuffer override
+        freshness: Option<FreshnessMode>, // Freshness override (None => config default)
+        cacheable: Option<bool>, // HTTP windowed: persist to disk (None/true) or treat as live (false)
+        speed: Option<f32>,      // Start speed, as the speed command sets it (None => the voice's)
+        pitch_correction: bool,  // Start with pitch correction, with an explicit speed
     },
     StopAll,
     FadeAll {
@@ -359,11 +487,24 @@ pub enum AudioCommand {
         voice: String,
         volume: f32,
     },
+    VoiceSpeed {
+        voice: String,
+        speed: f32,
+        pitch_correction: bool,
+    },
+    VoiceClear {
+        voice: VoiceTarget,
+    },
+    Reset,
     Precache {
         file: String,
     },
     CacheClear,
     CacheInvalidate {
+        file: String,
+    },
+    /// Invalidate a cached entry and re-precache it, so the next play is fresh+instant.
+    CacheReload {
         file: String,
     },
     InputVolume {
@@ -374,6 +515,9 @@ pub enum AudioCommand {
         input: String,
         mute: bool,
     },
+    TalkbackAcquire(TalkbackAcquireMessage),
+    TalkbackRelease(TalkbackReleaseMessage),
+    TalkbackHardMute,
     Seek {
         selector: SampleSelector,
         position_ms: u64,
@@ -448,17 +592,16 @@ pub fn expand_macros(
     let macro_names = match obj.remove("macro") {
         None => return serde_json::to_string(&value).map_err(ParseError::from),
         Some(serde_json::Value::String(s)) => vec![s],
-        Some(serde_json::Value::Array(arr)) => {
-            arr.into_iter()
-                .filter_map(|v| {
-                    if let serde_json::Value::String(s) = v {
-                        Some(s)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        }
+        Some(serde_json::Value::Array(arr)) => arr
+            .into_iter()
+            .filter_map(|v| {
+                if let serde_json::Value::String(s) = v {
+                    Some(s)
+                } else {
+                    None
+                }
+            })
+            .collect(),
         Some(_) => return serde_json::to_string(&value).map_err(ParseError::from),
     };
 
@@ -478,7 +621,10 @@ pub fn expand_macros(
                 }
             }
             None => {
-                tracing::warn!("Unknown macro '{}' referenced by command; ignoring it", macro_name);
+                tracing::warn!(
+                    "Unknown macro '{}' referenced by command; ignoring it",
+                    macro_name
+                );
             }
         }
     }
@@ -508,8 +654,20 @@ pub fn expand_macros(
 /// Supports both flattened and nested (legacy) formats:
 /// - Flattened: {"command": "play", "file": "test.wav", "volume": 0.8}
 /// - Nested: {"command": "play", "message": {"file": "test.wav", "volume": 0.8}}
+///
 /// Reject a non-numeric internal_id at parse time: the system-assigned ids
 /// are numeric, so a non-numeric value could only ever silently match nothing.
+/// Reject a speed of zero, which would otherwise be coerced to an
+/// unintelligible 0.01x drone; someone sending 0 almost certainly wanted stop.
+fn reject_zero_speed(speed: f32) -> Result<(), ParseError> {
+    if speed == 0.0 {
+        return Err(ParseError::InvalidParameter(
+            "speed 0 is not supported - use stop to end playback, or a small value like 0.05 to crawl".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_internal_id(internal_id: &Option<String>) -> Result<(), ParseError> {
     if let Some(iid) = internal_id {
         if iid.parse::<u64>().is_err() {
@@ -532,22 +690,41 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 return Err(ParseError::MissingMessage);
             }
             let play_msg: PlayMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            let speed = play_msg.speed;
+            let pitch_correction = play_msg.pitch_correction.unwrap_or(false);
+            if let Some(speed) = speed {
+                reject_zero_speed(speed)?;
+                if speed < 0.0 && pitch_correction {
+                    return Err(ParseError::InvalidParameter(format!(
+                        "negative speed ({}) plays in reverse, which pitch_correction does not support",
+                        speed
+                    )));
+                }
+            }
 
             Ok(AudioCommand::Play {
                 file: play_msg.file,
                 id: play_msg.id,
-                volume: play_msg.volume.unwrap_or(1.0).clamp(0.0, crate::config::MAX_GAIN),
+                volume: play_msg
+                    .volume
+                    .unwrap_or(1.0)
+                    .clamp(0.0, crate::config::MAX_GAIN),
                 voice: play_msg.voice,
                 channel_map: play_msg.channel_map,
                 fade_in: play_msg.fade_in,
                 start_position_ms: play_msg.start_position_ms,
                 loop_mode: play_msg.loop_mode.unwrap_or(false),
                 crossfade_ms: play_msg.crossfade_ms.unwrap_or(0),
+                mode: play_msg.mode.unwrap_or_default(),
+                window_ms: play_msg.window_ms,
+                prebuffer_ms: play_msg.prebuffer_ms,
+                freshness: play_msg.freshness,
+                cacheable: play_msg.cacheable,
+                speed,
+                pitch_correction,
             })
         }
-        "stopall" | "soundStopAll" => {
-            Ok(AudioCommand::StopAll)
-        }
+        "stopall" | "soundStopAll" => Ok(AudioCommand::StopAll),
         "fadeall" | "soundFadeAll" | "fadeout" | "soundFadeOut" => {
             let time_ms = if mqtt_cmd.has_params() {
                 let msg: FadeAllMessage = serde_json::from_value(mqtt_cmd.get_params())?;
@@ -590,6 +767,36 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 volume: voice_msg.volume,
             })
         }
+        "voice_speed" => {
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let voice_msg: VoiceSpeedMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+
+            reject_zero_speed(voice_msg.speed)?;
+            if voice_msg.pitch_correction && voice_msg.speed < 0.0 {
+                return Err(ParseError::InvalidParameter(
+                    "negative (reverse) speed is not supported with pitch_correction".to_string(),
+                ));
+            }
+
+            Ok(AudioCommand::VoiceSpeed {
+                voice: voice_msg.voice,
+                speed: voice_msg.speed,
+                pitch_correction: voice_msg.pitch_correction,
+            })
+        }
+        "voice_clear" => {
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let voice_msg: VoiceClearMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+
+            Ok(AudioCommand::VoiceClear {
+                voice: VoiceTarget::from_name(voice_msg.voice),
+            })
+        }
+        "reset" => Ok(AudioCommand::Reset),
         "precache" | "soundPrecache" => {
             if !mqtt_cmd.has_params() {
                 return Err(ParseError::MissingMessage);
@@ -600,17 +807,25 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 file: precache_msg.file,
             })
         }
-        "cache_clear" => {
-            Ok(AudioCommand::CacheClear)
-        }
+        "cache_clear" => Ok(AudioCommand::CacheClear),
         "cache_invalidate" => {
             if !mqtt_cmd.has_params() {
                 return Err(ParseError::MissingMessage);
             }
-            let invalidate_msg: CacheInvalidateMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            let invalidate_msg: CacheInvalidateMessage =
+                serde_json::from_value(mqtt_cmd.get_params())?;
 
             Ok(AudioCommand::CacheInvalidate {
                 file: invalidate_msg.file,
+            })
+        }
+        "cache_reload" => {
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let reload_msg: CacheInvalidateMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+            Ok(AudioCommand::CacheReload {
+                file: reload_msg.file,
             })
         }
         "input_volume" => {
@@ -635,6 +850,23 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 mute: input_msg.mute,
             })
         }
+        "talkback_acquire" => {
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            Ok(AudioCommand::TalkbackAcquire(serde_json::from_value(
+                mqtt_cmd.get_params(),
+            )?))
+        }
+        "talkback_release" => {
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            Ok(AudioCommand::TalkbackRelease(serde_json::from_value(
+                mqtt_cmd.get_params(),
+            )?))
+        }
+        "talkback_hard_mute" => Ok(AudioCommand::TalkbackHardMute),
         "seek" => {
             if !mqtt_cmd.has_params() {
                 return Err(ParseError::MissingMessage);
@@ -659,11 +891,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
             let speed_msg: SpeedMessage = serde_json::from_value(mqtt_cmd.get_params())?;
             validate_internal_id(&speed_msg.internal_id)?;
 
-            if speed_msg.speed == 0.0 {
-                return Err(ParseError::InvalidParameter(
-                    "speed 0 is not supported - use stop to end playback, or a small value like 0.05 to crawl".to_string(),
-                ));
-            }
+            reject_zero_speed(speed_msg.speed)?;
 
             Ok(AudioCommand::Speed {
                 selector: SampleSelector {
@@ -724,7 +952,13 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
+            AudioCommand::Play {
+                file,
+                volume,
+                voice,
+                channel_map,
+                ..
+            } => {
                 assert_eq!(file, "test.wav");
                 assert_eq!(volume, 1.0); // Default volume
                 assert!(voice.is_none()); // No voice specified
@@ -740,7 +974,13 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
+            AudioCommand::Play {
+                file,
+                volume,
+                voice,
+                channel_map,
+                ..
+            } => {
                 assert_eq!(file, "test.wav");
                 assert_eq!(volume, 0.5);
                 assert!(voice.is_none());
@@ -756,7 +996,13 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
+            AudioCommand::Play {
+                file,
+                volume,
+                voice,
+                channel_map,
+                ..
+            } => {
                 assert_eq!(file, "http://example.com/audio.mp3");
                 assert_eq!(volume, 0.8);
                 assert!(voice.is_none());
@@ -773,7 +1019,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { .. } => {}, // OK
+            AudioCommand::Play { .. } => {} // OK
             _ => panic!("Expected Play command"),
         }
     }
@@ -784,7 +1030,13 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
+            AudioCommand::Play {
+                file,
+                volume,
+                voice,
+                channel_map,
+                ..
+            } => {
                 assert_eq!(file, "test.wav");
                 assert_eq!(volume, 1.0);
                 assert_eq!(voice, Some("ambience".to_string()));
@@ -800,7 +1052,13 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
+            AudioCommand::Play {
+                file,
+                volume,
+                voice,
+                channel_map,
+                ..
+            } => {
                 assert_eq!(file, "music.mp3");
                 assert_eq!(volume, 0.6);
                 assert_eq!(voice, Some("background".to_string()));
@@ -858,7 +1116,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::MissingMessage => {}, // OK
+            ParseError::MissingMessage => {} // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
     }
@@ -870,7 +1128,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::MissingMessage => {}, // OK
+            ParseError::MissingMessage => {} // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
     }
@@ -882,9 +1140,129 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::MissingMessage => {}, // OK
+            ParseError::MissingMessage => {} // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
+    }
+
+    #[test]
+    fn test_parse_voice_speed_command() {
+        let json = r#"{"command": "voice_speed", "message": {"voice": "music", "speed": 1.5, "pitch_correction": true}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::VoiceSpeed {
+                voice,
+                speed,
+                pitch_correction,
+            } => {
+                assert_eq!(voice, "music");
+                assert_eq!(speed, 1.5);
+                assert!(pitch_correction);
+            }
+            _ => panic!("Expected VoiceSpeed command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_voice_speed_defaults_to_no_pitch_correction() {
+        let json = r#"{"command": "voice_speed", "voice": "music", "speed": 0.5}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::VoiceSpeed {
+                voice,
+                speed,
+                pitch_correction,
+            } => {
+                assert_eq!(voice, "music");
+                assert_eq!(speed, 0.5);
+                assert!(!pitch_correction);
+            }
+            _ => panic!("Expected VoiceSpeed command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_voice_speed_missing_message() {
+        let json = r#"{"command": "voice_speed"}"#;
+        match parse_command(json).unwrap_err() {
+            ParseError::MissingMessage => {} // OK
+            e => panic!("Expected MissingMessage error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_voice_speed_zero_is_rejected() {
+        let json = r#"{"command": "voice_speed", "voice": "music", "speed": 0}"#;
+        match parse_command(json).unwrap_err() {
+            ParseError::InvalidParameter(msg) => assert!(msg.contains("speed 0"), "got: {}", msg),
+            e => panic!("Expected InvalidParameter error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_voice_speed_reverse_with_pitch_correction_is_rejected() {
+        // A pitch-corrected sample ignores a negative speed, so storing one
+        // would leave every later play in the voice at the wrong speed
+        let json = r#"{"command": "voice_speed", "voice": "music", "speed": -1.0, "pitch_correction": true}"#;
+        match parse_command(json).unwrap_err() {
+            ParseError::InvalidParameter(msg) => {
+                assert!(msg.contains("pitch_correction"), "got: {}", msg)
+            }
+            e => panic!("Expected InvalidParameter error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_voice_speed_reverse_without_pitch_correction() {
+        let json = r#"{"command": "voice_speed", "voice": "music", "speed": -1.0}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::VoiceSpeed { speed, .. } => assert_eq!(speed, -1.0),
+            _ => panic!("Expected VoiceSpeed command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_voice_clear_command() {
+        let json = r#"{"command": "voice_clear", "message": {"voice": "music"}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::VoiceClear { voice } => {
+                assert_eq!(voice, VoiceTarget::Named("music".to_string()))
+            }
+            _ => panic!("Expected VoiceClear command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_voice_clear_wildcard_targets_all_voices() {
+        let json = r#"{"command": "voice_clear", "voice": "*"}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::VoiceClear { voice } => assert_eq!(voice, VoiceTarget::All),
+            _ => panic!("Expected VoiceClear command"),
+        }
+    }
+
+    #[test]
+    fn test_voice_target_matches() {
+        assert!(VoiceTarget::All.matches("music"));
+        assert!(VoiceTarget::Named("music".to_string()).matches("music"));
+        assert!(!VoiceTarget::Named("music".to_string()).matches("effects"));
+    }
+
+    #[test]
+    fn test_parse_voice_clear_missing_message() {
+        let json = r#"{"command": "voice_clear"}"#;
+        match parse_command(json).unwrap_err() {
+            ParseError::MissingMessage => {} // OK
+            e => panic!("Expected MissingMessage error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_reset_command() {
+        let json = r#"{"command": "reset"}"#;
+        assert!(matches!(parse_command(json).unwrap(), AudioCommand::Reset));
     }
 
     #[test]
@@ -893,7 +1271,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::StopAll => {}, // OK
+            AudioCommand::StopAll => {} // OK
             _ => panic!("Expected StopAll command"),
         }
     }
@@ -904,7 +1282,7 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::StopAll => {}, // OK
+            AudioCommand::StopAll => {} // OK
             _ => panic!("Expected StopAll command"),
         }
     }
@@ -958,7 +1336,8 @@ mod tests {
             assert!(
                 err.to_string().contains("internal_id"),
                 "{} should reject a non-numeric internal_id, got: {}",
-                command, err
+                command,
+                err
             );
         }
     }
@@ -972,6 +1351,89 @@ mod tests {
         assert!(
             err.to_string().contains("speed"),
             "the error should explain the speed problem, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_play_without_speed_leaves_the_speed_to_its_voice() {
+        let json = r#"{"command": "play", "file": "test.wav"}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play {
+                speed,
+                pitch_correction,
+                ..
+            } => {
+                assert_eq!(speed, None);
+                assert!(!pitch_correction);
+            }
+            other => panic!("Expected Play command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_carries_speed_and_pitch_correction() {
+        let json =
+            r#"{"command": "play", "file": "test.wav", "speed": 1.08, "pitch_correction": true}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play {
+                speed,
+                pitch_correction,
+                ..
+            } => {
+                assert_eq!(speed, Some(1.08));
+                assert!(pitch_correction);
+            }
+            other => panic!("Expected Play command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_nested_play_carries_speed_and_pitch_correction() {
+        let json = r#"{"command": "soundPlay", "message": {"file": "test.wav", "speed": 0.5, "pitch_correction": false}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play {
+                speed,
+                pitch_correction,
+                ..
+            } => {
+                assert_eq!(speed, Some(0.5));
+                assert!(!pitch_correction);
+            }
+            other => panic!("Expected Play command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_accepts_reverse_speed_without_pitch_correction() {
+        let json =
+            r#"{"command": "play", "file": "test.wav", "speed": -1.0, "start_position_ms": 1500}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play { speed, .. } => assert_eq!(speed, Some(-1.0)),
+            other => panic!("Expected Play command, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_speed_zero_is_rejected() {
+        let json = r#"{"command": "play", "file": "test.wav", "speed": 0}"#;
+        let err = parse_command(json).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidParameter(ref message) if message.contains("speed 0")),
+            "a play at speed 0 must be rejected like the speed command, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_play_reverse_speed_with_pitch_correction_is_rejected() {
+        let json =
+            r#"{"command": "play", "file": "test.wav", "speed": -1.0, "pitch_correction": true}"#;
+        let err = parse_command(json).unwrap_err();
+        assert!(
+            matches!(err, ParseError::InvalidParameter(ref message)
+                if message.contains("negative") && message.contains("pitch_correction")),
+            "reverse playback cannot be pitch-corrected, got: {}",
             err
         );
     }
@@ -1043,7 +1505,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::MissingMessage => {}, // OK
+            ParseError::MissingMessage => {} // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
     }
@@ -1067,7 +1529,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::JsonError(_) => {}, // OK
+            ParseError::JsonError(_) => {} // OK
             e => panic!("Expected JsonError, got: {:?}", e),
         }
     }
@@ -1078,15 +1540,35 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
+            AudioCommand::Play {
+                file,
+                volume,
+                voice,
+                channel_map,
+                ..
+            } => {
                 assert_eq!(file, "test.wav");
                 assert_eq!(volume, 1.0);
                 assert!(voice.is_none());
 
                 let map = channel_map.unwrap();
                 assert_eq!(map.len(), 2);
-                assert_eq!(map[0], ChannelMapping { src: ChannelRef::Index(0), dest: ChannelRef::Index(6) });
-                assert_eq!(map[1], ChannelMapping { src: ChannelRef::Index(1), dest: ChannelRef::Index(7) });
+                assert_eq!(
+                    map[0],
+                    ChannelMapping {
+                        src: ChannelRef::Index(0),
+                        dest: ChannelRef::Index(6),
+                        gain: None,
+                    }
+                );
+                assert_eq!(
+                    map[1],
+                    ChannelMapping {
+                        src: ChannelRef::Index(1),
+                        dest: ChannelRef::Index(7),
+                        gain: None,
+                    }
+                );
             }
             _ => panic!("Expected Play command"),
         }
@@ -1106,15 +1588,68 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, channel_map, .. } => {
+            AudioCommand::Play {
+                file, channel_map, ..
+            } => {
                 assert_eq!(file, "quad.wav");
 
                 let map = channel_map.unwrap();
                 assert_eq!(map.len(), 4);
-                assert_eq!(map[0], ChannelMapping { src: ChannelRef::Index(0), dest: ChannelRef::Index(0) });
-                assert_eq!(map[1], ChannelMapping { src: ChannelRef::Index(1), dest: ChannelRef::Index(1) });
-                assert_eq!(map[2], ChannelMapping { src: ChannelRef::Index(2), dest: ChannelRef::Index(2) });
-                assert_eq!(map[3], ChannelMapping { src: ChannelRef::Index(3), dest: ChannelRef::Index(3) });
+                assert_eq!(
+                    map[0],
+                    ChannelMapping {
+                        src: ChannelRef::Index(0),
+                        dest: ChannelRef::Index(0),
+                        gain: None,
+                    }
+                );
+                assert_eq!(
+                    map[1],
+                    ChannelMapping {
+                        src: ChannelRef::Index(1),
+                        dest: ChannelRef::Index(1),
+                        gain: None,
+                    }
+                );
+                assert_eq!(
+                    map[2],
+                    ChannelMapping {
+                        src: ChannelRef::Index(2),
+                        dest: ChannelRef::Index(2),
+                        gain: None,
+                    }
+                );
+                assert_eq!(
+                    map[3],
+                    ChannelMapping {
+                        src: ChannelRef::Index(3),
+                        dest: ChannelRef::Index(3),
+                        gain: None,
+                    }
+                );
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_channel_map_with_per_route_gain() {
+        // D29: an optional per-route `gain` parses into ChannelMapping.gain; routes
+        // that omit it stay None (resolved to unity downstream).
+        let json = r#"{"command": "play", "message": {
+            "file": "quad.wav",
+            "channel_map": [
+                {"src": 2, "dest": 0, "gain": 0.5},
+                {"src": 3, "dest": 1}
+            ]
+        }}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::Play { channel_map, .. } => {
+                let map = channel_map.unwrap();
+                assert_eq!(map[0].gain, Some(0.5), "explicit gain must parse");
+                assert_eq!(map[1].gain, None, "omitted gain stays None");
             }
             _ => panic!("Expected Play command"),
         }
@@ -1136,17 +1671,51 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, channel_map, .. } => {
+            AudioCommand::Play {
+                file,
+                volume,
+                voice,
+                channel_map,
+                ..
+            } => {
                 assert_eq!(file, "surround.wav");
                 assert_eq!(volume, 0.7);
                 assert_eq!(voice, Some("ambience".to_string()));
 
                 let map = channel_map.unwrap();
                 assert_eq!(map.len(), 4);
-                assert_eq!(map[0], ChannelMapping { src: ChannelRef::Index(0), dest: ChannelRef::Index(8) });
-                assert_eq!(map[1], ChannelMapping { src: ChannelRef::Index(1), dest: ChannelRef::Index(9) });
-                assert_eq!(map[2], ChannelMapping { src: ChannelRef::Index(2), dest: ChannelRef::Index(10) });
-                assert_eq!(map[3], ChannelMapping { src: ChannelRef::Index(3), dest: ChannelRef::Index(11) });
+                assert_eq!(
+                    map[0],
+                    ChannelMapping {
+                        src: ChannelRef::Index(0),
+                        dest: ChannelRef::Index(8),
+                        gain: None,
+                    }
+                );
+                assert_eq!(
+                    map[1],
+                    ChannelMapping {
+                        src: ChannelRef::Index(1),
+                        dest: ChannelRef::Index(9),
+                        gain: None,
+                    }
+                );
+                assert_eq!(
+                    map[2],
+                    ChannelMapping {
+                        src: ChannelRef::Index(2),
+                        dest: ChannelRef::Index(10),
+                        gain: None,
+                    }
+                );
+                assert_eq!(
+                    map[3],
+                    ChannelMapping {
+                        src: ChannelRef::Index(3),
+                        dest: ChannelRef::Index(11),
+                        gain: None,
+                    }
+                );
             }
             _ => panic!("Expected Play command"),
         }
@@ -1168,8 +1737,22 @@ mod tests {
             AudioCommand::Play { channel_map, .. } => {
                 let map = channel_map.unwrap();
                 assert_eq!(map.len(), 2);
-                assert_eq!(map[0], ChannelMapping { src: ChannelRef::Index(0), dest: ChannelRef::Index(0) });
-                assert_eq!(map[1], ChannelMapping { src: ChannelRef::Index(0), dest: ChannelRef::Index(1) });
+                assert_eq!(
+                    map[0],
+                    ChannelMapping {
+                        src: ChannelRef::Index(0),
+                        dest: ChannelRef::Index(0),
+                        gain: None,
+                    }
+                );
+                assert_eq!(
+                    map[1],
+                    ChannelMapping {
+                        src: ChannelRef::Index(0),
+                        dest: ChannelRef::Index(1),
+                        gain: None,
+                    }
+                );
             }
             _ => panic!("Expected Play command"),
         }
@@ -1205,14 +1788,22 @@ mod tests {
             AudioCommand::Play { channel_map, .. } => {
                 let map = channel_map.unwrap();
                 assert_eq!(map.len(), 2);
-                assert_eq!(map[0], ChannelMapping {
-                    src: ChannelRef::Index(0),
-                    dest: ChannelRef::Alias("front_left".to_string())
-                });
-                assert_eq!(map[1], ChannelMapping {
-                    src: ChannelRef::Index(1),
-                    dest: ChannelRef::Alias("front_right".to_string())
-                });
+                assert_eq!(
+                    map[0],
+                    ChannelMapping {
+                        src: ChannelRef::Index(0),
+                        dest: ChannelRef::Alias("front_left".to_string()),
+                        gain: None,
+                    }
+                );
+                assert_eq!(
+                    map[1],
+                    ChannelMapping {
+                        src: ChannelRef::Index(1),
+                        dest: ChannelRef::Alias("front_right".to_string()),
+                        gain: None,
+                    }
+                );
             }
             _ => panic!("Expected Play command"),
         }
@@ -1234,14 +1825,22 @@ mod tests {
             AudioCommand::Play { channel_map, .. } => {
                 let map = channel_map.unwrap();
                 assert_eq!(map.len(), 2);
-                assert_eq!(map[0], ChannelMapping {
-                    src: ChannelRef::Alias("left".to_string()),
-                    dest: ChannelRef::Alias("speaker_1".to_string())
-                });
-                assert_eq!(map[1], ChannelMapping {
-                    src: ChannelRef::Alias("right".to_string()),
-                    dest: ChannelRef::Alias("speaker_2".to_string())
-                });
+                assert_eq!(
+                    map[0],
+                    ChannelMapping {
+                        src: ChannelRef::Alias("left".to_string()),
+                        dest: ChannelRef::Alias("speaker_1".to_string()),
+                        gain: None,
+                    }
+                );
+                assert_eq!(
+                    map[1],
+                    ChannelMapping {
+                        src: ChannelRef::Alias("right".to_string()),
+                        dest: ChannelRef::Alias("speaker_2".to_string()),
+                        gain: None,
+                    }
+                );
             }
             _ => panic!("Expected Play command"),
         }
@@ -1249,7 +1848,8 @@ mod tests {
 
     #[test]
     fn test_parse_precache_command() {
-        let json = r#"{"command": "precache", "message": {"file": "http://example.com/bigfile.wav"}}"#;
+        let json =
+            r#"{"command": "precache", "message": {"file": "http://example.com/bigfile.wav"}}"#;
         let cmd = parse_command(json).unwrap();
 
         match cmd {
@@ -1280,7 +1880,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::MissingMessage => {}, // OK
+            ParseError::MissingMessage => {} // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
     }
@@ -1291,14 +1891,15 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::CacheClear => {}, // OK
+            AudioCommand::CacheClear => {} // OK
             _ => panic!("Expected CacheClear command"),
         }
     }
 
     #[test]
     fn test_parse_cache_invalidate_command() {
-        let json = r#"{"command": "cache_invalidate", "message": {"file": "http://example.com/old.wav"}}"#;
+        let json =
+            r#"{"command": "cache_invalidate", "message": {"file": "http://example.com/old.wav"}}"#;
         let cmd = parse_command(json).unwrap();
 
         match cmd {
@@ -1310,13 +1911,22 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_cache_reload_command() {
+        let json = r#"{"command": "cache_reload", "message": {"file": "/sounds/x.wav"}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::CacheReload { file } => assert_eq!(file, "/sounds/x.wav"),
+            _ => panic!("Expected CacheReload command"),
+        }
+    }
+
+    #[test]
     fn test_parse_cache_invalidate_missing_message() {
         let json = r#"{"command": "cache_invalidate"}"#;
         let result = parse_command(json);
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::MissingMessage => {}, // OK
+            ParseError::MissingMessage => {} // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
     }
@@ -1364,7 +1974,8 @@ mod tests {
 
     #[test]
     fn test_parse_input_volume_by_voice_id() {
-        let json = r#"{"command": "input_volume", "message": {"input": "gamemaster_mic", "volume": 0.8}}"#;
+        let json =
+            r#"{"command": "input_volume", "message": {"input": "gamemaster_mic", "volume": 0.8}}"#;
         let cmd = parse_command(json).unwrap();
 
         match cmd {
@@ -1383,7 +1994,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::MissingMessage => {}, // OK
+            ParseError::MissingMessage => {} // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
     }
@@ -1396,7 +2007,7 @@ mod tests {
         match cmd {
             AudioCommand::InputMute { input, mute } => {
                 assert_eq!(input, "0");
-                assert_eq!(mute, true);
+                assert!(mute);
             }
             _ => panic!("Expected InputMute command"),
         }
@@ -1410,10 +2021,29 @@ mod tests {
         match cmd {
             AudioCommand::InputMute { input, mute } => {
                 assert_eq!(input, "mic1");
-                assert_eq!(mute, false);
+                assert!(!mute);
             }
             _ => panic!("Expected InputMute command"),
         }
+    }
+
+    #[test]
+    fn test_parse_talkback_lease_commands() {
+        let acquire = parse_command(r#"{"command":"talkback_acquire","message":{"client_id":"gm-1","destination":"GUEST_ALL","gain":0.0,"lease_ms":500}}"#).unwrap();
+        match acquire {
+            AudioCommand::TalkbackAcquire(request) => {
+                assert_eq!(request.client_id, "gm-1");
+                assert_eq!(request.source_id, "GM_MIC");
+                assert_eq!(request.lease_ms, 500);
+            }
+            _ => panic!("Expected TalkbackAcquire command"),
+        }
+        let release = parse_command(r#"{"command":"talkback_release","message":{"client_id":"gm-1","lease_id":"lease-0001"}}"#).unwrap();
+        assert!(matches!(release, AudioCommand::TalkbackRelease(_)));
+        assert!(matches!(
+            parse_command(r#"{"command":"talkback_hard_mute"}"#).unwrap(),
+            AudioCommand::TalkbackHardMute
+        ));
     }
 
     #[test]
@@ -1423,7 +2053,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::MissingMessage => {}, // OK
+            ParseError::MissingMessage => {} // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
     }
@@ -1472,7 +2102,16 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, id, voice, volume, fade_in, start_position_ms, channel_map, .. } => {
+            AudioCommand::Play {
+                file,
+                id,
+                voice,
+                volume,
+                fade_in,
+                start_position_ms,
+                channel_map,
+                ..
+            } => {
                 assert_eq!(file, "background.mp3");
                 assert_eq!(id, Some("background-music".to_string()));
                 assert_eq!(voice, Some("music".to_string()));
@@ -1491,7 +2130,11 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, start_position_ms, .. } => {
+            AudioCommand::Play {
+                file,
+                start_position_ms,
+                ..
+            } => {
                 assert_eq!(file, "long_track.mp3");
                 assert_eq!(start_position_ms, Some(60000));
             }
@@ -1505,7 +2148,9 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { start_position_ms, .. } => {
+            AudioCommand::Play {
+                start_position_ms, ..
+            } => {
                 assert_eq!(start_position_ms, None);
             }
             _ => panic!("Expected Play command"),
@@ -1518,7 +2163,9 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, loop_mode, .. } => {
+            AudioCommand::Play {
+                file, loop_mode, ..
+            } => {
                 assert_eq!(file, "ambient.mp3");
                 assert!(loop_mode);
             }
@@ -1532,7 +2179,9 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, loop_mode, .. } => {
+            AudioCommand::Play {
+                file, loop_mode, ..
+            } => {
                 assert_eq!(file, "effect.wav");
                 assert!(!loop_mode);
             }
@@ -1559,7 +2208,12 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, loop_mode, crossfade_ms, .. } => {
+            AudioCommand::Play {
+                file,
+                loop_mode,
+                crossfade_ms,
+                ..
+            } => {
                 assert_eq!(file, "ambient.mp3");
                 assert!(loop_mode);
                 assert_eq!(crossfade_ms, 100);
@@ -1576,6 +2230,59 @@ mod tests {
         match cmd {
             AudioCommand::Play { crossfade_ms, .. } => {
                 assert_eq!(crossfade_ms, 0); // Defaults to 0 (disabled)
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_with_stream_mode_and_window() {
+        let json = r#"{"command": "play", "message": {"file": "long.wav", "mode": "stream", "window_ms": 2000, "prebuffer_ms": 100}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play {
+                mode,
+                window_ms,
+                prebuffer_ms,
+                ..
+            } => {
+                assert_eq!(mode, LoadMode::Stream);
+                assert_eq!(window_ms, Some(2000));
+                assert_eq!(prebuffer_ms, Some(100));
+            }
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_cacheable_override() {
+        // `cacheable: false` tags an HTTP source live (window, never persist).
+        let json = r#"{"command": "play", "message": {"file": "https://example.com/live.wav", "cacheable": false}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play { cacheable, .. } => assert_eq!(cacheable, Some(false)),
+            _ => panic!("Expected Play command"),
+        }
+        // Omitting it is backward compatible and resolves to None (cacheable default).
+        let json = r#"{"command": "play", "message": {"file": "https://example.com/cue.wav"}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play { cacheable, .. } => assert_eq!(cacheable, None),
+            _ => panic!("Expected Play command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_play_defaults_mode_to_auto() {
+        // Omitting mode/window/prebuffer is backward compatible and resolves to Auto.
+        let json = r#"{"command": "play", "message": {"file": "sfx.wav"}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::Play {
+                mode,
+                window_ms,
+                prebuffer_ms,
+                ..
+            } => {
+                assert_eq!(mode, LoadMode::Auto);
+                assert_eq!(window_ms, None);
+                assert_eq!(prebuffer_ms, None);
             }
             _ => panic!("Expected Play command"),
         }
@@ -1719,7 +2426,10 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Seek { selector, position_ms } => {
+            AudioCommand::Seek {
+                selector,
+                position_ms,
+            } => {
                 assert_eq!(selector.id, Some("my-sound".to_string()));
                 assert_eq!(selector.file, None);
                 assert_eq!(selector.voice, None);
@@ -1735,7 +2445,10 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Seek { selector, position_ms } => {
+            AudioCommand::Seek {
+                selector,
+                position_ms,
+            } => {
                 assert_eq!(selector.id, None);
                 assert_eq!(selector.file, Some("music.mp3".to_string()));
                 assert_eq!(selector.voice, None);
@@ -1751,7 +2464,10 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Seek { selector, position_ms } => {
+            AudioCommand::Seek {
+                selector,
+                position_ms,
+            } => {
                 assert_eq!(selector.id, None);
                 assert_eq!(selector.file, None);
                 assert_eq!(selector.voice, Some("background".to_string()));
@@ -1767,7 +2483,10 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Seek { selector, position_ms } => {
+            AudioCommand::Seek {
+                selector,
+                position_ms,
+            } => {
                 assert_eq!(selector.id, Some("bg-music".to_string()));
                 assert_eq!(selector.file, Some("music.mp3".to_string()));
                 assert_eq!(position_ms, 15000);
@@ -1783,7 +2502,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::MissingMessage => {}, // OK
+            ParseError::MissingMessage => {} // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
     }
@@ -1795,7 +2514,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::JsonError(_) => {}, // OK - position_ms is required
+            ParseError::JsonError(_) => {} // OK - position_ms is required
             e => panic!("Expected JsonError, got: {:?}", e),
         }
     }
@@ -1808,7 +2527,10 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Stop { selector, fade_out_ms } => {
+            AudioCommand::Stop {
+                selector,
+                fade_out_ms,
+            } => {
                 assert_eq!(selector.id, Some("effect-1".to_string()));
                 assert_eq!(fade_out_ms, None);
             }
@@ -1822,7 +2544,10 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Stop { selector, fade_out_ms } => {
+            AudioCommand::Stop {
+                selector,
+                fade_out_ms,
+            } => {
                 assert_eq!(selector.file, Some("music.mp3".to_string()));
                 assert_eq!(fade_out_ms, Some(500));
             }
@@ -1881,10 +2606,14 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Speed { selector, speed, pitch_correction } => {
+            AudioCommand::Speed {
+                selector,
+                speed,
+                pitch_correction,
+            } => {
                 assert_eq!(selector.id, Some("music-track".to_string()));
                 assert_eq!(speed, 1.5);
-                assert_eq!(pitch_correction, false); // default
+                assert!(!pitch_correction); // default
             }
             _ => panic!("Expected Speed command"),
         }
@@ -1896,10 +2625,14 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Speed { selector, speed, pitch_correction } => {
+            AudioCommand::Speed {
+                selector,
+                speed,
+                pitch_correction,
+            } => {
                 assert_eq!(selector.voice, Some("background".to_string()));
                 assert_eq!(speed, 0.5);
-                assert_eq!(pitch_correction, false);
+                assert!(!pitch_correction);
             }
             _ => panic!("Expected Speed command"),
         }
@@ -1911,10 +2644,14 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Speed { selector, speed, pitch_correction } => {
+            AudioCommand::Speed {
+                selector,
+                speed,
+                pitch_correction,
+            } => {
                 assert_eq!(selector.file, Some("music.mp3".to_string()));
                 assert_eq!(speed, 2.0);
-                assert_eq!(pitch_correction, true);
+                assert!(pitch_correction);
             }
             _ => panic!("Expected Speed command"),
         }
@@ -1927,7 +2664,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::MissingMessage => {}, // OK
+            ParseError::MissingMessage => {} // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
     }
@@ -1939,7 +2676,7 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            ParseError::JsonError(_) => {}, // OK - speed is required
+            ParseError::JsonError(_) => {} // OK - speed is required
             e => panic!("Expected JsonError, got: {:?}", e),
         }
     }
@@ -1956,7 +2693,12 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, .. } => {
+            AudioCommand::Play {
+                file,
+                volume,
+                voice,
+                ..
+            } => {
                 assert_eq!(file, "test.wav");
                 assert_eq!(volume, 1.0);
                 assert!(voice.is_none());
@@ -1980,7 +2722,16 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, id, voice, volume, fade_in, loop_mode, crossfade_ms, .. } => {
+            AudioCommand::Play {
+                file,
+                id,
+                voice,
+                volume,
+                fade_in,
+                loop_mode,
+                crossfade_ms,
+                ..
+            } => {
                 assert_eq!(file, "music.mp3");
                 assert_eq!(id, Some("bg-music".to_string()));
                 assert_eq!(voice, Some("background".to_string()));
@@ -2108,7 +2859,10 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Seek { selector, position_ms } => {
+            AudioCommand::Seek {
+                selector,
+                position_ms,
+            } => {
                 assert_eq!(selector.id, Some("track1".to_string()));
                 assert_eq!(position_ms, 60000);
             }
@@ -2118,11 +2872,16 @@ mod tests {
 
     #[test]
     fn test_flat_speed() {
-        let json = r#"{"command": "speed", "id": "playback", "speed": 1.5, "pitch_correction": true}"#;
+        let json =
+            r#"{"command": "speed", "id": "playback", "speed": 1.5, "pitch_correction": true}"#;
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Speed { selector, speed, pitch_correction } => {
+            AudioCommand::Speed {
+                selector,
+                speed,
+                pitch_correction,
+            } => {
                 assert_eq!(selector.id, Some("playback".to_string()));
                 assert_eq!(speed, 1.5);
                 assert!(pitch_correction);
@@ -2137,7 +2896,10 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Stop { selector, fade_out_ms } => {
+            AudioCommand::Stop {
+                selector,
+                fade_out_ms,
+            } => {
                 assert_eq!(selector.voice, Some("effects".to_string()));
                 assert_eq!(fade_out_ms, Some(500));
             }
@@ -2172,12 +2934,28 @@ mod tests {
         let cmd = parse_command(json).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, channel_map, .. } => {
+            AudioCommand::Play {
+                file, channel_map, ..
+            } => {
                 assert_eq!(file, "stereo.wav");
                 let map = channel_map.unwrap();
                 assert_eq!(map.len(), 2);
-                assert_eq!(map[0], ChannelMapping { src: ChannelRef::Index(0), dest: ChannelRef::Index(2) });
-                assert_eq!(map[1], ChannelMapping { src: ChannelRef::Index(1), dest: ChannelRef::Index(3) });
+                assert_eq!(
+                    map[0],
+                    ChannelMapping {
+                        src: ChannelRef::Index(0),
+                        dest: ChannelRef::Index(2),
+                        gain: None,
+                    }
+                );
+                assert_eq!(
+                    map[1],
+                    ChannelMapping {
+                        src: ChannelRef::Index(1),
+                        dest: ChannelRef::Index(3),
+                        gain: None,
+                    }
+                );
             }
             _ => panic!("Expected Play command"),
         }
@@ -2205,7 +2983,8 @@ mod tests {
 
     #[test]
     fn test_both_formats_produce_same_result() {
-        let nested = r#"{"command": "play", "message": {"file": "test.wav", "volume": 0.7, "voice": "fx"}}"#;
+        let nested =
+            r#"{"command": "play", "message": {"file": "test.wav", "volume": 0.7, "voice": "fx"}}"#;
         let flat = r#"{"command": "play", "file": "test.wav", "volume": 0.7, "voice": "fx"}"#;
 
         let cmd_nested = parse_command(nested).unwrap();
@@ -2213,8 +2992,18 @@ mod tests {
 
         match (cmd_nested, cmd_flat) {
             (
-                AudioCommand::Play { file: f1, volume: v1, voice: voice1, .. },
-                AudioCommand::Play { file: f2, volume: v2, voice: voice2, .. }
+                AudioCommand::Play {
+                    file: f1,
+                    volume: v1,
+                    voice: voice1,
+                    ..
+                },
+                AudioCommand::Play {
+                    file: f2,
+                    volume: v2,
+                    voice: voice2,
+                    ..
+                },
             ) => {
                 assert_eq!(f1, f2);
                 assert_eq!(v1, v2);
@@ -2272,7 +3061,8 @@ mod tests {
     #[test]
     fn test_expand_macros_command_overrides_macro() {
         let macros = make_macros();
-        let json = r#"{"command": "play", "file": "test.mp3", "macro": "wholeroom", "volume": 0.3}"#;
+        let json =
+            r#"{"command": "play", "file": "test.mp3", "macro": "wholeroom", "volume": 0.3}"#;
 
         let expanded = expand_macros(json, &macros).unwrap();
         let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
@@ -2298,7 +3088,8 @@ mod tests {
     fn test_expand_macros_later_macro_fills_gaps() {
         let macros = make_macros();
         // music_voice has voice, wholeroom has volume and channel_map
-        let json = r#"{"command": "play", "file": "test.mp3", "macro": ["music_voice", "wholeroom"]}"#;
+        let json =
+            r#"{"command": "play", "file": "test.mp3", "macro": ["music_voice", "wholeroom"]}"#;
 
         let expanded = expand_macros(json, &macros).unwrap();
         let value: serde_json::Value = serde_json::from_str(&expanded).unwrap();
@@ -2441,7 +3232,12 @@ mod tests {
         let cmd = parse_command(&expanded).unwrap();
 
         match cmd {
-            AudioCommand::Play { file, volume, voice, .. } => {
+            AudioCommand::Play {
+                file,
+                volume,
+                voice,
+                ..
+            } => {
                 assert_eq!(file, "test.mp3");
                 assert_eq!(volume, 0.1); // From quiet macro
                 assert_eq!(voice, Some("music".to_string())); // From music_voice macro

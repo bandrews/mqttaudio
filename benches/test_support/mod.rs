@@ -7,7 +7,12 @@ use tokio::sync::oneshot;
 
 /// Generate a WAV file with non-compressible audio content.
 /// Uses multiple inharmonic sine waves to defeat audio compression.
-pub fn generate_wav_file(path: &std::path::Path, duration_secs: u32, sample_rate: u32, channels: u16) {
+pub fn generate_wav_file(
+    path: &std::path::Path,
+    duration_secs: u32,
+    sample_rate: u32,
+    channels: u16,
+) {
     let samples = generate_test_audio(duration_secs as f32, sample_rate, channels as usize);
     write_wav_file(path, &samples, sample_rate, channels);
 }
@@ -21,12 +26,13 @@ pub fn generate_test_audio(duration_seconds: f32, sample_rate: u32, channels: us
     // Inharmonic frequencies defeat audio compression
     // These are deliberately not musical harmonics
     let frequencies = [
-        440.0, 553.0, 697.0, 877.0, 1103.0,
-        1388.0, 1746.0, 2198.0, 2767.0, 3480.0,
+        440.0, 553.0, 697.0, 877.0, 1103.0, 1388.0, 1746.0, 2198.0, 2767.0, 3480.0,
     ];
 
     // Different phases for each frequency
-    let phases: Vec<f32> = frequencies.iter().enumerate()
+    let phases: Vec<f32> = frequencies
+        .iter()
+        .enumerate()
         .map(|(i, _)| i as f32 * 0.7)
         .collect();
 
@@ -34,13 +40,15 @@ pub fn generate_test_audio(duration_seconds: f32, sample_rate: u32, channels: us
         let t = frame as f32 / sample_rate as f32;
 
         // Sum of inharmonic sine waves
-        let mut sample: f32 = frequencies.iter().zip(phases.iter())
-            .map(|(f, p)| ((t * f * std::f32::consts::TAU + p).sin() * 0.08))
+        let mut sample: f32 = frequencies
+            .iter()
+            .zip(phases.iter())
+            .map(|(f, p)| (t * f * std::f32::consts::TAU + p).sin() * 0.08)
             .sum();
 
         // Add some pseudo-random noise based on frame position
         // This further defeats compression
-        let noise = ((frame as f32 * 12345.6789).sin() * 0.02) as f32;
+        let noise = (frame as f32 * 12_345.679).sin() * 0.02;
         sample += noise;
 
         // Clamp to valid range
@@ -57,7 +65,7 @@ pub fn generate_test_audio(duration_seconds: f32, sample_rate: u32, channels: us
 
 /// Write samples to a WAV file
 fn write_wav_file(path: &std::path::Path, samples: &[f32], sample_rate: u32, channels: u16) {
-    let mut file = std::fs::File::create(path).unwrap();
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
 
     let bits_per_sample: u16 = 16;
     let byte_rate = sample_rate * channels as u32 * bits_per_sample as u32 / 8;
@@ -89,6 +97,7 @@ fn write_wav_file(path: &std::path::Path, samples: &[f32], sample_rate: u32, cha
         let i16_sample = (sample * 32767.0) as i16;
         file.write_all(&i16_sample.to_le_bytes()).unwrap();
     }
+    file.flush().unwrap();
 }
 
 /// Embedded HTTP server for benchmarking HTTP loading
@@ -110,8 +119,7 @@ impl TestHttpServer {
         let port = listener.local_addr().unwrap().port();
 
         // Build router with static file serving
-        let app = Router::new()
-            .nest_service("/", ServeDir::new(serve_dir));
+        let app = Router::new().nest_service("/", ServeDir::new(serve_dir));
 
         // Spawn server task
         tokio::spawn(async move {
