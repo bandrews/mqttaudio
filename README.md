@@ -9,7 +9,7 @@ Originally built for interactive installations, escape rooms, and immersive ente
 mqttaudio listens for JSON commands over MQTT or a REST endpoint, and plays audio with:
 
 - **Multichannel routing** — Route any audio channel to any output (up to 16+ channels)
-- **Voice grouping** — Control related sounds together (fade, stop, adjust volume)
+- **Voice grouping** — Control related sounds together (fade, stop, volume, speed); voices remember their settings until cleared
 - **Audio ducking** — Automatically lower background audio when narration plays
 - **Live mixing** — Play 20+ sounds simultaneously without glitches
 - **HTTP caching** — Stream audio from URLs with automatic caching
@@ -115,6 +115,9 @@ mosquitto_pub -t audio/commands -m '{
   "voice": "music",
   "volume": 0.3
 }'
+
+# Back to the startup state between games
+mosquitto_pub -t audio/commands -m '{"command": "reset"}'
 ```
 
 ### Route to Specific Channels

@@ -52,7 +52,7 @@ Config file example:
 | `/health` | GET | Health check (returns service status) |
 | `/status` | GET | Current playback status (samples, voices, cache) |
 | `/status/samples` | GET | List of active samples |
-| `/status/voices` | GET | List of active voices |
+| `/status/voices` | GET | List of voices, active or not, with their settings |
 | `/status/cache` | GET | Cache statistics |
 | `/status/inputs` | GET | Live inputs and their capture health |
 
@@ -71,6 +71,9 @@ Config file example:
 | `/voice/volume` | POST | Set voice volume |
 | `/voice/fade_out` | POST | Fade out a voice |
 | `/voice/stop` | POST | Stop a voice |
+| `/voice/speed` | POST | Set voice speed (`{"voice": "music", "speed": 0.8, "pitch_correction": true}`) |
+| `/voice/clear` | POST | Stop and forget a voice (`{"voice": "music"}`, or `"*"` for all) |
+| `/reset` | POST | Return to startup state (stop all, forget voices, restore inputs) |
 | `/cache/clear` | POST | Clear all caches |
 | `/cache/invalidate` | POST | Invalidate specific cache entry |
 | `/precache` | POST | Pre-cache an audio file |
@@ -102,6 +105,38 @@ curl -X POST "http://localhost:8080/stopall?token=your-secret-token"
 Status endpoints (`/health`, `/status/*`) do not require authentication.
 
 ## Status Response Formats
+
+### `/status` Voice Counts
+
+`/status` reports `voices` (every voice the daemon remembers, including idle
+ones holding settings) and `active_voices` (voices playing samples or fed by
+a live input).
+
+### `/status/voices` Response
+
+```json
+{
+  "voices": [
+    {
+      "id": "music",
+      "sample_count": 0,
+      "volume": 0.4,
+      "speed": 1.0,
+      "pitch_correction": false,
+      "active": false
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Voice name |
+| `sample_count` | integer | Samples playing in the voice |
+| `volume` | float | Voice volume (0.0-4.0, 1.0 = unity) |
+| `speed` | float | Speed given to the voice's samples |
+| `pitch_correction` | boolean | Whether the voice's samples keep their pitch |
+| `active` | boolean | Playing samples or fed by a live input |
 
 ### `/status/samples` Response
 

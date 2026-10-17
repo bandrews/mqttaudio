@@ -127,6 +127,9 @@ pub fn create_router(state: AppState, cors_permissive: bool, websocket_enabled: 
         .route("/voice/stop", post(handlers::handle_voice_stop))
         .route("/voice/fade_out", post(handlers::handle_voice_fade_out))
         .route("/voice/volume", post(handlers::handle_voice_volume))
+        .route("/voice/speed", post(handlers::handle_voice_speed))
+        .route("/voice/clear", post(handlers::handle_voice_clear))
+        .route("/reset", post(handlers::handle_reset))
         .route("/input/volume", post(handlers::handle_input_volume))
         .route("/input/mute", post(handlers::handle_input_mute));
 

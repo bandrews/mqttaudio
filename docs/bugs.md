@@ -38,3 +38,19 @@ is the reason to keep every other lock holder short.
 The test publishes to `localhost:1883` and fails without a broker running. It
 is a real integration test, not a broken one, but it makes `cargo test` fail on
 a machine that has no MQTT server.
+
+## The benchmarks do not compile
+
+`cargo build --benches` fails: `benches/mixer_benchmark.rs` builds
+`MixerState` without the `channel_gains` and `finished_samples` fields and
+calls a constructor with an outdated argument count, and
+`benches/test_support/mod.rs` has an unnecessary-parentheses warning. `cargo
+build` and `cargo test` do not build benches, so nothing caught it. Noticed
+while adding persistent voices; left alone because it is unrelated.
+
+## Unnamed plays in the same millisecond share a voice
+
+A `play` without a `voice` gets `_auto_<milliseconds>`. Two such plays whose
+loads finish in the same millisecond land in one anonymous voice, so a
+command aimed at that name reaches both. Harmless in practice since anonymous
+voices are rarely addressed, but a counter would make the names unique.

@@ -222,6 +222,52 @@ pub struct VoiceVolumeMessage {
     pub volume: f32,
 }
 
+/// Voice speed command parameters
+#[derive(Debug, Deserialize, Serialize)]
+pub struct VoiceSpeedMessage {
+    pub voice: String,
+    /// Playback speed multiplier (1.0 = normal, negative = reverse)
+    pub speed: f32,
+    /// If true, the voice's samples keep their pitch (tempo only)
+    #[serde(default)]
+    pub pitch_correction: bool,
+}
+
+/// Voice clear command parameters
+#[derive(Debug, Deserialize, Serialize)]
+pub struct VoiceClearMessage {
+    /// Voice name, or "*" for every voice
+    pub voice: String,
+}
+
+/// The voice name that targets every voice
+const ALL_VOICES: &str = "*";
+
+/// Which voices a command applies to
+#[derive(Debug, Clone, PartialEq)]
+pub enum VoiceTarget {
+    Named(String),
+    All,
+}
+
+impl VoiceTarget {
+    fn from_name(name: String) -> Self {
+        if name == ALL_VOICES {
+            VoiceTarget::All
+        } else {
+            VoiceTarget::Named(name)
+        }
+    }
+
+    /// Whether this target includes the given voice
+    pub fn matches(&self, voice_id: &str) -> bool {
+        match self {
+            VoiceTarget::Named(name) => name == voice_id,
+            VoiceTarget::All => true,
+        }
+    }
+}
+
 /// Precache command parameters
 #[derive(Debug, Deserialize, Serialize)]
 pub struct PrecacheMessage {
@@ -359,6 +405,15 @@ pub enum AudioCommand {
         voice: String,
         volume: f32,
     },
+    VoiceSpeed {
+        voice: String,
+        speed: f32,
+        pitch_correction: bool,
+    },
+    VoiceClear {
+        voice: VoiceTarget,
+    },
+    Reset,
     Precache {
         file: String,
     },
@@ -589,6 +644,42 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                 voice: voice_msg.voice,
                 volume: voice_msg.volume,
             })
+        }
+        "voice_speed" => {
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let voice_msg: VoiceSpeedMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+
+            if voice_msg.speed == 0.0 {
+                return Err(ParseError::InvalidParameter(
+                    "speed 0 is not supported - use voice_stop to end playback, or a small value like 0.05 to crawl".to_string(),
+                ));
+            }
+            if voice_msg.pitch_correction && voice_msg.speed < 0.0 {
+                return Err(ParseError::InvalidParameter(
+                    "negative (reverse) speed is not supported with pitch_correction".to_string(),
+                ));
+            }
+
+            Ok(AudioCommand::VoiceSpeed {
+                voice: voice_msg.voice,
+                speed: voice_msg.speed,
+                pitch_correction: voice_msg.pitch_correction,
+            })
+        }
+        "voice_clear" => {
+            if !mqtt_cmd.has_params() {
+                return Err(ParseError::MissingMessage);
+            }
+            let voice_msg: VoiceClearMessage = serde_json::from_value(mqtt_cmd.get_params())?;
+
+            Ok(AudioCommand::VoiceClear {
+                voice: VoiceTarget::from_name(voice_msg.voice),
+            })
+        }
+        "reset" => {
+            Ok(AudioCommand::Reset)
         }
         "precache" | "soundPrecache" => {
             if !mqtt_cmd.has_params() {
@@ -885,6 +976,114 @@ mod tests {
             ParseError::MissingMessage => {}, // OK
             e => panic!("Expected MissingMessage error, got: {:?}", e),
         }
+    }
+
+    #[test]
+    fn test_parse_voice_speed_command() {
+        let json = r#"{"command": "voice_speed", "message": {"voice": "music", "speed": 1.5, "pitch_correction": true}}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::VoiceSpeed { voice, speed, pitch_correction } => {
+                assert_eq!(voice, "music");
+                assert_eq!(speed, 1.5);
+                assert!(pitch_correction);
+            }
+            _ => panic!("Expected VoiceSpeed command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_voice_speed_defaults_to_no_pitch_correction() {
+        let json = r#"{"command": "voice_speed", "voice": "music", "speed": 0.5}"#;
+        let cmd = parse_command(json).unwrap();
+
+        match cmd {
+            AudioCommand::VoiceSpeed { voice, speed, pitch_correction } => {
+                assert_eq!(voice, "music");
+                assert_eq!(speed, 0.5);
+                assert!(!pitch_correction);
+            }
+            _ => panic!("Expected VoiceSpeed command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_voice_speed_missing_message() {
+        let json = r#"{"command": "voice_speed"}"#;
+        match parse_command(json).unwrap_err() {
+            ParseError::MissingMessage => {}, // OK
+            e => panic!("Expected MissingMessage error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_voice_speed_zero_is_rejected() {
+        let json = r#"{"command": "voice_speed", "voice": "music", "speed": 0}"#;
+        match parse_command(json).unwrap_err() {
+            ParseError::InvalidParameter(msg) => assert!(msg.contains("speed 0"), "got: {}", msg),
+            e => panic!("Expected InvalidParameter error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_voice_speed_reverse_with_pitch_correction_is_rejected() {
+        // A pitch-corrected sample ignores a negative speed, so storing one
+        // would leave every later play in the voice at the wrong speed
+        let json = r#"{"command": "voice_speed", "voice": "music", "speed": -1.0, "pitch_correction": true}"#;
+        match parse_command(json).unwrap_err() {
+            ParseError::InvalidParameter(msg) => assert!(msg.contains("pitch_correction"), "got: {}", msg),
+            e => panic!("Expected InvalidParameter error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_voice_speed_reverse_without_pitch_correction() {
+        let json = r#"{"command": "voice_speed", "voice": "music", "speed": -1.0}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::VoiceSpeed { speed, .. } => assert_eq!(speed, -1.0),
+            _ => panic!("Expected VoiceSpeed command"),
+        }
+    }
+
+    #[test]
+    fn test_parse_voice_clear_command() {
+        let json = r#"{"command": "voice_clear", "message": {"voice": "music"}}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::VoiceClear { voice } => assert_eq!(voice, VoiceTarget::Named("music".to_string())),
+            _ => panic!("Expected VoiceClear command"),
+        }
+    }
+
+    #[test]
+    fn test_flat_voice_clear_wildcard_targets_all_voices() {
+        let json = r#"{"command": "voice_clear", "voice": "*"}"#;
+        match parse_command(json).unwrap() {
+            AudioCommand::VoiceClear { voice } => assert_eq!(voice, VoiceTarget::All),
+            _ => panic!("Expected VoiceClear command"),
+        }
+    }
+
+    #[test]
+    fn test_voice_target_matches() {
+        assert!(VoiceTarget::All.matches("music"));
+        assert!(VoiceTarget::Named("music".to_string()).matches("music"));
+        assert!(!VoiceTarget::Named("music".to_string()).matches("effects"));
+    }
+
+    #[test]
+    fn test_parse_voice_clear_missing_message() {
+        let json = r#"{"command": "voice_clear"}"#;
+        match parse_command(json).unwrap_err() {
+            ParseError::MissingMessage => {}, // OK
+            e => panic!("Expected MissingMessage error, got: {:?}", e),
+        }
+    }
+
+    #[test]
+    fn test_parse_reset_command() {
+        let json = r#"{"command": "reset"}"#;
+        assert!(matches!(parse_command(json).unwrap(), AudioCommand::Reset));
     }
 
     #[test]

@@ -537,6 +537,9 @@ pub struct LiveInput {
     /// configured or boosted volume
     pub unmuted_volume: f32,
 
+    /// The volume this input was configured with, restored by reset
+    pub configured_volume: f32,
+
     /// Voice-level volume (0.0 - 1.0) - current smoothed value
     pub voice_volume: f32,
 
@@ -586,6 +589,7 @@ impl LiveInput {
             volume,
             target_volume: volume,
             unmuted_volume: volume,
+            configured_volume: volume,
             voice_volume: 1.0,
             target_voice_volume: 1.0,
             channel_map,
@@ -652,6 +656,13 @@ impl LiveInput {
     /// Whether this input is muted (or on its way there)
     pub fn is_muted(&self) -> bool {
         self.target_volume == 0.0
+    }
+
+    /// Ramp back to the configured volume, unmuted, at full voice volume
+    pub fn reset(&mut self) {
+        self.target_volume = self.configured_volume;
+        self.unmuted_volume = self.configured_volume;
+        self.target_voice_volume = 1.0;
     }
 
     /// Advance the input and voice volumes toward their targets by one frame.
@@ -2447,6 +2458,26 @@ mod tests {
 
         input.set_target_voice_volume(100.0);
         assert_eq!(input.target_voice_volume, crate::config::MAX_GAIN);
+    }
+
+    #[test]
+    fn test_live_input_reset_restores_configured_state() {
+        let consumer = create_test_ring_buffer_with_data(&[0.1f32; 4]);
+        let mut input = LiveInput::new("mic".to_string(), consumer, 1, 0.8, vec![(0, 0)]);
+
+        input.set_target_volume(0.3);
+        input.set_muted(true);
+        input.set_target_voice_volume(0.5);
+
+        input.reset();
+        assert!(!input.is_muted());
+        assert_eq!(input.target_volume, 0.8);
+        assert_eq!(input.target_voice_volume, 1.0);
+
+        // Unmute after a later mute returns to the configured level too
+        input.set_muted(true);
+        input.set_muted(false);
+        assert_eq!(input.target_volume, 0.8);
     }
 
     #[test]

@@ -488,6 +488,58 @@ pub async fn handle_voice_volume(
 }
 
 #[derive(Deserialize)]
+pub struct VoiceSpeedParams {
+    voice: String,
+    speed: f32,
+    #[serde(default)]
+    pitch_correction: bool,
+}
+
+pub async fn handle_voice_speed(
+    State(state): State<AppState>,
+    Json(params): Json<VoiceSpeedParams>,
+) -> impl IntoResponse {
+
+    let command = json!({
+        "command": "voice_speed",
+        "message": {
+            "voice": params.voice,
+            "speed": params.speed,
+            "pitch_correction": params.pitch_correction
+        }
+    });
+
+    send_command(&state, &command.to_string()).await
+}
+
+#[derive(Deserialize)]
+pub struct VoiceClearParams {
+    voice: String,
+}
+
+pub async fn handle_voice_clear(
+    State(state): State<AppState>,
+    Json(params): Json<VoiceClearParams>,
+) -> impl IntoResponse {
+
+    let command = json!({
+        "command": "voice_clear",
+        "message": { "voice": params.voice }
+    });
+
+    send_command(&state, &command.to_string()).await
+}
+
+pub async fn handle_reset(State(state): State<AppState>) -> impl IntoResponse {
+    let command = json!({
+        "command": "reset",
+        "message": {}
+    });
+
+    send_command(&state, &command.to_string()).await
+}
+
+#[derive(Deserialize)]
 pub struct InputVolumeParams {
     input: String,
     volume: f32,
@@ -552,13 +604,15 @@ pub async fn handle_status(State(state): State<AppState>) -> impl IntoResponse {
     let sample_count = mixer.active_samples.len();
     let input_count = mixer.live_inputs.len();
     let voice_count = voice_mgr.voice_count();
+    let active_voice_count = voice_mgr.active_voice_count();
 
     Json(json!({
         "status": "running",
         "version": env!("CARGO_PKG_VERSION"),
         "active_samples": sample_count,
         "active_inputs": input_count,
-        "active_voices": voice_count,
+        "voices": voice_count,
+        "active_voices": active_voice_count,
         "output_channels": mixer.output_channels,
         "cache": {
             "memory": {

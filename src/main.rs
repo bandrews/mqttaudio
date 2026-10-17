@@ -677,6 +677,16 @@ async fn main() {
 
     let voice_manager = Arc::new(Mutex::new(VoiceManager::new()));
 
+    // Microphone voices exist from startup, so their settings can be
+    // adjusted and they show in status before anything else touches them
+    {
+        let state = mixer_state.lock().unwrap();
+        let mut voice_mgr = voice_manager.lock().unwrap();
+        for input in &state.live_inputs {
+            voice_mgr.register_input_voice(&input.voice_id);
+        }
+    }
+
     // Track active voices for ducking notifications
     let active_voices: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
@@ -857,8 +867,9 @@ async fn main() {
         let stop_generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
         // Periodic bookkeeping: prune finished samples from the voice
-        // manager, drop empty voices, and fold finished streaming loads into
-        // the caches. Each lock is held only briefly.
+        // manager (which forgets anonymous voices once they empty), and fold
+        // finished streaming loads into the caches. Each lock is held only
+        // briefly.
         {
             let mixer_state = mixer_state.clone();
             let voice_manager = voice_manager.clone();
@@ -878,7 +889,6 @@ async fn main() {
                         for (sample_id, _voice_id) in &finished {
                             voice_mgr.remove_sample(*sample_id);
                         }
-                        voice_mgr.cleanup_empty_voices();
                     }
 
                     cache_manager.lock().await.cleanup_completed_loads();
@@ -946,6 +956,49 @@ async fn main() {
             if let Some(tx) = reply {
                 let _ = tx.send(outcome);
             }
+        }
+
+        /// Fade-out applied by stop commands, short enough to sound
+        /// immediate while preventing clicks/pops
+        const STOP_FADE_MS: u32 = 10;
+
+        /// Fade out every playing sample and cancel any loads still in
+        /// flight so nothing starts playing afterwards. The audio callback
+        /// removes the samples once their fade completes. Returns how many
+        /// samples were faded.
+        fn fade_out_all_samples(
+            mixer_state: &Mutex<MixerState>,
+            stop_generation: &std::sync::atomic::AtomicU64,
+            time_ms: u32,
+            sample_rate: u32,
+        ) -> usize {
+            stop_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+            let mut state = mixer_state.lock().unwrap();
+            for sample in state.active_samples.iter_mut() {
+                sample.set_fade(audio::mixer::FadeState::fade_out(time_ms, sample_rate));
+            }
+            state.active_samples.len()
+        }
+
+        /// Fade out the samples with the given IDs. The audio callback
+        /// removes them once their fade completes. Returns how many were
+        /// found playing.
+        fn fade_out_samples(
+            mixer_state: &Mutex<MixerState>,
+            sample_ids: &[u64],
+            time_ms: u32,
+            sample_rate: u32,
+        ) -> usize {
+            let mut state = mixer_state.lock().unwrap();
+            let mut count = 0;
+            for sample in state.active_samples.iter_mut() {
+                if sample_ids.contains(&sample.id) {
+                    sample.set_fade(audio::mixer::FadeState::fade_out(time_ms, sample_rate));
+                    count += 1;
+                }
+            }
+            count
         }
 
         while let Some(request) = cmd_rx.recv().await {
@@ -1035,6 +1088,7 @@ async fn main() {
                                             Err(CommandError::new(CommandErrorKind::Cancelled, format!("Play of {} cancelled by a stop command", file)))
                                         } else {
                                     // Use provided voice or auto-generate one
+                                    let is_anonymous = voice.is_none();
                                     let voice_id = voice.unwrap_or_else(|| {
                                         format!("_auto_{}", std::time::SystemTime::now()
                                             .duration_since(std::time::UNIX_EPOCH)
@@ -1075,10 +1129,15 @@ async fn main() {
                                         );
                                     }
 
-                                    // Get sample ID and voice volume from voice manager
+                                    // Get sample ID and voice settings from voice manager
                                     let mut voice_mgr = voice_manager.lock().unwrap();
-                                    let sample_id = voice_mgr.add_sample_to_voice(&voice_id);
+                                    let sample_id = if is_anonymous {
+                                        voice_mgr.add_sample_to_anonymous_voice(&voice_id)
+                                    } else {
+                                        voice_mgr.add_sample_to_voice(&voice_id)
+                                    };
                                     let voice_volume = voice_mgr.get_voice_volume(&voice_id).unwrap_or(1.0);
+                                    let (voice_speed, voice_pitch_correction) = voice_mgr.get_voice_speed(&voice_id).unwrap_or((1.0, false));
                                     drop(voice_mgr);
 
                                     // Convert crossfade_ms to samples
@@ -1113,6 +1172,9 @@ async fn main() {
                                             crossfade_samples,
                                         )
                                     };
+
+                                    // Start at the voice's stored speed
+                                    sample.set_speed_with_mode(voice_speed, voice_pitch_correction);
 
                                     // Apply start position if requested
                                     if let Some(start_ms) = start_position_ms {
@@ -1175,143 +1237,133 @@ async fn main() {
                             None
                         }
                         mqtt::commands::AudioCommand::StopAll => {
-                            // Apply quick 10ms fade-out to prevent clicks/pops
-                            const STOP_FADE_MS: u32 = 10;
-
-                            // Cancel any loads still in flight so nothing starts
-                            // playing after the stop
-                            stop_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-
-                            let mut state = mixer_state.lock().unwrap();
-                            let count = state.active_samples.len();
-
-                            for sample in state.active_samples.iter_mut() {
-                                sample.set_fade(audio::mixer::FadeState::fade_out(STOP_FADE_MS, output_sample_rate));
-                            }
-                            drop(state);
-
-                            // Note: Samples will be automatically removed by the audio callback
-                            // when the fade completes (is_finished() returns true).
-                            // Voice cleanup also happens automatically.
+                            let count = fade_out_all_samples(&mixer_state, &stop_generation, STOP_FADE_MS, output_sample_rate);
 
                             tracing::info!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS);
                             Some(Ok(format!("Stopping {} samples ({}ms fade-out)", count, STOP_FADE_MS)))
                         }
                         mqtt::commands::AudioCommand::FadeAll { time_ms } => {
-                            // Cancel any loads still in flight, matching stopall
-                            stop_generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            let count = fade_out_all_samples(&mixer_state, &stop_generation, time_ms, output_sample_rate);
 
-                            let mut state = mixer_state.lock().unwrap();
-                            let count = state.active_samples.len();
-
-                            for sample in state.active_samples.iter_mut() {
-                                sample.set_fade(audio::mixer::FadeState::fade_out(time_ms, output_sample_rate));
-                            }
-                            drop(state);
-
-                            // Samples are removed by the audio callback once the
-                            // fade completes, and voice cleanup follows from that.
                             tracing::info!("Fading out {} samples over {}ms", count, time_ms);
                             Some(Ok(format!("Fading out {} samples over {}ms", count, time_ms)))
                         }
                         mqtt::commands::AudioCommand::VoiceStop { voice } => {
-                            // Apply quick 10ms fade-out to prevent clicks/pops
-                            const STOP_FADE_MS: u32 = 10;
+                            let sample_ids = voice_manager.lock().unwrap().get_voice_sample_ids(&voice);
+                            let count = fade_out_samples(&mixer_state, &sample_ids, STOP_FADE_MS, output_sample_rate);
 
-                            // Get sample IDs in the voice
-                            let mut voice_mgr = voice_manager.lock().unwrap();
-                            let sample_ids = voice_mgr.clear_voice(&voice);
-                            drop(voice_mgr);
-
-                            if sample_ids.is_empty() {
-                                tracing::warn!("Voice '{}' not found or already empty", voice);
-                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Voice '{}' not found or already empty", voice))))
-                            } else {
-                                // Apply fade-out to all samples in the voice
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-                                for sample in state.active_samples.iter_mut() {
-                                    if sample_ids.contains(&sample.id) {
-                                        sample.set_fade(audio::mixer::FadeState::fade_out(STOP_FADE_MS, output_sample_rate));
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                tracing::info!(
-                                    "Stopping voice '{}': {} samples ({}ms fade-out)",
-                                    voice, updated_count, STOP_FADE_MS
-                                );
-                                Some(Ok(format!("Stopping voice '{}': {} samples", voice, updated_count)))
-                            }
+                            tracing::info!(
+                                "Stopping voice '{}': {} samples ({}ms fade-out)",
+                                voice, count, STOP_FADE_MS
+                            );
+                            Some(Ok(format!("Stopping voice '{}': {} samples", voice, count)))
                         }
                         mqtt::commands::AudioCommand::VoiceFadeOut { voice, time_ms } => {
-                            // Get sample IDs in the voice
-                            let voice_mgr = voice_manager.lock().unwrap();
-                            let sample_ids = voice_mgr.get_voice_sample_ids(&voice);
-                            drop(voice_mgr);
+                            let sample_ids = voice_manager.lock().unwrap().get_voice_sample_ids(&voice);
+                            let count = fade_out_samples(&mixer_state, &sample_ids, time_ms, output_sample_rate);
 
-                            if sample_ids.is_empty() {
-                                tracing::warn!("Voice '{}' not found or already empty", voice);
-                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Voice '{}' not found or already empty", voice))))
-                            } else {
-                                // Apply fade out to all samples in the voice
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut updated_count = 0;
-                                for sample in state.active_samples.iter_mut() {
-                                    if sample_ids.contains(&sample.id) {
-                                        sample.set_fade(audio::mixer::FadeState::fade_out(time_ms, output_sample_rate));
-                                        updated_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                tracing::info!(
-                                    "Applied {}ms fade out to voice '{}' ({} samples)",
-                                    time_ms, voice, updated_count
-                                );
-                                Some(Ok(format!("Fading out voice '{}' over {}ms ({} samples)", voice, time_ms, updated_count)))
-                            }
+                            tracing::info!(
+                                "Applied {}ms fade out to voice '{}' ({} samples)",
+                                time_ms, voice, count
+                            );
+                            Some(Ok(format!("Fading out voice '{}' over {}ms ({} samples)", voice, time_ms, count)))
                         }
                         mqtt::commands::AudioCommand::VoiceVolume { voice, volume: new_volume } => {
-                            // Set voice volume in voice manager
-                            let mut voice_mgr = voice_manager.lock().unwrap();
-                            let success = voice_mgr.set_voice_volume(&voice, new_volume);
-                            let actual_volume = voice_mgr.get_voice_volume(&voice).unwrap_or(1.0);
-                            drop(voice_mgr);
+                            // Store the voice volume, creating the voice if needed
+                            let actual_volume = voice_manager.lock().unwrap().set_voice_volume(&voice, new_volume);
 
-                            if success {
-                                // Update all active samples and live inputs in this voice with smooth ramping
-                                let mut state = mixer_state.lock().unwrap();
-                                let mut sample_count = 0;
-                                let mut input_count = 0;
+                            // Update all active samples and live inputs in this voice with smooth ramping
+                            let mut state = mixer_state.lock().unwrap();
+                            let mut sample_count = 0;
+                            let mut input_count = 0;
 
-                                for sample in state.active_samples.iter_mut() {
-                                    if sample.voice_id == voice {
-                                        // Set target for smooth ramping (avoids pops)
-                                        sample.set_target_voice_volume(actual_volume);
-                                        sample_count += 1;
-                                    }
+                            for sample in state.active_samples.iter_mut() {
+                                if sample.voice_id == voice {
+                                    // Set target for smooth ramping (avoids pops)
+                                    sample.set_target_voice_volume(actual_volume);
+                                    sample_count += 1;
                                 }
-
-                                for input in state.live_inputs.iter_mut() {
-                                    if input.voice_id == voice {
-                                        // Set target for smooth ramping (avoids pops)
-                                        input.set_target_voice_volume(actual_volume);
-                                        input_count += 1;
-                                    }
-                                }
-                                drop(state);
-
-                                tracing::info!(
-                                    "Set voice '{}' volume to {:.2} (updated {} samples, {} inputs)",
-                                    voice, actual_volume, sample_count, input_count
-                                );
-                                Some(Ok(format!("Set voice '{}' volume to {:.2} ({} samples, {} inputs)", voice, actual_volume, sample_count, input_count)))
-                            } else {
-                                tracing::warn!("Voice '{}' not found", voice);
-                                Some(Err(CommandError::new(CommandErrorKind::NotFound, format!("Voice '{}' not found", voice))))
                             }
+
+                            for input in state.live_inputs.iter_mut() {
+                                if input.voice_id == voice {
+                                    // Set target for smooth ramping (avoids pops)
+                                    input.set_target_voice_volume(actual_volume);
+                                    input_count += 1;
+                                }
+                            }
+                            drop(state);
+
+                            tracing::info!(
+                                "Set voice '{}' volume to {:.2} (updated {} samples, {} inputs)",
+                                voice, actual_volume, sample_count, input_count
+                            );
+                            Some(Ok(format!("Set voice '{}' volume to {:.2} ({} samples, {} inputs)", voice, actual_volume, sample_count, input_count)))
+                        }
+                        mqtt::commands::AudioCommand::VoiceSpeed { voice, speed, pitch_correction } => {
+                            // Store the voice speed, creating the voice if needed
+                            voice_manager.lock().unwrap().set_voice_speed(&voice, speed, pitch_correction);
+
+                            let mut state = mixer_state.lock().unwrap();
+                            let mut sample_count = 0;
+                            for sample in state.active_samples.iter_mut() {
+                                if sample.voice_id == voice {
+                                    sample.set_speed_with_mode(speed, pitch_correction);
+                                    sample_count += 1;
+                                }
+                            }
+                            drop(state);
+
+                            let mode = if pitch_correction { "pitch-corrected" } else { "normal" };
+                            tracing::info!(
+                                "Set voice '{}' speed to {}x ({}) (updated {} samples)",
+                                voice, speed, mode, sample_count
+                            );
+                            Some(Ok(format!("Set voice '{}' speed to {}x ({}) ({} samples)", voice, speed, mode, sample_count)))
+                        }
+                        mqtt::commands::AudioCommand::VoiceClear { voice } => {
+                            let sample_ids = {
+                                let mut voice_mgr = voice_manager.lock().unwrap();
+                                match &voice {
+                                    mqtt::commands::VoiceTarget::Named(name) => voice_mgr.clear_voice(name),
+                                    mqtt::commands::VoiceTarget::All => voice_mgr.clear_all_voices(),
+                                }
+                            };
+                            let count = fade_out_samples(&mixer_state, &sample_ids, STOP_FADE_MS, output_sample_rate);
+
+                            // A cleared voice's stored volume is gone, so its
+                            // microphones return to full voice volume
+                            let mut state = mixer_state.lock().unwrap();
+                            for input in state.live_inputs.iter_mut() {
+                                if voice.matches(&input.voice_id) {
+                                    input.set_target_voice_volume(1.0);
+                                }
+                            }
+                            drop(state);
+
+                            let cleared = match &voice {
+                                mqtt::commands::VoiceTarget::Named(name) => format!("voice '{}'", name),
+                                mqtt::commands::VoiceTarget::All => "all voices".to_string(),
+                            };
+                            tracing::info!("Cleared {}: stopped {} samples ({}ms fade-out)", cleared, count, STOP_FADE_MS);
+                            Some(Ok(format!("Cleared {}: stopped {} samples", cleared, count)))
+                        }
+                        mqtt::commands::AudioCommand::Reset => {
+                            let count = fade_out_all_samples(&mixer_state, &stop_generation, STOP_FADE_MS, output_sample_rate);
+                            voice_manager.lock().unwrap().clear_all_voices();
+
+                            let mut state = mixer_state.lock().unwrap();
+                            for input in state.live_inputs.iter_mut() {
+                                input.reset();
+                            }
+                            let input_count = state.live_inputs.len();
+                            drop(state);
+
+                            tracing::info!(
+                                "Reset: stopped {} samples, cleared all voices, restored {} inputs",
+                                count, input_count
+                            );
+                            Some(Ok(format!("Reset: stopped {} samples, cleared all voices, restored {} inputs", count, input_count)))
                         }
                         mqtt::commands::AudioCommand::Precache { file } => {
                             if let Err(e) = config.is_local_path_allowed(&file) {

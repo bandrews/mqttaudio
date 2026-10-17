@@ -710,6 +710,134 @@ async fn test_voice_volume_endpoint() {
     assert!((volume - 0.3).abs() < 0.001);
 }
 
+/// POST a JSON body to a command endpoint, assert success, and parse the
+/// command it forwarded with the daemon's real parser.
+async fn post_and_parse(uri: &str, body: &str) -> mqttaudio::mqtt::commands::AudioCommand {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = rx.try_recv().unwrap();
+    mqttaudio::mqtt::commands::parse_command(&received).unwrap()
+}
+
+#[tokio::test]
+async fn test_voice_speed_endpoint() {
+    match post_and_parse("/voice/speed", r#"{"voice": "music", "speed": 1.5, "pitch_correction": true}"#).await {
+        mqttaudio::mqtt::commands::AudioCommand::VoiceSpeed { voice, speed, pitch_correction } => {
+            assert_eq!(voice, "music");
+            assert_eq!(speed, 1.5);
+            assert!(pitch_correction);
+        }
+        other => panic!("Expected VoiceSpeed, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_voice_speed_endpoint_defaults_to_no_pitch_correction() {
+    match post_and_parse("/voice/speed", r#"{"voice": "music", "speed": 0.5}"#).await {
+        mqttaudio::mqtt::commands::AudioCommand::VoiceSpeed { pitch_correction, .. } => {
+            assert!(!pitch_correction);
+        }
+        other => panic!("Expected VoiceSpeed, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_voice_clear_endpoint() {
+    use mqttaudio::mqtt::commands::{AudioCommand, VoiceTarget};
+
+    match post_and_parse("/voice/clear", r#"{"voice": "music"}"#).await {
+        AudioCommand::VoiceClear { voice } => assert_eq!(voice, VoiceTarget::Named("music".to_string())),
+        other => panic!("Expected VoiceClear, got {:?}", other),
+    }
+    match post_and_parse("/voice/clear", r#"{"voice": "*"}"#).await {
+        AudioCommand::VoiceClear { voice } => assert_eq!(voice, VoiceTarget::All),
+        other => panic!("Expected VoiceClear, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn test_reset_endpoint() {
+    let (state, mut rx) = create_test_state();
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/reset")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let received = rx.try_recv().unwrap();
+    assert!(matches!(
+        mqttaudio::mqtt::commands::parse_command(&received).unwrap(),
+        mqttaudio::mqtt::commands::AudioCommand::Reset
+    ));
+}
+
+#[tokio::test]
+async fn test_status_reports_all_and_active_voice_counts() {
+    let (state, _rx) = create_test_state();
+    {
+        let mut voice_mgr = state.voice_manager.lock().unwrap();
+        voice_mgr.add_sample_to_voice("music");
+        voice_mgr.set_voice_volume("effects", 0.5);
+    }
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/status")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(json["voices"], 2);
+    assert_eq!(json["active_voices"], 1);
+}
+
+#[tokio::test]
+async fn test_voices_endpoint_lists_idle_voices_with_settings() {
+    let (state, _rx) = create_test_state();
+    state.voice_manager.lock().unwrap().set_voice_speed("music", 0.75, false);
+    let app = create_router(state, false, false);
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/status/voices")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(request).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let voices = json["voices"].as_array().unwrap();
+    assert_eq!(voices.len(), 1);
+    assert_eq!(voices[0]["id"], "music");
+    assert_eq!(voices[0]["speed"], 0.75);
+    assert_eq!(voices[0]["active"], false);
+}
+
 #[tokio::test]
 async fn test_samples_endpoint_returns_position_ms() {
     let (state, _rx) = create_test_state();

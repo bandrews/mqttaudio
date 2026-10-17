@@ -156,14 +156,20 @@ struct ActiveSample {
 
 ### Voice
 
-A group of samples controlled together:
+A group of samples controlled together. A voice holds settings that apply
+to every sample played into it, and lasts until `voice_clear` or `reset`
+whether or not anything is playing. Only voices created by a play that named
+no voice are transient, forgotten once their last sample finishes.
 
 ```rust
 struct Voice {
     id: String,
     sample_ids: Vec<u64>,
     volume: f32,
-    fade_state: Option<FadeState>,
+    speed: f32,
+    pitch_correction: bool,
+    transient: bool,       // created by an unnamed play
+    has_live_input: bool,  // a microphone's voice_id; never forgotten
 }
 ```
 

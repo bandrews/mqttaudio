@@ -109,6 +109,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Voices remember their settings**: a voice's volume and speed now last
+  until `voice_clear` or `reset`, instead of vanishing (along with the
+  volume) a few seconds after its last sound ended. `voice_volume` and the
+  new `voice_speed` create the voice, so a voice can be configured before
+  anything plays in it. Microphone `voice_id`s are registered at startup, and
+  `voice_volume` now reaches a microphone; it previously failed with "Voice
+  not found" unless a file was also playing on that voice. Voices created by
+  a play that named no voice are still forgotten when the sound ends.
+- **`voice_speed`** (`/voice/speed`): set a voice's playback speed and pitch
+  mode for its playing and future samples.
+- **`voice_clear`** (`/voice/clear`): stop a voice and forget its settings;
+  `"*"` clears every voice.
+- **`reset`** (`/reset`): return to the startup state between games - stop
+  all playback, forget all voices, restore microphones to their configured
+  volume, unmuted. Caches are kept.
+- **`/status` reports `voices` and `active_voices`**: all remembered voices,
+  and those playing samples or fed by a live input. `/status/voices` lists
+  idle voices too and adds `speed`, `pitch_correction` and `active`.
 - **Microphone-triggered ducking**: give an input an `activity_threshold`
   (peak capture level 0.0-1.0, plus `activity_hold_ms`, default 750) and its
   `voice_id` triggers ducking rules as a `primary_voice` - the mic goes hot,
@@ -173,6 +191,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "Unknown channel alias".
 - `play` volume is clamped to the gain limit; previously it was passed through
   unbounded while every other volume control clamped at 1.0.
+- `voice_stop`, `voice_fade_out` and `voice_volume` on a voice with nothing
+  playing succeed (reporting 0 samples) instead of failing with "not found"
+  (HTTP 404). `voice_stop` no longer resets the voice's volume.
 
 ## [2.0.0] - 2025-10-19
 

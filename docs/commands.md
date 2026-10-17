@@ -230,9 +230,16 @@ Adjust volume of specific samples.
 
 ## Voice Commands
 
+A voice remembers its settings (volume, speed) until `voice_clear` or
+`reset`, including while nothing is playing in it. Setting a voice's volume
+or speed creates the voice if needed, so you can configure a voice before its
+first `play`. See [Voice Management](features/voice-management.md) for the
+full lifecycle.
+
 ### voice_stop
 
-Stop all samples in a voice immediately.
+Stop all samples in a voice immediately. The voice keeps its settings.
+Stopping a voice with nothing playing succeeds and reports 0 samples.
 
 ```json
 {
@@ -243,7 +250,8 @@ Stop all samples in a voice immediately.
 
 ### voice_fade_out
 
-Fade out all samples in a voice.
+Fade out all samples in a voice. The voice keeps its settings. Fading a
+voice with nothing playing succeeds and reports 0 samples.
 
 ```json
 {
@@ -260,7 +268,9 @@ Fade out all samples in a voice.
 
 ### voice_volume
 
-Adjust volume for all samples in a voice.
+Set the volume of a voice: every sample playing in it, every later sample
+played into it, and any microphone whose `voice_id` it is. Creates the voice
+if it does not exist yet.
 
 ```json
 {
@@ -274,6 +284,52 @@ Adjust volume for all samples in a voice.
 |-----------|------|---------|-------------|
 | `voice` | string | *required* | Voice name |
 | `volume` | float | *required* | New volume (0.0 to 4.0, unity is 1.0) |
+
+### voice_speed
+
+Set the playback speed of a voice: every sample playing in it and every later
+sample played into it. Creates the voice if it does not exist yet.
+
+```json
+{
+  "command": "voice_speed",
+  "voice": "music",
+  "speed": 0.8,
+  "pitch_correction": true
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `voice` | string | *required* | Voice name |
+| `speed` | float | *required* | Speed multiplier, same ranges as [`speed`](#speed). 0 is rejected |
+| `pitch_correction` | bool | false | Keep the original pitch. Negative (reverse) speeds are rejected with pitch correction |
+
+The voice speed sets each sample's speed rather than multiplying it. A
+[`speed`](#speed) command aimed at one sample changes that sample until the
+next `voice_speed` on its voice.
+
+### voice_clear
+
+Stop a voice's samples and forget the voice and its settings. `"*"` clears
+every voice.
+
+```json
+{
+  "command": "voice_clear",
+  "voice": "*"
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `voice` | string | *required* | Voice name, or `"*"` for all voices |
+
+A microphone's voice stays registered with default settings, so its voice
+volume returns to 1.0; the microphone's own volume and mute are left alone
+(use [`reset`](#reset) for those). Clearing a voice that does not exist
+succeeds and reports 0 samples. Unlike `reset`, a play still loading when
+`voice_clear` arrives starts afterwards.
 
 ---
 
@@ -352,6 +408,28 @@ Mute or unmute an input.
 Muting ramps the level down over ~20ms (no pop), and unmuting restores the
 input's configured or last-set volume - a mic set to 0.7 comes back at 0.7,
 a boosted one comes back boosted.
+
+---
+
+## System Commands
+
+### reset
+
+Return the daemon to its startup state, for a predictable start between
+games or shows.
+
+```json
+{"command": "reset"}
+```
+
+- Stops all playback (10ms fade) and cancels plays still loading, like `stopall`
+- Forgets every voice and its settings (microphone voices stay registered
+  with default settings)
+- Restores every microphone to its configured volume, unmuted
+- Ducking driven by playback releases as the playback stops
+
+The caches are kept, so precached files stay ready; use `cache_clear` to
+drop them too. The configuration file is not reloaded.
 
 ---
 
