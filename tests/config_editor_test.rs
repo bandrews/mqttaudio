@@ -290,6 +290,7 @@ fn kind_covers(kind: &FieldKind, rest: &[String]) -> bool {
             rest.is_empty() || (rest.len() == 1 && rest[0].parse::<usize>().is_ok())
         }
         FieldKind::MapToUInt | FieldKind::MapToFloat { .. } => rest.len() <= 1,
+        FieldKind::Places => rest.len() <= 2,
         // Macro values are arbitrary JSON: anything below the key is covered.
         FieldKind::MapToJson => true,
         FieldKind::MemoryBudget => {
@@ -354,6 +355,7 @@ fn registry_covers_every_config_field() {
             "device": "hw:0,0",
             "channels": 8,
             "channel_aliases": { "lfe": 3 },
+            "places": { "door": { "0": 1.0, "1": 0.6 } },
             "channel_volumes": { "0": 0.9 }
         },
         "cache": {
@@ -734,6 +736,26 @@ fn ducked_voices_add_uses_voice_picker() {
     path.push(Seg::Key("ducked_voices".to_string()));
     path.push(Seg::Idx(0));
     assert_eq!(app.doc.get(&path), Some(&json!("mic")));
+}
+
+#[test]
+fn named_place_can_be_created_and_weighted_in_the_editor() {
+    let mut app = app_with(json!({"audio":{"channel_aliases":{"cabinet":1}}}));
+    goto_section(&mut app, Section::Audio);
+    goto_row(&mut app, "places");
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Char('a')));
+    type_text(&mut app, "doorway");
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Char('a')));
+    choose(&mut app, "cabinet");
+    type_text(&mut app, "2");
+    app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        app.doc
+            .get(&path_of(&["audio", "places", "doorway", "cabinet"])),
+        Some(&json!(2.0))
+    );
 }
 
 #[test]

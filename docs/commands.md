@@ -50,6 +50,7 @@ Play an audio file.
 | `speed` | float | the voice's | Start speed, as the [`speed`](#speed) command sets it. Without it the sound starts at its voice's [`voice_speed`](#voice_speed) (1.0 if none was set). `0` is rejected; a negative speed plays backwards from `start_position_ms` |
 | `pitch_correction` | boolean | false | Start with pitch correction, as the [`speed`](#speed) command sets it; applies with `speed`. Rejected with a negative `speed` |
 | `channel_map` | array | auto | Channel routing (see below) |
+| `motion` | object | omitted | Timed point-source routing through speakers and named places |
 | `mode` | string | `auto` | Load strategy: `auto` (decide by size/duration + memory budget), `full` (always in-memory), or `stream` (window a big/long file). Applies to local files and `http(s)://` URLs. A windowed voice plays forward only |
 | `window_ms` | integer | config | Windowed-source ring depth override (streamed plays) |
 | `prebuffer_ms` | integer | config | Windowed-source prebuffer override (streamed plays) |
@@ -122,6 +123,37 @@ without `gain` is unity, so existing maps are unaffected:
   ]
 }
 ```
+
+#### Speaker motion
+
+Use `motion` to control the destination of a playing file. Choose one of `motion` and `channel_map` per play.
+The daemon runs the entire cue on its output sample clock. Volume, ducking, fades, bass management and output calibration still apply.
+
+```json
+{
+  "command": "play",
+  "file": "/sounds/steps.wav",
+  "motion": {
+    "duration_ms": 5000,
+    "path": ["portrait", {"place": "doorway", "at_ms": 800}, "hall", "cabinet"],
+    "handoff": 0.5
+  }
+}
+```
+
+| Field | Behavior |
+|-------|----------|
+| `path` | One or more destinations. Use a zero-based output number, speaker alias, place name, or an object containing `speaker` or `place` and an optional `at_ms`. A one-point path parks the sound there. |
+| `duration_ms` | Total show time in whole milliseconds. The last waypoint's `at_ms` can supply the duration. When supplied together they must agree. A one-point path can omit both. |
+| `handoff` | Fraction of each leg's travel used for its crossfade, centered on the midpoint. The default `1` blends throughout. At `0.5` each end holds for a quarter of the leg. At `0` the sound switches directly at the midpoint. |
+| `easing` | `linear` (default), `ease_in`, `ease_out`, or `ease_in_out`. Easing applies across the span between consecutive timing marks, passing through any untimed waypoints in between. |
+| `source_channel` | Optional zero-based input channel. Mono uses its sole channel. Stereo defaults to `(L + R) / 2`. Files with more than two channels require an explicit selection. |
+
+The first point starts at 0 ms. Set strictly increasing arrival times where needed. Untimed intermediate stops divide the distance through a span equally. With linear easing they also divide its time equally. To hold, repeat a destination at a later time. Equal-power handoffs keep the sum of squared speaker gains constant, including when two places share a speaker.
+
+The clock starts with the first rendered source frame. File loops, seeks and speed changes preserve its progress. When the path ends, the cue continues at the last destination for the remainder of playback. Buffered, pitch-corrected and windowed playback use the same panner.
+
+Configure reusable places in the Audio section of `mqttaudio --configure` or in the JSON configuration. [Named places](configuration.md#named-places)
 
 ### stopall
 

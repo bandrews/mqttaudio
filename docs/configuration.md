@@ -248,6 +248,7 @@ for platform examples and ALSA prefix guidance.
 | `buffer_size` | integer | `512` | Buffer size in frames for output and capture streams (lower = less latency, more CPU) |
 | `channels` | integer | auto-detect | Number of output channels |
 | `channel_aliases` | object | `{}` | Named aliases for channel numbers |
+| `places` | object | `{}` | Named speaker mixes for motion cues |
 | `channel_volumes` | object | `{}` | Per-output-channel calibration gain, `0.0`–`4.0`, keyed by channel number or alias |
 | `output_ceiling_db` | number | `-1.0` | Limiter ceiling in dBFS (`-60.0`–`0.0`); the output peak is held at or below this level |
 | `master_gain` | number | `1.0` | Linear gain applied to the whole bus before limiting (`0.0`–`8.0`) |
@@ -272,6 +273,29 @@ The summed output bus passes through a soft-knee limiter so peaks never exceed `
 (default `-1.0` dBFS). Signal below the knee is unchanged; louder material is smoothly compressed toward
 the ceiling rather than hard-clipped. `master_gain` is applied to the bus before limiting. The number of
 samples the limiter held at the ceiling is reported as `clip_count` on `/status`.
+
+#### Named places
+
+Each entry in `audio.places` maps physical output numbers or channel aliases to relative speaker gains.
+For example, the midpoint of a doorway can use equal contributions from speakers in adjacent rooms.
+
+```json
+{
+  "audio": {
+    "channel_aliases": {"portrait": 0, "study": 1, "hall": 2, "cabinet": 3},
+    "places": {
+      "doorway": {"study": 1, "hall": 1},
+      "behind_portrait": {"portrait": 3, "study": 1}
+    }
+  }
+}
+```
+
+Use distinct names for places and speaker aliases. A place needs at least one positive gain.
+Weights must be finite and nonnegative, and each resolved output may appear once. The panner normalizes
+the mix to unit power. Use cue volume for loudness and channel calibration to level the installed speakers.
+In `mqttaudio --configure`, open **Audio → places**, add a place, then pick its speakers and enter weights.
+Use the place name in a [speaker motion cue](commands.md#speaker-motion).
 
 #### Channel Aliases
 

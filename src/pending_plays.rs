@@ -266,6 +266,7 @@ mod tests {
             volume: 1.0,
             voice: voice.map(str::to_string),
             channel_map: None,
+            motion: None,
             fade_in: None,
             start_position_ms: None,
             loop_mode: false,

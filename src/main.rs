@@ -1723,7 +1723,7 @@ enum LoadDone {
     Play(Result<PreparedPlayback, mqtt::commands::CommandError>),
     /// A cache command finished its work.
     Cache {
-        command: mqtt::commands::AudioCommand,
+        command: Box<mqtt::commands::AudioCommand>,
         reply: loading::PendingReply,
         result: Result<PreparedPlayback, mqtt::commands::CommandError>,
     },
@@ -1820,7 +1820,7 @@ impl CommandScheduler {
                 },
             ))) => {
                 self.cache_loads.remove(&task);
-                finish_cache_command(command, reply.0.take(), result, ctx).await
+                finish_cache_command(*command, reply.0.take(), result, ctx).await
             }
             SchedulerInput::Loaded(Err(ended)) => {
                 self.cache_loads.remove(&ended.id());
@@ -1966,7 +1966,7 @@ impl CommandScheduler {
                 .expect("load semaphore stays open");
             let result = loading::prepare(&command, &config, &cache, output_sample_rate).await;
             LoadDone::Cache {
-                command,
+                command: Box::new(command),
                 reply,
                 result,
             }
@@ -2240,6 +2240,7 @@ async fn finish_streamed_play(
     volume: f32,
     voice: Option<String>,
     channel_map: Option<Vec<mqtt::commands::ChannelMapping>>,
+    motion: Option<Box<audio::panner::PointSource>>,
     fade_in: Option<u32>,
     loop_mode: bool,
     prebuffer_frames: usize,
@@ -2317,6 +2318,7 @@ async fn finish_streamed_play(
         handles.producer_done,
         handles.stop_flag,
     );
+    source.motion = motion;
     // Start at the voice's current level (no ramp), like a sample play.
     source.voice_volume = voice_volume;
     source.target_voice_volume = voice_volume;
@@ -2457,6 +2459,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
             volume,
             voice,
             channel_map,
+            motion,
             fade_in,
             start_position_ms,
             loop_mode,
@@ -2471,6 +2474,29 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
         } => {
             // Stage clock for this play's latency event (Sprint 11, D50).
             let mut stages = PlayStages::begin();
+            let motion = if let Some(spec) = motion {
+                let channels = match ctx.prepared.as_ref() {
+                    Some(PreparedPlayback::Full(buffer)) => buffer.channels_blocking(),
+                    Some(PreparedPlayback::Stream(stream)) => stream.channels(),
+                    _ => {
+                        ctx.fail(
+                            CommandErrorKind::Internal,
+                            "Missing prepared audio for motion",
+                        );
+                        return;
+                    }
+                };
+                match spec.prepare(config, ctx.output_channels, output_sample_rate, channels) {
+                    Ok(source) => Some(Box::new(source)),
+                    Err(e) => {
+                        tracing::warn!(file, "Invalid speaker motion: {e}");
+                        ctx.fail_logged(CommandErrorKind::InvalidRequest, e);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
 
             // A play without its own speed starts at its voice's.
             let (speed, pitch_correction) = match speed {
@@ -2499,6 +2525,7 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                         volume,
                         voice,
                         channel_map,
+                        motion,
                         fade_in,
                         loop_mode && !file.starts_with("http"),
                         0,
@@ -2667,6 +2694,8 @@ async fn handle_command(cmd: mqtt::commands::AudioCommand, ctx: &mut CommandCtx<
                             crossfade_samples,
                         )
                     };
+
+                    sample.motion = motion;
 
                     // Apply start position if requested
                     if let Some(start_ms) = start_position_ms {
@@ -3650,6 +3679,93 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn motion_renders_keyframes_places_and_centered_handoffs() {
+        let mut fixture = Fixture::new(vec![]);
+        fixture.config = serde_json::from_value(serde_json::json!({
+            "audio": {
+                "channel_aliases": {"portrait": 0, "hall": 1},
+                "places": {"door": {"portrait": 3, "hall": 4}}
+            }
+        }))
+        .unwrap();
+        let command = mqtt::commands::parse_command(
+            r#"{
+            "command":"play","file":"steps.wav","loop":true,"speed":2,
+            "motion":{"duration_ms":10,"handoff":0.5,
+                "path":["portrait",{"speaker":"hall","at_ms":4},{"place":"door"}]}
+        }"#,
+        )
+        .unwrap();
+        // A short looping stereo clip also checks the point-source fold and show clock.
+        let data = [0.125, 0.375].repeat(17);
+        let buffer = Arc::new(audio::types::DecodedBuffer::new(data, 2, SR));
+        fixture
+            .run_prepared(command, Some(PreparedPlayback::Full(buffer.into())))
+            .await;
+        fixture.drain();
+        assert_eq!(fixture.mixer.active_samples[0].speed, 2.0);
+        let mut output = Vec::new();
+        for frames in [43, 89, 200, 225] {
+            let mut block = vec![0.0; frames * 2];
+            audio::mixer::mix_audio(&mut block, &mut fixture.mixer);
+            output.extend(block);
+        }
+        for (frame, left, right) in [
+            (0, 1.0, 0.0),
+            (48, 1.0, 0.0),
+            (
+                96,
+                std::f32::consts::FRAC_1_SQRT_2,
+                std::f32::consts::FRAC_1_SQRT_2,
+            ),
+            (144, 0.0, 1.0),
+            (192, 0.0, 1.0),
+            (480, 0.6, 0.8),
+            (555, 0.6, 0.8),
+        ] {
+            let actual = &output[frame * 2..frame * 2 + 2];
+            assert!(
+                (actual[0] - 0.25 * left).abs() < 0.00001
+                    && (actual[1] - 0.25 * right).abs() < 0.00001,
+                "frame {frame}: {actual:?}"
+            );
+        }
+        for frame in output.as_chunks::<2>().0 {
+            assert!((frame[0].hypot(frame[1]) - 0.25).abs() < 0.00001);
+        }
+    }
+
+    #[tokio::test]
+    async fn motion_routes_a_windowed_file_to_the_same_timed_outputs() {
+        let mut fixture = Fixture::new(vec![]);
+        let cmd = mqtt::commands::parse_command(
+            &serde_json::json!({
+                "command":"play","file":TEST_WAV,"mode":"stream","prebuffer_ms":100,
+                "motion":{"duration_ms":20,"path":[1,0],"handoff":0.5,"source_channel":0}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fixture.run(cmd).await;
+        fixture.drain();
+        assert_eq!(fixture.mixer.streamed_sources.len(), 1);
+        let mut output = vec![0.0; 1440 * 2];
+        audio::mixer::mix_audio(&mut output, &mut fixture.mixer);
+        for (slice, silent) in [(&output[..480], 0), (&output[1920..], 1)] {
+            assert!(slice
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|frame| frame[silent].abs() < 1e-6));
+            assert!(slice
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .any(|frame| frame[1 - silent].abs() > 0.001));
+        }
+    }
+
     fn play(voice: Option<&str>, volume: f32) -> AudioCommand {
         AudioCommand::Play {
             file: TEST_WAV.to_string(),
@@ -3657,6 +3773,7 @@ mod tests {
             volume,
             voice: voice.map(str::to_string),
             channel_map: None,
+            motion: None,
             fade_in: None,
             start_position_ms: None,
             loop_mode: false,
@@ -3679,6 +3796,7 @@ mod tests {
             volume: 1.0,
             voice: voice.map(str::to_string),
             channel_map: None,
+            motion: None,
             fade_in: None,
             start_position_ms: None,
             loop_mode: false,
@@ -3930,6 +4048,7 @@ mod tests {
             volume: 1.0,
             voice: Some("v".to_string()),
             channel_map: None,
+            motion: None,
             fade_in: None,
             start_position_ms: None,
             loop_mode,

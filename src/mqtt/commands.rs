@@ -220,6 +220,8 @@ pub struct PlayMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_map: Option<Vec<ChannelMapping>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub motion: Option<crate::motion::Motion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fade_in: Option<u32>, // Fade in duration in milliseconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub start_position_ms: Option<u64>, // Start playback at this offset
@@ -460,6 +462,7 @@ pub enum AudioCommand {
         volume: f32,
         voice: Option<String>,
         channel_map: Option<Vec<ChannelMapping>>,
+        motion: Option<crate::motion::Motion>,
         fade_in: Option<u32>,             // Fade in duration in milliseconds
         start_position_ms: Option<u64>,   // Start playback at this offset
         loop_mode: bool,                  // Loop playback continuously
@@ -701,6 +704,16 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                     )));
                 }
             }
+            if let Some(motion) = &play_msg.motion {
+                if play_msg.channel_map.is_some() {
+                    return Err(ParseError::InvalidParameter(
+                        "play must choose either motion or channel_map".into(),
+                    ));
+                }
+                motion
+                    .timing_marks()
+                    .map_err(ParseError::InvalidParameter)?;
+            }
 
             Ok(AudioCommand::Play {
                 file: play_msg.file,
@@ -711,6 +724,7 @@ pub fn parse_command(json: &str) -> Result<AudioCommand, ParseError> {
                     .clamp(0.0, crate::config::MAX_GAIN),
                 voice: play_msg.voice,
                 channel_map: play_msg.channel_map,
+                motion: play_msg.motion,
                 fade_in: play_msg.fade_in,
                 start_position_ms: play_msg.start_position_ms,
                 loop_mode: play_msg.loop_mode.unwrap_or(false),

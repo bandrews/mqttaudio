@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Timed speaker paths and named places for point-source playback. Motion cues support keyframes,
+  adjustable handoff length, easing, and input-channel selection on buffered and streamed files.
+  The cue launcher edits paths, and the configuration editor edits place mixes.
 - **`play` takes `speed` and `pitch_correction`.** A sound can start at a speed, with or without pitch
   correction, instead of needing a `speed` command right after the play. Both fields mean exactly what
   they mean on the `speed` command, with the same ranges; a play without `speed` starts at its voice's

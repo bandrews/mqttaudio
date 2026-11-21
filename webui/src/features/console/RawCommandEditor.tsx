@@ -1,7 +1,5 @@
 // Raw /command editor (Sprint W3, F3): send arbitrary command JSON to POST
-// /command — the universal path that reaches the full play surface
-// (channel_map/mode/window_ms/prebuffer_ms/freshness/cacheable) which the typed
-// /play endpoint silently drops (DW10). Validates that the body is JSON.
+// /command, including all motion and load options. Validates that the body is JSON.
 
 import { useState } from 'react';
 import Alert from '@mui/material/Alert';
@@ -51,8 +49,7 @@ export function RawCommandEditor() {
         Raw command (POST /command)
       </Typography>
       <Typography variant="caption" color="text.secondary">
-        The full play surface (channel_map, mode, window_ms, prebuffer_ms, freshness, cacheable) is only
-        reachable here or via MQTT — the typed /play endpoint drops these fields.
+        Send any MQTT command here, including motion cues and windowed playback options.
       </Typography>
       <Box mt={1}>
         <TextField

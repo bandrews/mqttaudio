@@ -308,6 +308,7 @@ pub struct PlayParams {
     /// [{"src": 0, "dest": "rear_left"}, ...]
     #[serde(default)]
     channel_map: Option<Value>,
+    motion: Option<Value>,
 }
 
 pub async fn handle_play(
@@ -344,6 +345,9 @@ pub async fn handle_play(
     }
     if let Some(channel_map) = params.channel_map {
         message["channel_map"] = channel_map;
+    }
+    if let Some(motion) = params.motion {
+        message["motion"] = motion;
     }
 
     let command = json!({

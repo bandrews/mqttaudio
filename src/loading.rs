@@ -16,6 +16,13 @@ pub enum PreparedPlayback {
 
 pub struct PreparedStream(Option<audio::streamed_source::StreamHandles>);
 impl PreparedStream {
+    pub fn channels(&self) -> usize {
+        self.0
+            .as_ref()
+            .expect("prepared stream owns its handles")
+            .channels
+    }
+
     pub fn into_handles(mut self) -> audio::streamed_source::StreamHandles {
         self.0.take().expect("prepared stream owns its handles")
     }

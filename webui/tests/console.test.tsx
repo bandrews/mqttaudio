@@ -49,6 +49,27 @@ describe('macro precedence (API-CONTRACT §1)', () => {
 });
 
 describe('CueLauncher (F4)', () => {
+  it('builds a timed place path and blocks a handoff outside the valid range', async () => {
+    const user = userEvent.setup();
+    const client = spyClient();
+    renderWithClient(<CueLauncher />, client);
+    await user.type(screen.getByLabelText('file'), '/steps.wav');
+    await user.click(screen.getByLabelText('Speaker motion'));
+    fireEvent.change(screen.getByLabelText('Destination type 2'), { target: { value: 'place' } });
+    fireEvent.change(screen.getByLabelText('Place 2'), { target: { value: 'doorway' } });
+    fireEvent.change(screen.getByLabelText('Arrival 2 (ms)'), { target: { value: '800' } });
+    await user.click(screen.getByRole('button', { name: 'Add waypoint' }));
+    fireEvent.change(screen.getByLabelText('Speaker 3'), { target: { value: 'hall' } });
+    fireEvent.change(screen.getByLabelText('Handoff (%)'), { target: { value: '120' } });
+    expect(screen.getByRole('button', { name: 'Play' })).toBeDisabled();
+    fireEvent.change(screen.getByLabelText('Handoff (%)'), { target: { value: '50' } });
+    const preview = JSON.parse(screen.getByLabelText('play JSON preview').textContent!);
+    expect(preview.message.motion).toEqual({
+      path: [0, { place: 'doorway', at_ms: 800 }, { speaker: 'hall' }], duration_ms: 5000, handoff: 0.5,
+    });
+    expect(screen.getByRole('button', { name: 'Play' })).toBeEnabled();
+  });
+
   it('previews and emits the full play surface via /command', async () => {
     const user = userEvent.setup();
     const client = spyClient();

@@ -70,6 +70,33 @@ const SR: u32 = 48000;
 const BLOCK: usize = 512;
 
 #[test]
+fn motion_mixes_shared_speakers_and_holds_without_callback_heap_work() {
+    let config = serde_json::from_str(r#"{"audio":{"places":{"door":{"0":1,"1":1}}}}"#).unwrap();
+    let motion: mqttaudio::motion::Motion =
+        serde_json::from_str(r#"{"path":[0,"door",1,1],"duration_ms":50,"handoff":0.5}"#).unwrap();
+    let mut sample = ActiveSample::new(
+        1,
+        "cue".into(),
+        decoded(vec![0.1; 4800], 1, SR),
+        1.0,
+        1.0,
+        "cue".into(),
+    );
+    sample.motion = Some(Box::new(motion.prepare(&config, 2, SR, 1).unwrap()));
+    let mut mixer = SceneBuilder::new(2).sample(sample).build();
+    let mut block = [0.0; BLOCK * 2];
+    assert_eq!(
+        count_allocs(|| {
+            for _ in 0..8 {
+                mix_audio(&mut block, &mut mixer);
+            }
+        }),
+        (0, 0)
+    );
+    assert_eq!(&block[..2], &[0.0, 0.1]);
+}
+
+#[test]
 fn mix_path_is_allocation_free_after_warmup() {
     // A representative scene: a plain sample plus a looping sample, mixed to a
     // stereo bus. (The pitch path is covered separately below.)

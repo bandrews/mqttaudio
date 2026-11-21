@@ -1,7 +1,7 @@
 import { test, expect } from '@playwright/test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { resolve } from 'node:path';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 // Lane B: drive the SPA through the dev proxy against a REAL daemon (spawned by
@@ -18,8 +18,9 @@ const WAV = resolve(process.cwd(), '..', 'tests', 'audio', 'test_beep_5s.wav');
 const DAEMON_PORT = 8099;
 const HEALTH = `http://127.0.0.1:${DAEMON_PORT}/health`;
 
-async function startDaemon(): Promise<ChildProcess> {
-  const proc = spawn(BIN, ['--http-port', String(DAEMON_PORT)], { stdio: 'ignore' });
+async function startDaemon(configPath?: string): Promise<ChildProcess> {
+  const args = configPath ? ['--config', configPath] : [];
+  const proc = spawn(BIN, [...args, '--http-port', String(DAEMON_PORT)], { stdio: 'ignore' });
   for (let i = 0; i < 100; i++) {
     try {
       const res = await fetch(HEALTH);
@@ -115,6 +116,41 @@ test('the console cue launcher plays a real file and Stop All clears it', async 
   await page.getByRole('button', { name: 'Stop all' }).click();
   await page.getByRole('tab', { name: 'Monitor' }).click();
   await expect(page.getByText(/no samples playing/i)).toBeVisible({ timeout: 6_000 });
+});
+
+test('a speaker path reaches its named place on the live output meters', async ({ page }, info) => {
+  mkdirSync(info.outputDir, { recursive: true });
+  const config = info.outputPath('config.json');
+  writeFileSync(config, JSON.stringify({
+    mqtt: { topic: null }, http: { enabled: true },
+    cache: { directory: info.outputPath('cache') },
+    audio: { places: { doorway: { '1': 1 } } },
+  }));
+  daemon = await startDaemon(config);
+  const invalid = await page.request.post('/api/play', {
+    data: { file: WAV, motion: { path: [{ place: 'missing' }] } },
+  });
+  expect(invalid.status()).toBe(400);
+  expect((await invalid.json()).error).toContain("unknown place 'missing'");
+  await page.goto('/');
+  await page.getByRole('button', { name: /connect/i }).click();
+  await page.getByRole('checkbox', { name: 'telemetry' }).click();
+  await page.getByRole('tab', { name: 'Console' }).click();
+  await page.getByLabel('file', { exact: true }).first().fill(WAV);
+  await page.getByLabel('volume', { exact: true }).first().fill('0.1');
+  await page.getByLabel('loop', { exact: true }).first().check();
+  await page.getByLabel('Speaker motion').check();
+  await page.getByLabel('Destination type 2').selectOption('place');
+  await page.getByLabel('Place 2', { exact: true }).fill('doorway');
+  await page.getByLabel('Motion duration (ms)').fill('1800');
+  await page.getByLabel('Arrival 2 (ms)').fill('1800');
+  await page.getByLabel('Handoff (%)').fill('50');
+  await page.getByRole('button', { name: 'Play', exact: true }).click();
+  await page.getByRole('tab', { name: 'Monitor' }).click();
+  const meter = (ch: number) => page.getByLabel(`output meter ${ch}`, { exact: true });
+  await expect.poll(async () => Number(await meter(1).getAttribute('aria-valuenow'))).toBeGreaterThan(0);
+  await expect(meter(0)).toHaveAttribute('aria-valuenow', '0');
+  await page.request.post('/api/command', { data: { command: 'stopall' } });
 });
 
 test('the matrix mixer routes a real play (dest 0/1 on the default device)', async ({ page }) => {

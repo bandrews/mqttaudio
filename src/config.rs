@@ -3,7 +3,7 @@
 
 use crate::audio::ducking::DuckingRule;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -93,6 +93,8 @@ pub struct AudioConfig {
     /// Maps alias names to channel numbers (e.g., "front_left" -> 0)
     #[serde(default)]
     pub channel_aliases: HashMap<String, usize>,
+    /// Named point-source destinations. Each maps speaker references to relative gains.
+    pub places: BTreeMap<String, BTreeMap<String, f32>>,
     /// Optional display labels, also accepted in channel volume settings.
     pub channel_names: HashMap<String, String>,
     /// Limiter ceiling in dBFS. The summed output bus is soft-limited so its peak
@@ -211,6 +213,7 @@ impl Default for AudioConfig {
             buffer_size: 512,
             channel_volumes: HashMap::new(),
             channel_aliases: HashMap::new(),
+            places: Default::default(),
             channel_names: HashMap::new(),
             output_ceiling_db: DEFAULT_OUTPUT_CEILING_DB,
             master_gain: DEFAULT_MASTER_GAIN,
@@ -1079,6 +1082,12 @@ impl Config {
     /// Validate configuration
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+
+        for name in self.audio.places.keys() {
+            if let Err(e) = crate::motion::resolve_place(self, name, self.audio.channels) {
+                errors.push(format!("audio.places.{name}: {e}"));
+            }
+        }
 
         // Either MQTT topic or HTTP must be enabled
         if self.mqtt.topic.is_none() && !self.http.enabled {

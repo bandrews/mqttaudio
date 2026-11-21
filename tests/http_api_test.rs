@@ -259,7 +259,8 @@ async fn test_play_endpoint() {
     let play_params = serde_json::json!({
         "file": "/path/to/test.wav",
         "volume": 0.8,
-        "voice": "test_voice"
+        "voice": "test_voice",
+        "motion": {"duration_ms": 1000, "path": [0, 1], "handoff": 0.5}
     });
 
     let request = Request::builder()
@@ -282,6 +283,7 @@ async fn test_play_endpoint() {
     let volume = parsed["message"]["volume"].as_f64().unwrap();
     assert!((volume - 0.8).abs() < 0.001);
     assert_eq!(parsed["message"]["voice"], "test_voice");
+    assert_eq!(parsed["message"]["motion"], play_params["motion"]);
 }
 
 #[tokio::test]

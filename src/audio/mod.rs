@@ -11,6 +11,7 @@ pub mod ducking;
 pub mod engine;
 pub mod input;
 pub mod mixer;
+pub mod panner;
 pub mod pitch_correction;
 pub mod rebuild;
 pub mod resampler;

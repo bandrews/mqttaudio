@@ -239,6 +239,8 @@ pub enum FieldKind {
     MapToUInt,
     /// A map of string keys to floats within [min, max] (channel volumes).
     MapToFloat { min: f64, max: f64 },
+    /// A map from a place name to its speakers and their relative weights.
+    Places,
     /// A map of string keys to arbitrary JSON values (macros).
     MapToJson,
     /// A channel reference: numeric index or alias string.
@@ -650,7 +652,7 @@ pub static INPUT_META: StructListMeta = StructListMeta {
 /// Command parameters offered when adding a field to a macro. Keys and kinds
 /// mirror the Play command's parameters (src/mqtt/commands.rs, PlayMessage);
 /// macros may also carry parameters of any other command, added as raw JSON.
-pub static MACRO_PARAM_FIELDS: [SubFieldSpec; 14] = [
+pub static MACRO_PARAM_FIELDS: [SubFieldSpec; 15] = [
     SubFieldSpec {
         key: "volume",
         label: "volume",
@@ -695,6 +697,12 @@ pub static MACRO_PARAM_FIELDS: [SubFieldSpec; 14] = [
             max: u64::MAX,
         },
         help: "Start playback at this offset in milliseconds.",
+    },
+    SubFieldSpec {
+        key: "motion",
+        label: "motion",
+        kind: FieldKind::MapToJson,
+        help: "Point-source path as JSON, with speaker or place waypoints, timing and handoff.",
     },
     SubFieldSpec {
         key: "channel_map",
@@ -757,7 +765,7 @@ pub fn macro_param_spec(key: &str) -> Option<&'static SubFieldSpec> {
 /// Every config field the editor can set, in display order. The coverage test
 /// in tests/config_editor_test.rs asserts this stays complete as the config
 /// schema grows.
-pub static REGISTRY: [FieldSpec; 55] = [
+pub static REGISTRY: [FieldSpec; 56] = [
     // --- MQTT ---
     FieldSpec {
         section: Section::Mqtt,
@@ -870,6 +878,13 @@ pub static REGISTRY: [FieldSpec; 55] = [
         path: &["audio", "channel_aliases"],
         kind: FieldKind::MapToUInt,
         help: "Friendly names for output channel numbers (e.g. front_left = 0, lfe = 3). Once defined, every channel field — bass management, input routes, channel volumes — can use the name instead of the number, and the channel pickers offer them.",
+    },
+    FieldSpec {
+        section: Section::Audio,
+        label: "places",
+        path: &["audio", "places"],
+        kind: FieldKind::Places,
+        help: "Named destinations for motion cues. Add a place, then add output channels and their relative speaker weights. Equal weights give equal signal to each speaker.",
     },
     FieldSpec {
         section: Section::Audio,
@@ -1290,6 +1305,7 @@ pub fn parse_field_value(kind: &FieldKind, input: &str) -> Result<Option<Value>,
         FieldKind::Flag
         | FieldKind::StringList
         | FieldKind::MapToUInt
+        | FieldKind::Places
         | FieldKind::MapToFloat { .. }
         | FieldKind::ChannelRefList
         | FieldKind::VoiceRefList
@@ -1326,7 +1342,10 @@ pub fn display_value(kind: &FieldKind, value: &Value) -> String {
                 _ => "[0 items]".to_string(),
             }
         }
-        FieldKind::MapToUInt | FieldKind::MapToFloat { .. } | FieldKind::MapToJson => match value {
+        FieldKind::MapToUInt
+        | FieldKind::MapToFloat { .. }
+        | FieldKind::Places
+        | FieldKind::MapToJson => match value {
             Value::Object(map) => format!(
                 "{{{} entr{}}}",
                 map.len(),

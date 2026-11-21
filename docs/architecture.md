@@ -154,6 +154,19 @@ struct ActiveSample {
 }
 ```
 
+### Point-source panning
+
+The motion compiler in `src/motion.rs` resolves channel aliases and places, checks the decoded input
+and negotiated output channels, and converts timing marks to absolute output frames. The renderer in
+`src/audio/panner.rs` takes normalized output mixes and timing marks. A coordinate path can supply
+those same mixes by sampling its geometry on the control thread.
+
+The mixer reads one mono sample or folds a stereo pair after source interpolation, loop crossfades or
+pitch correction. It pans that value once into the physical outputs, before bass management and output
+calibration. The panner accounts for speakers present in both endpoint mixes when normalizing a handoff.
+Each playing source owns its cursor and prepared data. The callback advances on the output clock and
+the existing reaper releases the data when playback ends.
+
 ### Voice
 
 A group of samples controlled together. A voice holds settings that apply

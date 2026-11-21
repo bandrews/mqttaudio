@@ -33,15 +33,8 @@
       "side_left": 6,
       "side_right": 7
     },
-    "channel_aliases": {
-      "front_left": 0,
-      "front_right": 1,
-      "center": 2,
-      "lfe": 3,
-      "rear_left": 4,
-      "rear_right": 5,
-      "side_left": 6,
-      "side_right": 7
+    "places": {
+      "doorway": { "front_left": 1, "front_right": 1 }
     },
     "channel_volumes": {
       "lfe": 1.4,

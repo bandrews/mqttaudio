@@ -17,6 +17,16 @@ export interface ChannelMapping {
 export type LoadMode = 'auto' | 'full' | 'stream';
 export type Freshness = 'trusting' | 'dev' | 'pinned';
 
+export type Waypoint = ChannelRef | { speaker: ChannelRef; at_ms?: number } | { place: string; at_ms?: number };
+
+export interface SpeakerMotion {
+  path: Waypoint[];
+  duration_ms?: number;
+  handoff?: number;
+  easing?: 'linear' | 'ease_in' | 'ease_out' | 'ease_in_out';
+  source_channel?: number;
+}
+
 /** Params for `play`. Only `file` is required; the rest mirror PlayMessage. */
 export interface PlayParams {
   file: string;
@@ -28,6 +38,7 @@ export interface PlayParams {
   fade_in?: number;
   start_position_ms?: number;
   channel_map?: ChannelMapping[];
+  motion?: SpeakerMotion;
   mode?: LoadMode;
   window_ms?: number;
   prebuffer_ms?: number;

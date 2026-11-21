@@ -365,6 +365,7 @@ fn play_command(op: &Op) -> AudioCommand {
         volume: volume.unwrap_or(1.0),
         voice: voice.map(|v| VOICES[v].to_string()),
         channel_map: None,
+        motion: None,
         fade_in: None,
         start_position_ms: *position,
         loop_mode: false,

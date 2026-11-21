@@ -67,7 +67,7 @@ Config file example:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/command` | POST | Send any command (same JSON as MQTT) |
-| `/play` | POST | Play audio file (same parameters as the MQTT `play` command, including `channel_map`) |
+| `/play` | POST | Play an audio file with optional channel mapping or a timed speaker path |
 | `/stop` | POST | Stop samples by selector |
 | `/stopall` | POST | Stop all playback |
 | `/fadeall` | POST | Fade out all playback |
@@ -107,10 +107,9 @@ loading](commands.md#commands-sent-while-a-play-is-loading)).
 
 > **Typed endpoints vs `/command`.** The convenience endpoints above deserialize a fixed set of fields. In
 > particular, `POST /play` accepts only `file`, `id`, `volume`, `voice`, `fade_in`, `start_position_ms`,
-> `loop` (also `loop_mode`), `crossfade_ms`, `speed`, `pitch_correction`, and `channel_map`. It does **not**
-> accept `mode`, `window_ms`, `prebuffer_ms`, `freshness`, or `cacheable` — to use those, POST the full
-> command JSON to `/command` (which accepts the same payload as MQTT). Unknown fields sent to a typed
-> endpoint are silently ignored.
+> `loop` (also `loop_mode`), `crossfade_ms`, `speed`, `pitch_correction`, `channel_map`, and `motion`. Send load options such as
+> `mode`, `window_ms`, `prebuffer_ms`, `freshness`, or `cacheable` to `/command` with the full MQTT
+> payload. Unknown fields sent to a typed endpoint are silently ignored. [Speaker motion](commands.md#speaker-motion)
 > Note also that `POST /voice/fade_out` takes `time_ms`, whereas the raw command / MQTT key is `time`.
 
 ## Authentication

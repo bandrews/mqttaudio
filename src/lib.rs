@@ -12,6 +12,7 @@ pub mod audio {
     pub mod engine;
     pub mod input;
     pub mod mixer;
+    pub mod panner;
     pub mod pitch_correction;
     pub mod rebuild;
     pub mod resampler;
@@ -41,6 +42,7 @@ pub mod http;
 pub mod config;
 pub mod config_editor;
 pub mod loading;
+pub mod motion;
 pub mod pending_plays;
 pub mod rt_engine;
 pub mod talkback;

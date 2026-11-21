@@ -376,7 +376,12 @@ impl App {
                             display,
                             path,
                             kind: *value_kind,
-                            help: map_item_help(value_kind).to_string(),
+                            help: if level.path.starts_with(&path_of(&["audio", "places"])) {
+                                "Relative speaker weights are normalized together for this place."
+                            } else {
+                                map_item_help(value_kind)
+                            }
+                            .to_string(),
                             is_set: true,
                         });
                     }
@@ -723,6 +728,18 @@ impl App {
                 cursor: 0,
                 intro: row.help.clone(),
             }),
+            FieldKind::Places => self.push_level(Level {
+                title: row.label.clone(),
+                path: row.path.clone(),
+                kind: LevelKind::Map {
+                    value_kind: FieldKind::MapToFloat {
+                        min: 0.0,
+                        max: f32::MAX as f64,
+                    },
+                },
+                cursor: 0,
+                intro: row.help.clone(),
+            }),
             FieldKind::MapToFloat { min, max } => self.push_level(Level {
                 title: row.label.clone(),
                 path: row.path.clone(),
@@ -931,7 +948,10 @@ impl App {
                 });
             }
             // Channel-volume keys are channel references: offer the picker.
-            Add::MapEntry(value_kind) if path == path_of(&["audio", "channel_volumes"]) => {
+            Add::MapEntry(value_kind)
+                if path == path_of(&["audio", "channel_volumes"])
+                    || (path.len() == 3 && path.starts_with(&path_of(&["audio", "places"]))) =>
+            {
                 let items = self.channel_choices();
                 self.open_choice_picker(
                     "Add channel".to_string(),
@@ -1074,6 +1094,20 @@ impl App {
                     self.edit = Some(EditState {
                         error: Some(format!("'{}' already exists", key)),
                         ..edit
+                    });
+                    return;
+                }
+                if let FieldKind::MapToFloat { min, max } = *value_kind {
+                    self.doc.set(&path, Value::Object(serde_json::Map::new()));
+                    self.dirty = true;
+                    self.push_level(Level {
+                        title: key,
+                        path,
+                        cursor: 0,
+                        kind: LevelKind::Map {
+                            value_kind: FieldKind::Float { min, max },
+                        },
+                        intro: "Add a speaker and its relative weight in this place.".into(),
                     });
                     return;
                 }

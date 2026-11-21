@@ -14,6 +14,7 @@ Originally built for interactive installations, escape rooms, and immersive ente
 mqttaudio listens for JSON commands over MQTT or a REST endpoint, and plays audio with:
 
 - **Multichannel routing** — Route any audio channel to any output (up to 16+ channels)
+- **Speaker motion** — Move a point source through speakers or named places with timed keyframes and adjustable overlap.
 - **Voice grouping** — Control related sounds together (fade, stop, volume, speed); voices remember their settings until cleared
 - **Audio ducking** — Automatically lower background audio when narration plays
 - **Live mixing** — Play 20+ sounds simultaneously without glitches
@@ -173,6 +174,24 @@ mosquitto_pub -t audio/commands -m '{
   ]
 }'
 ```
+
+### Move a sound through speakers
+
+```json
+{
+  "command": "play",
+  "file": "/sounds/footsteps.wav",
+  "motion": {
+    "duration_ms": 5000,
+    "path": [0, 4, {"speaker": 2, "at_ms": 600}, 3, 1, 7, 5],
+    "handoff": 1
+  }
+}
+```
+
+This reaches output 2 at 600 ms, then takes 4.4 seconds to travel the remaining four legs.
+Output numbers start at zero. A named place such as `"doorway"` can stand in for a mix of speakers.
+The web console's cue launcher can build and preview the same command. [Speaker motion options](docs/commands.md#speaker-motion)
 
 ## Configuration
 

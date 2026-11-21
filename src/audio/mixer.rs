@@ -1,6 +1,7 @@
 // ABOUTME: Real-time audio mixer performing sample mixing and channel routing.
 // ABOUTME: Runs in audio callback thread with strict real-time constraints.
 
+use super::panner::PointSource;
 use crate::audio::bass_management::BassManagement;
 use crate::audio::ducking::DuckingApplier;
 use crate::audio::pitch_correction::PitchCorrector;
@@ -132,6 +133,9 @@ pub struct ActiveSample {
     /// Channel routing: vec![(src_channel, dest_channel), ...]
     pub channel_map: Vec<(usize, usize)>,
 
+    /// Per-play point-source routing, prepared on the control thread.
+    pub motion: Option<Box<PointSource>>,
+
     /// Optional per-route gain parallel to `channel_map` (D29). When shorter than
     /// `channel_map` (including empty, the default) a missing route reads as unity,
     /// so absent gains leave existing 1:1/sum routing unchanged. Lets a downmix that
@@ -251,6 +255,7 @@ impl ActiveSample {
             target_voice_volume: voice_volume,
             channel_map,
             channel_route_gains: Vec::new(),
+            motion: None,
             fade_state: FadeState::None,
             speed: 1.0,
             pitch_corrector: None,
@@ -303,6 +308,7 @@ impl ActiveSample {
             target_voice_volume: voice_volume,
             channel_map,
             channel_route_gains: Vec::new(),
+            motion: None,
             fade_state: FadeState::None,
             speed: 1.0,
             pitch_corrector: None,
@@ -352,6 +358,7 @@ impl ActiveSample {
             target_voice_volume: voice_volume,
             channel_map,
             channel_route_gains: Vec::new(),
+            motion: None,
             fade_state: FadeState::None,
             speed: 1.0,
             pitch_corrector: None,
@@ -383,12 +390,6 @@ impl ActiveSample {
     /// routes (or none) leaves those routes at unity.
     pub fn set_channel_route_gains(&mut self, gains: Vec<f32>) {
         self.channel_route_gains = gains;
-    }
-
-    /// The gain for channel-map route `route_idx`, or unity when no per-route gain
-    /// was configured for it (D29).
-    fn channel_route_gain(&self, route_idx: usize) -> f32 {
-        channel_route_gain(&self.channel_route_gains, route_idx)
     }
 
     /// Attach the latency probe (Sprint 11, D50): the instant the play path
@@ -1118,6 +1119,9 @@ pub struct StreamedSource {
     /// Channel routing: vec![(src_channel, dest_channel), ...].
     pub channel_map: Vec<(usize, usize)>,
 
+    /// Per-play point-source routing, prepared on the control thread.
+    pub motion: Option<Box<PointSource>>,
+
     /// Optional per-route gain parallel to `channel_map` (D29), with the same
     /// semantics as `ActiveSample::channel_route_gains`: a route beyond the vector's
     /// length (including every route when it is empty, the default) reads as unity.
@@ -1179,6 +1183,7 @@ impl StreamedSource {
             target_voice_volume: 1.0,
             channel_map,
             channel_route_gains: Vec::new(),
+            motion: None,
             fade_state: FadeState::None,
             producer_done,
             stop_flag,
@@ -1693,6 +1698,7 @@ fn mix_sample_into_output(
 
     // Calculate current precise position (integer + fractional parts)
     let mut src_pos = sample.precise_position();
+    let mut rendered = 0;
 
     for frame_idx in 0..frames {
         // Advance voice volume toward target (smooth ramping to avoid pops)
@@ -1748,16 +1754,7 @@ fn mix_sample_into_output(
         // loop crossfade below keys on direction).
         let frac = src_pos.fract() as f32;
 
-        // Apply channel mapping and mix into output
-        for (route_idx, &(src_ch, dest_ch)) in sample.channel_map.iter().enumerate() {
-            // Bounds check
-            if src_ch >= buffer_channels || dest_ch >= output_channels {
-                continue;
-            }
-
-            let route_gain = sample.channel_route_gain(route_idx);
-            let dest_idx = frame_idx * output_channels + dest_ch;
-
+        let read = |src_ch| {
             // Get current sample value (returns silence for streaming buffers if unavailable)
             let sample_val = sample.buffer.get_sample_or_silence(src_frame, src_ch);
 
@@ -1776,7 +1773,7 @@ fn mix_sample_into_output(
             };
 
             // Apply loop crossfade by blending samples from end and beginning
-            let blended_val = if loop_mode
+            if loop_mode
                 && sample.crossfade_samples > 0
                 && buffer_frames > sample.crossfade_samples * 2
             {
@@ -1811,11 +1808,19 @@ fn mix_sample_into_output(
                 }
             } else {
                 interpolated_val
-            };
-
-            // Mix with combined volume, fade, and the per-route downmix gain applied
-            output[dest_idx] += blended_val * final_volume * route_gain;
-        }
+            }
+        };
+        let dest = &mut output[frame_idx * output_channels..(frame_idx + 1) * output_channels];
+        mix_routed_frame(
+            dest,
+            buffer_channels,
+            &sample.channel_map,
+            &sample.channel_route_gains,
+            sample.motion.as_deref_mut(),
+            final_volume,
+            read,
+        );
+        rendered = frame_idx + 1;
 
         // Advance fade state
         sample.fade_state.advance();
@@ -1824,9 +1829,37 @@ fn mix_sample_into_output(
         src_pos += speed;
     }
 
+    if let Some(motion) = sample.motion.as_deref_mut() {
+        motion.panner.skip_silence(frames - rendered);
+    }
+
     // The non-pitch path does not advance the position itself; the caller applies
     // the generic speed-based advance.
     false
+}
+
+/// Read and route a source frame after its playback processing. Spatial cues fold
+/// once per frame, even when a place feeds several physical outputs.
+fn mix_routed_frame(
+    output: &mut [f32],
+    src_channels: usize,
+    routes: &[(usize, usize)],
+    route_gains: &[f32],
+    motion: Option<&mut PointSource>,
+    level: f32,
+    read: impl Fn(usize) -> f32,
+) {
+    if let Some(source) = motion {
+        source.mix(level, output, src_channels, read);
+    } else {
+        for (i, &(src, dest)) in routes.iter().enumerate() {
+            if src < src_channels {
+                if let Some(out) = output.get_mut(dest) {
+                    *out += read(src) * level * channel_route_gain(route_gains, i);
+                }
+            }
+        }
+    }
 }
 
 /// Mix a sample with pitch correction using time-stretching.
@@ -2059,25 +2092,23 @@ fn apply_pitch_block(
             (1.0, 0.0, None)
         };
 
-        // Apply channel mapping and mix into output
-        for (route_idx, &(src_ch, dest_ch)) in sample.channel_map.iter().enumerate() {
-            // Bounds check
-            if src_ch >= src_channels || dest_ch >= output_channels {
-                continue;
+        let read = |src_ch| {
+            let mut value = stretched[frame_idx * src_channels + src_ch] * gain_stretched;
+            if let Some(pos) = direct_pos {
+                value += interpolated_source_sample(decoded, pos, src_ch) * gain_direct;
             }
-
-            let route_gain = sample.channel_route_gain(route_idx);
-            let src_idx = frame_idx * src_channels + src_ch;
-            let dest_idx = frame_idx * output_channels + dest_ch;
-
-            if src_idx < stretched.len() {
-                let mut value = stretched[src_idx] * gain_stretched;
-                if let Some(pos) = direct_pos {
-                    value += interpolated_source_sample(decoded, pos, src_ch) * gain_direct;
-                }
-                output[dest_idx] += value * final_volume * route_gain;
-            }
-        }
+            value
+        };
+        let dest = &mut output[frame_idx * output_channels..(frame_idx + 1) * output_channels];
+        mix_routed_frame(
+            dest,
+            src_channels,
+            &sample.channel_map,
+            &sample.channel_route_gains,
+            sample.motion.as_deref_mut(),
+            final_volume,
+            read,
+        );
 
         // Advance fade state
         sample.fade_state.advance();
@@ -2113,6 +2144,7 @@ fn mix_ring_voice_frame(
     input_channels: usize,
     channel_map: &[(usize, usize)],
     route_gains: &[f32],
+    motion: Option<&mut PointSource>,
     output: &mut [f32],
     frame_idx: usize,
     output_channels: usize,
@@ -2141,15 +2173,23 @@ fn mix_ring_voice_frame(
         1.0
     };
 
-    let final_gain = gain * fade_gain;
-    for (route_idx, &(src_ch, dest_ch)) in channel_map.iter().enumerate() {
-        if src_ch >= input_channels || dest_ch >= output_channels || src_ch >= 64 {
-            continue;
-        }
-        let dest_idx = frame_idx * output_channels + dest_ch;
-        output[dest_idx] +=
-            last_frame[src_ch] * final_gain * channel_route_gain(route_gains, route_idx);
+    if underrun
+        && motion
+            .as_ref()
+            .is_some_and(|source| !source.panner.started())
+    {
+        return;
     }
+    let dest = &mut output[frame_idx * output_channels..(frame_idx + 1) * output_channels];
+    mix_routed_frame(
+        dest,
+        input_channels.min(last_frame.len()),
+        channel_map,
+        route_gains,
+        motion,
+        gain * fade_gain,
+        |ch| last_frame[ch],
+    );
 }
 
 /// Mix a live input (microphone) into the output buffer.
@@ -2192,6 +2232,7 @@ fn mix_live_input_into_output(
             input.input_channels,
             &input.channel_map,
             &[],
+            None,
             output,
             frame_idx,
             output_channels,
@@ -2234,6 +2275,7 @@ fn mix_streamed_source_into_output(
             source.input_channels,
             &source.channel_map,
             &source.channel_route_gains,
+            source.motion.as_deref_mut(),
             output,
             frame_idx,
             output_channels,
@@ -3154,8 +3196,8 @@ mod tests {
             TEST_FILE.to_string(),
         );
         // No route gains set: the lookup yields unity for every route.
-        assert_eq!(sample.channel_route_gain(0), 1.0);
-        assert_eq!(sample.channel_route_gain(7), 1.0);
+        assert_eq!(channel_route_gain(&sample.channel_route_gains, 0), 1.0);
+        assert_eq!(channel_route_gain(&sample.channel_route_gains, 7), 1.0);
     }
 
     #[test]

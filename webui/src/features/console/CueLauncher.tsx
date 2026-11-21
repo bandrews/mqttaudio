@@ -16,8 +16,9 @@ import Stack from '@mui/material/Stack';
 import Switch from '@mui/material/Switch';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
-import type { Freshness, LoadMode, PlayParams } from '../../api/contract';
-import { validateVolume } from './validation';
+import type { Freshness, LoadMode, PlayParams, SpeakerMotion } from '../../api/contract';
+import { SpeakerPath } from './SpeakerPath';
+import { motionError, validateVolume } from './validation';
 import { parseMacroList } from './macroMerge';
 import { useCommandRunner } from './useCommandRunner';
 
@@ -43,6 +44,8 @@ export function CueLauncher() {
   const [freshness, setFreshness] = useState<Freshness | ''>('');
   const [cacheable, setCacheable] = useState(true);
   const [macros, setMacros] = useState('');
+  const [motion, setMotion] = useState<SpeakerMotion>();
+  const pathError = motionError(motion);
 
   const params = useMemo<PlayParams & { macro?: string[] }>(() => {
     const p: PlayParams & { macro?: string[] } = { file: file.trim() };
@@ -66,8 +69,9 @@ export function CueLauncher() {
     if (!cacheable) p.cacheable = false;
     const macroList = parseMacroList(macros);
     if (macroList.length > 0) p.macro = macroList;
+    if (motion) p.motion = motion;
     return p;
-  }, [file, id, voice, volume, loop, crossfade, fadeIn, startPos, mode, windowMs, prebufferMs, freshness, cacheable, macros]);
+  }, [file, id, voice, volume, loop, crossfade, fadeIn, startPos, mode, windowMs, prebufferMs, freshness, cacheable, macros, motion]);
 
   const volIssue = volume.trim() ? validateVolume(Number(volume)) : {};
   const preview = JSON.stringify({ command: 'play', message: params }, null, 2);
@@ -126,11 +130,13 @@ export function CueLauncher() {
         {streamForwardOnlyNote && (
           <Alert severity="info">mode=stream is forward-only: seek, loop-crossfade, reverse, and variable speed do not apply.</Alert>
         )}
+        <SpeakerPath motion={motion} change={setMotion} />
+        {pathError && <Alert severity="error">{pathError}</Alert>}
         <Box component="pre" sx={{ m: 0, p: 1, bgcolor: 'background.default', borderRadius: 1, fontSize: 12, overflowX: 'auto' }} aria-label="play JSON preview">
           {preview}
         </Box>
         <Stack direction="row" spacing={2} alignItems="center">
-          <Button variant="contained" disabled={!file.trim() || state.status === 'sending'} onClick={() => run((c) => c.rawCommand({ command: 'play', message: params }))}>
+          <Button variant="contained" disabled={!file.trim() || !!pathError || state.status === 'sending'} onClick={() => run((c) => c.rawCommand({ command: 'play', message: params }))}>
             Play
           </Button>
           {state.status === 'ok' && <Alert severity="success" sx={{ py: 0 }}>Accepted (enqueued — confirm on the dashboard).</Alert>}
