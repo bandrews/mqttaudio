@@ -1,78 +1,169 @@
 // ABOUTME: Audio input device handling for microphone capture.
 // ABOUTME: Manages input streams and routes audio to mixer via ring buffers.
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, SampleRate, Stream, SupportedStreamConfig};
-use ringbuf::{HeapRb, HeapConsumer, HeapProducer};
 use crate::config::ResamplerQuality;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{Device, Stream, SupportedStreamConfig};
+use std::sync::atomic::{AtomicU32, AtomicU64};
+const MAX_REASONABLE_SAMPLE_RATE: u32 = 384000;
+const MAX_REASONABLE_CHANNELS: u16 = 64;
+use ringbuf::{HeapConsumer, HeapProducer, HeapRb};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-/// ALSA plugin devices advertise absurd rates (4294967295 Hz); anything above
-/// this is treated as a bogus capability report.
-const MAX_REASONABLE_SAMPLE_RATE: u32 = 384000;
+/// Capabilities of an input device, as far as they could be determined.
+pub enum InputCaps {
+    /// Capabilities probed from the device's supported configurations.
+    Probed {
+        max_channels: u16,
+        /// Unique (min, max) sample-rate ranges across the supported configurations.
+        sample_rates: Vec<(u32, u32)>,
+    },
+    /// All supported configurations were implausible (ALSA plugin devices report
+    /// fake rates), so this reflects the default configuration instead.
+    PluginFallback { channels: u16, sample_rate: u32 },
+    /// Supported configurations could not be enumerated; this reflects the
+    /// default configuration.
+    DefaultOnly { channels: u16, sample_rate: u32 },
+    /// No capability information could be obtained.
+    Unknown,
+}
 
-/// Upper bound on channel counts accepted from device capability reports
-const MAX_REASONABLE_CHANNELS: u16 = 64;
+/// An input device discovered by enumeration.
+pub struct InputDeviceInfo {
+    /// Device name (used for the `inputs[].device` config field)
+    pub name: String,
+    pub caps: InputCaps,
+}
+
+impl InputDeviceInfo {
+    /// Channel count from whichever capability source was available, if any.
+    pub fn channels(&self) -> Option<u16> {
+        match self.caps {
+            InputCaps::Probed { max_channels, .. } => Some(max_channels),
+            InputCaps::PluginFallback { channels, .. } => Some(channels),
+            InputCaps::DefaultOnly { channels, .. } => Some(channels),
+            InputCaps::Unknown => None,
+        }
+    }
+}
+
+/// Enumerate available audio input devices with their capabilities.
+/// Errors during enumeration are returned as Err with a description.
+pub fn input_device_list() -> Result<Vec<InputDeviceInfo>, String> {
+    let host = cpal::default_host();
+
+    let devices = host.input_devices().map_err(|e| e.to_string())?;
+    let mut list = Vec::new();
+    for device in devices {
+        let Ok(name) = device.description().map(|d| {
+            super::device::output_device_identifier(&d, cfg!(target_os = "linux")).to_string()
+        }) else {
+            continue;
+        };
+
+        // Query all supported configs to find max channels
+        if name == "null" {
+            continue;
+        }
+        let caps = if let Ok(configs) = device.supported_input_configs() {
+            let mut max_channels = 0u16;
+            let mut sample_rates: Vec<(u32, u32)> = Vec::new();
+
+            // Filter configs: ignore those with absurd sample rates
+            // (ALSA plugins report 4294967295 Hz which is clearly fake)
+            const MAX_REASONABLE_SAMPLE_RATE: u32 = 384000;
+
+            for config in configs {
+                let max_rate = config.max_sample_rate();
+                // Skip configs from ALSA plugins that claim unrealistic capabilities
+                if max_rate > MAX_REASONABLE_SAMPLE_RATE {
+                    continue;
+                }
+
+                max_channels = max_channels.max(config.channels());
+                let min_rate = config.min_sample_rate();
+                // Collect unique sample rate ranges
+                if !sample_rates
+                    .iter()
+                    .any(|(min, max)| *min == min_rate && *max == max_rate)
+                {
+                    sample_rates.push((min_rate, max_rate));
+                }
+            }
+
+            if max_channels > 0 {
+                InputCaps::Probed {
+                    max_channels,
+                    sample_rates,
+                }
+            } else if let Ok(config) = device.default_input_config() {
+                // All configs were filtered out - fall back to default
+                // This happens with ALSA plugin devices
+                InputCaps::PluginFallback {
+                    channels: config.channels(),
+                    sample_rate: config.sample_rate(),
+                }
+            } else {
+                InputCaps::Unknown
+            }
+        } else if let Ok(config) = device.default_input_config() {
+            // Fallback to default config if supported_input_configs fails
+            InputCaps::DefaultOnly {
+                channels: config.channels(),
+                sample_rate: config.sample_rate(),
+            }
+        } else {
+            InputCaps::Unknown
+        };
+
+        list.push(InputDeviceInfo { name, caps });
+    }
+    Ok(list)
+}
 
 /// List available audio input devices
 pub fn list_input_devices() {
-    let host = cpal::default_host();
-
     println!("Available audio input devices:");
-    match host.input_devices() {
+    match input_device_list() {
         Ok(devices) => {
-            let mut count = 0usize;
-            for (i, device) in devices.enumerate() {
-                count += 1;
-                if let Ok(name) = device.name() {
-                    println!("  {}. {}", i, name);
-
-                    // Query all supported configs to find max channels
-                    if let Ok(configs) = device.supported_input_configs() {
-                        let mut max_channels = 0u16;
-                        let mut sample_rates: Vec<(u32, u32)> = Vec::new();
-
-                        for config in configs {
-                            let max_rate = config.max_sample_rate().0;
-                            // Skip configs from ALSA plugins that claim unrealistic capabilities
-                            if max_rate > MAX_REASONABLE_SAMPLE_RATE {
-                                continue;
+            let count = devices.len();
+            for (i, device) in devices.iter().enumerate() {
+                println!("  {}. {}", i, device.name);
+                match &device.caps {
+                    InputCaps::Probed {
+                        max_channels,
+                        sample_rates,
+                    } => {
+                        // Show sample rate range(s)
+                        if sample_rates.len() == 1 {
+                            let (min, max) = sample_rates[0];
+                            if min == max {
+                                println!("     Sample rate: {} Hz", min);
+                            } else {
+                                println!("     Sample rate: {}-{} Hz", min, max);
                             }
-
-                            max_channels = max_channels.max(config.channels());
-                            let min_rate = config.min_sample_rate().0;
-                            // Collect unique sample rate ranges
-                            if !sample_rates.iter().any(|(min, max)| *min == min_rate && *max == max_rate) {
-                                sample_rates.push((min_rate, max_rate));
-                            }
+                        } else if !sample_rates.is_empty() {
+                            // Multiple ranges, just show common rates
+                            println!("     Sample rates: (multiple configurations)");
                         }
-
-                        if max_channels > 0 {
-                            // Show sample rate range(s)
-                            if sample_rates.len() == 1 {
-                                let (min, max) = sample_rates[0];
-                                if min == max {
-                                    println!("     Sample rate: {} Hz", min);
-                                } else {
-                                    println!("     Sample rate: {}-{} Hz", min, max);
-                                }
-                            } else if !sample_rates.is_empty() {
-                                // Multiple ranges, just show common rates
-                                println!("     Sample rates: (multiple configurations)");
-                            }
-                            println!("     Max channels: {}", max_channels);
-                        } else if let Ok(config) = device.default_input_config() {
-                            // All configs were filtered out - fall back to default
-                            // This happens with ALSA plugin devices
-                            println!("     Sample rate: {} Hz (plugin)", config.sample_rate().0);
-                            println!("     Channels: {} (plugin)", config.channels());
-                        }
-                    } else if let Ok(config) = device.default_input_config() {
-                        // Fallback to default config if supported_input_configs fails
-                        println!("     Sample rate: {} Hz", config.sample_rate().0);
-                        println!("     Channels: {}", config.channels());
+                        println!("     Max channels: {}", max_channels);
                     }
+                    InputCaps::PluginFallback {
+                        channels,
+                        sample_rate,
+                    } => {
+                        println!("     Sample rate: {} Hz (plugin)", sample_rate);
+                        println!("     Channels: {} (plugin)", channels);
+                    }
+                    InputCaps::DefaultOnly {
+                        channels,
+                        sample_rate,
+                    } => {
+                        println!("     Sample rate: {} Hz", sample_rate);
+                        println!("     Channels: {}", channels);
+                    }
+                    InputCaps::Unknown => {}
                 }
             }
             if count == 0 {
@@ -171,9 +262,10 @@ fn resolve_requested_device(requested: &str, names: &[String]) -> Option<usize> 
     }
     #[cfg(target_os = "linux")]
     {
-        if let Some(pos) = names.iter().position(|n| {
-            crate::audio::device::try_match_alsa_device(requested, n) == Some(true)
-        }) {
+        if let Some(pos) = names
+            .iter()
+            .position(|n| crate::audio::device::try_match_alsa_device(requested, n) == Some(true))
+        {
             return Some(pos);
         }
     }
@@ -191,28 +283,33 @@ pub fn get_input_device(name: Option<&str>) -> Result<Device, InputError> {
 
     match name {
         Some(device_name) => {
-            // Enumeration opens every device for capture, so each one must be
-            // dropped before the next opens: holding them all at once lets
-            // the first alias of a card claim its only capture substream and
-            // hide every other alias (plughw:, dsnoop:) of the same card.
-            // Collecting names only also keeps the numbering identical to
-            // --list-inputs.
-            let names: Vec<String> = host.input_devices()
+            let names: Vec<String> = host
+                .input_devices()
                 .map_err(|e| InputError::DeviceEnumeration(e.to_string()))?
-                .map(|d| d.name().unwrap_or_else(|_| "<unknown>".to_string()))
+                .filter_map(|device| {
+                    device.description().ok().map(|d| {
+                        super::device::output_device_identifier(&d, cfg!(target_os = "linux"))
+                            .to_string()
+                    })
+                })
+                .filter(|name| name != "null")
                 .collect();
-
             if let Some(pos) = resolve_requested_device(device_name, &names) {
-                let target = names[pos].clone();
-                if target != device_name {
-                    tracing::info!("Matched input device '{}' to '{}'", device_name, target);
-                }
-                // The chosen device is fetched by name in a second pass; the
-                // device set can shift between passes, so a vanished device
-                // falls through to the not-found report.
-                let found = host.input_devices()
+                let target = &names[pos];
+                let found = host
+                    .input_devices()
                     .map_err(|e| InputError::DeviceEnumeration(e.to_string()))?
-                    .find(|d| d.name().map(|n| n == target).unwrap_or(false));
+                    .find(|device| {
+                        device
+                            .description()
+                            .map(|d| {
+                                super::device::output_device_identifier(
+                                    &d,
+                                    cfg!(target_os = "linux"),
+                                ) == target
+                            })
+                            .unwrap_or(false)
+                    });
                 if let Some(device) = found {
                     return Ok(device);
                 }
@@ -229,16 +326,19 @@ pub fn get_input_device(name: Option<&str>) -> Result<Device, InputError> {
                 probe,
             })
         }
-        None => {
-            host.default_input_device()
-                .ok_or_else(|| InputError::NoDefaultDevice)
-        }
+        None => host
+            .default_input_device()
+            .ok_or(InputError::NoDefaultDevice),
     }
 }
 
 /// Lowest input channel count that can serve every routed source channel
 pub fn required_channels(channel_map: &[(usize, usize)]) -> usize {
-    channel_map.iter().map(|(src, _)| src + 1).max().unwrap_or(0)
+    channel_map
+        .iter()
+        .map(|(src, _)| src + 1)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Choose the channel count to open a capture stream with.
@@ -249,7 +349,11 @@ pub fn required_channels(channel_map: &[(usize, usize)]) -> usize {
 /// opened wider than the routing needs while a device with a fixed layout
 /// (ALSA `hw:` on a multichannel interface) still matches. Returns None when
 /// no supported count satisfies the request.
-pub fn select_channel_count(available: &[u16], exact: Option<usize>, minimum: usize) -> Option<u16> {
+pub fn select_channel_count(
+    available: &[u16],
+    exact: Option<usize>,
+    minimum: usize,
+) -> Option<u16> {
     match exact {
         Some(requested) => available
             .iter()
@@ -265,9 +369,7 @@ pub fn select_channel_count(available: &[u16], exact: Option<usize>, minimum: us
 
 /// Find a capture configuration for the device.
 ///
-/// Only f32 configurations are considered: the capture callback reads f32
-/// samples, and ALSA `hw:` devices that expose integer formats only must be
-/// opened through their `plughw:` alias instead.
+/// Supported native formats are converted to f32 by the typed capture callback.
 /// Choose the capture rate from a reported range. ALSA plug devices report a
 /// continuous range with an implausible maximum; that is capability-report
 /// noise, not a reason to disqualify the configuration, so the ceiling is
@@ -286,7 +388,7 @@ pub fn find_input_config(
     let supported: Vec<_> = device
         .supported_input_configs()
         .map_err(|e| InputError::ConfigError(e.to_string()))?
-        .filter(|c| c.min_sample_rate().0 <= MAX_REASONABLE_SAMPLE_RATE)
+        .filter(|c| c.min_sample_rate() <= MAX_REASONABLE_SAMPLE_RATE)
         .filter(|c| c.channels() <= MAX_REASONABLE_CHANNELS)
         .collect();
 
@@ -298,7 +400,7 @@ pub fn find_input_config(
 
     let float_configs: Vec<_> = supported
         .iter()
-        .filter(|c| c.sample_format() == SampleFormat::F32)
+        .filter(|c| input_stream_builder(c.sample_format()).is_some())
         .collect();
 
     if float_configs.is_empty() {
@@ -309,7 +411,7 @@ pub fn find_input_config(
             .into_iter()
             .collect();
         return Err(InputError::ConfigError(format!(
-            "device offers no f32 capture format (has: {}); use the 'plughw:' alias for this card",
+            "device offers no supported capture format (has: {}); use the 'plughw:' alias for this card",
             formats.join(", ")
         )));
     }
@@ -339,20 +441,23 @@ pub fn find_input_config(
 
     // Matching the output rate keeps the resampler out of the signal path
     let exact_rate = matching.iter().find(|c| {
-        choose_capture_rate(c.min_sample_rate().0, c.max_sample_rate().0, preferred_sample_rate)
-            == preferred_sample_rate
+        choose_capture_rate(
+            c.min_sample_rate(),
+            c.max_sample_rate(),
+            preferred_sample_rate,
+        ) == preferred_sample_rate
     });
 
     match exact_rate {
-        Some(c) => Ok(c.with_sample_rate(SampleRate(preferred_sample_rate))),
+        Some(c) => Ok(c.with_sample_rate(preferred_sample_rate)),
         None => {
             let closest = matching[0];
             let rate = choose_capture_rate(
-                closest.min_sample_rate().0,
-                closest.max_sample_rate().0,
+                closest.min_sample_rate(),
+                closest.max_sample_rate(),
                 preferred_sample_rate,
             );
-            Ok(closest.with_sample_rate(SampleRate(rate)))
+            Ok(closest.with_sample_rate(rate))
         }
     }
 }
@@ -363,6 +468,7 @@ pub fn find_input_config(
 /// seen by the mixer, sending each microphone to the wrong output and leaving a
 /// residue that grows until the buffer is full. Frames that do not fit are
 /// counted as dropped instead.
+#[cfg(test)]
 fn push_frames(
     producer: &mut HeapProducer<f32>,
     data: &[f32],
@@ -389,7 +495,8 @@ fn push_frames(
 
 /// Get the default input configuration for a device
 pub fn get_input_config(device: &Device) -> Result<SupportedStreamConfig, InputError> {
-    device.default_input_config()
+    device
+        .default_input_config()
         .map_err(|e| InputError::ConfigError(e.to_string()))
 }
 
@@ -408,6 +515,7 @@ pub fn create_ring_buffer(size: usize) -> (HeapProducer<f32>, HeapConsumer<f32>)
 }
 
 /// Input stream configuration
+#[derive(Clone)]
 pub struct InputStreamConfig {
     pub device_name: Option<String>,
     pub latency_ms: u32,
@@ -443,37 +551,26 @@ impl Default for InputStreamConfig {
 pub struct ActiveInput {
     #[allow(dead_code)] // Stream must be kept alive for audio to flow
     stream: Stream,
-    consumer: Option<HeapConsumer<f32>>,
+    consumers: Vec<HeapConsumer<f32>>,
     pub channels: usize,
+    /// Capture-path counters (D57), drained/logged off-RT and surfaced on /metrics.
+    pub telemetry: Arc<InputTelemetry>,
     pub sample_rate: u32,
-    /// Frames the capture callback could not hand over because the ring buffer
-    /// was full. Shared with the mixer so input health can be reported.
-    pub dropped_frames: Arc<AtomicU64>,
-    /// Peak absolute sample level (as f32 bits) seen since the last reader
-    /// reset it. Written lock-free by the capture callback; the activity
-    /// detector swaps it back to zero on each poll.
-    pub peak_level: Arc<AtomicU32>,
-}
-
-/// Fold a chunk's peak absolute level into the shared atomic.
-/// Non-negative f32 bit patterns order like the floats themselves, so
-/// fetch_max on the bits is a lock-free running maximum.
-fn update_peak_level(peak_level: &AtomicU32, data: &[f32]) {
-    let mut max = 0.0f32;
-    for sample in data {
-        let a = sample.abs();
-        if a > max {
-            max = a;
-        }
-    }
-    peak_level.fetch_max(max.to_bits(), Ordering::Relaxed);
+    /// Backlog the mixer tolerates before trimming, from the ring and resampler
+    /// geometry.
+    pub max_backlog_frames: usize,
 }
 
 impl ActiveInput {
     /// Take ownership of the ring buffer consumer
     /// Returns None if already taken
     pub fn take_consumer(&mut self) -> Option<HeapConsumer<f32>> {
-        self.consumer.take()
+        self.consumers.pop()
+    }
+
+    /// Take every logical-strip consumer fed by this one physical capture.
+    pub fn take_consumers(&mut self) -> Vec<HeapConsumer<f32>> {
+        std::mem::take(&mut self.consumers)
     }
 }
 
@@ -483,18 +580,36 @@ pub fn create_input_stream(
     config: InputStreamConfig,
     target_sample_rate: u32,
 ) -> Result<ActiveInput, InputError> {
-    let device = get_input_device(config.device_name.as_deref())?;
-    let device_name = device.name().unwrap_or_else(|_| "Unknown".to_string());
+    create_input_stream_with_fanout(config, target_sample_rate, 1)
+}
 
-    let preferred_rate = config.sample_rate.unwrap_or(target_sample_rate);
+/// Create one physical capture stream and fan its resampled frames into a
+/// bounded ring for each logical input strip. This avoids opening a single-open
+/// ALSA device once per team microphone while keeping existing one-consumer
+/// callers source-compatible.
+pub fn create_input_stream_with_fanout(
+    config: InputStreamConfig,
+    target_sample_rate: u32,
+    consumer_count: usize,
+) -> Result<ActiveInput, InputError> {
+    if consumer_count == 0 {
+        return Err(InputError::ConfigError(
+            "consumer_count must be positive".to_string(),
+        ));
+    }
+    let device = get_input_device(config.device_name.as_deref())?;
+    let device_name = device
+        .description()
+        .map(|d| super::device::output_device_identifier(&d, cfg!(target_os = "linux")).to_string())
+        .unwrap_or_else(|_| "Unknown".to_string());
     let supported_config = find_input_config(
         &device,
         config.channels,
         config.min_channels,
-        preferred_rate,
+        config.sample_rate.unwrap_or(target_sample_rate),
     )?;
 
-    let input_sample_rate = supported_config.sample_rate().0;
+    let input_sample_rate = supported_config.sample_rate();
     let channels = supported_config.channels() as usize;
 
     if channels == 0 {
@@ -511,14 +626,24 @@ pub fn create_input_stream(
         )));
     }
 
+    let minimum_latency = minimum_latency_ms(input_sample_rate, target_sample_rate);
+    let latency_ms = if config.latency_ms < minimum_latency {
+        tracing::warn!(
+            "Input device '{}' latency_ms {} is below the {} ms its ring needs to hold one \
+             resampler burst; using {} ms",
+            device_name,
+            config.latency_ms,
+            minimum_latency,
+            minimum_latency
+        );
+        minimum_latency
+    } else {
+        config.latency_ms
+    };
     // Calculate ring buffer size based on OUTPUT sample rate (after potential resampling)
-    let ring_buffer_size = calculate_ring_buffer_size(target_sample_rate, channels, config.latency_ms);
-    let dropped_frames = Arc::new(AtomicU64::new(0));
-    let peak_level = Arc::new(AtomicU32::new(0));
+    let buffer_size = calculate_ring_buffer_size(target_sample_rate, channels, latency_ms);
 
-    // Check if we need resampling
-    let needs_resampling = input_sample_rate != target_sample_rate;
-    if needs_resampling {
+    if input_sample_rate != target_sample_rate {
         tracing::warn!(
             "Input device '{}' sample rate ({} Hz) differs from output ({} Hz) - resampling will add latency",
             device_name,
@@ -527,204 +652,581 @@ pub fn create_input_stream(
         );
     }
 
+    let sample_format = supported_config.sample_format();
     tracing::info!(
-        "Opening input device: {} ({} Hz, {} channels, {}ms buffer)",
+        "Opening input device: {} ({} Hz, {} channels, {:?}, {}ms buffer)",
         device_name,
         input_sample_rate,
         channels,
-        config.latency_ms
+        sample_format,
+        latency_ms
     );
 
-    let mut stream_config: cpal::StreamConfig = supported_config.into();
-
-    let build = |stream_config: &cpal::StreamConfig| -> Result<(Stream, HeapConsumer<f32>), InputError> {
-        let (producer, consumer) = create_ring_buffer(ring_buffer_size);
-        let stream = if needs_resampling {
-            create_resampling_input_stream(
-                &device,
-                stream_config,
-                producer,
-                input_sample_rate,
-                target_sample_rate,
-                channels,
-                config.resampler_quality,
-                dropped_frames.clone(),
-                peak_level.clone(),
-            )?
-        } else {
-            create_passthrough_input_stream(
-                &device,
-                stream_config,
-                producer,
-                channels,
-                dropped_frames.clone(),
-                peak_level.clone(),
-            )?
-        };
-        Ok((stream, consumer))
+    // Every input runs through async sample-rate conversion so two independently
+    // clocked devices stay drift-bounded, even at equal nominal rates (D33). The
+    // device sample format is handled orthogonally: a typed callback converts the
+    // native format to f32 before the resampler sees it (D37).
+    let build = |requested_buffer: Option<u32>| -> Result<_, InputError> {
+        let rings: Vec<(HeapProducer<f32>, HeapConsumer<f32>)> = (0..consumer_count)
+            .map(|_| create_ring_buffer(buffer_size))
+            .collect();
+        let (producers, consumers): (Vec<_>, Vec<_>) = rings.into_iter().unzip();
+        let mut options = config.clone();
+        options.buffer_size = requested_buffer;
+        let (stream, telemetry, max_backlog_frames) = build_resampling_input_stream(
+            &device,
+            supported_config,
+            sample_format,
+            producers,
+            input_sample_rate,
+            target_sample_rate,
+            channels,
+            &options,
+        )?;
+        Ok((stream, telemetry, max_backlog_frames, consumers))
     };
-
-    // Capture runs with the same buffer size as the output stream when one is
-    // configured: USB interfaces that share a clock between directions accept
-    // playback alongside capture only when both run compatible parameters.
-    let (stream, consumer) = match config.buffer_size {
-        Some(frames) => {
-            stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
-            match build(&stream_config) {
-                Ok(built) => built,
-                Err(e) => {
-                    tracing::warn!(
-                        "Input device rejected buffer size {}: {}; retrying with the device default",
-                        frames, e
-                    );
-                    stream_config.buffer_size = cpal::BufferSize::Default;
-                    build(&stream_config)?
-                }
-            }
+    let (stream, telemetry, max_backlog_frames, consumers) = match build(config.buffer_size) {
+        Ok(built) => built,
+        Err(error) if config.buffer_size.is_some() => {
+            tracing::warn!(
+                "Capture rejected the requested buffer size: {}; retrying the device default",
+                error
+            );
+            build(None)?
         }
-        None => build(&stream_config)?,
+        Err(error) => return Err(error),
     };
 
-    stream.play().map_err(|e| InputError::StreamError(e.to_string()))?;
+    stream
+        .play()
+        .map_err(|e| InputError::StreamError(e.to_string()))?;
 
     Ok(ActiveInput {
         stream,
-        consumer: Some(consumer),
+        consumers,
         channels,
         sample_rate: input_sample_rate,
-        dropped_frames,
-        peak_level,
+        telemetry,
+        max_backlog_frames,
     })
 }
 
-/// Create a passthrough input stream (no resampling)
-///
-/// The callback runs on the capture thread and must not allocate, lock, or log:
-/// stalling it costs whole capture periods and causes the very overruns it
-/// would be reporting. Dropped frames are counted for the caller to report.
-fn create_passthrough_input_stream(
-    device: &Device,
-    config: &cpal::StreamConfig,
-    mut producer: HeapProducer<f32>,
-    channels: usize,
-    dropped_frames: Arc<AtomicU64>,
-    peak_level: Arc<AtomicU32>,
-) -> Result<Stream, InputError> {
-    let stream = device.build_input_stream(
-        config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            update_peak_level(&peak_level, data);
-            push_frames(&mut producer, data, channels, &dropped_frames);
-        },
-        move |err| {
-            tracing::error!("Input stream error: {}", err);
-        },
-        None,
-    ).map_err(|e| InputError::StreamError(e.to_string()))?;
-
-    Ok(stream)
+/// Convert one block of typed cpal input samples to f32 and hand the f32 slice to
+/// `forward`. `scratch` is reused across calls and grows only when a larger block
+/// arrives, so in steady state (a stable cpal block size) this does no heap work.
+pub fn convert_input_block<T>(data: &[T], scratch: &mut Vec<f32>, forward: impl FnOnce(&[f32]))
+where
+    T: cpal::Sample,
+    f32: cpal::FromSample<T>,
+{
+    use cpal::Sample as _;
+    scratch.resize(data.len(), 0.0);
+    for (dst, &src) in scratch.iter_mut().zip(data.iter()) {
+        *dst = f32::from_sample(src);
+    }
+    forward(scratch);
 }
 
-/// Create a resampling input stream
+/// Which typed input handler a device sample format maps to. Mirrors Sprint 1's
+/// output dispatch; any other format is unsupported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputSampleHandling {
+    F32,
+    I16,
+    U16,
+    I32,
+}
+
+/// Map a cpal sample format to the typed input handler that converts it to f32,
+/// or `None` if this app does not support capturing that format. This is the
+/// single source of truth for the format dispatch in [`build_resampling_input_stream`].
+pub fn input_stream_builder(format: cpal::SampleFormat) -> Option<InputSampleHandling> {
+    use cpal::SampleFormat;
+    match format {
+        SampleFormat::F32 => Some(InputSampleHandling::F32),
+        SampleFormat::I16 => Some(InputSampleHandling::I16),
+        SampleFormat::U16 => Some(InputSampleHandling::U16),
+        SampleFormat::I32 => Some(InputSampleHandling::I32),
+        _ => None,
+    }
+}
+
+/// Number of input frames the resampler consumes per chunk.
+const RESAMPLE_CHUNK_SIZE: usize = 1024;
+
+/// Maximum ratio deviation the steered resampler may apply relative to the
+/// nominal ratio. The `SincFixedIn` constructor's `max_resample_ratio_relative`
+/// is set generously (the resampler sizes its internal buffers from it), while
+/// the control loop itself only ever nudges within [`STEER_MAX_DEVIATION`].
+const RESAMPLE_MAX_RELATIVE: f64 = 2.0;
+
+/// Largest fractional deviation from the nominal ratio the drift-control loop is
+/// allowed to command. Drift between two device clocks is tens of ppm, so a 2%
+/// authority is far more than enough to track it while staying well inside
+/// `RESAMPLE_MAX_RELATIVE` and small enough to be inaudible as pitch wobble.
+const STEER_MAX_DEVIATION: f64 = 0.02;
+
+/// Proportional gain of the drift-control loop, applied to the normalized fill
+/// error (where ±1.0 spans empty..full). Kept small so the ratio moves gently.
+const STEER_GAIN: f64 = 0.05;
+
+/// Smoothing factor for the measured ring-buffer fill. The instantaneous fill
+/// jitters by a chunk each time the resampler emits; this EMA rejects that so the
+/// loop steers on the slow trend, not the burst.
+const STEER_FILL_SMOOTHING: f64 = 0.05;
+
+/// Drives a `SincFixedIn` resampler from interleaved capture frames into a ring
+/// buffer, steering the resample ratio from the measured ring fill so two
+/// independently-clocked devices stay drift-bounded (D33). All working storage is
+/// pre-allocated so [`resample_block`] does no heap work on the RT capture thread.
+/// Capture-path telemetry counters (D57). The capture callback only does relaxed
+/// `fetch_add`s here — never `tracing`, whose cost depends on the installed
+/// subscriber — and the control thread drains/logs deltas off-RT and surfaces
+/// totals on `/metrics`.
+#[derive(Default)]
+pub struct InputTelemetry {
+    pub dropped_frames: Arc<AtomicU64>,
+    pub peak_levels: Vec<AtomicU32>,
+    /// Resampler `process_into_buffer` failures (the chunk was dropped).
+    pub resample_errors: std::sync::atomic::AtomicU64,
+    /// Interleaved samples dropped because the ring was full (overflow).
+    pub overflow_dropped_samples: std::sync::atomic::AtomicU64,
+    /// `set_resample_ratio` rejections from the drift-control loop.
+    pub ratio_rejects: std::sync::atomic::AtomicU64,
+    /// Capture blocks larger than the pre-sized conversion scratch (D58): each
+    /// one cost a reallocation on the capture thread. Persistently non-zero means
+    /// the device delivers blocks beyond its advertised maximum.
+    pub scratch_regrows: std::sync::atomic::AtomicU64,
+}
+
+pub struct ResampleState {
+    resampler: rubato::SincFixedIn<f32>,
+    channels: usize,
+    /// Per-channel de-interleave accumulators, each pre-sized to one full chunk.
+    deinterleave: Vec<Vec<f32>>,
+    /// Frames currently accumulated in `deinterleave` (0..RESAMPLE_CHUNK_SIZE).
+    filled: usize,
+    /// Reusable resampler output buffer from `output_buffer_allocate(true)`.
+    output: Vec<Vec<f32>>,
+    /// Nominal output/input ratio; the steered ratio is a small deviation of this.
+    nominal_ratio: f64,
+    /// Output frames one resampler chunk publishes at the nominal ratio, the burst
+    /// the ring absorbs on top of its steady fill.
+    burst_frames: usize,
+    /// Ring fill (interleaved samples) the drift-control loop steers toward: the
+    /// middle of the span a burst still fits above.
+    fill_target: usize,
+    /// Smoothed ring fill in interleaved samples; `-1.0` until first measured.
+    smoothed_fill: f64,
+    /// Most recent ratio commanded by the drift-control loop (== nominal until
+    /// the first steer). Exposed for tests/observability via [`ResampleState::current_ratio`].
+    last_ratio: f64,
+    /// Capture-path counters (D57), shared with the control thread.
+    telemetry: Arc<InputTelemetry>,
+}
+
+impl ResampleState {
+    /// The capture-path telemetry counters this state increments (D57). The
+    /// builder hands the clone to the control thread for draining and `/metrics`.
+    pub fn telemetry(&self) -> Arc<InputTelemetry> {
+        Arc::clone(&self.telemetry)
+    }
+
+    /// Build a resampler+accumulators sized for `channels` and the given nominal
+    /// `output_rate / input_rate` ratio, feeding a ring of `ring_capacity`
+    /// interleaved samples. All buffers are allocated here, off the RT thread.
+    pub fn new(
+        input_rate: u32,
+        output_rate: u32,
+        channels: usize,
+        ring_capacity: usize,
+    ) -> Result<Self, InputError> {
+        Self::with_quality(
+            input_rate,
+            output_rate,
+            channels,
+            ring_capacity,
+            ResamplerQuality::Maximum,
+        )
+    }
+
+    pub fn with_quality(
+        input_rate: u32,
+        output_rate: u32,
+        channels: usize,
+        ring_capacity: usize,
+        quality: ResamplerQuality,
+    ) -> Result<Self, InputError> {
+        use rubato::{
+            Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType,
+            WindowFunction,
+        };
+
+        let params = SincInterpolationParameters {
+            sinc_len: quality.sinc_len(),
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: quality.oversampling_factor(),
+            window: WindowFunction::BlackmanHarris2,
+        };
+
+        let nominal_ratio = output_rate as f64 / input_rate as f64;
+
+        let resampler = SincFixedIn::<f32>::new(
+            nominal_ratio,
+            RESAMPLE_MAX_RELATIVE,
+            params,
+            RESAMPLE_CHUNK_SIZE,
+            channels,
+        )
+        .map_err(|e| InputError::ResamplerError(format!("{:?}", e)))?;
+
+        // Pre-size de-interleave accumulators to exactly one chunk per channel.
+        let deinterleave = vec![vec![0.0f32; RESAMPLE_CHUNK_SIZE]; channels];
+        // Reusable output buffer with capacity for the largest possible chunk.
+        let output = resampler.output_buffer_allocate(true);
+
+        let burst_frames = resample_burst_frames(input_rate, output_rate);
+        let fill_target = ring_capacity.saturating_sub(burst_frames * channels) / 2;
+
+        Ok(Self {
+            resampler,
+            channels,
+            deinterleave,
+            filled: 0,
+            output,
+            nominal_ratio,
+            burst_frames,
+            fill_target,
+            smoothed_fill: -1.0,
+            last_ratio: nominal_ratio,
+            telemetry: Arc::new(InputTelemetry {
+                peak_levels: (0..channels).map(|_| AtomicU32::new(0)).collect(),
+                ..Default::default()
+            }),
+        })
+    }
+
+    /// The ratio the drift-control loop last commanded (output frames per input
+    /// frame). Settles toward the true `r_out / r_in` of the two device clocks.
+    #[allow(dead_code)] // Observability/testing accessor; not read on the hot path.
+    pub fn current_ratio(&self) -> f64 {
+        self.last_ratio
+    }
+
+    /// The nominal `output_rate / input_rate` ratio the resampler was built with.
+    #[allow(dead_code)] // Observability/testing accessor; not read on the hot path.
+    pub fn nominal_ratio(&self) -> f64 {
+        self.nominal_ratio
+    }
+
+    /// Backlog the mixer tolerates before trimming: the highest fill the loop
+    /// parks at while its authority still covers the drift, plus one burst landing
+    /// on top. Beyond this the drift exceeds what steering can absorb and trimming
+    /// is the right response.
+    pub fn backlog_ceiling_frames(&self) -> usize {
+        let target_frames = self.fill_target / self.channels;
+        let parked_max = target_frames as f64 * (1.0 + STEER_MAX_DEVIATION / STEER_GAIN);
+        parked_max.ceil() as usize + self.burst_frames
+    }
+}
+
+/// Output frames one resampler chunk publishes at the nominal ratio.
+fn resample_burst_frames(input_rate: u32, output_rate: u32) -> usize {
+    (RESAMPLE_CHUNK_SIZE as f64 * output_rate as f64 / input_rate as f64).ceil() as usize
+}
+
+/// Smallest `latency_ms` whose ring holds the steering target plus one resampler
+/// burst. Below this the capture side drops at the ring on every chunk, so a
+/// configured value under it is raised.
+pub fn minimum_latency_ms(input_rate: u32, output_rate: u32) -> u32 {
+    let burst = resample_burst_frames(input_rate, output_rate);
+    let frames_per_ms = (output_rate / 1000).max(1) as usize;
+    // The ring holds 4 * latency_ms * frames_per_ms frames; two bursts leave the
+    // target one burst of headroom on each side.
+    (2 * burst).div_ceil(4 * frames_per_ms) as u32
+}
+
+/// Resample one block of interleaved capture `data` into `producer`.
 ///
-/// All working buffers are allocated up front: the callback runs on the capture
-/// thread, where an allocation or a log write costs capture periods and causes
-/// overruns.
+/// RT-safe: pre-sized accumulators receive de-interleaved samples by index (no
+/// `Vec` growth), `process_into_buffer` writes into a reusable output buffer (no
+/// allocation), and the ratio is steered toward a half-full ring via
+/// `set_resample_ratio` (which only updates two floats). Nothing here allocates,
+/// frees, or locks.
+#[allow(dead_code)]
+pub fn resample_block(state: &mut ResampleState, data: &[f32], producer: &mut HeapProducer<f32>) {
+    resample_block_fanout(state, data, std::slice::from_mut(producer));
+}
+
+/// Resample one block and publish the interleaved result to every logical-strip
+/// ring backed by one physical capture. All producers are preallocated during
+/// setup; this function only performs bounded pushes and relaxed counters.
+pub fn resample_block_fanout(
+    state: &mut ResampleState,
+    data: &[f32],
+    producers: &mut [HeapProducer<f32>],
+) {
+    use rubato::Resampler;
+
+    if producers.is_empty() {
+        return;
+    }
+
+    let channels = state.channels;
+    // cpal delivers whole frames; a non-frame-aligned block would desync the
+    // de-interleave below (F6). This cannot trigger in release in practice.
+    debug_assert!(
+        data.len().is_multiple_of(channels),
+        "capture block not frame-aligned: {} samples, {} channels",
+        data.len(),
+        channels
+    );
+
+    let mut offset = 0;
+    while offset < data.len() {
+        // Fill the accumulators frame-by-frame up to one chunk.
+        let frames_in_data = (data.len() - offset) / channels;
+        let room = RESAMPLE_CHUNK_SIZE - state.filled;
+        let take = frames_in_data.min(room);
+        for f in 0..take {
+            let base = offset + f * channels;
+            for ch in 0..channels {
+                state.deinterleave[ch][state.filled + f] = data[base + ch];
+            }
+        }
+        state.filled += take;
+        offset += take * channels;
+
+        if state.filled < RESAMPLE_CHUNK_SIZE {
+            // Not enough for a chunk yet; wait for the next callback.
+            break;
+        }
+
+        // Steer the ratio toward a half-full ring before processing this chunk.
+        steer_ratio(state, &producers[0]);
+
+        // Resample one full chunk into the reusable output buffer.
+        let (_in_frames, out_frames) =
+            match state
+                .resampler
+                .process_into_buffer(&state.deinterleave, &mut state.output, None)
+            {
+                Ok(counts) => counts,
+                Err(_) => {
+                    // A relaxed counter, never tracing, on the capture thread
+                    // (D57); the control thread logs the delta off-RT.
+                    state
+                        .telemetry
+                        .resample_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    state.filled = 0;
+                    continue;
+                }
+            };
+        state.filled = 0;
+
+        // Interleave the produced frames into the ring buffer.
+        let mut dropped = 0usize;
+        for producer in producers.iter_mut() {
+            let writable = out_frames.min(producer.free_len() / channels);
+            dropped += (out_frames - writable) * channels;
+            for frame_idx in 0..writable {
+                for ch in 0..channels {
+                    let _ = producer.push(state.output[ch][frame_idx]);
+                }
+            }
+        }
+        if dropped > 0 {
+            state
+                .telemetry
+                .dropped_frames
+                .fetch_add((dropped / channels) as u64, Ordering::Relaxed);
+            state
+                .telemetry
+                .overflow_dropped_samples
+                .fetch_add(dropped as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Nudge the resampler ratio toward keeping the ring buffer at its fill target
+/// (D33).
+///
+/// Two independently-clocked devices drift; left alone the ring monotonically
+/// fills or drains until it clicks (overflow) or starves (underrun silence). A
+/// slow proportional loop on the smoothed fill error corrects that: when the
+/// ring runs above the target the consumer is slower than the producer, so we
+/// reduce the output ratio (emit fewer frames) and vice versa. The commanded
+/// deviation is clamped to [`STEER_MAX_DEVIATION`], well inside the resampler's
+/// `RESAMPLE_MAX_RELATIVE`, so it is inaudible as pitch.
+fn steer_ratio(state: &mut ResampleState, producer: &HeapProducer<f32>) {
+    use rubato::Resampler;
+
+    if state.fill_target == 0 {
+        return;
+    }
+
+    let fill = producer.len() as f64;
+    state.smoothed_fill = if state.smoothed_fill < 0.0 {
+        fill
+    } else {
+        state.smoothed_fill + STEER_FILL_SMOOTHING * (fill - state.smoothed_fill)
+    };
+
+    let target = state.fill_target as f64;
+    // Normalized error: -1.0 when empty, +1.0 at twice the target.
+    let err = (state.smoothed_fill - target) / target;
+    // Above the target => slow the output (ratio < nominal); below => speed it up.
+    let deviation = (-STEER_GAIN * err).clamp(-STEER_MAX_DEVIATION, STEER_MAX_DEVIATION);
+    let new_ratio = state.nominal_ratio * (1.0 + deviation);
+
+    // Ramp so the change is spread across the chunk (no per-chunk step in pitch).
+    match state.resampler.set_resample_ratio(new_ratio, true) {
+        Ok(()) => state.last_ratio = new_ratio,
+        Err(_) => {
+            state
+                .telemetry
+                .ratio_rejects
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Build the async-SRC input stream, dispatching on the device sample format so
+/// a non-f32 device opens (D37). The format choice is orthogonal to resampling:
+/// the typed callback converts the native samples to f32, then the same
+/// [`resample_block`] drives the drift-steered resampler regardless of format.
 #[allow(clippy::too_many_arguments)]
-fn create_resampling_input_stream(
+fn build_resampling_input_stream(
     device: &Device,
-    config: &cpal::StreamConfig,
-    mut producer: HeapProducer<f32>,
+    config: SupportedStreamConfig,
+    sample_format: cpal::SampleFormat,
+    producers: Vec<HeapProducer<f32>>,
     input_rate: u32,
     output_rate: u32,
     channels: usize,
-    quality: ResamplerQuality,
-    dropped_frames: Arc<AtomicU64>,
-    peak_level: Arc<AtomicU32>,
-) -> Result<Stream, InputError> {
-    use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction, Resampler};
+    options: &InputStreamConfig,
+) -> Result<(Stream, Arc<InputTelemetry>, usize), InputError> {
+    match input_stream_builder(sample_format) {
+        Some(InputSampleHandling::F32) => build_typed_resampling_input_stream::<f32>(
+            device,
+            config,
+            producers,
+            input_rate,
+            output_rate,
+            channels,
+            options,
+        ),
+        Some(InputSampleHandling::I16) => build_typed_resampling_input_stream::<i16>(
+            device,
+            config,
+            producers,
+            input_rate,
+            output_rate,
+            channels,
+            options,
+        ),
+        Some(InputSampleHandling::U16) => build_typed_resampling_input_stream::<u16>(
+            device,
+            config,
+            producers,
+            input_rate,
+            output_rate,
+            channels,
+            options,
+        ),
+        Some(InputSampleHandling::I32) => build_typed_resampling_input_stream::<i32>(
+            device,
+            config,
+            producers,
+            input_rate,
+            output_rate,
+            channels,
+            options,
+        ),
+        None => Err(InputError::UnsupportedFormat(format!(
+            "{:?}",
+            sample_format
+        ))),
+    }
+}
 
-    // The conversion runs per capture callback, so the configured quality
-    // preset decides the CPU cost here just as it does for file decoding
-    let params = SincInterpolationParameters {
-        sinc_len: quality.sinc_len(),
-        f_cutoff: 0.95,
-        interpolation: SincInterpolationType::Linear,
-        oversampling_factor: quality.oversampling_factor(),
-        window: WindowFunction::BlackmanHarris2,
-    };
-
-    let resample_ratio = output_rate as f64 / input_rate as f64;
-
-    // Resample in fixed-size chunks so the resampler's own buffers stay fixed
-    let chunk_size = 1024;
-    let mut resampler = SincFixedIn::<f32>::new(
-        resample_ratio,
-        2.0, // Max relative ratio deviation
-        params,
-        chunk_size,
+/// Build the async-SRC input stream for a specific native sample type `T`. The
+/// callback converts `T` to f32 into a reused scratch buffer and feeds it to the
+/// resampler. RT-safe in steady state: the scratch grows only on the first (or a
+/// larger) block, and `resample_block` itself does no heap work.
+#[allow(clippy::too_many_arguments)]
+fn build_typed_resampling_input_stream<T>(
+    device: &Device,
+    config: SupportedStreamConfig,
+    mut producers: Vec<HeapProducer<f32>>,
+    input_rate: u32,
+    output_rate: u32,
+    channels: usize,
+    options: &InputStreamConfig,
+) -> Result<(Stream, Arc<InputTelemetry>, usize), InputError>
+where
+    T: cpal::SizedSample,
+    f32: cpal::FromSample<T>,
+{
+    let ring_capacity = producers
+        .first()
+        .map(|producer| producer.capacity())
+        .unwrap_or(0);
+    let mut state = ResampleState::with_quality(
+        input_rate,
+        output_rate,
         channels,
-    ).map_err(|e| InputError::ResamplerError(format!("{:?}", e)))?;
+        ring_capacity,
+        options.resampler_quality,
+    )?;
+    let telemetry = state.telemetry();
+    let callback_telemetry = Arc::clone(&telemetry);
+    let max_backlog_frames = state.backlog_ceiling_frames();
 
-    let mut resampler_input = resampler.input_buffer_allocate(true);
-    let mut resampler_output = resampler.output_buffer_allocate(true);
-    let max_output_frames = resampler_output.first().map_or(0, |ch| ch.len());
+    // Pre-size the conversion scratch to the largest block the device says it can
+    // deliver (D58), clamped to a sane cap; `Unknown` gets the cap. The resize in
+    // `convert_input_block` then never reallocates for in-range blocks, and an
+    // out-of-range block is counted instead of silently reallocating.
+    const MAX_PRESIZE_FRAMES: usize = 8192;
+    let max_block_frames = match config.buffer_size() {
+        cpal::SupportedBufferSize::Range { max, .. } => (*max as usize).min(MAX_PRESIZE_FRAMES),
+        cpal::SupportedBufferSize::Unknown => MAX_PRESIZE_FRAMES,
+    };
+    let mut scratch: Vec<f32> = Vec::with_capacity(max_block_frames.max(1) * channels);
 
-    // Deinterleaved samples accumulated until a full chunk is available
-    let mut pending: Vec<Vec<f32>> = (0..channels)
-        .map(|_| Vec::with_capacity(chunk_size * 2))
-        .collect();
-
-    // Interleaved resampler output, staged here before going into the ring buffer
-    let mut interleaved = vec![0.0f32; max_output_frames * channels];
-
-    let stream = device.build_input_stream(
-        config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            update_peak_level(&peak_level, data);
-            for (i, sample) in data.iter().enumerate() {
-                pending[i % channels].push(*sample);
-            }
-
-            while pending[0].len() >= chunk_size {
-                for ch in 0..channels {
-                    resampler_input[ch].clear();
-                    resampler_input[ch].extend(pending[ch].drain(..chunk_size));
+    let mut stream_config: cpal::StreamConfig = config.into();
+    if let Some(frames) = options.buffer_size {
+        stream_config.buffer_size = cpal::BufferSize::Fixed(frames);
+    }
+    let stream = device
+        .build_input_stream(
+            stream_config,
+            move |data: &[T], _: &cpal::InputCallbackInfo| {
+                if data.len() > scratch.capacity() {
+                    // Pathological device: a block beyond the advertised maximum
+                    // is about to regrow the scratch on the capture thread (D58).
+                    callback_telemetry
+                        .scratch_regrows
+                        .fetch_add(1, Ordering::Relaxed);
                 }
-
-                let frames_out = match resampler
-                    .process_into_buffer(&resampler_input, &mut resampler_output, None)
-                {
-                    Ok((_, frames_out)) => frames_out,
-                    Err(_) => {
-                        // Count the chunk as lost rather than logging from the
-                        // capture thread
-                        dropped_frames.fetch_add(chunk_size as u64, Ordering::Relaxed);
-                        continue;
+                convert_input_block::<T>(data, &mut scratch, |f32s| {
+                    for (i, &value) in f32s.iter().enumerate() {
+                        callback_telemetry.peak_levels[i % channels]
+                            .fetch_max(value.abs().to_bits(), Ordering::Relaxed);
                     }
-                };
+                    resample_block_fanout(&mut state, f32s, &mut producers);
+                });
+            },
+            move |err| {
+                tracing::error!("Input stream error: {}", err);
+            },
+            None,
+        )
+        .map_err(|e| InputError::StreamError(e.to_string()))?;
 
-                for frame_idx in 0..frames_out {
-                    for ch in 0..channels {
-                        interleaved[frame_idx * channels + ch] = resampler_output[ch][frame_idx];
-                    }
-                }
-
-                push_frames(
-                    &mut producer,
-                    &interleaved[..frames_out * channels],
-                    channels,
-                    &dropped_frames,
-                );
-            }
-        },
-        move |err| {
-            tracing::error!("Input stream error: {}", err);
-        },
-        None,
-    ).map_err(|e| InputError::StreamError(e.to_string()))?;
-
-    Ok(stream)
+    Ok((stream, telemetry, max_backlog_frames))
 }
 
 /// Error types for input operations
@@ -740,19 +1242,31 @@ pub enum InputError {
     ConfigError(String),
     StreamError(String),
     ResamplerError(String),
+    UnsupportedFormat(String),
 }
 
 impl std::fmt::Display for InputError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InputError::DeviceEnumeration(e) => write!(f, "Failed to enumerate devices: {}", e),
-            InputError::DeviceNotFound { requested, available, probe } => {
-                write!(f, "{}", device_not_found_message(requested, available, probe.as_deref()))
+            InputError::DeviceNotFound {
+                requested,
+                available,
+                probe,
+            } => {
+                write!(
+                    f,
+                    "{}",
+                    device_not_found_message(requested, available, probe.as_deref())
+                )
             }
             InputError::NoDefaultDevice => write!(f, "No default input device available"),
             InputError::ConfigError(e) => write!(f, "Configuration error: {}", e),
             InputError::StreamError(e) => write!(f, "Stream error: {}", e),
             InputError::ResamplerError(e) => write!(f, "Resampler error: {}", e),
+            InputError::UnsupportedFormat(fmt) => {
+                write!(f, "Unsupported input sample format: {}", fmt)
+            }
         }
     }
 }
@@ -830,6 +1344,29 @@ mod tests {
     }
 
     #[test]
+    fn test_resample_fanout_feeds_each_logical_strip_ring() {
+        let channels = 2;
+        let mut state = ResampleState::new(48000, 48000, channels, 8192).unwrap();
+        let (first, mut first_consumer) = create_ring_buffer(8192);
+        let (second, mut second_consumer) = create_ring_buffer(8192);
+        let data = vec![0.25_f32; 1024 * channels];
+        resample_block_fanout(&mut state, &data, &mut [first, second]);
+        let mut first_out = vec![0.0; 2048];
+        let mut second_out = vec![0.0; 2048];
+        let first_count = first_consumer.pop_slice(&mut first_out);
+        let second_count = second_consumer.pop_slice(&mut second_out);
+        assert!(first_count > 0);
+        assert_eq!(first_count, second_count);
+        assert_eq!(&first_out[..first_count], &second_out[..second_count]);
+    }
+
+    // Note: Device enumeration tests require actual hardware and are skipped in CI
+    // The following tests are integration tests that need real devices:
+    // - test_list_input_devices
+    // - test_get_default_input_device
+    // - test_create_input_stream
+
+    #[test]
     fn test_parse_device_index() {
         assert_eq!(parse_device_index("0", 3), Some(0));
         assert_eq!(parse_device_index("2", 3), Some(2));
@@ -847,8 +1384,14 @@ mod tests {
             "hw:CARD=UMC1820,DEV=0".to_string(),
             "plughw:CARD=UMC1820,DEV=0".to_string(),
         ];
-        assert_eq!(resolve_requested_device("plughw:CARD=UMC1820,DEV=0", &names), Some(1));
-        assert_eq!(resolve_requested_device("hw:CARD=UMC1820,DEV=0", &names), Some(0));
+        assert_eq!(
+            resolve_requested_device("plughw:CARD=UMC1820,DEV=0", &names),
+            Some(1)
+        );
+        assert_eq!(
+            resolve_requested_device("hw:CARD=UMC1820,DEV=0", &names),
+            Some(0)
+        );
     }
 
     #[test]
@@ -868,13 +1411,19 @@ mod tests {
             "hw:CARD=Headset,DEV=0".to_string(),
             "hw:CARD=UMC1820,DEV=0".to_string(),
         ];
-        assert_eq!(resolve_requested_device("hw:CARD=UMC1820, DEV=0", &names), Some(1));
+        assert_eq!(
+            resolve_requested_device("hw:CARD=UMC1820, DEV=0", &names),
+            Some(1)
+        );
     }
 
     #[test]
     fn test_resolve_requested_device_unmatched() {
         let names = vec!["hw:CARD=UMC1820,DEV=0".to_string()];
-        assert_eq!(resolve_requested_device("hw:CARD=Missing,DEV=0", &names), None);
+        assert_eq!(
+            resolve_requested_device("hw:CARD=Missing,DEV=0", &names),
+            None
+        );
         assert_eq!(resolve_requested_device("anything", &[]), None);
     }
 
@@ -895,10 +1444,7 @@ mod tests {
 
     #[test]
     fn test_device_not_found_message_lists_available_devices() {
-        let available = vec![
-            "hw:CARD=UMC1820,DEV=0".to_string(),
-            "default".to_string(),
-        ];
+        let available = vec!["hw:CARD=UMC1820,DEV=0".to_string(), "default".to_string()];
         let msg = device_not_found_message("plughw:CARD=UMC1820,DEV=0", &available, None);
         assert!(msg.contains("plughw:CARD=UMC1820,DEV=0"));
         assert!(msg.contains("hw:CARD=UMC1820,DEV=0"));
@@ -942,10 +1488,15 @@ mod tests {
         // carry the requested name and, on Linux, a direct-ALSA diagnosis of
         // why the capture open fails.
         match get_input_device(Some("hw:CARD=NoSuchCardExists,DEV=0")) {
-            Err(InputError::DeviceNotFound { requested, probe, .. }) => {
+            Err(InputError::DeviceNotFound {
+                requested, probe, ..
+            }) => {
                 assert_eq!(requested, "hw:CARD=NoSuchCardExists,DEV=0");
                 #[cfg(target_os = "linux")]
-                assert!(probe.is_some(), "Linux probe should always produce a diagnosis");
+                assert!(
+                    probe.is_some(),
+                    "Linux probe should always produce a diagnosis"
+                );
                 #[cfg(not(target_os = "linux"))]
                 assert!(probe.is_none());
             }
@@ -994,12 +1545,16 @@ mod tests {
         for _ in 0..10 {
             push_frames(&mut producer, &data, channels, &dropped);
             assert_eq!(
-                consumer.len() % channels, 0,
+                consumer.len() % channels,
+                0,
                 "ring buffer must always hold a whole number of frames"
             );
         }
 
-        assert!(dropped.load(Ordering::Relaxed) > 0, "saturation should be counted");
+        assert!(
+            dropped.load(Ordering::Relaxed) > 0,
+            "saturation should be counted"
+        );
     }
 
     #[test]
@@ -1046,10 +1601,4 @@ mod tests {
         assert_eq!(required_channels(&[(0, 0), (17, 3), (2, 1)]), 18);
         assert_eq!(required_channels(&[]), 0);
     }
-
-    // Note: Device enumeration tests require actual hardware and are skipped in CI
-    // The following tests are integration tests that need real devices:
-    // - test_list_input_devices
-    // - test_get_default_input_device
-    // - test_create_input_stream
 }

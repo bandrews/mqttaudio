@@ -96,7 +96,10 @@ mod tests {
         let mut det = ActivityDetector::new(0.1, 500, now);
 
         det.update(0.5, now);
-        assert_eq!(det.update(0.0, now + Duration::from_millis(600)), Some(false));
+        assert_eq!(
+            det.update(0.0, now + Duration::from_millis(600)),
+            Some(false)
+        );
         assert!(!det.is_active());
         // And it does not fire again while silent
         assert_eq!(det.update(0.0, now + Duration::from_millis(700)), None);
@@ -112,7 +115,10 @@ mod tests {
         assert_eq!(det.update(0.5, now + Duration::from_millis(400)), None);
         assert_eq!(det.update(0.0, now + Duration::from_millis(700)), None);
         assert!(det.is_active());
-        assert_eq!(det.update(0.0, now + Duration::from_millis(950)), Some(false));
+        assert_eq!(
+            det.update(0.0, now + Duration::from_millis(950)),
+            Some(false)
+        );
     }
 
     #[test]
@@ -122,6 +128,9 @@ mod tests {
 
         det.update(0.5, now);
         det.update(0.0, now + Duration::from_millis(600));
-        assert_eq!(det.update(0.5, now + Duration::from_millis(1000)), Some(true));
+        assert_eq!(
+            det.update(0.5, now + Duration::from_millis(1000)),
+            Some(true)
+        );
     }
 }

@@ -8,7 +8,7 @@ This document explains how to set up your development environment and run tests.
 
 ### Prerequisites
 
-- Rust 1.70+
+- Rust 1.95 (matches the Linux validation image)
 - Node.js (for interactive integration tests)
 - ffmpeg (for generating test audio files)
 
@@ -29,6 +29,9 @@ cargo build --release  # Release build
 ```
 
 ## Running Tests
+
+Run validation locally, including the Docker-based Linux validation and local browser suites. GitHub Actions is intentionally disabled for this repository to avoid hosted CI costs and quota usage. Do not add or enable Actions workflows or re-enable repository Actions without an explicit maintainer request.
+
 
 ### Unit Tests
 

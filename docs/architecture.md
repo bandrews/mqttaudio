@@ -154,16 +154,38 @@ struct ActiveSample {
 }
 ```
 
+### Point-source panning
+
+The motion compiler in `src/motion.rs` resolves channel aliases and places, checks the decoded input
+and negotiated output channels, and converts timing marks to absolute output frames. The renderer in
+`src/audio/panner.rs` takes normalized output mixes and timing marks. A coordinate path can supply
+those same mixes by sampling its geometry on the control thread.
+
+The mixer reads one mono sample or folds a stereo pair after source interpolation, loop crossfades or
+pitch correction. It pans that value once into the physical outputs, before bass management and output
+calibration. The panner accounts for speakers present in both endpoint mixes when normalizing a handoff.
+Each playing source owns its cursor and prepared data. The callback advances on the output clock and
+the existing reaper releases the data when playback ends.
+
 ### Voice
 
-A group of samples controlled together:
+A group of samples controlled together. A voice holds settings that apply
+to every sample played into it, and lasts until `voice_clear` or `reset`
+whether or not anything is playing. A voice that exists only for a play that
+named no voice, or only for plays still loading, is transient: it is
+forgotten once empty, unless a setting is stored on it or a play naming it
+starts.
 
 ```rust
 struct Voice {
     id: String,
     sample_ids: Vec<u64>,
     volume: f32,
-    fade_state: Option<FadeState>,
+    loading_plays: usize, // plays naming this voice that are still loading
+    speed: f32,
+    pitch_correction: bool,
+    transient: bool,       // only for an unnamed play or plays still loading
+    has_live_input: bool,  // a microphone's voice_id; never forgotten
 }
 ```
 
@@ -194,6 +216,13 @@ struct Voice {
 11. **Latency: ~100-300ms**
 
 ## Key Components
+
+### Command Scheduler (`src/main.rs`, `src/pending_plays.rs`)
+
+Takes commands from MQTT and HTTP. A play's file loads in the background while
+the scheduler keeps the play; commands that arrive meanwhile carry their
+settings onto it or cancel it, and the play starts when its load finishes. See
+[Command ordering](command-ordering.md).
 
 ### Mixer (`src/audio/mixer.rs`)
 
@@ -248,7 +277,7 @@ Two-tier caching:
 
 | Crate | Purpose |
 |-------|---------|
-| cpal | Cross-platform audio I/O |
+| cpal | Cross-platform audio I/O (`0.17`; device names via `Device::description()`) |
 | symphonia | Audio decoding |
 | rubato | Sample rate conversion |
 | rumqttc | MQTT client |
@@ -309,6 +338,7 @@ src/
 ├── http/
 │   ├── mod.rs           # HTTP REST API
 │   └── handlers.rs      # Request handlers
+├── pending_plays.rs     # Plays still loading, and the commands that reach them
 └── voice.rs             # Voice management
 ```
 

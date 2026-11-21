@@ -68,6 +68,21 @@ Change playback speed in real-time:
 }
 ```
 
+### Voice Speed
+
+To set the speed of a whole voice and keep it for later plays into that voice, use [`voice_speed`](../commands.md#voice_speed):
+
+```json
+{
+  "command": "voice_speed",
+  "voice": "music",
+  "speed": 0.8,
+  "pitch_correction": true
+}
+```
+
+The voice speed sets each sound's speed rather than multiplying it. A `speed` aimed at one sound changes that sound until the next `voice_speed` on its voice, and a `play` that gives its own `speed` starts at it; a `play` without one starts at its voice's speed.
+
 ### Speed Values
 
 | Speed | Effect |
@@ -191,6 +206,29 @@ Start playback from a specific position:
   "start_position_ms": 120000
 }
 ```
+
+### Start Speed
+
+Start playback at a speed, with or without pitch correction, instead of sending
+a `speed` command after the play:
+
+```json
+{
+  "command": "play",
+  "file": "/sounds/engine.wav",
+  "voice": "engine",
+  "speed": 1.08,
+  "pitch_correction": false
+}
+```
+
+`speed` and `pitch_correction` mean exactly what they mean on the `speed`
+command, with the same ranges. `speed: 0`, and a negative speed with
+`pitch_correction`, reject the play. A negative speed plays backwards from
+`start_position_ms`, so give one, or the sound is already at its beginning and
+ends at once. A windowed play (`mode: "stream"`, or a file long or large enough
+for `auto` to window) plays forward only: it starts at normal speed and logs a
+warning. Use `mode: "full"` for a sound that has to start at another speed.
 
 ## Examples
 

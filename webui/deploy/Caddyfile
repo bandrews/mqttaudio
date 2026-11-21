@@ -1,0 +1,38 @@
+# Reverse-proxy sidecar for the mqttaudio web app (DW1).
+#
+# Serves the built SPA and proxies the daemon surface so the browser is
+# same-origin (no CORS) and never carries the auth token: the Bearer header is
+# injected here, server-side (DW9). The daemon needs NO static-serving (DW1
+# rejected that); it stays single-purpose.
+#
+# Environment:
+#   SITE_ADDRESS  listen address (default :8088; use a hostname for auto-HTTPS/wss)
+#   DAEMON_HOST   daemon HTTP host:port (default 127.0.0.1:8080)
+#   DAEMON_TOKEN  the daemon's http.auth_token (omit/empty if the daemon is open)
+#   WEBUI_DIST    path to the built SPA, i.e. webui/dist (default /srv/webui)
+
+{$SITE_ADDRESS::8088} {
+	encode gzip
+
+	# REST API: strip the /api prefix and inject the Bearer header server-side.
+	handle_path /api/* {
+		reverse_proxy {$DAEMON_HOST:127.0.0.1:8080} {
+			header_up Authorization "Bearer {$DAEMON_TOKEN}"
+		}
+	}
+
+	# WebSocket streams: /ws (logs) and /ws/state (state events, Sprint W7). Caddy
+	# upgrades WebSockets automatically. The `/ws*` matcher covers both.
+	handle /ws* {
+		reverse_proxy {$DAEMON_HOST:127.0.0.1:8080} {
+			header_up Authorization "Bearer {$DAEMON_TOKEN}"
+		}
+	}
+
+	# SPA: serve the built bundle with history fallback to index.html.
+	handle {
+		root * {$WEBUI_DIST:/srv/webui}
+		try_files {path} /index.html
+		file_server
+	}
+}
